@@ -1,11 +1,13 @@
 package wire
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,6 +18,8 @@ func TestTCPFrameRoundTripAndSequentialFrames(t *testing.T) {
 	defer server.Close()
 	auth := NewHMACAuthenticator(testKey)
 	limits := DefaultLimits()
+	clientStream := NewTCPFrameStream(client, auth, limits, time.Second)
+	serverStream := NewTCPFrameStream(server, auth, limits, time.Second)
 	frames := []Frame{
 		{Header: testHeader(), Payload: []byte("first")},
 		{Header: testHeader(), Payload: []byte("second")},
@@ -25,7 +29,7 @@ func TestTCPFrameRoundTripAndSequentialFrames(t *testing.T) {
 	writeErrors := make(chan error, 1)
 	go func() {
 		for _, frame := range frames {
-			if err := WriteTCPFrame(context.Background(), client, frame, auth, limits, time.Second); err != nil {
+			if err := clientStream.WriteFrame(context.Background(), frame); err != nil {
 				writeErrors <- err
 				return
 			}
@@ -34,7 +38,7 @@ func TestTCPFrameRoundTripAndSequentialFrames(t *testing.T) {
 	}()
 
 	for index, want := range frames {
-		got, err := ReadTCPFrame(context.Background(), server, auth, limits, time.Second)
+		got, err := serverStream.ReadFrame(context.Background())
 		if err != nil {
 			t.Fatalf("read frame %d: %v", index, err)
 		}
@@ -189,6 +193,78 @@ func TestTCPWriteFrameJoinsPrimaryAndDeadlineClearErrors(t *testing.T) {
 	}
 }
 
+func TestTCPFrameStreamSerializesWritesAndDeadlines(t *testing.T) {
+	conn := newSerializedWriteConn()
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(conn.releaseFirstWrite)
+		}
+	})
+	auth := NewHMACAuthenticator(testKey)
+	stream := NewTCPFrameStream(conn, auth, DefaultLimits(), time.Second)
+	first := Frame{Header: testHeader(), Payload: []byte("first")}
+	second := Frame{Header: testHeader(), Payload: []byte("second")}
+	second.Header.RequestID = RequestID{2}
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- stream.WriteFrame(context.Background(), first)
+	}()
+	<-conn.firstWriteEntered
+	if stream.writeMu.TryLock() {
+		stream.writeMu.Unlock()
+		t.Fatal("stream did not hold its write lock across connection I/O")
+	}
+	if !stream.readMu.TryLock() {
+		t.Fatal("blocked write also blocked the independent read direction")
+	}
+	stream.readMu.Unlock()
+
+	secondStarted := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondResult <- stream.WriteFrame(context.Background(), second)
+	}()
+	<-secondStarted
+	close(conn.releaseFirstWrite)
+	released = true
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+
+	firstBody, err := Encode(first.Header, first.Payload, auth, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody, err := Encode(second.Header, second.Payload, auth, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWrites := [][]byte{tcpPrefix(firstBody), firstBody, tcpPrefix(secondBody), secondBody}
+	events := conn.snapshotEvents()
+	if len(events) != 8 {
+		t.Fatalf("connection events = %#v", events)
+	}
+	wantKinds := []string{"set", "write", "write", "clear", "set", "write", "write", "clear"}
+	writeIndex := 0
+	for index, event := range events {
+		if event.kind != wantKinds[index] {
+			t.Fatalf("event %d = %q, want %q; all events = %#v", index, event.kind, wantKinds[index], events)
+		}
+		if event.kind == "write" {
+			if !bytes.Equal(event.payload, wantWrites[writeIndex]) {
+				t.Fatalf("write %d = %x, want %x", writeIndex, event.payload, wantWrites[writeIndex])
+			}
+			writeIndex++
+		}
+	}
+}
+
 type limitedWriteConn struct {
 	net.Conn
 	maximum int
@@ -225,4 +301,73 @@ func (c *deadlineFailureConn) SetWriteDeadline(value time.Time) error {
 		return c.clearError
 	}
 	return nil
+}
+
+type serializedWriteConn struct {
+	mu                sync.Mutex
+	events            []serializedConnEvent
+	writeCalls        int
+	firstWriteEntered chan struct{}
+	releaseFirstWrite chan struct{}
+}
+
+type serializedConnEvent struct {
+	kind    string
+	payload []byte
+}
+
+func newSerializedWriteConn() *serializedWriteConn {
+	return &serializedWriteConn{
+		firstWriteEntered: make(chan struct{}),
+		releaseFirstWrite: make(chan struct{}),
+	}
+}
+
+func (*serializedWriteConn) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (c *serializedWriteConn) Write(payload []byte) (int, error) {
+	c.mu.Lock()
+	c.writeCalls++
+	call := c.writeCalls
+	c.events = append(c.events, serializedConnEvent{kind: "write", payload: append([]byte(nil), payload...)})
+	if call == 1 {
+		close(c.firstWriteEntered)
+	}
+	c.mu.Unlock()
+	if call == 1 {
+		<-c.releaseFirstWrite
+	}
+	return len(payload), nil
+}
+
+func (*serializedWriteConn) Close() error                { return nil }
+func (*serializedWriteConn) LocalAddr() net.Addr         { return nil }
+func (*serializedWriteConn) RemoteAddr() net.Addr        { return nil }
+func (*serializedWriteConn) SetDeadline(time.Time) error { return nil }
+func (*serializedWriteConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (c *serializedWriteConn) SetWriteDeadline(value time.Time) error {
+	kind := "set"
+	if value.IsZero() {
+		kind = "clear"
+	}
+	c.mu.Lock()
+	c.events = append(c.events, serializedConnEvent{kind: kind})
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *serializedWriteConn) snapshotEvents() []serializedConnEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	events := make([]serializedConnEvent, len(c.events))
+	copy(events, c.events)
+	return events
+}
+
+func tcpPrefix(body []byte) []byte {
+	prefix := make([]byte, tcpLengthPrefixSize)
+	binary.BigEndian.PutUint32(prefix, uint32(len(body)))
+	return prefix
 }

@@ -7,12 +7,64 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
 const tcpLengthPrefixSize = 4
 
-// ReadTCPFrame reads one uint32-length-prefixed authenticated frame body.
+// TCPFrameStream owns one connection and serializes complete framed operations
+// independently in each direction. Callers must not perform direct I/O or call
+// the free frame helpers on its connection.
+type TCPFrameStream struct {
+	conn      net.Conn
+	auth      Authenticator
+	limits    Limits
+	ioTimeout time.Duration
+	readMu    sync.Mutex
+	writeMu   sync.Mutex
+}
+
+// NewTCPFrameStream returns the concurrency-safe framed operational path for conn.
+func NewTCPFrameStream(conn net.Conn, auth Authenticator, limits Limits, ioTimeout time.Duration) *TCPFrameStream {
+	if limits.ExpectedClusterID != nil {
+		expectedClusterID := *limits.ExpectedClusterID
+		limits.ExpectedClusterID = &expectedClusterID
+	}
+	return &TCPFrameStream{conn: conn, auth: auth, limits: limits, ioTimeout: ioTimeout}
+}
+
+// ReadFrame reads one complete frame while excluding other reads on the connection.
+func (s *TCPFrameStream) ReadFrame(ctx context.Context) (Frame, error) {
+	if s == nil {
+		return Frame{}, errors.New("read TCP frame stream: nil stream")
+	}
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	return ReadTCPFrame(ctx, s.conn, s.auth, s.limits, s.ioTimeout)
+}
+
+// WriteFrame writes one complete frame while excluding other writes on the connection.
+func (s *TCPFrameStream) WriteFrame(ctx context.Context, frame Frame) error {
+	if s == nil {
+		return errors.New("write TCP frame stream: nil stream")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return WriteTCPFrame(ctx, s.conn, frame, s.auth, s.limits, s.ioTimeout)
+}
+
+// Close closes the owned connection.
+func (s *TCPFrameStream) Close() error {
+	if s == nil || s.conn == nil {
+		return errors.New("close TCP frame stream: nil connection")
+	}
+	return s.conn.Close()
+}
+
+// ReadTCPFrame reads one uint32-length-prefixed authenticated frame body. It is
+// a single-operation primitive; use TCPFrameStream to serialize repeated or
+// concurrent reads and their connection deadlines.
 func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits Limits, ioTimeout time.Duration) (_ Frame, err error) {
 	if conn == nil {
 		return Frame{}, errors.New("read TCP frame: nil connection")
@@ -51,7 +103,9 @@ func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits
 	return frame, nil
 }
 
-// WriteTCPFrame encodes and completely writes one uint32-length-prefixed frame body.
+// WriteTCPFrame encodes and completely writes one uint32-length-prefixed frame
+// body. It is a single-operation primitive; use TCPFrameStream to serialize
+// repeated or concurrent writes and their connection deadlines.
 func WriteTCPFrame(ctx context.Context, conn net.Conn, frame Frame, auth Authenticator, limits Limits, ioTimeout time.Duration) (err error) {
 	if conn == nil {
 		return errors.New("write TCP frame: nil connection")
