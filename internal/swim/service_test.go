@@ -806,6 +806,146 @@ func TestServiceFailedSnapshotResponseDoesNotPublishRepairBarrier(t *testing.T) 
 	}
 }
 
+func TestServiceWrittenSnapshotWithoutApplicationAckKeepsRepairPending(t *testing.T) {
+	now := time.Unix(3975, 0)
+	configuration := serviceTestConfig(t, 1)
+	manualClock := clock.NewManual(now)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: authenticator,
+		Clock:         manualClock,
+		Random:        random.NewLockedSource(46),
+		Store:         newServiceStore(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	service.active.Store(map[uint16]Member{peer.NodeID: peer})
+	frame := tcpServiceTestFrameWithPayload(service.clusterID, peer.NodeID, wire.RequestID{93}, now, wire.MessageSWIMSnapshotRequest, mustEncodeGob(t, SnapshotRequest{}))
+
+	serverConnection, clientConnection := net.Pipe()
+	serverStream := wire.NewTCPFrameStream(serverConnection, authenticator, service.limits, time.Second)
+	clientStream := wire.NewTCPFrameStream(clientConnection, authenticator, service.limits, time.Second)
+	defer serverStream.Close()
+	handled := make(chan struct{})
+	go func() {
+		service.handleTCPSnapshot(context.Background(), serverStream, frame)
+		close(handled)
+	}()
+	snapshotRequested := make(chan struct{})
+	go func() {
+		event := <-service.events
+		request := event.(tcpSnapshotServiceEvent)
+		request.response <- snapshotResult{
+			members:          []Member{{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}, peer},
+			digestGeneration: 7,
+		}
+		close(snapshotRequested)
+	}()
+
+	response, err := clientStream.ReadFrame(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.Message != wire.MessageSWIMSnapshotResponse {
+		t.Fatalf("snapshot response type = %d", response.Header.Message)
+	}
+	select {
+	case event := <-service.events:
+		t.Fatalf("response write without application ack published repair barrier: %#v", event)
+	case <-handled:
+		select {
+		case event := <-service.events:
+			t.Fatalf("response write without application ack published repair barrier: %#v", event)
+		default:
+			t.Fatal("snapshot handler completed without waiting for application ack")
+		}
+	case <-time.After(100 * time.Millisecond):
+		// The handler remains the stream owner while awaiting application.
+	}
+	if err := clientStream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-snapshotRequested
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot handler did not exit after requester closed without application ack")
+	}
+}
+
+func TestServiceSnapshotApplicationAckRevalidatesRequesterGeneration(t *testing.T) {
+	now := time.Unix(3980, 0)
+	configuration := serviceTestConfig(t, 1)
+	manualClock := clock.NewManual(now)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: authenticator,
+		Clock:         manualClock,
+		Random:        random.NewLockedSource(49),
+		Store:         newServiceStore(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	service.active.Store(map[uint16]Member{requester.NodeID: requester})
+	requestID := wire.RequestID{94}
+	request := tcpServiceTestFrameWithPayload(service.clusterID, requester.NodeID, requestID, now, wire.MessageSWIMSnapshotRequest, mustEncodeGob(t, SnapshotRequest{}))
+
+	serverConnection, clientConnection := net.Pipe()
+	serverStream := wire.NewTCPFrameStream(serverConnection, authenticator, service.limits, time.Second)
+	clientStream := wire.NewTCPFrameStream(clientConnection, authenticator, service.limits, time.Second)
+	defer serverStream.Close()
+	defer clientStream.Close()
+	handled := make(chan struct{})
+	go func() {
+		service.handleTCPSnapshot(context.Background(), serverStream, request)
+		close(handled)
+	}()
+	go func() {
+		event := (<-service.events).(tcpSnapshotServiceEvent)
+		event.response <- snapshotResult{
+			members:          []Member{{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}, requester},
+			digestGeneration: 7,
+		}
+	}()
+	if response, err := clientStream.ReadFrame(testContext(t)); err != nil || response.Header.Message != wire.MessageSWIMSnapshotResponse {
+		t.Fatalf("snapshot response = %#v, error = %v", response, err)
+	}
+
+	currentRequester := requester
+	currentRequester.Incarnation++
+	service.active.Store(map[uint16]Member{currentRequester.NodeID: currentRequester})
+	applied := tcpServiceTestFrameWithPayload(service.clusterID, requester.NodeID, requestID, now, wire.MessageSWIMSnapshotApplied, mustEncodeGob(t, SnapshotApplied{}))
+	if err := clientStream.WriteFrame(testContext(t), applied); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot handler did not accept correlated application ack")
+	}
+	event := (<-service.events).(snapshotServedServiceEvent)
+	if event.requester != requester {
+		t.Fatalf("captured requester = %#v, want %#v", event.requester, requester)
+	}
+
+	table := NewTable()
+	table.Merge(Update{Member: currentRequester, ReporterID: currentRequester.NodeID})
+	dissemination := NewDisseminator(1, 1)
+	dissemination.DigestRequired = true
+	dissemination.digestGeneration = 7
+	loop := &serviceLoop{engine: &Engine{table: table}, dissemination: dissemination}
+	loop.handleSnapshotServed(event)
+	if !dissemination.DigestRequired {
+		t.Fatal("application ack from stale requester generation cleared digest recovery")
+	}
+}
+
 func TestServiceJoinUsesSnapshotPersistAnnounceAcceptOrder(t *testing.T) {
 	now := time.Unix(4000, 0)
 	network := transport.NewMemoryNetwork()

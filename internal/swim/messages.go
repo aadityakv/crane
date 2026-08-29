@@ -44,6 +44,10 @@ type SnapshotResponse struct {
 	Members []Member
 }
 
+// SnapshotApplied acknowledges that the correlated snapshot was validated and
+// applied by the requester's membership owner.
+type SnapshotApplied struct{}
+
 // ProtocolErrorMessage is an authentication-safe TCP failure response.
 type ProtocolErrorMessage struct {
 	Code    string

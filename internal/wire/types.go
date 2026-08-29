@@ -58,6 +58,8 @@ const (
 	MessageSWIMSnapshotResponse MessageType = 12
 	// MessageSWIMError carries an authentication-safe TCP protocol failure.
 	MessageSWIMError MessageType = 13
+	// MessageSWIMSnapshotApplied acknowledges owner-validated snapshot application.
+	MessageSWIMSnapshotApplied MessageType = 14
 
 	// MessageSWIMACK preserves the conventional all-caps ACK spelling.
 	MessageSWIMACK = MessageSWIMAck

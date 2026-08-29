@@ -478,15 +478,16 @@ type joinCompletedServiceEvent struct {
 func (joinCompletedServiceEvent) serviceEvent() {}
 
 type snapshotResyncServiceEvent struct {
-	senderID uint16
-	members  []Member
-	err      error
+	sender  Member
+	members []Member
+	applied chan<- error
+	err     error
 }
 
 func (snapshotResyncServiceEvent) serviceEvent() {}
 
 type snapshotServedServiceEvent struct {
-	senderID         uint16
+	requester        Member
 	digestGeneration uint64
 }
 
@@ -792,7 +793,8 @@ func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream
 
 func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameStream, frame wire.Frame) {
 	active := s.active.Load().(map[uint16]Member)
-	if _, exists := active[frame.Header.SenderID]; !exists {
+	requester, exists := active[frame.Header.SenderID]
+	if !exists {
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, ErrServiceNotAdmitted)
 		return
 	}
@@ -813,7 +815,18 @@ func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameSt
 	if err := s.writeTCPPayload(ctx, stream, wire.MessageSWIMSnapshotResponse, frame.Header.RequestID, SnapshotResponse{Members: result.members}); err != nil {
 		return
 	}
-	s.enqueueWorkerEvent(ctx, snapshotServedServiceEvent{senderID: frame.Header.SenderID, digestGeneration: result.digestGeneration})
+	appliedFrame, err := stream.ReadFrame(ctx)
+	if err != nil {
+		return
+	}
+	if appliedFrame.Header.SenderID != requester.NodeID || appliedFrame.Header.RequestID != frame.Header.RequestID || appliedFrame.Header.Message != wire.MessageSWIMSnapshotApplied {
+		return
+	}
+	var applied SnapshotApplied
+	if wire.DecodeGob(appliedFrame.Payload, &applied) != nil {
+		return
+	}
+	s.enqueueWorkerEvent(ctx, snapshotServedServiceEvent{requester: requester, digestGeneration: result.digestGeneration})
 }
 
 func (s *Service) acceptTCPReplay(frame wire.Frame) error {
@@ -1103,31 +1116,59 @@ func (l *serviceLoop) startSnapshotResync(sender Member) {
 	l.workers.Add(1)
 	go func() {
 		defer l.workers.Done()
-		members, err := l.client.snapshot(l.workerContext, endpoint)
-		l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{senderID: sender.NodeID, members: members, err: err})
+		pending, err := l.client.beginSnapshot(l.workerContext, endpoint)
+		if err != nil {
+			l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, err: err})
+			return
+		}
+		defer pending.close()
+		if pending.senderID != sender.NodeID {
+			l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, err: fmt.Errorf("%w: snapshot responder %d, expected %d", ErrSnapshotProtocol, pending.senderID, sender.NodeID)})
+			return
+		}
+		applied := make(chan error, 1)
+		if !l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, members: pending.members, applied: applied}) {
+			return
+		}
+		select {
+		case applyError := <-applied:
+			if applyError == nil {
+				_ = pending.acknowledge(l.workerContext)
+			}
+		case <-l.workerContext.Done():
+		}
 	}()
 }
 
 func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) error {
-	delete(l.resyncing, event.senderID)
+	delete(l.resyncing, event.sender.NodeID)
 	if event.err != nil {
 		return nil
 	}
-	current, exists := l.engine.table.Get(event.senderID)
-	if !exists || (current.Status != Alive && current.Status != Suspect) {
+	current, exists := l.engine.table.Get(event.sender.NodeID)
+	if !exists || current != event.sender || (current.Status != Alive && current.Status != Suspect) {
+		if event.applied != nil {
+			event.applied <- ErrSnapshotProtocol
+		}
 		return nil
 	}
 	for _, member := range event.members {
-		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.senderID}, l.service.options.Clock.Now())); err != nil {
+		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.sender.NodeID}, l.service.options.Clock.Now())); err != nil {
+			if event.applied != nil {
+				event.applied <- err
+			}
 			return err
 		}
+	}
+	if event.applied != nil {
+		event.applied <- nil
 	}
 	return nil
 }
 
 func (l *serviceLoop) handleSnapshotServed(event snapshotServedServiceEvent) {
-	current, exists := l.engine.table.Get(event.senderID)
-	if !exists || (current.Status != Alive && current.Status != Suspect) {
+	current, exists := l.engine.table.Get(event.requester.NodeID)
+	if !exists || current != event.requester || (current.Status != Alive && current.Status != Suspect) {
 		return
 	}
 	l.dissemination.markDigestRepaired(event.digestGeneration)

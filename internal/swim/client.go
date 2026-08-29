@@ -90,6 +90,16 @@ type joinClientResult struct {
 	accepted Member
 }
 
+type pendingSnapshot struct {
+	client           *protocolClient
+	stream           *wire.TCPFrameStream
+	stopCancellation func()
+	requestID        wire.RequestID
+	senderID         uint16
+	members          []Member
+	closeOnce        sync.Once
+}
+
 func newProtocolClient(configuration config.NodeConfig, authenticator wire.Authenticator, sourceClock clock.Clock, source random.Source, ioTimeout time.Duration) (*protocolClient, error) {
 	if authenticator == nil || sourceClock == nil || source == nil || configuration.NodeID == 0 {
 		return nil, fmt.Errorf("%w: incomplete snapshot client dependencies", ErrInvalidServiceOptions)
@@ -120,14 +130,28 @@ func newProtocolClient(configuration config.NodeConfig, authenticator wire.Authe
 }
 
 func (c *protocolClient) snapshot(ctx context.Context, endpoint config.Endpoint) ([]Member, error) {
+	pending, err := c.beginSnapshot(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	defer pending.close()
+	return append([]Member(nil), pending.members...), nil
+}
+
+func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endpoint) (_ *pendingSnapshot, err error) {
 	stream, stopCancellation, err := c.dial(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-	defer stopCancellation()
-	defer stream.Close()
+	pending := &pendingSnapshot{client: c, stream: stream, stopCancellation: stopCancellation}
+	defer func() {
+		if err != nil {
+			pending.close()
+		}
+	}()
 
 	requestID := c.nextRequestID()
+	pending.requestID = requestID
 	if err := c.writePayload(ctx, stream, wire.MessageSWIMSnapshotRequest, requestID, SnapshotRequest{}); err != nil {
 		return nil, err
 	}
@@ -145,7 +169,30 @@ func (c *protocolClient) snapshot(ctx context.Context, endpoint config.Endpoint)
 	if err := c.acceptResponse(frame); err != nil {
 		return nil, err
 	}
-	return append([]Member(nil), response.Members...), nil
+	pending.senderID = frame.Header.SenderID
+	pending.members = append([]Member(nil), response.Members...)
+	return pending, nil
+}
+
+func (p *pendingSnapshot) acknowledge(ctx context.Context) error {
+	if p == nil || p.client == nil || p.stream == nil {
+		return fmt.Errorf("%w: nil pending snapshot", ErrSnapshotProtocol)
+	}
+	return p.client.writePayload(ctx, p.stream, wire.MessageSWIMSnapshotApplied, p.requestID, SnapshotApplied{})
+}
+
+func (p *pendingSnapshot) close() {
+	if p == nil {
+		return
+	}
+	p.closeOnce.Do(func() {
+		if p.stopCancellation != nil {
+			p.stopCancellation()
+		}
+		if p.stream != nil {
+			_ = p.stream.Close()
+		}
+	})
 }
 
 func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, store IncarnationStore, self Member) (joinClientResult, error) {
