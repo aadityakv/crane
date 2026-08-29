@@ -433,9 +433,11 @@ type subscriptionCountServiceEvent struct{ response chan<- int }
 func (subscriptionCountServiceEvent) serviceEvent() {}
 
 type datagramServiceEvent struct {
-	senderID uint16
-	message  any
-	updates  []Update
+	senderID  uint16
+	requestID wire.RequestID
+	timestamp time.Time
+	message   any
+	updates   []Update
 }
 
 func (datagramServiceEvent) serviceEvent() {}
@@ -903,7 +905,11 @@ func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent,
 	if !exists || !matchesDatagramSource(packet.From, sender, frame.Header.Message) {
 		return datagramServiceEvent{}, false
 	}
-	event := datagramServiceEvent{senderID: frame.Header.SenderID}
+	event := datagramServiceEvent{
+		senderID:  frame.Header.SenderID,
+		requestID: frame.Header.RequestID,
+		timestamp: time.UnixMilli(frame.Header.TimestampMillis),
+	}
 	switch frame.Header.Message {
 	case wire.MessageSWIMPing:
 		var message PingMessage
@@ -950,9 +956,14 @@ func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent,
 	if !validDatagramMessage(event.message, sender, active, s.options.Config.NodeID) {
 		return datagramServiceEvent{}, false
 	}
-	timestamp := time.UnixMilli(frame.Header.TimestampMillis)
-	if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, timestamp); err != nil {
-		return datagramServiceEvent{}, false
+	switch frame.Header.Message {
+	case wire.MessageSWIMAck, wire.MessageSWIMIndirectAck:
+		// Exact probe/relay correlation is owner-confined and runs immediately
+		// before replay acceptance and any state mutation.
+	default:
+		if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, event.timestamp); err != nil {
+			return datagramServiceEvent{}, false
+		}
 	}
 	return event, true
 }
@@ -975,6 +986,22 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 	sender, exists := l.engine.table.Get(event.senderID)
 	if !exists || (sender.Status != Alive && sender.Status != Suspect) {
 		return nil
+	}
+	switch message := event.message.(type) {
+	case AckMessage:
+		if !l.engine.acceptsAck(sender, message.Ack) {
+			return nil
+		}
+		if err := l.service.replay.Accept(event.senderID, event.requestID, event.timestamp); err != nil {
+			return nil
+		}
+	case IndirectAckMessage:
+		if !l.engine.acceptsIndirectAck(sender, message.IndirectAck) {
+			return nil
+		}
+		if err := l.service.replay.Accept(event.senderID, event.requestID, event.timestamp); err != nil {
+			return nil
+		}
 	}
 	for _, update := range event.updates {
 		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(update, l.service.options.Clock.Now())); err != nil {

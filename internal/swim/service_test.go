@@ -303,6 +303,120 @@ func TestServiceRejectsZeroIncarnationBeforeReplayAcceptance(t *testing.T) {
 	}
 }
 
+func TestServiceStateDependentACKsCannotPoisonReplayCapacity(t *testing.T) {
+	now := time.Unix(2250, 0)
+	for _, test := range []struct {
+		name        string
+		messageType wire.MessageType
+		message     func(sequence uint64, target Member) any
+		install     func(engine *Engine, sender, target Member, sequence uint64)
+	}{
+		{
+			name:        "ACK",
+			messageType: wire.MessageSWIMAck,
+			message: func(sequence uint64, _ Member) any {
+				return AckMessage{Ack: Ack{OriginID: 1, Sequence: sequence}}
+			},
+			install: func(engine *Engine, sender, _ Member, sequence uint64) {
+				engine.activeProbes[sequence] = &activeProbe{target: sender, phase: probeDirect}
+			},
+		},
+		{
+			name:        "IndirectACK",
+			messageType: wire.MessageSWIMIndirectAck,
+			message: func(sequence uint64, target Member) any {
+				return IndirectAckMessage{IndirectAck: IndirectAck{OriginID: 1, Target: target, Sequence: sequence}}
+			},
+			install: func(engine *Engine, sender, target Member, sequence uint64) {
+				engine.activeProbes[sequence] = &activeProbe{target: target, phase: probeIndirect, relays: map[uint16]Member{sender.NodeID: sender}}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configuration := serviceTestConfig(t, 1)
+			manualClock := clock.NewManual(now)
+			authenticator := wire.NewHMACAuthenticator(testServiceKey())
+			service, err := NewService(ServiceOptions{
+				Config:        configuration,
+				Authenticator: authenticator,
+				Clock:         manualClock,
+				Random:        random.NewLockedSource(47),
+				Store:         newServiceStore(1),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.replay = wire.NewReplayGuard(manualClock, time.Minute, time.Minute, 1)
+			service.admitted.Store(true)
+
+			self := Member{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}
+			sender := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+			target := sender
+			if test.messageType == wire.MessageSWIMIndirectAck {
+				target = Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
+			}
+			dissemination := NewDisseminator(serviceDisseminationMax, serviceRetransmitFactor)
+			engine, err := NewEngine(EngineConfig{
+				SelfID:               1,
+				ProbeInterval:        time.Second,
+				DirectProbeTimeout:   300 * time.Millisecond,
+				IndirectProbeTimeout: 200 * time.Millisecond,
+				IndirectChecks:       3,
+				SuspicionMultiplier:  5,
+			}, NewTable(), dissemination, random.NewLockedSource(48))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, member := range []Member{self, sender, target} {
+				engine.table.Merge(Update{Member: member, ReporterID: self.NodeID})
+			}
+			service.active.Store(map[uint16]Member{self.NodeID: self, sender.NodeID: sender, target.NodeID: target})
+			loop := &serviceLoop{service: service, engine: engine, dissemination: dissemination, admitted: true, runContext: context.Background()}
+			source, _ := (config.NodeConfig{AdvertiseHost: sender.Host, BasePort: sender.BasePort}).AdvertiseEndpoint(config.ServiceSWIMACK)
+
+			const validSequence = uint64(77)
+			test.install(engine, sender, target, validSequence)
+			for index := uint64(0); index < 32; index++ {
+				frame := encodeSimulationDatagram(t, authenticator, now, sender.NodeID, 100+index, test.messageType, test.message(1_000+index, target))
+				event, ok := service.decodeDatagram(transport.Packet{From: source, Data: frame})
+				if !ok {
+					t.Fatalf("uncorrelated %s %d was rejected before owner validation", test.name, index)
+				}
+				if err := loop.handleDatagram(event); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, exists := engine.activeProbes[validSequence]; !exists {
+				t.Fatalf("uncorrelated %s canceled the valid probe", test.name)
+			}
+
+			validFrame := encodeSimulationDatagram(t, authenticator, now, sender.NodeID, 100, test.messageType, test.message(validSequence, target))
+			validEvent, ok := service.decodeDatagram(transport.Packet{From: source, Data: validFrame})
+			if !ok {
+				t.Fatalf("valid correlated %s was poisoned out of replay capacity", test.name)
+			}
+			if err := loop.handleDatagram(validEvent); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := engine.activeProbes[validSequence]; exists {
+				t.Fatalf("valid correlated %s did not cancel the exact probe", test.name)
+			}
+
+			test.install(engine, sender, target, validSequence)
+			duplicateEvent, ok := service.decodeDatagram(transport.Packet{From: source, Data: validFrame})
+			if !ok {
+				t.Fatalf("duplicate %s did not reach owner replay validation", test.name)
+			}
+			if err := loop.handleDatagram(duplicateEvent); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := engine.activeProbes[validSequence]; !exists {
+				t.Fatalf("duplicate valid %s mutated probe state", test.name)
+			}
+		})
+	}
+}
+
 func newDatagramDecoderService(t *testing.T, now time.Time, replayEntries int) (*Service, Member, config.Endpoint, wire.Authenticator) {
 	t.Helper()
 	configuration := serviceTestConfig(t, 1)

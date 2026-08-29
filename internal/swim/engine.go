@@ -217,44 +217,71 @@ func (e *Engine) HandlePingReq(from Member, message PingReq, now time.Time) Effe
 // HandleAck completes a local direct or late-direct probe, or turns a target
 // ACK for a relay generation into an IndirectAck to the preserved origin.
 func (e *Engine) HandleAck(from Member, message Ack, _ time.Time) Effects {
+	switch e.ackDisposition(from, message) {
+	case ackLocalProbe:
+		delete(e.activeProbes, message.Sequence)
+		return Effects{}
+	case ackRelayProbe:
+		key := relayProbeKey{originID: message.OriginID, sequence: message.Sequence}
+		probe := e.relayProbes[key]
+		delete(e.relayProbes, key)
+		return Effects{Outbound: []Outbound{{
+			To: probe.origin,
+			Message: IndirectAck{
+				OriginID: message.OriginID,
+				Target:   probe.target,
+				Sequence: message.Sequence,
+			},
+		}}}
+	default:
+		return Effects{}
+	}
+}
+
+type ackDisposition uint8
+
+const (
+	ackNotAccepted ackDisposition = iota
+	ackLocalProbe
+	ackRelayProbe
+)
+
+func (e *Engine) acceptsAck(from Member, message Ack) bool {
+	return e.ackDisposition(from, message) != ackNotAccepted
+}
+
+func (e *Engine) ackDisposition(from Member, message Ack) ackDisposition {
 	originID := message.OriginID
 	if originID == 0 || originID == e.config.SelfID {
 		probe, exists := e.activeProbes[message.Sequence]
 		if exists && sameProbeIdentity(from, probe.target) {
-			delete(e.activeProbes, message.Sequence)
-			return Effects{}
+			return ackLocalProbe
 		}
 	}
-
-	key := relayProbeKey{originID: originID, sequence: message.Sequence}
-	probe, exists := e.relayProbes[key]
-	if !exists || !sameProbeIdentity(from, probe.target) {
-		return Effects{}
+	probe, exists := e.relayProbes[relayProbeKey{originID: originID, sequence: message.Sequence}]
+	if exists && sameProbeIdentity(from, probe.target) {
+		return ackRelayProbe
 	}
-	delete(e.relayProbes, key)
-	return Effects{Outbound: []Outbound{{
-		To: probe.origin,
-		Message: IndirectAck{
-			OriginID: originID,
-			Target:   probe.target,
-			Sequence: message.Sequence,
-		},
-	}}}
+	return ackNotAccepted
 }
 
 // HandleIndirectAck completes only an indirect-phase generation from one of
 // the relays authorized for that probe and for the exact target identity.
 func (e *Engine) HandleIndirectAck(from Member, message IndirectAck, _ time.Time) Effects {
-	probe, exists := e.activeProbes[message.Sequence]
-	if !exists || probe.phase != probeIndirect || (message.OriginID != 0 && message.OriginID != e.config.SelfID) || !sameProbeIdentity(message.Target, probe.target) {
-		return Effects{}
-	}
-	relay, allowed := probe.relays[from.NodeID]
-	if !allowed || !sameProbeIdentity(from, relay) {
+	if !e.acceptsIndirectAck(from, message) {
 		return Effects{}
 	}
 	delete(e.activeProbes, message.Sequence)
 	return Effects{}
+}
+
+func (e *Engine) acceptsIndirectAck(from Member, message IndirectAck) bool {
+	probe, exists := e.activeProbes[message.Sequence]
+	if !exists || probe.phase != probeIndirect || (message.OriginID != 0 && message.OriginID != e.config.SelfID) || !sameProbeIdentity(message.Target, probe.target) {
+		return false
+	}
+	relay, allowed := probe.relays[from.NodeID]
+	return allowed && sameProbeIdentity(from, relay)
 }
 
 // HandleRelayTimeout discards only the named origin/sequence generation.
