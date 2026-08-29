@@ -68,12 +68,12 @@ func TestDisseminatorNewIncarnationReplacesWholeUpdateAndBudget(t *testing.T) {
 	newer.ReporterID = 7
 	d.Enqueue(newer, 3)
 
-	first := mustTake(t, d, 3, countEncoder)
-	second := mustTake(t, d, 3, countEncoder)
+	first := mustTakeForMembers(t, d, 3, 3, countEncoder)
+	second := mustTakeForMembers(t, d, 3, 3, countEncoder)
 	if !reflect.DeepEqual(first, []Update{newer}) || !reflect.DeepEqual(second, []Update{newer}) {
 		t.Fatalf("replacement batches = %#v then %#v, want %#v twice", first, second, []Update{newer})
 	}
-	if got := mustTake(t, d, 3, countEncoder); len(got) != 0 {
+	if got := mustTakeForMembers(t, d, 3, 3, countEncoder); len(got) != 0 {
 		t.Fatalf("batch after replacement budget exhausted = %#v, want empty", got)
 	}
 }
@@ -93,6 +93,19 @@ func TestDisseminatorOrdersSeverityThenEnqueueAge(t *testing.T) {
 	wantIDs := []uint16{3, 4, 5, 9, 8}
 	if got := nodeIDs(batch); !reflect.DeepEqual(got, wantIDs) {
 		t.Fatalf("batch node IDs = %v, want %v", got, wantIDs)
+	}
+}
+
+func TestDisseminatorFallsBackToNodeIDWhenEnqueueSequenceSaturates(t *testing.T) {
+	d := NewDisseminator(3, 1)
+	d.nextSequence = math.MaxUint64
+	for _, nodeID := range []uint16{9, 2, 5} {
+		d.Enqueue(updateFor(nodeID, 1, Alive), 1)
+	}
+
+	batch := mustTake(t, d, 3, countEncoder)
+	if got, want := nodeIDs(batch), []uint16{2, 5, 9}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("saturated-sequence batch node IDs = %v, want %v", got, want)
 	}
 }
 
@@ -171,7 +184,7 @@ func TestDisseminatorRejectsNilEncoderWithoutDecrementingBudget(t *testing.T) {
 	}
 }
 
-func TestDisseminatorExtendsRemainingBudgetWhenClusterGrows(t *testing.T) {
+func TestDisseminatorUsesGrownBudgetWhileItemRemainsPending(t *testing.T) {
 	d := NewDisseminator(1, 1)
 	update := updateFor(2, 1, Alive)
 	d.Enqueue(update, 1)
@@ -183,6 +196,58 @@ func TestDisseminatorExtendsRemainingBudgetWhenClusterGrows(t *testing.T) {
 	}
 	if got := mustTakeForMembers(t, d, 1, 3, countEncoder); len(got) != 0 {
 		t.Fatalf("batch after grown-cluster budget exhausted = %#v, want empty", got)
+	}
+}
+
+func TestDisseminatorShrinkRemovesItemAlreadyAtCurrentBudget(t *testing.T) {
+	d := NewDisseminator(1, 1)
+	update := updateFor(2, 1, Alive)
+	d.Enqueue(update, 8)
+
+	for send := 0; send < 2; send++ {
+		if got := mustTakeForMembers(t, d, 1, 8, countEncoder); !reflect.DeepEqual(got, []Update{update}) {
+			t.Fatalf("send %d batch = %#v, want %#v", send+1, got, []Update{update})
+		}
+	}
+	if got := mustTakeForMembers(t, d, 1, 1, countEncoder); len(got) != 0 {
+		t.Fatalf("batch after shrink below sent count = %#v, want empty", got)
+	}
+	if got := mustTakeForMembers(t, d, 1, 8, countEncoder); len(got) != 0 {
+		t.Fatalf("batch after regrowth of removed item = %#v, want empty", got)
+	}
+}
+
+func TestDisseminatorShrinkAllowsOnlyCurrentBudgetRemainder(t *testing.T) {
+	d := NewDisseminator(1, 1)
+	update := updateFor(2, 1, Alive)
+	d.Enqueue(update, 8)
+
+	if got := mustTakeForMembers(t, d, 1, 8, countEncoder); !reflect.DeepEqual(got, []Update{update}) {
+		t.Fatalf("initial batch = %#v, want %#v", got, []Update{update})
+	}
+	if got := mustTakeForMembers(t, d, 1, 3, countEncoder); !reflect.DeepEqual(got, []Update{update}) {
+		t.Fatalf("last current-budget batch = %#v, want %#v", got, []Update{update})
+	}
+	if got := mustTakeForMembers(t, d, 1, 8, countEncoder); len(got) != 0 {
+		t.Fatalf("batch after shrink exhausted item = %#v, want empty", got)
+	}
+}
+
+func TestDisseminatorShrinkPrunesExhaustedItemWithZeroByteBatch(t *testing.T) {
+	d := NewDisseminator(1, 1)
+	update := updateFor(2, 1, Alive)
+	d.Enqueue(update, 8)
+
+	for send := 0; send < 2; send++ {
+		if got := mustTakeForMembers(t, d, 1, 8, countEncoder); !reflect.DeepEqual(got, []Update{update}) {
+			t.Fatalf("send %d batch = %#v, want %#v", send+1, got, []Update{update})
+		}
+	}
+	if got := mustTakeForMembers(t, d, 0, 1, countEncoder); len(got) != 0 {
+		t.Fatalf("zero-byte shrink batch = %#v, want empty", got)
+	}
+	if got := mustTakeForMembers(t, d, 1, 8, countEncoder); len(got) != 0 {
+		t.Fatalf("batch after zero-byte shrink pruning = %#v, want empty", got)
 	}
 }
 

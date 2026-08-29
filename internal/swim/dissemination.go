@@ -30,10 +30,9 @@ type Disseminator struct {
 }
 
 type disseminationItem struct {
-	update    Update
-	sequence  uint64
-	budget    int
-	remaining int
+	update        Update
+	sequence      uint64
+	transmissions int
 }
 
 // NewDisseminator returns an empty bounded dissemination queue. Non-positive
@@ -78,16 +77,15 @@ func (d *Disseminator) Enqueue(update Update, aliveMembers int) {
 	}
 
 	d.items[nodeID] = &disseminationItem{
-		update:    update,
-		sequence:  d.takeSequence(),
-		budget:    budget,
-		remaining: budget,
+		update:   update,
+		sequence: d.takeSequence(),
 	}
 }
 
-// Take returns the highest-priority prefix whose concrete encoding fits
-// maxBytes. It decrements retransmission budgets only after the whole returned
-// prefix has encoded successfully. A zero byte limit returns an empty batch.
+// Take removes items already exhausted under the current aliveMembers view,
+// then returns the highest-priority prefix whose concrete encoding fits
+// maxBytes. Only updates in a successfully encoded returned prefix count as
+// transmissions. A zero byte limit still performs exhaustion cleanup.
 func (d *Disseminator) Take(maxBytes int, aliveMembers int, encode func([]Update) ([]byte, error)) ([]Update, error) {
 	if maxBytes < 0 {
 		return nil, ErrInvalidByteBudget
@@ -95,20 +93,21 @@ func (d *Disseminator) Take(maxBytes int, aliveMembers int, encode func([]Update
 	if encode == nil {
 		return nil, ErrNilBatchEncoder
 	}
-	if maxBytes == 0 || len(d.items) == 0 {
+	if len(d.items) == 0 {
 		return []Update{}, nil
 	}
 
 	currentBudget := RetransmitBudget(d.retransmitMultiplier, aliveMembers)
 	candidates := make([]*disseminationItem, 0, len(d.items))
-	for _, item := range d.items {
-		if currentBudget > item.budget {
-			item.remaining += currentBudget - item.budget
-			item.budget = currentBudget
+	for nodeID, item := range d.items {
+		if item.transmissions >= currentBudget {
+			delete(d.items, nodeID)
+			continue
 		}
-		if item.remaining > 0 {
-			candidates = append(candidates, item)
-		}
+		candidates = append(candidates, item)
+	}
+	if maxBytes == 0 || len(candidates) == 0 {
+		return []Update{}, nil
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
@@ -136,8 +135,8 @@ func (d *Disseminator) Take(maxBytes int, aliveMembers int, encode func([]Update
 
 	for _, update := range selected {
 		item := d.items[update.Member.NodeID]
-		item.remaining--
-		if item.remaining == 0 {
+		item.transmissions++
+		if item.transmissions >= currentBudget {
 			delete(d.items, update.Member.NodeID)
 		}
 	}
