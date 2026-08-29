@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -166,6 +167,53 @@ func TestRunClusterProcessesSeedFailureDoesNotStartPeers(t *testing.T) {
 	}
 	if fileExists(configPaths[1]+".started") || fileExists(configPaths[2]+".started") {
 		t.Fatal("peer process started after seed failed before readiness")
+	}
+}
+
+func TestRunClusterProcessesClosedSignalBeforeSeedReadyTerminatesAndReapsSeed(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configDirectory := t.TempDir()
+	configPaths := make([]string, 3)
+	for index := range configPaths {
+		configPaths[index] = filepath.Join(configDirectory, fmt.Sprintf("node-%d.json", index+1))
+		if err := os.WriteFile(configPaths[index], []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(configPaths[0]+".delay-ready", []byte("delay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	signals := make(chan os.Signal)
+	result := make(chan error, 1)
+	go func() {
+		result <- runClusterProcesses(ctx, nodeBinary, configPaths, signals, os.Stderr, os.Stderr)
+	}()
+	waitForFile(t, ctx, configPaths[0]+".started")
+	seedPID := readHelperPID(t, configPaths[0]+".pid")
+	defer func() {
+		_ = syscall.Kill(-seedPID, syscall.SIGKILL)
+	}()
+	close(signals)
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "signal channel closed") {
+			t.Fatalf("runClusterProcesses error = %v, want closed signal-channel error", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("launcher did not return after signal channel closed")
+	}
+	if !fileExists(configPaths[0] + ".stopped") {
+		t.Fatal("seed did not record forwarded termination before launcher returned")
+	}
+	if signalErr := syscall.Kill(seedPID, syscall.Signal(0)); signalErr == nil {
+		t.Fatal("seed process still exists after launcher returned")
+	}
+	if fileExists(configPaths[1]+".started") || fileExists(configPaths[2]+".started") {
+		t.Fatal("peer process started after readiness signal channel closed")
 	}
 }
 
@@ -330,6 +378,9 @@ func TestClusterChildHelper(t *testing.T) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
+	if err := os.WriteFile(configPath+".pid", []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		os.Exit(90)
+	}
 	if err := os.WriteFile(configPath+".started", []byte("started\n"), 0o600); err != nil {
 		os.Exit(92)
 	}
@@ -421,6 +472,19 @@ func waitForFile(t *testing.T, ctx context.Context, path string) {
 	}); err != nil {
 		t.Fatalf("wait for file %q: %v", path, err)
 	}
+}
+
+func readHelperPID(t *testing.T, path string) int {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(content))
+	if err != nil || pid <= 0 {
+		t.Fatalf("helper PID %q: %v", content, err)
+	}
+	return pid
 }
 
 func waitForHelperFile(path string, timeout time.Duration, signals <-chan os.Signal) (bool, bool) {

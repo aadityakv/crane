@@ -144,6 +144,7 @@ func runClusterProcesses(ctx context.Context, nodeBinary string, configPaths []s
 	var graceDeadline <-chan time.Time
 	forceKilling := false
 	contextDone := ctx.Done()
+	signalStream := signals
 	beginShutdown := func(sig os.Signal, err error) {
 		shuttingDown = true
 		cause = err
@@ -187,13 +188,15 @@ func runClusterProcesses(ctx context.Context, nodeBinary string, configPaths []s
 					beginShutdown(syscall.SIGTERM, fmt.Errorf("node %d exited: %w", result.nodeID, result.err))
 				}
 			}
-		case sig := <-signals:
-			if sig != nil {
-				if shuttingDown {
-					forceKill()
-				} else {
-					beginShutdown(sig, nil)
-				}
+		case sig, ok := <-signalStream:
+			if !ok {
+				signalStream = nil
+				continue
+			}
+			if shuttingDown {
+				forceKill()
+			} else {
+				beginShutdown(sig, nil)
 			}
 		case <-contextDone:
 			contextDone = nil
@@ -249,9 +252,10 @@ func waitForSeedReadiness(ctx context.Context, seed *clusterChild, children []*c
 			return false, fmt.Errorf("seed node %d exited before readiness", result.nodeID)
 		}
 		return false, fmt.Errorf("seed node %d failed before readiness: %w", result.nodeID, result.err)
-	case signal := <-signals:
-		if signal == nil {
-			return false, errors.New("seed readiness signal channel closed")
+	case signal, ok := <-signals:
+		if !ok {
+			terminateChildren(children, syscall.SIGTERM)
+			return false, errors.Join(errors.New("seed readiness signal channel closed"), drainChildren(children, results))
 		}
 		terminateChildren(children, signal)
 		return false, drainChildren(children, results)
