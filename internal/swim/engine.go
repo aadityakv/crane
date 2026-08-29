@@ -205,7 +205,7 @@ func (e *Engine) HandlePingReq(from Member, message PingReq, now time.Time) Effe
 			Kind:     TimerRelayProbe,
 			OriginID: originID,
 			Sequence: message.Sequence,
-			Deadline: now.Add(e.config.DirectProbeTimeout),
+			Deadline: now.Add(e.config.IndirectProbeTimeout),
 		}},
 	}
 }

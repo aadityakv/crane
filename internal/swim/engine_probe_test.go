@@ -199,6 +199,31 @@ func TestEngineProbeDirectAckCancelsProbeAndMakesLateMessagesHarmless(t *testing
 	}
 }
 
+func TestEngineProbeLateDirectAckDuringIndirectPhaseCancelsProbe(t *testing.T) {
+	self := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 4, Status: Alive}
+	relay := Member{NodeID: 3, Host: "node3", BasePort: 8003, Incarnation: 5, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	for _, member := range []Member{target, relay} {
+		mustMerge(t, engine.table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	now := time.Date(2026, 8, 29, 14, 22, 0, 0, time.UTC)
+	sequence := engine.BeginProbe(now).Outbound[0].Message.(Ping).Sequence
+	indirect := engine.HandleDirectTimeout(sequence, now.Add(300*time.Millisecond))
+	if len(indirect.Outbound) != 1 || len(indirect.Timers) != 1 {
+		t.Fatalf("indirect effects = %#v, want one PingReq and timer", indirect)
+	}
+
+	engine.HandleAck(target, Ack{OriginID: self.NodeID, Sequence: sequence}, now.Add(500*time.Millisecond))
+
+	if len(engine.activeProbes) != 0 {
+		t.Fatalf("active probes after late direct ack = %d, want zero", len(engine.activeProbes))
+	}
+	if got := engine.HandleIndirectTimeout(sequence, now.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("indirect timeout after late direct ack = %#v, want zero", got)
+	}
+}
+
 func TestEngineProbeRejectsSpoofedDirectAckWithoutCancelingProbe(t *testing.T) {
 	self := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
 	target := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 4, Status: Alive}
@@ -380,7 +405,7 @@ func TestIndirectProbeRelaysAckToOriginalProbeAndCancelsBothTimeouts(t *testing.
 		Kind:     TimerRelayProbe,
 		OriginID: origin.NodeID,
 		Sequence: sequence,
-		Deadline: now.Add(610 * time.Millisecond),
+		Deadline: now.Add(1010 * time.Millisecond),
 	}}
 	if !reflect.DeepEqual(relayEffects.Timers, wantRelayTimers) {
 		t.Fatalf("relay timers = %#v, want %#v", relayEffects.Timers, wantRelayTimers)
@@ -407,7 +432,7 @@ func TestIndirectProbeRelaysAckToOriginalProbeAndCancelsBothTimeouts(t *testing.
 	if !reflect.DeepEqual(ackEffects.Outbound, wantAckOutbound) {
 		t.Fatalf("relayed ack outbound = %#v, want %#v", ackEffects.Outbound, wantAckOutbound)
 	}
-	if got := relayEngine.HandleRelayTimeout(origin.NodeID, sequence, now.Add(610*time.Millisecond)); !reflect.DeepEqual(got, Effects{}) {
+	if got := relayEngine.HandleRelayTimeout(origin.NodeID, sequence, now.Add(1010*time.Millisecond)); !reflect.DeepEqual(got, Effects{}) {
 		t.Fatalf("late relay timeout effects = %#v, want zero", got)
 	}
 
@@ -544,6 +569,55 @@ func TestIndirectRelayDerivesOmittedOriginFromAuthenticatedPingReqSender(t *test
 	want := []Outbound{{To: target, Message: Ping{OriginID: origin.NodeID, Sequence: 92}}}
 	if !reflect.DeepEqual(effects.Outbound, want) {
 		t.Fatalf("outbound = %#v, want %#v", effects.Outbound, want)
+	}
+}
+
+func TestIndirectRelayStateLivesThroughOriginWindowAndCleanupIsExact(t *testing.T) {
+	origin := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 4, Status: Alive}
+	relay := Member{NodeID: 3, Host: "node3", BasePort: 8003, Incarnation: 5, Status: Alive}
+	engine := newTestEngineWithSelf(relay)
+	for _, member := range []Member{origin, target} {
+		mustMerge(t, engine.table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	now := time.Date(2026, 8, 29, 15, 0, 0, 0, time.UTC)
+
+	lateAckEffects := engine.HandlePingReq(origin, PingReq{Target: target, Sequence: 101}, now)
+	wantTimer := TimerRequest{
+		Kind:     TimerRelayProbe,
+		OriginID: origin.NodeID,
+		Sequence: 101,
+		Deadline: now.Add(700 * time.Millisecond),
+	}
+	if !reflect.DeepEqual(lateAckEffects.Timers, []TimerRequest{wantTimer}) {
+		t.Fatalf("relay timers = %#v, want %#v", lateAckEffects.Timers, []TimerRequest{wantTimer})
+	}
+	ackEffects := engine.HandleAck(target, Ack{OriginID: origin.NodeID, Sequence: 101}, now.Add(400*time.Millisecond))
+	if len(ackEffects.Outbound) != 1 {
+		t.Fatalf("ack after direct duration effects = %#v, want one IndirectAck", ackEffects)
+	}
+	if _, ok := ackEffects.Outbound[0].Message.(IndirectAck); !ok {
+		t.Fatalf("ack after direct duration message = %T, want IndirectAck", ackEffects.Outbound[0].Message)
+	}
+	if got := engine.HandleRelayTimeout(origin.NodeID, 101, wantTimer.Deadline); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("late cleanup after ack effects = %#v, want zero", got)
+	}
+
+	for _, sequence := range []uint64{102, 103} {
+		engine.HandlePingReq(origin, PingReq{Target: target, Sequence: sequence}, now.Add(time.Second))
+	}
+	cleanupDeadline := now.Add(time.Second + 700*time.Millisecond)
+	if got := engine.HandleRelayTimeout(origin.NodeID, 102, cleanupDeadline); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("cleanup effects = %#v, want zero", got)
+	}
+	if got := engine.HandleRelayTimeout(origin.NodeID, 102, cleanupDeadline.Add(time.Millisecond)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("duplicate cleanup effects = %#v, want zero", got)
+	}
+	if got := engine.HandleAck(target, Ack{OriginID: origin.NodeID, Sequence: 102}, cleanupDeadline.Add(time.Millisecond)); len(got.Outbound) != 0 {
+		t.Fatalf("ack after cleanup effects = %#v, want no IndirectAck", got)
+	}
+	if got := engine.HandleAck(target, Ack{OriginID: origin.NodeID, Sequence: 103}, cleanupDeadline.Add(time.Millisecond)); len(got.Outbound) != 1 {
+		t.Fatalf("neighbor generation after cleanup effects = %#v, want one IndirectAck", got)
 	}
 }
 
