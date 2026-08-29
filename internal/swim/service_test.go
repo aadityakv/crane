@@ -108,6 +108,33 @@ func TestServiceDoesNotReportReadyWhenSnapshotBindFails(t *testing.T) {
 	}
 }
 
+func TestNewServiceRejectsInjectedDatagramWithoutSourceSelection(t *testing.T) {
+	configuration := serviceTestConfig(t, 1)
+	_, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+		Clock:         clock.NewManual(time.Unix(1000, 0)),
+		Random:        random.NewLockedSource(302),
+		Store:         newServiceStore(1),
+		Datagram:      datagramWithoutSourceSelection{},
+	})
+	if err == nil || !errors.Is(err, ErrInvalidServiceOptions) || !strings.Contains(err.Error(), "source selection") {
+		t.Fatalf("NewService error = %v, want invalid source-selecting datagram", err)
+	}
+}
+
+type datagramWithoutSourceSelection struct{}
+
+func (datagramWithoutSourceSelection) Send(context.Context, config.Endpoint, []byte) error {
+	return nil
+}
+
+func (datagramWithoutSourceSelection) Receive(context.Context) (transport.Packet, error) {
+	return transport.Packet{}, transport.ErrDatagramClosed
+}
+
+func (datagramWithoutSourceSelection) Close() error { return nil }
+
 func TestServiceDropsInvalidAuthenticatedDatagramBoundaries(t *testing.T) {
 	now := time.Unix(2000, 0)
 	manualClock := clock.NewManual(now)

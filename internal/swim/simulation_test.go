@@ -1006,6 +1006,10 @@ func (d *contextBlockingDatagram) Send(ctx context.Context, _ config.Endpoint, _
 	return ctx.Err()
 }
 
+func (d *contextBlockingDatagram) SendFrom(ctx context.Context, _ config.Endpoint, destination config.Endpoint, payload []byte) error {
+	return d.Send(ctx, destination, payload)
+}
+
 func (d *contextBlockingDatagram) Receive(ctx context.Context) (transport.Packet, error) {
 	select {
 	case packet := <-d.receive:

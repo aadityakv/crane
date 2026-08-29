@@ -92,6 +92,11 @@ func NewService(options ServiceOptions) (*Service, error) {
 	if options.Store == nil {
 		return nil, fmt.Errorf("%w: incarnation store is nil", ErrInvalidServiceOptions)
 	}
+	if options.Datagram != nil {
+		if _, ok := options.Datagram.(transport.SourceDatagram); !ok {
+			return nil, fmt.Errorf("%w: injected datagram does not support source selection", ErrInvalidServiceOptions)
+		}
+	}
 	clusterID, err := parseClusterID(options.Config.ClusterID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidServiceOptions, err)
@@ -248,8 +253,8 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 
 	workerContext, stopWorkers := context.WithCancel(ctx)
 	var workers sync.WaitGroup
-	datagram := s.options.Datagram
-	if datagram == nil {
+	var datagram transport.SourceDatagram
+	if s.options.Datagram == nil {
 		pingEndpoint, err := s.options.Config.BindEndpoint(config.ServiceSWIMPing)
 		if err != nil {
 			stopWorkers()
@@ -265,6 +270,8 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 			stopWorkers()
 			return err
 		}
+	} else {
+		datagram = s.options.Datagram.(transport.SourceDatagram)
 	}
 	defer func() {
 		if err := datagram.Close(); err != nil && !errors.Is(err, transport.ErrDatagramClosed) {
@@ -499,7 +506,7 @@ type serviceLoop struct {
 	dissemination      *Disseminator
 	subscriptions      *Subscriptions
 	activeMembers      []Member
-	datagram           transport.Datagram
+	datagram           transport.SourceDatagram
 	runContext         context.Context
 	workerContext      context.Context
 	workers            *sync.WaitGroup
@@ -1317,14 +1324,11 @@ func (l *serviceLoop) sendMessage(ctx context.Context, member Member, message an
 }
 
 func (l *serviceLoop) sendDatagram(ctx context.Context, sourceService config.Service, destination config.Endpoint, encoded []byte) error {
-	if sourceDatagram, ok := l.datagram.(transport.SourceDatagram); ok {
-		source, err := l.service.options.Config.BindEndpoint(sourceService)
-		if err != nil {
-			return err
-		}
-		return sourceDatagram.SendFrom(ctx, source, destination, encoded)
+	source, err := l.service.options.Config.BindEndpoint(sourceService)
+	if err != nil {
+		return err
 	}
-	return l.datagram.Send(ctx, destination, encoded)
+	return l.datagram.SendFrom(ctx, source, destination, encoded)
 }
 
 func datagramMessageDescriptor(message any) (wire.MessageType, config.Service, func([]Update) any, error) {
