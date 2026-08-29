@@ -181,7 +181,7 @@ func TestServiceDropsInvalidAuthenticatedDatagramBoundaries(t *testing.T) {
 
 	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
 	barrierFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 7, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: peer, ReporterID: 1}}}))
-	if err := attacker.Send(context.Background(), destination, barrierFrame); err != nil {
+	if err := serviceDatagram.SendFrom(context.Background(), destination, destination, barrierFrame); err != nil {
 		t.Fatal(err)
 	}
 	if got := network.Advance(); got != 8 {
@@ -204,6 +204,128 @@ func TestServiceDropsInvalidAuthenticatedDatagramBoundaries(t *testing.T) {
 	if err := waitServiceResult(t, result); err != nil {
 		t.Fatalf("Run cancellation error = %v", err)
 	}
+}
+
+func TestServiceDatagramBindsSenderIdentityToTypedSourceEndpoint(t *testing.T) {
+	now := time.Unix(2050, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: authenticator,
+		Clock:         clock.NewManual(now),
+		Random:        random.NewLockedSource(300),
+		Store:         newServiceStore(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := Member{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}
+	seed := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 3, Status: Alive}
+	peer := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 4, Status: Alive}
+	service.admitted.Store(true)
+	service.active.Store(map[uint16]Member{self.NodeID: self, seed.NodeID: seed, peer.NodeID: peer})
+	clusterID := decodedTestClusterID(t, testClusterID)
+	attacker := config.Endpoint{Host: "127.0.0.9", Port: 65000}
+
+	for index, member := range []Member{seed, peer, self} {
+		payload := mustEncodeGob(t, GossipMessage{Updates: []Update{{
+			Member:     Member{NodeID: uint16(50 + index), Host: "forged.local", BasePort: uint16(15000 + index*10), Incarnation: 1, Status: Alive},
+			ReporterID: member.NodeID,
+		}}})
+		frame := encodeServiceTestFrame(t, authenticator, clusterID, member.NodeID, byte(70+index), now, wire.MessageSWIMGossip, payload)
+		if event, ok := service.decodeDatagram(transport.Packet{From: attacker, Data: frame}); ok {
+			t.Fatalf("forged sender %d from %s accepted as %#v", member.NodeID, attacker, event)
+		}
+	}
+
+	peerPing, _ := (config.NodeConfig{AdvertiseHost: peer.Host, BasePort: peer.BasePort}).AdvertiseEndpoint(config.ServiceSWIMPing)
+	peerACK, _ := (config.NodeConfig{AdvertiseHost: peer.Host, BasePort: peer.BasePort}).AdvertiseEndpoint(config.ServiceSWIMACK)
+	pingFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 80, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 1}}))
+	if event, ok := service.decodeDatagram(transport.Packet{From: peerACK, Data: pingFrame}); ok {
+		t.Fatalf("Ping from ACK endpoint accepted as %#v", event)
+	}
+	if _, ok := service.decodeDatagram(transport.Packet{From: peerPing, Data: pingFrame}); !ok {
+		t.Fatal("Ping from advertised ping endpoint was rejected")
+	}
+
+	ackFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 81, now, wire.MessageSWIMAck, mustEncodeGob(t, AckMessage{Ack: Ack{OriginID: self.NodeID, Sequence: 1}}))
+	if event, ok := service.decodeDatagram(transport.Packet{From: peerPing, Data: ackFrame}); ok {
+		t.Fatalf("ACK from ping endpoint accepted as %#v", event)
+	}
+	if _, ok := service.decodeDatagram(transport.Packet{From: peerACK, Data: ackFrame}); !ok {
+		t.Fatal("ACK from advertised ACK endpoint was rejected")
+	}
+}
+
+func TestServiceInvalidDatagramsCannotPoisonReplayCapacity(t *testing.T) {
+	now := time.Unix(2060, 0)
+	service, peer, source, authenticator := newDatagramDecoderService(t, now, 1)
+	clusterID := decodedTestClusterID(t, testClusterID)
+
+	for requestByte := byte(1); requestByte <= 8; requestByte++ {
+		frame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, requestByte, now, wire.MessageSWIMGossip, []byte("not-gob"))
+		if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: frame}); ok {
+			t.Fatalf("invalid gob request %d accepted as %#v", requestByte, event)
+		}
+	}
+	invalidPing := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 9, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID}}))
+	if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: invalidPing}); ok {
+		t.Fatalf("zero-sequence Ping accepted as %#v", event)
+	}
+
+	legitimate := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 10, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 1}}))
+	if _, ok := service.decodeDatagram(transport.Packet{From: source, Data: legitimate}); !ok {
+		t.Fatal("invalid traffic exhausted replay capacity before legitimate frame")
+	}
+	if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: legitimate}); ok {
+		t.Fatalf("duplicate legitimate frame accepted as %#v", event)
+	}
+}
+
+func TestServiceRejectsZeroIncarnationBeforeReplayAcceptance(t *testing.T) {
+	now := time.Unix(2070, 0)
+	service, peer, source, authenticator := newDatagramDecoderService(t, now, 1)
+	clusterID := decodedTestClusterID(t, testClusterID)
+	requestByte := byte(20)
+	poisoned := Member{NodeID: 50, Host: "zero.local", BasePort: 15000, Incarnation: 0, Status: Alive}
+	zeroFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, requestByte, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: poisoned, ReporterID: peer.NodeID}}}))
+	if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: zeroFrame}); ok {
+		t.Fatalf("zero-incarnation update accepted as %#v", event)
+	}
+
+	valid := poisoned
+	valid.Incarnation = 1
+	validFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, requestByte, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: valid, ReporterID: peer.NodeID}}}))
+	if _, ok := service.decodeDatagram(transport.Packet{From: source, Data: validFrame}); !ok {
+		t.Fatal("zero-incarnation update consumed the legitimate frame's replay ID")
+	}
+}
+
+func newDatagramDecoderService(t *testing.T, now time.Time, replayEntries int) (*Service, Member, config.Endpoint, wire.Authenticator) {
+	t.Helper()
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: authenticator,
+		Clock:         clock.NewManual(now),
+		Random:        random.NewLockedSource(301),
+		Store:         newServiceStore(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := Member{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 3, Status: Alive}
+	service.admitted.Store(true)
+	service.active.Store(map[uint16]Member{self.NodeID: self, peer.NodeID: peer})
+	service.replay = wire.NewReplayGuard(service.options.Clock, time.Duration(configuration.Timing.ReplayWindow), serviceFutureSkew, replayEntries)
+	source, err := (config.NodeConfig{AdvertiseHost: peer.Host, BasePort: peer.BasePort}).AdvertiseEndpoint(config.ServiceSWIMPing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service, peer, source, authenticator
 }
 
 func TestServicePersistsSelfRefutationBeforePublishingOrSending(t *testing.T) {
@@ -560,16 +682,22 @@ func TestServiceDigestTriggersAuthenticatedSnapshotResync(t *testing.T) {
 	seedPing, _ := seedConfig.AdvertiseEndpoint(config.ServiceSWIMPing)
 	joinPing, _ := joinConfig.AdvertiseEndpoint(config.ServiceSWIMPing)
 	network.Drop(seedPing, joinPing)
-	injector, err := network.Endpoint(config.Endpoint{Host: "injector", Port: 9200})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer injector.Close()
 	authenticator := wire.NewHMACAuthenticator(testServiceKey())
 	clusterID := decodedTestClusterID(t, testClusterID)
 	missing := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
+	zero := missing
+	zero.Incarnation = 0
+	zeroFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 60, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: zero, ReporterID: 1}}}))
 	updateFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 60, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: missing, ReporterID: 1}}}))
-	if err := injector.Send(context.Background(), seedPing, updateFrame); err != nil {
+	seedDatagram := seed.service.options.Datagram.(transport.SourceDatagram)
+	if err := seedDatagram.SendFrom(context.Background(), seedPing, seedPing, zeroFrame); err != nil {
+		t.Fatal(err)
+	}
+	network.Advance()
+	if snapshot, err := seed.service.Snapshot(testContext(t)); err != nil || len(snapshot) != 2 {
+		t.Fatalf("zero-incarnation poison snapshot = %#v, error = %v", snapshot, err)
+	}
+	if err := seedDatagram.SendFrom(context.Background(), seedPing, seedPing, updateFrame); err != nil {
 		t.Fatal(err)
 	}
 	if got := network.Advance(); got < 1 {
@@ -584,8 +712,9 @@ func TestServiceDigestTriggersAuthenticatedSnapshotResync(t *testing.T) {
 		t.Fatalf("dropped UDP update reached joining node: %#v", joiningSnapshot)
 	}
 
+	network.Heal(seedPing, joinPing)
 	digestFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 61, now, wire.MessageSWIMDigest, mustEncodeGob(t, DigestMessage{}))
-	if err := injector.Send(context.Background(), joinPing, digestFrame); err != nil {
+	if err := seedDatagram.SendFrom(context.Background(), seedPing, joinPing, digestFrame); err != nil {
 		t.Fatal(err)
 	}
 	if got := network.Advance(); got < 1 {
@@ -771,11 +900,23 @@ type observingDatagram struct {
 }
 
 func (d *observingDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
+	d.observeSend()
+	return d.Datagram.Send(ctx, destination, payload)
+}
+
+func (d *observingDatagram) SendFrom(ctx context.Context, source, destination config.Endpoint, payload []byte) error {
+	d.observeSend()
+	if datagram, ok := d.Datagram.(transport.SourceDatagram); ok {
+		return datagram.SendFrom(ctx, source, destination, payload)
+	}
+	return d.Datagram.Send(ctx, destination, payload)
+}
+
+func (d *observingDatagram) observeSend() {
 	if d.armed.Load() && !d.store.hasStored(d.store.blockValue) {
 		d.violation.Store(true)
 	}
 	d.sendCount.Add(1)
-	return d.Datagram.Send(ctx, destination, payload)
 }
 
 type persistenceHarness struct {
@@ -814,21 +955,23 @@ func startPersistenceService(t *testing.T, store *barrierServiceStore) *persiste
 	go func() { result <- service.Run(ctx) }()
 	waitServiceReady(t, service)
 
-	senderAddress := config.Endpoint{Host: "sender", Port: 9100}
-	sender, err := network.Endpoint(senderAddress)
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	peerPing, _ := (config.NodeConfig{AdvertiseHost: peer.Host, BasePort: peer.BasePort}).AdvertiseEndpoint(config.ServiceSWIMPing)
+	peerACK, _ := (config.NodeConfig{AdvertiseHost: peer.Host, BasePort: peer.BasePort}).AdvertiseEndpoint(config.ServiceSWIMACK)
+	sender, err := network.Endpoint(peerPing, peerACK)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sender.Close() })
-	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
 	clusterID := decodedTestClusterID(t, testClusterID)
 	frame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 20, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: peer, ReporterID: 1}}}))
 	destination, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMPing)
-	if err := sender.Send(context.Background(), destination, frame); err != nil {
+	if err := observed.SendFrom(context.Background(), destination, destination, frame); err != nil {
 		t.Fatal(err)
 	}
 	network.Advance()
 	waitForSnapshot(t, service, func(members []Member) bool { return len(members) == 2 && members[1] == peer })
+	network.Advance()
 	return &persistenceHarness{
 		service:       service,
 		network:       network,

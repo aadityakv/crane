@@ -157,7 +157,7 @@ func RetransmitBudget(multiplier int, aliveMembers int) int {
 }
 
 func validUpdate(update Update) bool {
-	return update.Member.NodeID != 0 && update.ReporterID != 0 && update.Member.Status.valid()
+	return update.Member.NodeID != 0 && update.Member.Incarnation != 0 && update.ReporterID != 0 && update.Member.Status.valid()
 }
 
 func mergePendingUpdate(current Update, incoming Update) (Update, bool) {

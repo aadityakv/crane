@@ -277,8 +277,8 @@ func TestEngineProbeRejectsWrongDirectAcksWithoutCancelingExactSequence(t *testi
 }
 
 func TestEngineProbeWithoutRelaysStillWaitsForIndirectGenerationOnce(t *testing.T) {
-	self := Member{NodeID: 1, Status: Alive}
-	target := Member{NodeID: 2, Status: Alive}
+	self := Member{NodeID: 1, Incarnation: 1, Status: Alive}
+	target := Member{NodeID: 2, Incarnation: 1, Status: Alive}
 	engine := newTestEngineWithSelf(self)
 	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
 	now := time.Date(2026, 8, 29, 14, 28, 0, 0, time.UTC)

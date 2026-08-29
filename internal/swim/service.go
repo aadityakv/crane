@@ -565,7 +565,7 @@ func (l *serviceLoop) sendDirectUpdate(ctx context.Context, member Member, updat
 	if err != nil {
 		return false, err
 	}
-	if err := l.datagram.Send(ctx, destination, encoded); err != nil {
+	if err := l.sendDatagram(ctx, config.ServiceSWIMPing, destination, encoded); err != nil {
 		return false, nil
 	}
 	return true, nil
@@ -793,18 +793,14 @@ func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent,
 	if err != nil || frame.Header.SenderID == 0 || !knownDatagramType(frame.Header.Message) {
 		return datagramServiceEvent{}, false
 	}
-	timestamp := time.UnixMilli(frame.Header.TimestampMillis)
-	if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, timestamp); err != nil {
-		return datagramServiceEvent{}, false
-	}
 	if !s.admitted.Load() {
 		return datagramServiceEvent{}, false
 	}
 	active := s.active.Load().(map[uint16]Member)
-	if _, exists := active[frame.Header.SenderID]; !exists {
+	sender, exists := active[frame.Header.SenderID]
+	if !exists || !matchesDatagramSource(packet.From, sender, frame.Header.Message) {
 		return datagramServiceEvent{}, false
 	}
-
 	event := datagramServiceEvent{senderID: frame.Header.SenderID}
 	switch frame.Header.Message {
 	case wire.MessageSWIMPing:
@@ -848,6 +844,13 @@ func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent,
 		if !validUpdate(update) || validateAdvertisedEndpoint(update.Member) != nil {
 			return datagramServiceEvent{}, false
 		}
+	}
+	if !validDatagramMessage(event.message, sender, active, s.options.Config.NodeID) {
+		return datagramServiceEvent{}, false
+	}
+	timestamp := time.UnixMilli(frame.Header.TimestampMillis)
+	if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, timestamp); err != nil {
+		return datagramServiceEvent{}, false
 	}
 	return event, true
 }
@@ -1124,10 +1127,21 @@ func (l *serviceLoop) sendMessage(ctx context.Context, member Member, message an
 	if err != nil {
 		return false, err
 	}
-	if err := l.datagram.Send(ctx, destination, encoded); err != nil {
+	if err := l.sendDatagram(ctx, endpointService, destination, encoded); err != nil {
 		return false, nil
 	}
 	return true, nil
+}
+
+func (l *serviceLoop) sendDatagram(ctx context.Context, sourceService config.Service, destination config.Endpoint, encoded []byte) error {
+	if sourceDatagram, ok := l.datagram.(transport.SourceDatagram); ok {
+		source, err := l.service.options.Config.BindEndpoint(sourceService)
+		if err != nil {
+			return err
+		}
+		return sourceDatagram.SendFrom(ctx, source, destination, encoded)
+	}
+	return l.datagram.Send(ctx, destination, encoded)
 }
 
 func datagramMessageDescriptor(message any) (wire.MessageType, config.Service, func([]Update) any, error) {
@@ -1217,6 +1231,51 @@ func (l *serviceLoop) nextRequestID() wire.RequestID {
 func knownDatagramType(message wire.MessageType) bool {
 	switch message {
 	case wire.MessageSWIMPing, wire.MessageSWIMAck, wire.MessageSWIMPingReq, wire.MessageSWIMIndirectAck, wire.MessageSWIMGossip, wire.MessageSWIMDigest:
+		return true
+	default:
+		return false
+	}
+}
+
+func matchesDatagramSource(source config.Endpoint, sender Member, message wire.MessageType) bool {
+	var sourceService config.Service
+	switch message {
+	case wire.MessageSWIMPing, wire.MessageSWIMPingReq, wire.MessageSWIMGossip, wire.MessageSWIMDigest:
+		sourceService = config.ServiceSWIMPing
+	case wire.MessageSWIMAck, wire.MessageSWIMIndirectAck:
+		sourceService = config.ServiceSWIMACK
+	default:
+		return false
+	}
+	expected, err := (config.NodeConfig{AdvertiseHost: sender.Host, BasePort: sender.BasePort}).AdvertiseEndpoint(sourceService)
+	return err == nil && source == expected
+}
+
+func validDatagramMessage(message any, sender Member, active map[uint16]Member, selfID uint16) bool {
+	activeIdentity := func(member Member, requireAlive bool) bool {
+		current, exists := active[member.NodeID]
+		if !exists || current != member {
+			return false
+		}
+		return !requireAlive || current.Status == Alive
+	}
+	validOrigin := func(originID uint16) bool {
+		_, exists := active[originID]
+		return originID != 0 && exists
+	}
+
+	switch message := message.(type) {
+	case PingMessage:
+		return message.Ping.Sequence != 0 && validOrigin(message.Ping.OriginID)
+	case AckMessage:
+		return message.Ack.Sequence != 0 && validOrigin(message.Ack.OriginID)
+	case PingReqMessage:
+		request := message.PingReq
+		return request.Sequence != 0 && request.OriginID == sender.NodeID && request.Target.NodeID != sender.NodeID && request.Target.NodeID != selfID && activeIdentity(request.Target, true)
+	case IndirectAckMessage:
+		ack := message.IndirectAck
+		return ack.Sequence != 0 && ack.OriginID == selfID && activeIdentity(ack.Target, false)
+	case GossipMessage, DigestMessage:
 		return true
 	default:
 		return false

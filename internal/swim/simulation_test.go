@@ -27,12 +27,8 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	injector, err := network.Endpoint(config.Endpoint{Host: "subscriber-injector", Port: 9300})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer injector.Close()
 	destination, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMPing)
+	sender := running.service.options.Datagram.(transport.SourceDatagram)
 	authenticator := wire.NewHMACAuthenticator(testServiceKey())
 	clusterID := decodedTestClusterID(t, testClusterID)
 	first := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
@@ -41,7 +37,7 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 		{Member: first, ReporterID: 1},
 		{Member: second, ReporterID: 1},
 	}}))
-	if err := injector.Send(context.Background(), destination, overflow); err != nil {
+	if err := sender.SendFrom(context.Background(), destination, destination, overflow); err != nil {
 		t.Fatal(err)
 	}
 	network.Advance()
@@ -64,7 +60,7 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 
 	third := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
 	afterResync := encodeServiceTestFrame(t, authenticator, clusterID, 1, 71, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: third, ReporterID: 1}}}))
-	if err := injector.Send(context.Background(), destination, afterResync); err != nil {
+	if err := sender.SendFrom(context.Background(), destination, destination, afterResync); err != nil {
 		t.Fatal(err)
 	}
 	network.Advance()
@@ -217,7 +213,7 @@ func TestSimulationSuspicionRefutationStaleAndDuplicateUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	newMember := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
-	cluster.network.Duplicate(cluster.injectorAddress, cluster.endpoint(1, config.ServiceSWIMPing))
+	cluster.network.Duplicate(cluster.endpoint(1, config.ServiceSWIMPing), cluster.endpoint(1, config.ServiceSWIMPing))
 	cluster.inject(t, 1, 1, 82, GossipMessage{Updates: []Update{{Member: newMember, ReporterID: 1}}})
 	select {
 	case event := <-events:
@@ -245,7 +241,7 @@ func TestSimulationTwoWayPartitionConcurrentSuspicionsHealBySelfRefutation(t *te
 		cluster.waitMember(viewer, 3, func(member Member) bool { return member.Status == Suspect })
 	}
 	cluster.network.Heal()
-	cluster.network.Duplicate(cluster.injectorAddress, cluster.endpoint(3, config.ServiceSWIMPing))
+	cluster.network.Duplicate(cluster.endpoint(1, config.ServiceSWIMPing), cluster.endpoint(3, config.ServiceSWIMPing))
 	suspect := cluster.member(t, 1, 3)
 	cluster.inject(t, 1, 3, 83, GossipMessage{Updates: []Update{{Member: suspect, ReporterID: 1}}})
 	for _, viewer := range []uint16{1, 2, 3} {
@@ -353,11 +349,6 @@ func TestSimulationBoundedDisseminationFallsBackToDigest(t *testing.T) {
 	authenticator := wire.NewHMACAuthenticator(testServiceKey())
 	recording := newRecordingDatagram(base, authenticator, serviceWireLimits(t))
 	running := startRunningServiceWithDatagram(t, configuration, newServiceStore(1), clock.NewManual(now), recording, &scriptedRandom{uint64s: []uint64{1, 2, 3, 4, 5}})
-	injector, err := network.Endpoint(config.Endpoint{Host: "bounded-injector", Port: 9500})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer injector.Close()
 	destination, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMPing)
 
 	const terminalUpdates = serviceDisseminationMax
@@ -382,7 +373,7 @@ func TestSimulationBoundedDisseminationFallsBackToDigest(t *testing.T) {
 			}
 			frame := encodeSimulationGossip(t, authenticator, now, requestNumber, GossipMessage{Updates: updates})
 			requestNumber++
-			if err := injector.Send(context.Background(), destination, frame); err != nil {
+			if err := recording.SendFrom(context.Background(), destination, destination, frame); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -396,7 +387,7 @@ func TestSimulationBoundedDisseminationFallsBackToDigest(t *testing.T) {
 	recording.clear()
 	peer := Member{NodeID: 6000, Host: "127.0.0.6", BasePort: 16000, Incarnation: 1, Status: Alive}
 	peerFrame := encodeSimulationGossip(t, authenticator, now, requestNumber, GossipMessage{Updates: []Update{{Member: peer, ReporterID: 1}}})
-	if err := injector.Send(context.Background(), destination, peerFrame); err != nil {
+	if err := recording.SendFrom(context.Background(), destination, destination, peerFrame); err != nil {
 		t.Fatal(err)
 	}
 	network.Advance()
@@ -434,13 +425,11 @@ func encodeSimulationGossip(t *testing.T, authenticator wire.Authenticator, now 
 }
 
 type simulationCluster struct {
-	t               *testing.T
-	clock           *clock.Manual
-	network         *transport.MemoryNetwork
-	nodes           map[uint16]*simulationNode
-	injector        *transport.MemoryDatagram
-	injectorAddress config.Endpoint
-	seedEndpoint    config.Endpoint
+	t            *testing.T
+	clock        *clock.Manual
+	network      *transport.MemoryNetwork
+	nodes        map[uint16]*simulationNode
+	seedEndpoint config.Endpoint
 }
 
 type simulationNode struct {
@@ -456,18 +445,11 @@ func newSimulationCluster(t *testing.T, size int) *simulationCluster {
 	t.Helper()
 	start := time.Unix(6000, 0)
 	cluster := &simulationCluster{
-		t:               t,
-		clock:           clock.NewManual(start),
-		network:         transport.NewMemoryNetwork(),
-		nodes:           make(map[uint16]*simulationNode),
-		injectorAddress: config.Endpoint{Host: "simulation-injector", Port: 9400},
+		t:       t,
+		clock:   clock.NewManual(start),
+		network: transport.NewMemoryNetwork(),
+		nodes:   make(map[uint16]*simulationNode),
 	}
-	injector, err := cluster.network.Endpoint(cluster.injectorAddress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cluster.injector = injector
-	t.Cleanup(func() { _ = injector.Close() })
 	for index := 1; index <= size; index++ {
 		nodeID := uint16(index)
 		configuration := serviceTestConfig(t, nodeID)
@@ -643,7 +625,8 @@ func (c *simulationCluster) inject(t *testing.T, senderID, destinationID uint16,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.injector.Send(context.Background(), c.endpoint(destinationID, config.ServiceSWIMPing), encoded); err != nil {
+	source := c.endpoint(senderID, config.ServiceSWIMPing)
+	if err := c.nodes[senderID].recording.SendFrom(context.Background(), source, c.endpoint(destinationID, config.ServiceSWIMPing), encoded); err != nil {
 		t.Fatal(err)
 	}
 	c.network.Advance()
@@ -691,12 +674,24 @@ func newRecordingDatagram(datagram transport.Datagram, auth wire.Authenticator, 
 }
 
 func (d *recordingDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
+	d.record(destination, payload)
+	return d.Datagram.Send(ctx, destination, payload)
+}
+
+func (d *recordingDatagram) SendFrom(ctx context.Context, source, destination config.Endpoint, payload []byte) error {
+	d.record(destination, payload)
+	if datagram, ok := d.Datagram.(transport.SourceDatagram); ok {
+		return datagram.SendFrom(ctx, source, destination, payload)
+	}
+	return d.Datagram.Send(ctx, destination, payload)
+}
+
+func (d *recordingDatagram) record(destination config.Endpoint, payload []byte) {
 	if frame, err := wire.Decode(payload, d.auth, d.limits); err == nil {
 		d.mu.Lock()
 		d.sent = append(d.sent, recordedDatagram{destination: destination, frame: frame})
 		d.mu.Unlock()
 	}
-	return d.Datagram.Send(ctx, destination, payload)
 }
 
 func (d *recordingDatagram) clear() {

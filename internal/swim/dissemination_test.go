@@ -290,6 +290,7 @@ func TestDisseminatorRejectsInvalidUpdates(t *testing.T) {
 	for _, update := range []Update{
 		{Member: Member{NodeID: 0, Status: Alive}, ReporterID: 1},
 		{Member: Member{NodeID: 1, Status: Alive}, ReporterID: 0},
+		{Member: Member{NodeID: 1, Incarnation: 0, Status: Alive}, ReporterID: 1},
 		{Member: Member{NodeID: 1, Status: Status(255)}, ReporterID: 1},
 	} {
 		d.Enqueue(update, 1)
