@@ -4,14 +4,16 @@ This repository contains the modern Go runtime foundation and its SWIM membershi
 
 ## Prerequisites and verification
 
-Install Go 1.26 or newer, then confirm that the selected toolchain is available:
+Install Go 1.26.x for the full pinned verification gate and CI, then confirm that the selected toolchain is available:
 
 ```sh
 go version
 go env GOMOD
 ```
 
-The second command must point to this repository's `go.mod`. Run the full local gate before changing or operating the runtime:
+The second command must point to this repository's `go.mod`. The module's Go version floor remains 1.26. A newer Go release may build and test the project, but the pinned Staticcheck v0.7.0 analyzer is verified only with Go 1.26.x; use that toolchain for `make verify`.
+
+Run the full local gate before changing or operating the runtime:
 
 ```sh
 make verify
@@ -21,10 +23,11 @@ The gate checks formatting, unit tests, race safety, `go vet`, Staticcheck, and 
 
 ## Cluster secret
 
-Every node in one cluster must use the same nonempty secret file. The file is read as the HMAC key and validation rejects any group- or world-readable file. Create one with owner-only permissions before starting a node:
+Every node in one cluster must use the same secret file containing at least 32 raw bytes (a 256-bit HMAC key). Validation reads the opened regular file, rejects group- or world-readable permissions, and rejects empty or shorter key material. Create it once with owner-only permissions before starting a node:
 
 ```sh
 umask 077
+test ! -e local.secret || { echo "refusing to overwrite local.secret" >&2; exit 1; }
 head -c 32 /dev/urandom > local.secret
 chmod 600 local.secret
 ```
@@ -64,12 +67,21 @@ Ports come only from the typed registry, never hostname parsing or node-ID arith
 
 ## Running a node
 
-Build the executables and launch a configured node:
+Build the executables, provision the example node's identity state exactly once, and launch it:
 
 ```sh
 make build
+umask 077
+state_dir=./data/node-1
+mkdir -p "$state_dir"
+chmod 700 "$state_dir"
+test ! -e "$state_dir/swim.incarnation" || { echo "refusing to overwrite existing SWIM identity state" >&2; exit 1; }
+printf '1\n' > "$state_dir/swim.incarnation"
+chmod 600 "$state_dir/swim.incarnation"
 ./bin/cs425-node -config examples/config/node-1.json
 ```
+
+The secret-creation command in the preceding section must also have created `./local.secret`, the path used by the example config. Writing `swim.incarnation` is an explicit first-run trust/bootstrap ceremony: it establishes the initial nonzero identity generation before any network admission. It deliberately refuses overwriting state. On every later restart, preserve this file; SWIM atomically increments it when required. A corrupted state is rejected. A missing prior state is never silently reset to zero: recovery requires authenticated seed knowledge of the identity, otherwise admission is refused and the operator must restore state or allocate a new node ID.
 
 `-config` is required. For generated local clusters only, the node command accepts `-node-id`, `-bind-host`, `-advertise-host`, `-base-port`, and `-storage-dir` overrides. Cluster identity, seed, voters, timing, and secret location remain file-controlled so a command-line typo cannot create another security or consensus domain.
 
@@ -77,7 +89,7 @@ Startup creates the storage directory with owner-only permissions, loads the las
 
 ## Local three-node cluster
 
-The launcher generates strict `0600` configuration files under its data root, creates per-node storage directories, and never writes the secret into those files. Its default local bases are 8000, 8100, and 8200 (a stride of 100); node 1 is the initial seed, not a permanent authority.
+The launcher generates strict `0600` configuration files under its data root, creates per-node storage directories and initial nonzero incarnation state, and never writes the secret into those files. Its default local bases are 8000, 8100, and 8200 (a stride of 100); node 1 is the initial seed, not a permanent authority.
 
 ```sh
 make build
@@ -98,7 +110,20 @@ chmod 600 local.secret
 
 Use one config per machine, with a unique `node_id`, separate writable `storage_dir`, the shared protected secret path, and an identical `cluster_id`, timing block, and `raft_voters` map on every node. Set `bind_host` to the interface the local process can bind and `advertise_host` to the routable DNS name or IP peers can contact. The `introducer` must be the configured seed's advertised `swim-snapshot` endpoint (base port `+2`), not its bind-only or wildcard address. Open the registry's UDP and TCP ports as needed by the enabled runtime services.
 
-The introducer admits a joining node and supplies its snapshot; after admission it has no special authority. If the original seed stops, existing members continue probing and disseminating. A new node still needs a configured reachable seed to join. On restart, a node chooses and atomically persists an incarnation higher than both its prior state and the seed's retained value. If its state directory is lost and no seed retains its identity, restore the state or assign a new node ID rather than reusing incarnation zero.
+Before the first remote start, securely create or copy the shared 32-byte-or-longer secret to the exact `cluster_secret_file` path on each host, then provision the configured storage directory once on that host (substitute its exact configured path). This is the same explicit identity-trust ceremony as the standalone example; do not repeat it for restarts:
+
+```sh
+umask 077
+storage_dir=/var/lib/cs425/node-1
+mkdir -p "$storage_dir"
+chmod 700 "$storage_dir"
+test ! -e "$storage_dir/swim.incarnation" || { echo "refusing to overwrite existing SWIM identity state" >&2; exit 1; }
+printf '1\n' > "$storage_dir/swim.incarnation"
+chmod 600 "$storage_dir/swim.incarnation"
+./bin/cs425-node -config /etc/cs425/node-1.json
+```
+
+The introducer admits a joining node and supplies its snapshot; after admission it has no special authority. If the original seed stops, existing members continue probing and disseminating. A new node still needs a configured reachable seed to join. On restart, a node chooses and atomically persists an incarnation higher than both its prior state and the seed's retained value. If its state directory is lost, do not recreate `swim.incarnation` with `1`: recovery requires a seed-retained identity; without it, admission is refused and the operator must restore the state or assign a new node ID rather than reusing incarnation zero.
 
 ## SWIM behavior and current scope
 
