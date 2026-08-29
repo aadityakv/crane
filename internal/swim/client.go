@@ -163,7 +163,7 @@ func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endp
 	if err := c.writePayload(ctx, stream, wire.MessageSWIMSnapshotRequest, requestID, SnapshotRequest{}); err != nil {
 		return nil, err
 	}
-	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMSnapshotResponse)
+	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMSnapshotResponse, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +215,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := c.writePayload(ctx, stream, wire.MessageSWIMJoinRequest, requestID, JoinRequest{NodeID: self.NodeID}); err != nil {
 		return joinClientResult{}, err
 	}
-	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMJoinSnapshot)
+	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMJoinSnapshot, 0)
 	if err != nil {
 		return joinClientResult{}, err
 	}
@@ -241,7 +241,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := c.writePayload(ctx, stream, wire.MessageSWIMJoinAnnounce, announceID, JoinAnnounce{Member: prepared}); err != nil {
 		return joinClientResult{}, err
 	}
-	acceptedFrame, err := c.readResponse(ctx, stream, announceID, wire.MessageSWIMJoinAccepted)
+	acceptedFrame, err := c.readResponse(ctx, stream, announceID, wire.MessageSWIMJoinAccepted, frame.Header.SenderID)
 	if err != nil {
 		return joinClientResult{}, err
 	}
@@ -329,13 +329,16 @@ func (c *protocolClient) writePayload(ctx context.Context, stream *wire.TCPFrame
 	return nil
 }
 
-func (c *protocolClient) readResponse(ctx context.Context, stream *wire.TCPFrameStream, requestID wire.RequestID, expected wire.MessageType) (wire.Frame, error) {
+func (c *protocolClient) readResponse(ctx context.Context, stream *wire.TCPFrameStream, requestID wire.RequestID, expected wire.MessageType, expectedSenderID uint16) (wire.Frame, error) {
 	frame, err := stream.ReadFrame(ctx)
 	if err != nil {
 		return wire.Frame{}, fmt.Errorf("read SWIM TCP response: %w", err)
 	}
 	if frame.Header.SenderID == 0 || frame.Header.RequestID != requestID {
 		return wire.Frame{}, fmt.Errorf("%w: uncorrelated response", ErrSnapshotProtocol)
+	}
+	if expectedSenderID != 0 && frame.Header.SenderID != expectedSenderID {
+		return wire.Frame{}, fmt.Errorf("%w: responder changed from %d to %d", ErrSnapshotProtocol, expectedSenderID, frame.Header.SenderID)
 	}
 	if frame.Header.Message == wire.MessageSWIMError {
 		var response ProtocolErrorMessage

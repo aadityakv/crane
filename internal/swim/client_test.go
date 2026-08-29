@@ -61,6 +61,34 @@ func TestJoinClientRequiresOneResponderIdentity(t *testing.T) {
 	}
 }
 
+func TestJoinClientRejectsMismatchedErrorResponderBeforeReplayAcceptance(t *testing.T) {
+	now := time.Unix(4475, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	endpoint := startJoinResponderErrorMismatchServer(t, authenticator, clusterID, now)
+	client, err := newProtocolClient(configuration, authenticator, clock.NewManual(now), random.NewLockedSource(196), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.replay = wire.NewReplayGuard(client.clock, time.Duration(configuration.Timing.ReplayWindow), serviceFutureSkew, 2)
+	self := Member{NodeID: configuration.NodeID, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort}
+	if _, err := client.join(testContext(t), endpoint, newServiceStore(1), self); !errors.Is(err, ErrSnapshotProtocol) {
+		t.Fatalf("mismatched SWIMError responder error = %v, want ErrSnapshotProtocol", err)
+	}
+
+	validMember := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	validPayload := mustEncodeGob(t, SnapshotResponse{Members: []Member{validMember}})
+	validEndpoint := startScriptedTCPServer(t, authenticator, clusterID, []func(wire.Frame) wire.Frame{
+		func(request wire.Frame) wire.Frame {
+			return tcpServiceTestFrameWithPayload(clusterID, 2, request.Header.RequestID, now, wire.MessageSWIMSnapshotResponse, validPayload)
+		},
+	})
+	if snapshot, err := client.snapshot(testContext(t), validEndpoint); err != nil || len(snapshot) != 1 || snapshot[0] != validMember {
+		t.Fatalf("valid response after mismatched SWIMError = %#v, error = %v", snapshot, err)
+	}
+}
+
 func TestJoinClientBindsFirstResponderToDialedSeedBeforeReplayOrPersistence(t *testing.T) {
 	now := time.Unix(4480, 0)
 	joiningConfiguration := serviceTestConfig(t, 1)
@@ -157,6 +185,10 @@ func startJoinResponderMismatchServer(t *testing.T, authenticator wire.Authentic
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
+	address := listener.Addr().(*net.TCPAddr)
+	endpoint := config.Endpoint{Host: address.IP.String(), Port: uint16(address.Port)}
+	seed.Host = endpoint.Host
+	seed.BasePort = endpoint.Port - 2
 	go func() {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -187,8 +219,48 @@ func startJoinResponderMismatchServer(t *testing.T, authenticator wire.Authentic
 		}
 		_ = stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, seed.NodeID+1, announceFrame.Header.RequestID, now, wire.MessageSWIMJoinAccepted, acceptedPayload))
 	}()
+	return endpoint
+}
+
+func startJoinResponderErrorMismatchServer(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, now time.Time) config.Endpoint {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
 	address := listener.Addr().(*net.TCPAddr)
-	return config.Endpoint{Host: address.IP.String(), Port: uint16(address.Port)}
+	endpoint := config.Endpoint{Host: address.IP.String(), Port: uint16(address.Port)}
+	seed := Member{NodeID: 2, Host: endpoint.Host, BasePort: endpoint.Port - 2, Incarnation: 1, Status: Alive}
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		stream := wire.NewTCPFrameStream(connection, authenticator, clientTestWireLimits(clusterID), time.Second)
+		defer stream.Close()
+		request, err := stream.ReadFrame(context.Background())
+		if err != nil {
+			return
+		}
+		snapshotPayload, err := wire.EncodeGob(JoinSnapshot{Members: []Member{seed}})
+		if err != nil {
+			return
+		}
+		if stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, seed.NodeID, request.Header.RequestID, now, wire.MessageSWIMJoinSnapshot, snapshotPayload)) != nil {
+			return
+		}
+		announceFrame, err := stream.ReadFrame(context.Background())
+		if err != nil {
+			return
+		}
+		errorPayload, err := wire.EncodeGob(encodeProtocolError(ErrServiceNotAdmitted))
+		if err != nil {
+			return
+		}
+		_ = stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, seed.NodeID+1, announceFrame.Header.RequestID, now, wire.MessageSWIMError, errorPayload))
+	}()
+	return endpoint
 }
 
 func startJoinSnapshotOnlyServer(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, now time.Time, member func(config.Endpoint) Member) config.Endpoint {
