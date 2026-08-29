@@ -60,6 +60,9 @@ type TimingConfig struct {
 	ReplayWindow Duration `json:"replay_window"`
 }
 
+// MinClusterSecretBytes is the minimum raw HMAC-SHA256 key length accepted for a cluster secret.
+const MinClusterSecretBytes = 32
+
 // DefaultTimingConfig returns the deterministic timing configuration used when a JSON config omits timing fields.
 func DefaultTimingConfig() TimingConfig {
 	return TimingConfig{
@@ -249,25 +252,38 @@ func validateStorageDir(path string) error {
 }
 
 func validateSecretFile(path string) error {
+	_, err := LoadClusterSecret(path)
+	return err
+}
+
+// LoadClusterSecret validates and reads a permission-restricted cluster HMAC key into an owned copy.
+func LoadClusterSecret(path string) ([]byte, error) {
 	if path == "" {
-		return fmt.Errorf("cluster secret file is empty")
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("stat cluster secret file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("cluster secret file must be a regular file")
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("cluster secret file permissions must not grant group or other access")
+		return nil, fmt.Errorf("cluster secret file is empty")
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open cluster secret file: %w", err)
+		return nil, fmt.Errorf("open cluster secret file: %w", err)
 	}
 	defer file.Close()
-	return nil
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat opened cluster secret file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("cluster secret file must be a regular file")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("cluster secret file permissions must not grant group or other access")
+	}
+	secret, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("read cluster secret file: %w", err)
+	}
+	if len(secret) < MinClusterSecretBytes {
+		return nil, fmt.Errorf("cluster secret file must contain at least %d bytes", MinClusterSecretBytes)
+	}
+	return append([]byte(nil), secret...), nil
 }
 
 func validateTiming(timing TimingConfig) error {

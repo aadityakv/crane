@@ -14,7 +14,7 @@ import (
 )
 
 func TestGenerateConfigsBuildsStrictSharedLocalLayout(t *testing.T) {
-	secretContents := "launcher-secret-that-must-not-enter-json"
+	secretContents := "launcher-secret-that-must-not-enter-json-32"
 	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
 	if err := os.WriteFile(secretFile, []byte(secretContents), 0o600); err != nil {
 		t.Fatal(err)
@@ -89,7 +89,7 @@ func TestGenerateConfigsBuildsStrictSharedLocalLayout(t *testing.T) {
 
 func TestGenerateConfigsRejectsInvalidClusterLayouts(t *testing.T) {
 	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
-	if err := os.WriteFile(secretFile, []byte("secret"), 0o600); err != nil {
+	if err := os.WriteFile(secretFile, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	valid := ClusterOptions{
@@ -133,7 +133,7 @@ func TestValidateGeneratedPortRangesRejectsOverlap(t *testing.T) {
 }
 
 func TestPrepareClusterFilesWritesStrictConfigsAndTrustworthyInitialState(t *testing.T) {
-	secretContents := []byte("private-local-cluster-secret")
+	secretContents := []byte("private-local-cluster-secret-32bytes")
 	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
 	if err := os.WriteFile(secretFile, secretContents, 0o600); err != nil {
 		t.Fatal(err)

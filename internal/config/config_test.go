@@ -11,13 +11,47 @@ import (
 func createSecret(t *testing.T, mode os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cluster.secret")
-	if err := os.WriteFile(path, []byte("test-cluster-secret"), mode); err != nil {
+	if err := os.WriteFile(path, bytes.Repeat([]byte("s"), 32), mode); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	if err := os.Chmod(path, mode); err != nil {
 		t.Fatalf("Chmod: %v", err)
 	}
 	return path
+}
+
+func TestLoadClusterSecretRejectsUnsafeOrWeakKeyMaterial(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents []byte
+		wantErr  bool
+	}{
+		{name: "empty", contents: nil, wantErr: true},
+		{name: "short", contents: bytes.Repeat([]byte("s"), 31), wantErr: true},
+		{name: "minimum_256_bit_key", contents: bytes.Repeat([]byte("s"), 32)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cluster.secret")
+			if err := os.WriteFile(path, test.contents, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			secret, err := LoadClusterSecret(path)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("LoadClusterSecret accepted weak key material")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadClusterSecret: %v", err)
+			}
+			if !bytes.Equal(secret, test.contents) {
+				t.Fatalf("LoadClusterSecret returned %d bytes, want original key material", len(secret))
+			}
+		})
+	}
 }
 
 func validConfig(secretPath string) NodeConfig {

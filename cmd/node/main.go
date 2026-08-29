@@ -161,9 +161,9 @@ func newSWIMService(configuration config.NodeConfig) (*swim.Service, error) {
 	if err := configuration.Validate(); err != nil {
 		return nil, fmt.Errorf("validate node configuration: %w", err)
 	}
-	secret, err := os.ReadFile(configuration.ClusterSecretFile)
+	secret, err := config.LoadClusterSecret(configuration.ClusterSecretFile)
 	if err != nil {
-		return nil, fmt.Errorf("read cluster secret: %w", err)
+		return nil, err
 	}
 	seed, err := randomSeed()
 	if err != nil {

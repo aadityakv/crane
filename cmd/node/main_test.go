@@ -109,10 +109,23 @@ func TestNewSWIMServiceDoesNotBootstrapMissingIdentityState(t *testing.T) {
 	}
 }
 
+func TestNewSWIMServiceReloadsAndValidatesSecretAfterConfigValidation(t *testing.T) {
+	configuration := writeNodeTestConfig(t)
+	if err := configuration.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if err := os.WriteFile(configuration.ClusterSecretFile, []byte("too-short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if service, err := newSWIMService(configuration); err == nil || service != nil {
+		t.Fatalf("newSWIMService accepted a replaced short secret: service=%v err=%v", service, err)
+	}
+}
+
 func writeNodeTestConfig(t *testing.T) config.NodeConfig {
 	t.Helper()
 	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
-	if err := os.WriteFile(secretFile, []byte("node-command-test-secret"), 0o600); err != nil {
+	if err := os.WriteFile(secretFile, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	storageDir := filepath.Join(t.TempDir(), "node-1")
