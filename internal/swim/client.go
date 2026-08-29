@@ -226,7 +226,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := validateSnapshot(snapshot.Members); err != nil {
 		return joinClientResult{}, err
 	}
-	if err := validateJoinResponder(ctx, c.addresses, remoteEndpoint, frame.Header.SenderID, snapshot.Members); err != nil {
+	if err := validateJoinResponder(ctx, c.addresses, remoteEndpoint, c.senderID, frame.Header.SenderID, snapshot.Members); err != nil {
 		return joinClientResult{}, err
 	}
 	if err := c.acceptResponse(frame); err != nil {
@@ -265,7 +265,10 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	}, nil
 }
 
-func validateJoinResponder(ctx context.Context, addresses *addressMatcher, endpoint config.Endpoint, senderID uint16, members []Member) error {
+func validateJoinResponder(ctx context.Context, addresses *addressMatcher, endpoint config.Endpoint, localSenderID, senderID uint16, members []Member) error {
+	if senderID == localSenderID {
+		return fmt.Errorf("%w: first responder uses local node ID %d", ErrSnapshotProtocol, senderID)
+	}
 	var responder Member
 	found := false
 	for _, member := range members {

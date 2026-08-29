@@ -3,6 +3,7 @@ package swim
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"testing"
@@ -126,6 +127,49 @@ func TestJoinClientBindsFirstResponderToDialedSeedBeforeReplayOrPersistence(t *t
 		t.Fatalf("valid seed persisted incarnation %d, want 2", got)
 	}
 	seed.stop(t)
+}
+
+func TestJoinClientRejectsSelfAsFirstResponderBeforeReplayOrPersistence(t *testing.T) {
+	now := time.Unix(4482, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	selfEndpoint := startJoinSnapshotOnlyServer(t, authenticator, clusterID, now, func(endpoint config.Endpoint) Member {
+		return Member{
+			NodeID:      configuration.NodeID,
+			Host:        endpoint.Host,
+			BasePort:    endpoint.Port - 2,
+			Incarnation: math.MaxUint64 - 1,
+			Status:      Alive,
+		}
+	})
+	client, err := newProtocolClient(configuration, authenticator, clock.NewManual(now), random.NewLockedSource(197), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.replay = wire.NewReplayGuard(client.clock, time.Duration(configuration.Timing.ReplayWindow), serviceFutureSkew, 2)
+	store := &recordingIncarnationStore{loaded: 1}
+	self := Member{NodeID: configuration.NodeID, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort}
+	if _, err := client.join(testContext(t), selfEndpoint, store, self); !errors.Is(err, ErrSnapshotProtocol) {
+		t.Fatalf("self first responder error = %v, want ErrSnapshotProtocol", err)
+	}
+	if store.loads != 0 || len(store.stored) != 0 {
+		t.Fatalf("self first responder durable calls = loads:%d stores:%v, want none", store.loads, store.stored)
+	}
+
+	seedEndpoint := startSuccessfulJoinServer(t, authenticator, clusterID, now, func(endpoint config.Endpoint) Member {
+		return Member{NodeID: 2, Host: endpoint.Host, BasePort: endpoint.Port - 2, Incarnation: 1, Status: Alive}
+	})
+	result, err := client.join(testContext(t), seedEndpoint, store, self)
+	if err != nil {
+		t.Fatalf("legitimate seed after self responder: %v", err)
+	}
+	if result.seedID != 2 || result.accepted.NodeID != self.NodeID || result.accepted.Incarnation != 2 {
+		t.Fatalf("legitimate seed result = %#v", result)
+	}
+	if store.loads != 1 || len(store.stored) != 1 || store.stored[0] != 2 {
+		t.Fatalf("legitimate seed durable calls = loads:%d stores:%v, want one load and Store(2)", store.loads, store.stored)
+	}
 }
 
 func TestJoinClientAcceptsResolvedResponderMatchingNumericConnectionTarget(t *testing.T) {

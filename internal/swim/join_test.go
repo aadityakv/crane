@@ -262,12 +262,14 @@ func TestJoinMessagesRoundTripThroughGob(t *testing.T) {
 
 type recordingIncarnationStore struct {
 	loaded   uint64
+	loads    int
 	loadErr  error
 	storeErr error
 	stored   []uint64
 }
 
 func (s *recordingIncarnationStore) Load() (uint64, error) {
+	s.loads++
 	return s.loaded, s.loadErr
 }
 
