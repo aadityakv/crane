@@ -1,0 +1,91 @@
+package wire
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/aaditya/cs425mp3/internal/clock"
+)
+
+func TestReplayGuardRejectsDuplicateAndFutureMessages(t *testing.T) {
+	now := time.Unix(1000, 0)
+	manualClock := clock.NewManual(now)
+	guard := NewReplayGuard(manualClock, 2*time.Minute, 30*time.Second, 100)
+	id := RequestID{1}
+	if err := guard.Accept(2, id, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Accept(2, id, now); !errors.Is(err, ErrReplay) {
+		t.Fatalf("duplicate error = %v", err)
+	}
+	if err := guard.Accept(2, RequestID{2}, now.Add(31*time.Second)); !errors.Is(err, ErrTimestamp) {
+		t.Fatalf("future timestamp error = %v", err)
+	}
+}
+
+func TestReplayGuardRejectsExpiredTimestamps(t *testing.T) {
+	now := time.Unix(1000, 0)
+	guard := NewReplayGuard(clock.NewManual(now), 2*time.Minute, 30*time.Second, 100)
+
+	if err := guard.Accept(2, RequestID{1}, now.Add(-2*time.Minute)); !errors.Is(err, ErrTimestamp) {
+		t.Fatalf("timestamp at replay-window boundary error = %v", err)
+	}
+	if err := guard.Accept(2, RequestID{2}, now.Add(-2*time.Minute-time.Nanosecond)); !errors.Is(err, ErrTimestamp) {
+		t.Fatalf("stale timestamp error = %v", err)
+	}
+}
+
+func TestReplayGuardFailsClosedAtCapacity(t *testing.T) {
+	now := time.Unix(1000, 0)
+	guard := NewReplayGuard(clock.NewManual(now), 2*time.Minute, 30*time.Second, 2)
+	if err := guard.Accept(1, RequestID{1}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Accept(1, RequestID{2}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Accept(1, RequestID{3}, now); !errors.Is(err, ErrReplayCacheFull) {
+		t.Fatalf("capacity error = %v", err)
+	}
+	if err := guard.Accept(1, RequestID{1}, now); !errors.Is(err, ErrReplay) {
+		t.Fatalf("duplicate at capacity error = %v", err)
+	}
+}
+
+func TestReplayGuardPurgesExpiryBeforeCapacityCheck(t *testing.T) {
+	now := time.Unix(1000, 0)
+	manualClock := clock.NewManual(now)
+	guard := NewReplayGuard(manualClock, 2*time.Minute, 30*time.Second, 1)
+	if err := guard.Accept(1, RequestID{1}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	manualClock.Advance(2*time.Minute + time.Nanosecond)
+	if err := guard.Accept(1, RequestID{2}, manualClock.Now()); err != nil {
+		t.Fatalf("fresh request after expiry error = %v", err)
+	}
+	if err := guard.Accept(1, RequestID{1}, manualClock.Now()); !errors.Is(err, ErrReplayCacheFull) {
+		t.Fatalf("expired request remained cached or capacity did not fail closed: %v", err)
+	}
+}
+
+func TestReplayGuardExpiresEntriesFromMessageTimestamp(t *testing.T) {
+	now := time.Unix(1000, 0)
+	manualClock := clock.NewManual(now)
+	guard := NewReplayGuard(manualClock, 2*time.Minute, 30*time.Second, 2)
+	if err := guard.Accept(1, RequestID{1}, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Accept(1, RequestID{2}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	manualClock.Advance(time.Minute + time.Nanosecond)
+	if err := guard.Accept(1, RequestID{3}, manualClock.Now()); err != nil {
+		t.Fatalf("entry did not expire from its message timestamp: %v", err)
+	}
+	if err := guard.Accept(1, RequestID{2}, now); !errors.Is(err, ErrReplay) {
+		t.Fatalf("unexpired entry error = %v", err)
+	}
+}
