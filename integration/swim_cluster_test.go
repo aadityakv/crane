@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -51,6 +52,55 @@ func TestTypedPortAllocatorUsesAuthoritativeRegistryBounds(t *testing.T) {
 	}
 	if maxOffset != wantMax {
 		t.Fatalf("maximum offset = %d, want registry maximum %d", maxOffset, wantMax)
+	}
+}
+
+func TestLocalClusterLauncher(t *testing.T) {
+	repositoryRoot, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeBinary := buildNodeBinary(t, repositoryRoot)
+	clusterBinary := buildClusterBinary(t, repositoryRoot)
+	secret := []byte("launcher-integration-secret-32bytes")
+	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
+	if err := os.WriteFile(secretFile, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secretFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	basePort, releasePorts := reserveTypedClusterPorts(t, 3)
+	t.Cleanup(releasePorts)
+	dataRoot := filepath.Join(t.TempDir(), "launcher-data")
+	releasePorts()
+
+	harness := newProcessHarness(t)
+	launcher := harness.startCluster(clusterBinary, nodeBinary, dataRoot, secretFile, basePort)
+	testContext, cancelTest := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelTest()
+	configurations := waitForLauncherConfigs(t, testContext, harness, launcher, dataRoot, 3)
+	clients := newSnapshotClients(t, configurations, secret)
+	waitForCluster(t, testContext, harness, "launcher nodes to share one Alive view", func() (bool, error) {
+		views, err := clients.views(testContext, 1, 2, 3)
+		if err != nil {
+			return false, err
+		}
+		for observer, members := range views {
+			if len(members) != 3 || !hasMember(members, 1, swim.Alive, 0) || !hasMember(members, 2, swim.Alive, 0) || !hasMember(members, 3, swim.Alive, 0) {
+				return false, fmt.Errorf("observer %d view = %#v", observer, members)
+			}
+		}
+		return true, nil
+	})
+	readyLine := "[node-1] CS425_NODE_READY node_id=1"
+	if logs := launcher.log.String(); !strings.Contains(logs, readyLine) {
+		t.Fatalf("launcher logs do not contain seed readiness %q:\n%s", readyLine, harness.logs())
+	}
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelShutdown()
+	if err := launcher.terminate(shutdownContext); err != nil {
+		t.Fatalf("terminate cluster launcher: %v\n%s", err, harness.logs())
 	}
 }
 
@@ -153,16 +203,49 @@ func TestLocalSWIMCluster(t *testing.T) {
 }
 
 func buildNodeBinary(t *testing.T, repositoryRoot string) string {
+	return buildGoBinary(t, repositoryRoot, "cs425-node", "./cmd/node")
+}
+
+func buildClusterBinary(t *testing.T, repositoryRoot string) string {
+	return buildGoBinary(t, repositoryRoot, "cs425-cluster", "./cmd/cluster")
+}
+
+func buildGoBinary(t *testing.T, repositoryRoot, name, packagePath string) string {
 	t.Helper()
-	binary := filepath.Join(t.TempDir(), "cs425-node")
+	binary := filepath.Join(t.TempDir(), name)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/node")
+	command := exec.CommandContext(ctx, "go", "build", "-o", binary, packagePath)
 	command.Dir = repositoryRoot
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build node binary: %v\n%s", err, output)
+		t.Fatalf("build %s: %v\n%s", name, err, output)
 	}
 	return binary
+}
+
+func waitForLauncherConfigs(t *testing.T, ctx context.Context, harness *processHarness, launcher *nodeProcess, dataRoot string, nodes int) []config.NodeConfig {
+	t.Helper()
+	configurations := make([]config.NodeConfig, nodes)
+	err := testutil.WaitFor(ctx, 25*time.Millisecond, func() (bool, error) {
+		select {
+		case <-launcher.done:
+			return false, fmt.Errorf("launcher exited while generating configs: %v", launcher.result())
+		default:
+		}
+		for index := range configurations {
+			path := filepath.Join(dataRoot, "configs", fmt.Sprintf("node-%d.json", index+1))
+			loaded, err := config.Load(path)
+			if err != nil {
+				return false, err
+			}
+			configurations[index] = loaded
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("wait for launcher configs: %v\n%s", err, harness.logs())
+	}
+	return configurations
 }
 
 func integrationConfigs(t *testing.T, startingBasePort uint16, secretFile string) []config.NodeConfig {
@@ -341,17 +424,32 @@ func (l *synchronizedLog) String() string {
 }
 
 type nodeProcess struct {
-	name    string
-	command *exec.Cmd
-	log     *synchronizedLog
-	done    chan struct{}
-	mu      sync.Mutex
-	waitErr error
+	name              string
+	command           *exec.Cmd
+	log               *synchronizedLog
+	done              chan struct{}
+	gracefulOnCleanup bool
+	mu                sync.Mutex
+	waitErr           error
 }
 
 func startNodeProcess(binary, configPath, name string) (*nodeProcess, error) {
-	process := &nodeProcess{name: name, log: &synchronizedLog{}, done: make(chan struct{})}
-	process.command = exec.Command(binary, "-config", configPath)
+	return startManagedProcess(binary, []string{"-config", configPath}, name, false)
+}
+
+func startClusterProcess(clusterBinary, nodeBinary, dataRoot, secretFile string, basePort uint16) (*nodeProcess, error) {
+	return startManagedProcess(clusterBinary, []string{
+		"-nodes", "3",
+		"-base-port", fmt.Sprint(basePort),
+		"-data-root", dataRoot,
+		"-secret-file", secretFile,
+		"-node-binary", nodeBinary,
+	}, "cluster-launcher", true)
+}
+
+func startManagedProcess(binary string, args []string, name string, gracefulOnCleanup bool) (*nodeProcess, error) {
+	process := &nodeProcess{name: name, log: &synchronizedLog{}, done: make(chan struct{}), gracefulOnCleanup: gracefulOnCleanup}
+	process.command = exec.Command(binary, args...)
 	process.command.Stdout = process.log
 	process.command.Stderr = process.log
 	process.command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -408,11 +506,24 @@ func (p *nodeProcess) cleanup() {
 		return
 	default:
 	}
-	_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGKILL)
+	signal := syscall.SIGKILL
+	timeout := 5 * time.Second
+	if p.gracefulOnCleanup {
+		signal = syscall.SIGTERM
+		timeout = 20 * time.Second
+	}
+	_ = syscall.Kill(-p.command.Process.Pid, signal)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-p.done:
-	case <-time.After(5 * time.Second):
+	case <-timer.C:
 		_ = p.command.Process.Kill()
+		timer.Reset(5 * time.Second)
+		select {
+		case <-p.done:
+		case <-timer.C:
+		}
 	}
 }
 
@@ -440,6 +551,18 @@ func (h *processHarness) start(binary, configPath, name string) *nodeProcess {
 	process, err := startNodeProcess(binary, configPath, name)
 	if err != nil {
 		h.t.Fatalf("start %s: %v\n%s", name, err, h.logs())
+	}
+	h.mu.Lock()
+	h.processes = append(h.processes, process)
+	h.mu.Unlock()
+	return process
+}
+
+func (h *processHarness) startCluster(clusterBinary, nodeBinary, dataRoot, secretFile string, basePort uint16) *nodeProcess {
+	h.t.Helper()
+	process, err := startClusterProcess(clusterBinary, nodeBinary, dataRoot, secretFile, basePort)
+	if err != nil {
+		h.t.Fatalf("start cluster launcher: %v\n%s", err, h.logs())
 	}
 	h.mu.Lock()
 	h.processes = append(h.processes, process)
