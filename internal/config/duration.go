@@ -9,6 +9,14 @@ import (
 // Duration is a positive configuration duration decoded from a JSON string.
 type Duration time.Duration
 
+// MarshalJSON encodes the duration in the same strict string form accepted by UnmarshalJSON.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	if d <= 0 {
+		return nil, fmt.Errorf("duration must be greater than zero")
+	}
+	return json.Marshal(time.Duration(d).String())
+}
+
 // UnmarshalJSON decodes a positive duration string accepted by time.ParseDuration.
 func (d *Duration) UnmarshalJSON(data []byte) error {
 	var value string

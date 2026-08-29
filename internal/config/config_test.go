@@ -103,6 +103,15 @@ func TestNodeConfigAcceptsDNSHost(t *testing.T) {
 	}
 }
 
+func TestNodeConfigAcceptsNonVoterWithSharedFixedVoterMap(t *testing.T) {
+	cfg := validConfig(createSecret(t, 0o600))
+	cfg.NodeID = 4
+	cfg.BasePort = 8300
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate non-voter: %v", err)
+	}
+}
+
 func TestNodeConfigAcceptsAbsoluteDNSHosts(t *testing.T) {
 	tests := []struct {
 		name      string

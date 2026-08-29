@@ -146,7 +146,6 @@ func (c NodeConfig) Validate() error {
 	if err != nil {
 		return err
 	}
-	localFound := false
 	for _, voter := range c.RaftVoters {
 		if voter.NodeID == 0 {
 			return fmt.Errorf("raft voter ID must be nonzero")
@@ -165,14 +164,10 @@ func (c NodeConfig) Validate() error {
 		}
 		voterEndpoints[endpointKey] = struct{}{}
 		if voter.NodeID == c.NodeID {
-			localFound = true
 			if endpoint != localEndpoint {
 				return fmt.Errorf("local raft voter endpoint %q does not match advertised endpoint %q", endpoint, localEndpoint)
 			}
 		}
-	}
-	if !localFound {
-		return fmt.Errorf("node ID %d is not a raft voter", c.NodeID)
 	}
 	return nil
 }

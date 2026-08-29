@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+func TestDurationMarshalJSONUsesStrictDurationString(t *testing.T) {
+	encoded, err := json.Marshal(Duration(1500 * time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `"1.5s"` {
+		t.Fatalf("Marshal duration = %s, want %q", encoded, `"1.5s"`)
+	}
+	var decoded Duration
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("Unmarshal marshaled duration: %v", err)
+	}
+	if decoded != Duration(1500*time.Millisecond) {
+		t.Fatalf("round-trip duration = %v", decoded)
+	}
+}
+
 func TestDurationUnmarshalJSON(t *testing.T) {
 	tests := []struct {
 		name  string
