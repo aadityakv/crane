@@ -216,6 +216,12 @@ func validateHost(host string) error {
 	if len(host) > 253 {
 		return fmt.Errorf("DNS host exceeds 253 characters")
 	}
+	if strings.HasSuffix(host, ".") {
+		host = strings.TrimSuffix(host, ".")
+		if host == "" {
+			return fmt.Errorf("DNS host contains an invalid label length")
+		}
+	}
 	for _, label := range strings.Split(host, ".") {
 		if len(label) == 0 || len(label) > 63 {
 			return fmt.Errorf("DNS host contains an invalid label length")

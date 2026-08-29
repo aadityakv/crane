@@ -103,6 +103,41 @@ func TestNodeConfigAcceptsDNSHost(t *testing.T) {
 	}
 }
 
+func TestNodeConfigAcceptsAbsoluteDNSHosts(t *testing.T) {
+	tests := []struct {
+		name      string
+		bindHost  string
+		advertise string
+	}{
+		{name: "absolute_fqdn", bindHost: "localhost.", advertise: "node-1.example.test."},
+		{name: "absolute_localhost", bindHost: "localhost.", advertise: "localhost."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig(createSecret(t, 0o600))
+			cfg.BindHost = tt.bindHost
+			cfg.AdvertiseHost = tt.advertise
+			cfg.RaftVoters[0].Endpoint = tt.advertise + ":8008"
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
+func TestNodeConfigRejectsInvalidTrailingDNSDots(t *testing.T) {
+	for _, host := range []string{".", "localhost.."} {
+		t.Run(host, func(t *testing.T) {
+			cfg := validConfig(createSecret(t, 0o600))
+			cfg.BindHost = host
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate accepted invalid DNS root-dot syntax")
+			}
+		})
+	}
+}
+
 func TestDecode(t *testing.T) {
 	t.Run("unknown_json_field", func(t *testing.T) {
 		secret := createSecret(t, 0o600)
