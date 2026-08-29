@@ -38,6 +38,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err := validateServices(s.services); err != nil {
 		return err
 	}
+	if len(s.services) == 0 {
+		return nil
+	}
 
 	serviceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

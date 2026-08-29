@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+func TestSupervisorReturnsImmediatelyWithNoServices(t *testing.T) {
+	result := make(chan error, 1)
+	go func() { result <- NewSupervisor().Run(context.Background()) }()
+
+	if err := <-result; err != nil {
+		t.Fatalf("Run error = %v, want nil for an empty service set", err)
+	}
+}
+
 func TestSupervisorWaitsForEveryServiceToBecomeReady(t *testing.T) {
 	first := newFakeService("first")
 	second := newFakeService("second")
@@ -183,15 +192,27 @@ func TestSupervisorJoinsEveryServiceBeforeReturning(t *testing.T) {
 	service.waitAfterCancellation = make(chan struct{})
 	supervisor := NewSupervisor(service)
 	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan lifecycleEvent, 2)
+	service.events = events
 	result := make(chan error)
-	go func() { result <- supervisor.Run(ctx) }()
-	gate := observeResult(result)
+	go func() {
+		err := supervisor.Run(ctx)
+		events <- supervisorReturned
+		result <- err
+	}()
 
 	<-service.started
 	cancel()
 	<-service.canceled
-	if err := gate.releaseAfterBlocked(t, func() { close(service.waitAfterCancellation) }); err != nil {
+	close(service.waitAfterCancellation)
+	if err := <-result; err != nil {
 		t.Fatalf("Run error = %v, want nil after parent cancellation", err)
+	}
+	if got, want := <-events, serviceFinished; got != want {
+		t.Fatalf("first lifecycle event = %q, want %q", got, want)
+	}
+	if got, want := <-events, supervisorReturned; got != want {
+		t.Fatalf("second lifecycle event = %q, want %q", got, want)
 	}
 	<-service.returned
 }
@@ -217,45 +238,6 @@ func assertRunBlockedBefore(t *testing.T, result <-chan error, release func()) {
 		t.Fatalf("Run returned before release with error %v", outcome.err)
 	}
 	release()
-}
-
-type resultGate struct {
-	allowCheck chan struct{}
-	observed   chan gateOutcome
-	final      chan error
-}
-
-type gateOutcome struct {
-	returned bool
-	err      error
-}
-
-func observeResult(result <-chan error) *resultGate {
-	gate := &resultGate{
-		allowCheck: make(chan struct{}),
-		observed:   make(chan gateOutcome, 1),
-		final:      make(chan error, 1),
-	}
-	go func() {
-		select {
-		case err := <-result:
-			gate.observed <- gateOutcome{returned: true, err: err}
-		case <-gate.allowCheck:
-			gate.observed <- gateOutcome{}
-			gate.final <- <-result
-		}
-	}()
-	return gate
-}
-
-func (g *resultGate) releaseAfterBlocked(t *testing.T, release func()) error {
-	t.Helper()
-	close(g.allowCheck)
-	if outcome := <-g.observed; outcome.returned {
-		t.Fatalf("Run returned before release with error %v", outcome.err)
-	}
-	release()
-	return <-g.final
 }
 
 func TestSupervisorTreatsDeadlineReturnFromCanceledParentAsNormalShutdown(t *testing.T) {
@@ -314,6 +296,7 @@ type fakeService struct {
 	returnedOnce            sync.Once
 	waitAfterCancellation   chan struct{}
 	returnAfterCancellation error
+	events                  chan<- lifecycleEvent
 }
 
 func newFakeService(name string) *fakeService {
@@ -341,17 +324,31 @@ func (s *fakeService) Run(ctx context.Context) error {
 
 	select {
 	case err := <-s.finish:
-		return err
+		return s.finishWith(err)
 	case <-ctx.Done():
 		s.canceledOnce.Do(func() { close(s.canceled) })
 		if s.waitAfterCancellation != nil {
 			<-s.waitAfterCancellation
 		}
 		if s.returnAfterCancellation != nil {
-			return s.returnAfterCancellation
+			return s.finishWith(s.returnAfterCancellation)
 		}
-		return ctx.Err()
+		return s.finishWith(ctx.Err())
 	}
+}
+
+type lifecycleEvent string
+
+const (
+	serviceFinished    lifecycleEvent = "service-finished"
+	supervisorReturned lifecycleEvent = "supervisor-returned"
+)
+
+func (s *fakeService) finishWith(err error) error {
+	if s.events != nil {
+		s.events <- serviceFinished
+	}
+	return err
 }
 
 func (s *fakeService) markReady() {
