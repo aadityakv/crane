@@ -167,6 +167,28 @@ func TestTCPWriteFramePreservesConnectionError(t *testing.T) {
 	}
 }
 
+func TestTCPWriteFrameReturnsDeadlineClearError(t *testing.T) {
+	clearError := errors.New("clear deadline")
+	conn := &deadlineFailureConn{clearError: clearError}
+	frame := Frame{Header: testHeader(), Payload: []byte("payload")}
+
+	if err := WriteTCPFrame(context.Background(), conn, frame, NewHMACAuthenticator(testKey), DefaultLimits(), time.Second); !errors.Is(err, clearError) {
+		t.Fatalf("deadline-clear error = %v", err)
+	}
+}
+
+func TestTCPWriteFrameJoinsPrimaryAndDeadlineClearErrors(t *testing.T) {
+	writeError := errors.New("write failed")
+	clearError := errors.New("clear deadline")
+	conn := &deadlineFailureConn{writeError: writeError, clearError: clearError}
+	frame := Frame{Header: testHeader(), Payload: []byte("payload")}
+
+	err := WriteTCPFrame(context.Background(), conn, frame, NewHMACAuthenticator(testKey), DefaultLimits(), time.Second)
+	if !errors.Is(err, writeError) || !errors.Is(err, clearError) {
+		t.Fatalf("write and deadline-clear error = %v", err)
+	}
+}
+
 type limitedWriteConn struct {
 	net.Conn
 	maximum int
@@ -177,4 +199,30 @@ func (c *limitedWriteConn) Write(payload []byte) (int, error) {
 		payload = payload[:c.maximum]
 	}
 	return c.Conn.Write(payload)
+}
+
+type deadlineFailureConn struct {
+	writeError error
+	clearError error
+}
+
+func (*deadlineFailureConn) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (c *deadlineFailureConn) Write(payload []byte) (int, error) {
+	if c.writeError != nil {
+		return 0, c.writeError
+	}
+	return len(payload), nil
+}
+
+func (*deadlineFailureConn) Close() error                    { return nil }
+func (*deadlineFailureConn) LocalAddr() net.Addr             { return nil }
+func (*deadlineFailureConn) RemoteAddr() net.Addr            { return nil }
+func (*deadlineFailureConn) SetDeadline(time.Time) error     { return nil }
+func (*deadlineFailureConn) SetReadDeadline(time.Time) error { return nil }
+func (c *deadlineFailureConn) SetWriteDeadline(value time.Time) error {
+	if value.IsZero() {
+		return c.clearError
+	}
+	return nil
 }

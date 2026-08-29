@@ -13,7 +13,7 @@ import (
 const tcpLengthPrefixSize = 4
 
 // ReadTCPFrame reads one uint32-length-prefixed authenticated frame body.
-func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits Limits, ioTimeout time.Duration) (Frame, error) {
+func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits Limits, ioTimeout time.Duration) (_ Frame, err error) {
 	if conn == nil {
 		return Frame{}, errors.New("read TCP frame: nil connection")
 	}
@@ -25,7 +25,11 @@ func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits
 	if err != nil {
 		return Frame{}, fmt.Errorf("set TCP read deadline: %w", err)
 	}
-	defer clearDeadline()
+	defer func() {
+		if clearError := clearDeadline(); clearError != nil {
+			err = errors.Join(err, fmt.Errorf("clear TCP read deadline: %w", clearError))
+		}
+	}()
 
 	var prefix [tcpLengthPrefixSize]byte
 	if _, err := io.ReadFull(conn, prefix[:]); err != nil {
@@ -48,7 +52,7 @@ func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits
 }
 
 // WriteTCPFrame encodes and completely writes one uint32-length-prefixed frame body.
-func WriteTCPFrame(ctx context.Context, conn net.Conn, frame Frame, auth Authenticator, limits Limits, ioTimeout time.Duration) error {
+func WriteTCPFrame(ctx context.Context, conn net.Conn, frame Frame, auth Authenticator, limits Limits, ioTimeout time.Duration) (err error) {
 	if conn == nil {
 		return errors.New("write TCP frame: nil connection")
 	}
@@ -64,7 +68,11 @@ func WriteTCPFrame(ctx context.Context, conn net.Conn, frame Frame, auth Authent
 	if err != nil {
 		return fmt.Errorf("set TCP write deadline: %w", err)
 	}
-	defer clearDeadline()
+	defer func() {
+		if clearError := clearDeadline(); clearError != nil {
+			err = errors.Join(err, fmt.Errorf("clear TCP write deadline: %w", clearError))
+		}
+	}()
 
 	var prefix [tcpLengthPrefixSize]byte
 	binary.BigEndian.PutUint32(prefix[:], uint32(len(body)))
@@ -77,12 +85,12 @@ func WriteTCPFrame(ctx context.Context, conn net.Conn, frame Frame, auth Authent
 	return nil
 }
 
-func applyOperationDeadline(ctx context.Context, ioTimeout time.Duration, setDeadline func(time.Time) error) (func(), error) {
+func applyOperationDeadline(ctx context.Context, ioTimeout time.Duration, setDeadline func(time.Time) error) (func() error, error) {
 	if ctx == nil {
-		return func() {}, errors.New("nil context")
+		return func() error { return nil }, errors.New("nil context")
 	}
 	if err := ctx.Err(); err != nil {
-		return func() {}, err
+		return func() error { return nil }, err
 	}
 
 	var deadline time.Time
@@ -93,13 +101,13 @@ func applyOperationDeadline(ctx context.Context, ioTimeout time.Duration, setDea
 		deadline = contextDeadline
 	}
 	if deadline.IsZero() {
-		return func() {}, nil
+		return func() error { return nil }, nil
 	}
 	if err := setDeadline(deadline); err != nil {
-		return func() {}, err
+		return func() error { return nil }, err
 	}
-	return func() {
-		_ = setDeadline(time.Time{})
+	return func() error {
+		return setDeadline(time.Time{})
 	}, nil
 }
 
