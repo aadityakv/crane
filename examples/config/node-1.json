@@ -1,0 +1,32 @@
+{
+  "node_id": 1,
+  "cluster_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+  "bind_host": "127.0.0.1",
+  "advertise_host": "127.0.0.1",
+  "base_port": 8000,
+  "introducer": "127.0.0.1:8002",
+  "storage_dir": "./data/node-1",
+  "cluster_secret_file": "./local.secret",
+  "raft_voters": [
+    {
+      "node_id": 1,
+      "endpoint": "127.0.0.1:8008"
+    },
+    {
+      "node_id": 2,
+      "endpoint": "127.0.0.1:8108"
+    },
+    {
+      "node_id": 3,
+      "endpoint": "127.0.0.1:8208"
+    }
+  ],
+  "timing": {
+    "probe_interval": "1s",
+    "direct_probe_timeout": "300ms",
+    "indirect_probe_timeout": "700ms",
+    "suspicion_multiplier": 5,
+    "indirect_checks": 3,
+    "replay_window": "2m0s"
+  }
+}

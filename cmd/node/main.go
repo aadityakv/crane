@@ -21,7 +21,7 @@ import (
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
-const incarnationStateFilename = "swim.incarnation"
+const incarnationStateFilename = swim.IncarnationStateFilename
 
 type nodeFlags struct {
 	configPath    string

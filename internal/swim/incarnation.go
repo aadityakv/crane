@@ -20,6 +20,9 @@ var (
 	ErrIncarnationRegression = errors.New("incarnation would decrease")
 )
 
+// IncarnationStateFilename is the durable SWIM identity file stored beneath a node's storage directory.
+const IncarnationStateFilename = "swim.incarnation"
+
 // IncarnationStore loads and monotonically persists one node identity's
 // incarnation.
 type IncarnationStore interface {
