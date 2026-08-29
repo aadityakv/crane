@@ -145,7 +145,20 @@ func (s *Service) Snapshot(ctx context.Context) ([]Member, error) {
 	}
 	select {
 	case result := <-response:
-		return result.members, result.err
+		if result.err != nil {
+			return nil, result.err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		select {
+		case s.events <- snapshotDeliveredServiceEvent{}:
+			return result.members, nil
+		case <-s.done:
+			return nil, ErrServiceNotRunning
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	case <-s.done:
 		return nil, ErrServiceNotRunning
 	case <-ctx.Done():
@@ -163,7 +176,8 @@ func (s *Service) Subscribe(ctx context.Context, capacity int) (<-chan Membershi
 		return nil, ErrServiceNotRunning
 	}
 	response := make(chan subscriptionResult, 1)
-	request := subscribeServiceEvent{capacity: capacity, response: response}
+	requestState := new(subscribeRequestState)
+	request := subscribeServiceEvent{capacity: capacity, response: response, state: requestState}
 	select {
 	case s.events <- request:
 	case <-s.done:
@@ -174,10 +188,23 @@ func (s *Service) Subscribe(ctx context.Context, capacity int) (<-chan Membershi
 	var result subscriptionResult
 	select {
 	case result = <-response:
+		if err := ctx.Err(); err != nil {
+			s.enqueueUnsubscribe(result.id)
+			return nil, err
+		}
 	case <-s.done:
 		return nil, ErrServiceNotRunning
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		if requestState.state.CompareAndSwap(subscribeRequestPending, subscribeRequestCanceled) {
+			return nil, ctx.Err()
+		}
+		select {
+		case result = <-response:
+			s.enqueueUnsubscribe(result.id)
+			return nil, ctx.Err()
+		case <-s.done:
+			return nil, ErrServiceNotRunning
+		}
 	}
 	go func(id uint64) {
 		select {
@@ -190,6 +217,16 @@ func (s *Service) Subscribe(ctx context.Context, capacity int) (<-chan Membershi
 		}
 	}(result.id)
 	return result.events, nil
+}
+
+func (s *Service) enqueueUnsubscribe(id uint64) {
+	if id == 0 {
+		return
+	}
+	select {
+	case s.events <- unsubscribeServiceEvent{id: id}:
+	case <-s.done:
+	}
 }
 
 // Run binds transports, starts bounded readers, and owns all SWIM state until
@@ -209,7 +246,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 		close(s.done)
 	}()
 
-	workerContext, stopWorkers := context.WithCancel(context.WithoutCancel(ctx))
+	workerContext, stopWorkers := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	datagram := s.options.Datagram
 	if datagram == nil {
@@ -250,6 +287,11 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 			runError = errors.Join(runError, err)
 		}
 	}()
+	stopParentShutdown := context.AfterFunc(ctx, func() {
+		_ = listener.Close()
+		s.closeTCPConnections()
+	})
+	defer stopParentShutdown()
 
 	table := NewTable()
 	dissemination := NewDisseminator(serviceDisseminationMax, serviceRetransmitFactor)
@@ -271,6 +313,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 		dissemination: dissemination,
 		subscriptions: NewSubscriptions(),
 		datagram:      datagram,
+		runContext:    ctx,
 		workerContext: workerContext,
 		workers:       &workers,
 		requestPrefix: s.options.Random.Uint64(),
@@ -304,7 +347,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 			stopWorkers()
 			return fmt.Errorf("bootstrap SWIM seed: %w", err)
 		}
-		if err := loop.executeEffects(workerContext, engine.ApplyUpdate(Update{Member: self, ReporterID: self.NodeID}, s.options.Clock.Now())); err != nil {
+		if err := loop.executeEffects(ctx, engine.ApplyUpdate(Update{Member: self, ReporterID: self.NodeID}, s.options.Clock.Now())); err != nil {
 			stopWorkers()
 			return err
 		}
@@ -355,14 +398,27 @@ type snapshotServiceEvent struct{ response chan<- snapshotResult }
 
 func (snapshotServiceEvent) serviceEvent() {}
 
+type snapshotDeliveredServiceEvent struct{}
+
+func (snapshotDeliveredServiceEvent) serviceEvent() {}
+
 type subscriptionResult struct {
 	id     uint64
 	events <-chan MembershipEvent
 }
 
+const (
+	subscribeRequestPending uint32 = iota
+	subscribeRequestAccepted
+	subscribeRequestCanceled
+)
+
+type subscribeRequestState struct{ state atomic.Uint32 }
+
 type subscribeServiceEvent struct {
 	capacity int
 	response chan<- subscriptionResult
+	state    *subscribeRequestState
 }
 
 func (subscribeServiceEvent) serviceEvent() {}
@@ -370,6 +426,10 @@ func (subscribeServiceEvent) serviceEvent() {}
 type unsubscribeServiceEvent struct{ id uint64 }
 
 func (unsubscribeServiceEvent) serviceEvent() {}
+
+type subscriptionCountServiceEvent struct{ response chan<- int }
+
+func (subscriptionCountServiceEvent) serviceEvent() {}
 
 type datagramServiceEvent struct {
 	senderID uint16
@@ -428,6 +488,7 @@ type serviceLoop struct {
 	subscriptions *Subscriptions
 	activeMembers []Member
 	datagram      transport.Datagram
+	runContext    context.Context
 	workerContext context.Context
 	workers       *sync.WaitGroup
 	client        *protocolClient
@@ -443,14 +504,19 @@ func (l *serviceLoop) run(parent context.Context) error {
 		case event := <-l.service.events:
 			switch event := event.(type) {
 			case snapshotServiceEvent:
-				members := l.engine.Snapshot()
+				event.response <- snapshotResult{members: l.engine.Snapshot()}
+			case snapshotDeliveredServiceEvent:
 				l.subscriptions.markAllResynchronized()
-				event.response <- snapshotResult{members: members}
 			case subscribeServiceEvent:
+				if event.state == nil || !event.state.state.CompareAndSwap(subscribeRequestPending, subscribeRequestAccepted) {
+					continue
+				}
 				id, events := l.subscriptions.Subscribe(event.capacity)
 				event.response <- subscriptionResult{id: id, events: events}
 			case unsubscribeServiceEvent:
 				l.subscriptions.Unsubscribe(event.id)
+			case subscriptionCountServiceEvent:
+				event.response <- len(l.subscriptions.subscribers)
 			case datagramServiceEvent:
 				if err := l.handleDatagram(event); err != nil {
 					return err
@@ -478,25 +544,20 @@ func (l *serviceLoop) run(parent context.Context) error {
 			}
 		case <-parent.Done():
 			if l.admitted {
-				if err := l.gracefulLeave(l.workerContext); err != nil {
+				if err := l.gracefulLeave(); err != nil {
 					return err
 				}
 			}
-			return nil
-		case <-l.workerContext.Done():
 			return nil
 		}
 	}
 }
 
-func (l *serviceLoop) gracefulLeave(ctx context.Context) error {
+func (l *serviceLoop) gracefulLeave() error {
 	aliveBefore := l.engine.aliveMembers()
 	effects := l.engine.Leave(l.service.options.Clock.Now())
-	if err := l.executeEffects(ctx, effects); err != nil {
-		return err
-	}
 	if len(effects.Events) == 0 {
-		return nil
+		return l.executeEffects(context.WithoutCancel(l.runContext), effects)
 	}
 	left := effects.Events[len(effects.Events)-1].Current
 	if left.NodeID != l.service.options.Config.NodeID || left.Status != Left {
@@ -508,6 +569,29 @@ func (l *serviceLoop) gracefulLeave(ctx context.Context) error {
 			deadline = timer.Deadline
 			break
 		}
+	}
+	cleanupContext, cancelCleanup := context.WithCancel(context.WithoutCancel(l.runContext))
+	duration := deadline.Sub(l.service.options.Clock.Now())
+	if duration < 0 {
+		duration = 0
+	}
+	deadlineTimer := l.service.options.Clock.NewTimer(duration)
+	deadlineDone := make(chan struct{})
+	go func() {
+		defer close(deadlineDone)
+		select {
+		case <-deadlineTimer.C():
+			cancelCleanup()
+		case <-cleanupContext.Done():
+		}
+	}()
+	defer func() {
+		cancelCleanup()
+		deadlineTimer.Stop()
+		<-deadlineDone
+	}()
+	if err := l.executeEffects(cleanupContext, effects); err != nil {
+		return err
 	}
 	budget := RetransmitBudget(serviceRetransmitFactor, aliveBefore)
 	peers := make([]Member, 0)
@@ -521,13 +605,13 @@ func (l *serviceLoop) gracefulLeave(ctx context.Context) error {
 	}
 	update := Update{Member: left, ReporterID: left.NodeID}
 	sent := 0
-	for sent < budget && l.service.options.Clock.Now().Before(deadline) {
+	for sent < budget && cleanupContext.Err() == nil {
 		progress := false
 		for _, peer := range peers {
 			if sent >= budget {
 				break
 			}
-			delivered, err := l.sendDirectUpdate(ctx, peer, update)
+			delivered, err := l.sendDirectUpdate(cleanupContext, peer, update)
 			if err != nil {
 				return err
 			}
@@ -875,7 +959,7 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 		return nil
 	}
 	for _, update := range event.updates {
-		if err := l.executeEffects(l.workerContext, l.engine.ApplyUpdate(update, l.service.options.Clock.Now())); err != nil {
+		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(update, l.service.options.Clock.Now())); err != nil {
 			return err
 		}
 	}
@@ -903,7 +987,7 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 	default:
 		return nil
 	}
-	return l.executeEffects(l.workerContext, effects)
+	return l.executeEffects(l.runContext, effects)
 }
 
 func (l *serviceLoop) handleJoinAdmission(event joinAdmissionServiceEvent) error {
@@ -916,7 +1000,7 @@ func (l *serviceLoop) handleJoinAdmission(event joinAdmissionServiceEvent) error
 		return nil
 	}
 	effects := l.engine.ApplyUpdate(Update{Member: event.announce.Member, ReporterID: event.announce.Member.NodeID}, l.service.options.Clock.Now())
-	if err := l.executeEffects(l.workerContext, effects); err != nil {
+	if err := l.executeEffects(l.runContext, effects); err != nil {
 		event.response <- joinAdmissionResult{err: err}
 		return err
 	}
@@ -940,14 +1024,14 @@ func (l *serviceLoop) handleJoinCompleted(event joinCompletedServiceEvent) error
 		if member.NodeID == result.seedID && (member.Status == Alive || member.Status == Suspect) {
 			seedPresent = true
 		}
-		if err := l.executeEffects(l.workerContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: result.seedID}, l.service.options.Clock.Now())); err != nil {
+		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: result.seedID}, l.service.options.Clock.Now())); err != nil {
 			return err
 		}
 	}
 	if !seedPresent {
 		return fmt.Errorf("%w: join snapshot omitted active seed %d", ErrSnapshotProtocol, result.seedID)
 	}
-	if err := l.executeEffects(l.workerContext, l.engine.ApplyUpdate(Update{Member: result.accepted, ReporterID: result.accepted.NodeID}, l.service.options.Clock.Now())); err != nil {
+	if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(Update{Member: result.accepted, ReporterID: result.accepted.NodeID}, l.service.options.Clock.Now())); err != nil {
 		return err
 	}
 	l.admitted = true
@@ -985,7 +1069,7 @@ func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) err
 		return nil
 	}
 	for _, member := range event.members {
-		if err := l.executeEffects(l.workerContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.senderID}, l.service.options.Clock.Now())); err != nil {
+		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.senderID}, l.service.options.Clock.Now())); err != nil {
 			return err
 		}
 	}
@@ -996,7 +1080,7 @@ func (l *serviceLoop) handleTimer(event timerServiceEvent) error {
 	now := l.service.options.Clock.Now()
 	if event.probe {
 		if l.admitted {
-			if err := l.executeEffects(l.workerContext, l.engine.BeginProbe(now)); err != nil {
+			if err := l.executeEffects(l.runContext, l.engine.BeginProbe(now)); err != nil {
 				return err
 			}
 			l.scheduleProbe()
@@ -1019,7 +1103,7 @@ func (l *serviceLoop) handleTimer(event timerServiceEvent) error {
 	case TimerLeaveDeadline:
 		return nil
 	}
-	return l.executeEffects(l.workerContext, effects)
+	return l.executeEffects(l.runContext, effects)
 }
 
 func (l *serviceLoop) executeEffects(ctx context.Context, effects Effects) error {

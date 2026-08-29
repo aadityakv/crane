@@ -398,6 +398,126 @@ func TestServicePersistenceFailureAbortsEffectsAndFailsRun(t *testing.T) {
 	}
 }
 
+func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
+	store := newBarrierServiceStore(1, 3, nil)
+	harness := startPersistenceService(t, store)
+	subscriptionContext, cancelSubscription := context.WithCancel(context.Background())
+	defer cancelSubscription()
+	events, err := harness.service.Subscribe(subscriptionContext, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	third := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
+	fourth := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
+	harness.enqueuePeerGossip([]Update{{Member: third, ReporterID: 2}, {Member: fourth, ReporterID: 2}})
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if event.Cause != EventResyncRequired {
+			t.Fatalf("overflow event = %#v, want resync marker", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resync marker")
+	}
+
+	self := Member{NodeID: 1, Host: harness.configuration.AdvertiseHost, BasePort: harness.configuration.BasePort, Incarnation: 2, Status: Suspect}
+	harness.enqueuePeerGossip([]Update{{Member: self, ReporterID: 2}})
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("self-refutation persistence did not block")
+	}
+
+	snapshotContext, cancelSnapshot := context.WithCancel(context.Background())
+	snapshotResult := make(chan error, 1)
+	go func() {
+		_, err := harness.service.Snapshot(snapshotContext)
+		snapshotResult <- err
+	}()
+	waitServiceEventQueue(t, harness.service, 1)
+	cancelSnapshot()
+	if err := <-snapshotResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Snapshot error = %v, want context.Canceled", err)
+	}
+	close(store.release)
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	fifth := Member{NodeID: 5, Host: "127.0.0.5", BasePort: 15000, Incarnation: 1, Status: Alive}
+	harness.enqueuePeerGossip([]Update{{Member: fifth, ReporterID: 2}})
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("canceled Snapshot resumed slow subscriber: %#v", event)
+	default:
+	}
+
+	if _, err := harness.service.Snapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	sixth := Member{NodeID: 6, Host: "127.0.0.6", BasePort: 16000, Incarnation: 1, Status: Alive}
+	harness.enqueuePeerGossip([]Update{{Member: sixth, ReporterID: 2}})
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if event.Current != sixth {
+			t.Fatalf("post-snapshot delta = %#v, want %#v", event, sixth)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("successful Snapshot did not resume delta delivery")
+	}
+	harness.stop(t)
+}
+
+func TestServiceCanceledSubscribeRequestsDoNotLeakOwnerState(t *testing.T) {
+	store := newBarrierServiceStore(1, 3, nil)
+	harness := startPersistenceService(t, store)
+	self := Member{NodeID: 1, Host: harness.configuration.AdvertiseHost, BasePort: harness.configuration.BasePort, Incarnation: 2, Status: Suspect}
+	harness.enqueuePeerGossip([]Update{{Member: self, ReporterID: 2}})
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("self-refutation persistence did not block")
+	}
+
+	const requests = 512
+	cancels := make([]context.CancelFunc, 0, requests)
+	results := make(chan error, requests)
+	for range requests {
+		requestContext, cancel := context.WithCancel(context.Background())
+		cancels = append(cancels, cancel)
+		go func() {
+			_, err := harness.service.Subscribe(requestContext, 1)
+			results <- err
+		}()
+	}
+	waitServiceEventQueue(t, harness.service, requests)
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for range requests {
+		if err := <-results; !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled Subscribe error = %v, want context.Canceled", err)
+		}
+	}
+	close(store.release)
+	if got := serviceSubscriptionCount(t, harness.service); got != 0 {
+		t.Fatalf("subscriptions after %d canceled queued requests = %d, want 0", requests, got)
+	}
+	harness.stop(t)
+}
+
 func TestServiceJoinUsesSnapshotPersistAnnounceAcceptOrder(t *testing.T) {
 	now := time.Unix(4000, 0)
 	network := transport.NewMemoryNetwork()
@@ -1058,6 +1178,42 @@ func (h *persistenceHarness) sendSelfSuspicion(t *testing.T, peerID uint16) {
 	if got := h.network.Advance(); got != 1 {
 		h.cancel()
 		t.Fatalf("Advance delivered = %d, want suspicion datagram", got)
+	}
+}
+
+func (h *persistenceHarness) enqueuePeerGossip(updates []Update) {
+	h.service.events <- datagramServiceEvent{
+		senderID: 2,
+		message:  GossipMessage{Updates: append([]Update(nil), updates...)},
+		updates:  append([]Update(nil), updates...),
+	}
+}
+
+func waitServiceEventQueue(t *testing.T, service *Service, minimum int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for len(service.events) < minimum && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if got := len(service.events); got < minimum {
+		t.Fatalf("queued service events = %d, want at least %d", got, minimum)
+	}
+}
+
+func serviceSubscriptionCount(t *testing.T, service *Service) int {
+	t.Helper()
+	response := make(chan int, 1)
+	select {
+	case service.events <- subscriptionCountServiceEvent{response: response}:
+	case <-time.After(time.Second):
+		t.Fatal("timed out enqueueing subscription-count query")
+	}
+	select {
+	case count := <-response:
+		return count
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subscription-count query")
+		return -1
 	}
 }
 

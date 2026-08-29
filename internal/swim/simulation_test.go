@@ -12,6 +12,7 @@ import (
 
 	"github.com/aaditya/cs425mp3/internal/clock"
 	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aaditya/cs425mp3/internal/random"
 	"github.com/aaditya/cs425mp3/internal/transport"
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
@@ -310,6 +311,57 @@ func TestSimulationUnexpectedDatagramClosureFailsService(t *testing.T) {
 		t.Fatalf("Run error after unexpected datagram closure = %v, want ErrDatagramClosed", err)
 	}
 	running.markStopped()
+}
+
+func TestSimulationCancellationInterruptsNormalSendAndLeaveAtClockDeadline(t *testing.T) {
+	now := time.Unix(8150, 0)
+	manualClock := clock.NewManual(now)
+	configuration := serviceTestConfig(t, 1)
+	datagram := newContextBlockingDatagram()
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+		Clock:         manualClock,
+		Random:        random.NewLockedSource(193),
+		Store:         newServiceStore(1),
+		Datagram:      datagram,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- service.Run(ctx) }()
+	waitServiceReady(t, service)
+
+	selfPing, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMPing)
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	frame := encodeServiceTestFrame(t, wire.NewHMACAuthenticator(testServiceKey()), decodedTestClusterID(t, testClusterID), 1, 90, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: peer, ReporterID: 1}}}))
+	datagram.receive <- transport.Packet{From: selfPing, Data: frame}
+	if call := receiveBlockingSendCall(t, datagram.started); call != 1 {
+		t.Fatalf("first blocked send call = %d, want 1", call)
+	}
+
+	cancel()
+	if call := receiveBlockingSendCall(t, datagram.returned); call != 1 {
+		t.Fatalf("parent cancellation released send call %d, want 1", call)
+	}
+	if call := receiveBlockingSendCall(t, datagram.started); call != 2 {
+		t.Fatalf("leave blocked send call = %d, want 2", call)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("Run returned before leave deadline: %v", err)
+	default:
+	}
+
+	manualClock.Advance(6 * time.Second)
+	if call := receiveBlockingSendCall(t, datagram.returned); call != 2 {
+		t.Fatalf("leave deadline released send call %d, want 2", call)
+	}
+	if err := waitServiceResult(t, result); err != nil {
+		t.Fatalf("Run after bounded leave cleanup = %v", err)
+	}
 }
 
 func TestSimulationGracefulRestartAndSeedFailure(t *testing.T) {
@@ -773,5 +825,62 @@ func settleMemoryServices(network *transport.MemoryNetwork, services ...*Service
 			_, _ = service.Snapshot(ctx)
 			cancel()
 		}
+	}
+}
+
+type contextBlockingDatagram struct {
+	receive   chan transport.Packet
+	started   chan int
+	returned  chan int
+	closed    chan struct{}
+	closeOnce sync.Once
+	mu        sync.Mutex
+	sends     int
+}
+
+func newContextBlockingDatagram() *contextBlockingDatagram {
+	return &contextBlockingDatagram{
+		receive:  make(chan transport.Packet, 1),
+		started:  make(chan int, 16),
+		returned: make(chan int, 16),
+		closed:   make(chan struct{}),
+	}
+}
+
+func (d *contextBlockingDatagram) Send(ctx context.Context, _ config.Endpoint, _ []byte) error {
+	d.mu.Lock()
+	d.sends++
+	call := d.sends
+	d.mu.Unlock()
+	d.started <- call
+	<-ctx.Done()
+	d.returned <- call
+	return ctx.Err()
+}
+
+func (d *contextBlockingDatagram) Receive(ctx context.Context) (transport.Packet, error) {
+	select {
+	case packet := <-d.receive:
+		return packet, nil
+	case <-ctx.Done():
+		return transport.Packet{}, ctx.Err()
+	case <-d.closed:
+		return transport.Packet{}, transport.ErrDatagramClosed
+	}
+}
+
+func (d *contextBlockingDatagram) Close() error {
+	d.closeOnce.Do(func() { close(d.closed) })
+	return nil
+}
+
+func receiveBlockingSendCall(t *testing.T, calls <-chan int) int {
+	t.Helper()
+	select {
+	case call := <-calls:
+		return call
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocked datagram send transition")
+		return 0
 	}
 }
