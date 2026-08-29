@@ -166,6 +166,27 @@ func TestSupervisorSelectsFailureByServiceDeclarationOrder(t *testing.T) {
 	}
 }
 
+func TestSupervisorDoesNotLetEarlierNilCancellationMaskLaterFailure(t *testing.T) {
+	earlier := newFakeService("earlier")
+	earlier.returnNilAfterCancellation = true
+	later := newFakeService("later")
+	earlier.markReady()
+	later.markReady()
+	failure := errors.New("later listener failed")
+	result := make(chan error, 1)
+	go func() { result <- NewSupervisor(earlier, later).Run(context.Background()) }()
+
+	<-earlier.started
+	<-later.started
+	later.fail(failure)
+
+	if err := <-result; !errors.Is(err, failure) || !strings.Contains(err.Error(), "later") {
+		t.Fatalf("Run error = %v, want later failure %v", err, failure)
+	}
+	<-earlier.canceled
+	<-earlier.returned
+}
+
 func TestSupervisorRejectsDuplicateServiceNames(t *testing.T) {
 	first := newFakeService("duplicate")
 	second := newFakeService("duplicate")

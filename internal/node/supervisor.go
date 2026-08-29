@@ -19,11 +19,13 @@ type serviceState struct {
 }
 
 type completion struct {
-	index      int
-	err        error
-	ready      bool
-	contextErr error
+	index        int
+	err          error
+	ready        bool
+	contextCause error
 }
+
+var errSupervisorShutdown = errors.New("supervisor initiated shutdown")
 
 // NewSupervisor constructs a Supervisor for services. It does not start any
 // services; Run validates service names before it starts them.
@@ -42,8 +44,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return nil
 	}
 
-	serviceCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	serviceCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(errSupervisorShutdown)
 
 	states := make([]serviceState, len(s.services))
 	for index, service := range s.services {
@@ -66,10 +68,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		go func() {
 			err := state.service.Run(serviceCtx)
 			completions <- completion{
-				index:      index,
-				err:        err,
-				ready:      channelClosed(state.ready),
-				contextErr: ctx.Err(),
+				index:        index,
+				err:          err,
+				ready:        channelClosed(state.ready),
+				contextCause: context.Cause(serviceCtx),
 			}
 		}()
 	}
@@ -115,7 +117,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 	}
 
-	cancel()
+	cancel(errSupervisorShutdown)
 	readinessWG.Wait()
 	for completedCount < len(states) {
 		record(<-completions)
@@ -148,7 +150,7 @@ func startupFailure(name string, err error) error {
 func selectFailure(states []serviceState, completed []completion) error {
 	for index, state := range states {
 		result := completed[index]
-		if isCancellation(result.err, result.contextErr) {
+		if isCancellation(result.err, result.contextCause) {
 			continue
 		}
 		if !result.ready {
