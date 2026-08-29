@@ -24,11 +24,35 @@ func TestTableMergeUsesIncarnationThenSeverity(t *testing.T) {
 	if event != (MembershipEvent{}) {
 		t.Fatalf("stale update event = %#v, want zero value", event)
 	}
+	wantAfterStale := withStatus(alive, Suspect)
+	if got := mustGet(t, table, 2); got != wantAfterStale {
+		t.Fatalf("member after stale update = %#v, want %#v", got, wantAfterStale)
+	}
 
 	newer := Member{NodeID: 2, Host: "replacement", BasePort: 8100, Incarnation: 5, Status: Alive}
 	mustMerge(t, table, Update{Member: newer, ReporterID: 2})
 	if got := mustGet(t, table, 2); got != newer {
 		t.Fatalf("member = %#v, want %#v", got, newer)
+	}
+}
+
+func TestTableMergeRejectsZeroReporterWithoutMutation(t *testing.T) {
+	table := NewTable()
+	original := Member{NodeID: 6, Host: "node6", BasePort: 8006, Incarnation: 3, Status: Alive}
+	mustMerge(t, table, Update{Member: original, ReporterID: 6})
+
+	changed, event := table.Merge(Update{
+		Member:     Member{NodeID: 6, Host: "replacement", BasePort: 9006, Incarnation: 4, Status: Dead},
+		ReporterID: 0,
+	})
+	if changed {
+		t.Fatal("zero-reporter update changed the table")
+	}
+	if event != (MembershipEvent{}) {
+		t.Fatalf("zero-reporter event = %#v, want zero value", event)
+	}
+	if got := mustGet(t, table, 6); got != original {
+		t.Fatalf("member after zero-reporter update = %#v, want %#v", got, original)
 	}
 }
 

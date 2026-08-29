@@ -21,7 +21,7 @@ func NewTable() *Table {
 // change an address.
 func (t *Table) Merge(update Update) (bool, MembershipEvent) {
 	incoming := update.Member
-	if incoming.NodeID == 0 || !incoming.Status.valid() {
+	if incoming.NodeID == 0 || update.ReporterID == 0 || !incoming.Status.valid() {
 		return false, MembershipEvent{}
 	}
 
