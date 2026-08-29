@@ -665,6 +665,57 @@ func TestServiceTCPBoundaryFailuresDoNotMutateOrStopService(t *testing.T) {
 	seed.stop(t)
 }
 
+func TestServiceInvalidTCPRequestsCannotPoisonReplayCapacity(t *testing.T) {
+	now := time.Unix(4450, 0)
+	configuration := serviceTestConfig(t, 1)
+	seed := startRunningService(t, configuration, newServiceStore(1), clock.NewManual(now), transport.NewMemoryNetwork(), 190)
+	seed.service.replay = wire.NewReplayGuard(seed.service.options.Clock, time.Duration(configuration.Timing.ReplayWindow), serviceFutureSkew, 1)
+	endpoint, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	clusterID := decodedTestClusterID(t, testClusterID)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+
+	invalidGob := tcpServiceTestFrameWithPayload(clusterID, 1, wire.RequestID{60}, now, wire.MessageSWIMSnapshotRequest, []byte("not-gob"))
+	invalidStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	if err := invalidStream.WriteFrame(testContext(t), invalidGob); err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeServiceProtocolError(t, mustReadServiceFrame(t, invalidStream)); got.Code != protocolErrorInvalidPayload {
+		t.Fatalf("invalid gob error = %#v", got)
+	}
+	_ = invalidStream.Close()
+
+	unknown := tcpServiceTestFrame(t, clusterID, 77, 61, now, wire.MessageSWIMSnapshotRequest, SnapshotRequest{})
+	unknownStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	if err := unknownStream.WriteFrame(testContext(t), unknown); err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeServiceProtocolError(t, mustReadServiceFrame(t, unknownStream)); got.Code != protocolErrorNotAdmitted {
+		t.Fatalf("unknown sender error = %#v, want not-admitted", got)
+	}
+	_ = unknownStream.Close()
+
+	legitimate := tcpServiceTestFrame(t, clusterID, 1, 62, now, wire.MessageSWIMSnapshotRequest, SnapshotRequest{})
+	validStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	if err := validStream.WriteFrame(testContext(t), legitimate); err != nil {
+		t.Fatal(err)
+	}
+	response := mustReadServiceFrame(t, validStream)
+	if response.Header.Message != wire.MessageSWIMSnapshotResponse {
+		t.Fatalf("legitimate response = %d, want snapshot; error=%#v", response.Header.Message, decodeServiceProtocolError(t, response))
+	}
+	_ = validStream.Close()
+
+	duplicateStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	if err := duplicateStream.WriteFrame(testContext(t), legitimate); err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeServiceProtocolError(t, mustReadServiceFrame(t, duplicateStream)); got.Code != protocolErrorReplay {
+		t.Fatalf("duplicate valid request error = %#v, want replay", got)
+	}
+	_ = duplicateStream.Close()
+	seed.stop(t)
+}
+
 func TestServiceDigestTriggersAuthenticatedSnapshotResync(t *testing.T) {
 	now := time.Unix(4500, 0)
 	network := transport.NewMemoryNetwork()
@@ -821,6 +872,15 @@ func decodeServiceProtocolError(t *testing.T, frame wire.Frame) ProtocolErrorMes
 		t.Fatal(err)
 	}
 	return response
+}
+
+func mustReadServiceFrame(t *testing.T, stream *wire.TCPFrameStream) wire.Frame {
+	t.Helper()
+	frame, err := stream.ReadFrame(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame
 }
 
 type serviceStore struct {

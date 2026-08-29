@@ -627,8 +627,8 @@ func (s *Service) handleTCPConnection(ctx context.Context, connection net.Conn) 
 	if err != nil {
 		return
 	}
-	if err := s.validateTCPRequest(frame); err != nil {
-		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
+	if frame.Header.SenderID == 0 {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, fmt.Errorf("%w: zero sender ID", ErrSnapshotProtocol))
 		return
 	}
 	if !s.admitted.Load() {
@@ -652,6 +652,10 @@ func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream
 		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, fmt.Errorf("%w: invalid join request", ErrInvalidJoinAnnouncement))
 		return
 	}
+	if err := s.acceptTCPReplay(requestFrame); err != nil {
+		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, err)
+		return
+	}
 	snapshot, err := s.requestTCPSnapshot(ctx)
 	if err != nil {
 		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, err)
@@ -665,17 +669,17 @@ func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream
 	if err != nil {
 		return
 	}
-	if err := s.validateTCPRequest(announceFrame); err != nil {
-		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, err)
-		return
-	}
-	if announceFrame.Header.SenderID != requestFrame.Header.SenderID || announceFrame.Header.Message != wire.MessageSWIMJoinAnnounce {
+	if announceFrame.Header.SenderID == 0 || announceFrame.Header.SenderID != requestFrame.Header.SenderID || announceFrame.Header.Message != wire.MessageSWIMJoinAnnounce {
 		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, fmt.Errorf("%w: join announcement must follow snapshot", ErrSnapshotProtocol))
 		return
 	}
 	var announce JoinAnnounce
-	if err := wire.DecodeGob(announceFrame.Payload, &announce); err != nil || announce.Member.NodeID != announceFrame.Header.SenderID {
+	if err := wire.DecodeGob(announceFrame.Payload, &announce); err != nil || announce.Member.NodeID != announceFrame.Header.SenderID || announce.Member.Incarnation == 0 || announce.Member.Status != Alive || validateAdvertisedEndpoint(announce.Member) != nil {
 		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, fmt.Errorf("%w: invalid join announcement payload", ErrInvalidJoinAnnouncement))
+		return
+	}
+	if err := s.acceptTCPReplay(announceFrame); err != nil {
+		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, err)
 		return
 	}
 	result := s.requestJoinAdmission(ctx, announce)
@@ -697,6 +701,10 @@ func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameSt
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, fmt.Errorf("%w: invalid snapshot request", ErrInvalidSnapshotPayload))
 		return
 	}
+	if err := s.acceptTCPReplay(frame); err != nil {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
+		return
+	}
 	snapshot, err := s.requestTCPSnapshot(ctx)
 	if err != nil {
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
@@ -705,15 +713,7 @@ func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameSt
 	_ = s.writeTCPPayload(ctx, stream, wire.MessageSWIMSnapshotResponse, frame.Header.RequestID, SnapshotResponse{Members: snapshot})
 }
 
-func (s *Service) validateTCPRequest(frame wire.Frame) error {
-	if frame.Header.SenderID == 0 {
-		return fmt.Errorf("%w: zero sender ID", ErrSnapshotProtocol)
-	}
-	switch frame.Header.Message {
-	case wire.MessageSWIMJoinRequest, wire.MessageSWIMJoinAnnounce, wire.MessageSWIMSnapshotRequest:
-	default:
-		return fmt.Errorf("%w: unsupported request type %d", ErrSnapshotProtocol, frame.Header.Message)
-	}
+func (s *Service) acceptTCPReplay(frame wire.Frame) error {
 	if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
 		return err
 	}

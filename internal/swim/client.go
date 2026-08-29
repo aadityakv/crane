@@ -140,6 +140,9 @@ func (c *protocolClient) snapshot(ctx context.Context, endpoint config.Endpoint)
 	if err := validateSnapshot(response.Members); err != nil {
 		return nil, err
 	}
+	if err := c.acceptResponse(frame); err != nil {
+		return nil, err
+	}
 	return append([]Member(nil), response.Members...), nil
 }
 
@@ -166,6 +169,9 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := validateSnapshot(snapshot.Members); err != nil {
 		return joinClientResult{}, err
 	}
+	if err := c.acceptResponse(frame); err != nil {
+		return joinClientResult{}, err
+	}
 	prepared, err := PrepareJoin(store, snapshot.Members, self)
 	if err != nil {
 		return joinClientResult{}, err
@@ -179,12 +185,18 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err != nil {
 		return joinClientResult{}, err
 	}
+	if acceptedFrame.Header.SenderID != frame.Header.SenderID {
+		return joinClientResult{}, fmt.Errorf("%w: join responder changed from %d to %d", ErrSnapshotProtocol, frame.Header.SenderID, acceptedFrame.Header.SenderID)
+	}
 	var accepted JoinAccepted
 	if err := wire.DecodeGob(acceptedFrame.Payload, &accepted); err != nil {
 		return joinClientResult{}, fmt.Errorf("%w: decode join acceptance: %v", ErrSnapshotProtocol, err)
 	}
 	if accepted.Member != prepared {
 		return joinClientResult{}, fmt.Errorf("%w: accepted member %#v does not match announced %#v", ErrSnapshotProtocol, accepted.Member, prepared)
+	}
+	if err := c.acceptResponse(acceptedFrame); err != nil {
+		return joinClientResult{}, err
 	}
 	return joinClientResult{
 		seedID:   frame.Header.SenderID,
@@ -237,13 +249,13 @@ func (c *protocolClient) readResponse(ctx context.Context, stream *wire.TCPFrame
 	if frame.Header.SenderID == 0 || frame.Header.RequestID != requestID {
 		return wire.Frame{}, fmt.Errorf("%w: uncorrelated response", ErrSnapshotProtocol)
 	}
-	if err := c.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
-		return wire.Frame{}, fmt.Errorf("%w: response replay validation: %v", ErrSnapshotProtocol, err)
-	}
 	if frame.Header.Message == wire.MessageSWIMError {
 		var response ProtocolErrorMessage
 		if err := wire.DecodeGob(frame.Payload, &response); err != nil {
 			return wire.Frame{}, fmt.Errorf("%w: decode protocol error: %v", ErrSnapshotProtocol, err)
+		}
+		if err := c.acceptResponse(frame); err != nil {
+			return wire.Frame{}, err
 		}
 		return wire.Frame{}, decodeProtocolError(response)
 	}
@@ -251,6 +263,13 @@ func (c *protocolClient) readResponse(ctx context.Context, stream *wire.TCPFrame
 		return wire.Frame{}, fmt.Errorf("%w: got message %d, want %d", ErrSnapshotProtocol, frame.Header.Message, expected)
 	}
 	return frame, nil
+}
+
+func (c *protocolClient) acceptResponse(frame wire.Frame) error {
+	if err := c.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
+		return fmt.Errorf("%w: response replay validation: %v", ErrSnapshotProtocol, err)
+	}
+	return nil
 }
 
 func (c *protocolClient) nextRequestID() wire.RequestID {
