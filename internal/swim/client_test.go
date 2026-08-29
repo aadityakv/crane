@@ -335,7 +335,7 @@ func startJoinResponderMismatchServer(t *testing.T, authenticator wire.Authentic
 		if wire.DecodeGob(announceFrame.Payload, &announce) != nil {
 			return
 		}
-		acceptedPayload, err := wire.EncodeGob(JoinAccepted{Member: announce.Member})
+		acceptedPayload, err := wire.EncodeGob(JoinAccepted(announce))
 		if err != nil {
 			return
 		}
@@ -451,7 +451,7 @@ func startSuccessfulJoinServer(t *testing.T, authenticator wire.Authenticator, c
 		if wire.DecodeGob(announceFrame.Payload, &announce) != nil {
 			return
 		}
-		acceptedPayload, err := wire.EncodeGob(JoinAccepted{Member: announce.Member})
+		acceptedPayload, err := wire.EncodeGob(JoinAccepted(announce))
 		if err != nil {
 			return
 		}

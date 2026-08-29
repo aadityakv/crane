@@ -37,6 +37,7 @@ func TestWaitForDeadlineIncludesLastConditionError(t *testing.T) {
 }
 
 func TestWaitForRejectsInvalidInputs(t *testing.T) {
+	//lint:ignore SA1012 This assertion verifies that WaitFor rejects a nil context.
 	if err := WaitFor(nil, time.Millisecond, func() (bool, error) { return true, nil }); err == nil {
 		t.Fatal("WaitFor accepted nil context")
 	}

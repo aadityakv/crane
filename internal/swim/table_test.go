@@ -161,7 +161,6 @@ func TestTableSnapshotIsSortedAndIsolated(t *testing.T) {
 	}
 
 	snapshot[0].Host = "mutated"
-	snapshot = append(snapshot, Member{NodeID: 11})
 	fresh := table.Snapshot()
 	if len(fresh) != 3 || fresh[0].Host != "node" {
 		t.Fatalf("snapshot mutation leaked into table: %#v", fresh)
