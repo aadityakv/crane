@@ -270,8 +270,12 @@ func (e *Engine) HandleIndirectTimeout(sequence uint64, now time.Time) Effects {
 	if !exists || probe.phase != probeIndirect {
 		return Effects{}
 	}
+	current, currentExists := e.table.Get(probe.target.NodeID)
 	delete(e.activeProbes, sequence)
-	suspect := probe.target
+	if !currentExists || (current.Status != Alive && current.Status != Suspect) || !sameProbeIdentity(current, probe.target) {
+		return Effects{}
+	}
+	suspect := current
 	suspect.Status = Suspect
 	return e.ApplyUpdate(Update{Member: suspect, ReporterID: e.config.SelfID}, now)
 }

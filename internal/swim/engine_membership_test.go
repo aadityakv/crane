@@ -50,6 +50,100 @@ func TestSuspicionFailedFullProbeTransitionsOnlyExactGeneration(t *testing.T) {
 	}
 }
 
+func TestSuspicionIndirectTimeoutRequiresCurrentEligibleTargetIdentity(t *testing.T) {
+	self := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 4, Status: Alive}
+	tests := []struct {
+		name    string
+		current *Member
+	}{
+		{name: "missing"},
+		{name: "higher incarnation", current: memberPointer(withIncarnation(target, 5))},
+		{name: "lower incarnation", current: memberPointer(withIncarnation(target, 3))},
+		{name: "address mismatch", current: memberPointer(Member{NodeID: target.NodeID, Host: "replacement", BasePort: 9002, Incarnation: target.Incarnation, Status: Alive})},
+		{name: "dead", current: memberPointer(withStatus(target, Dead))},
+		{name: "left", current: memberPointer(withStatus(target, Left))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			engine := newTestEngineWithSelf(self)
+			mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+			now := time.Date(2026, 8, 29, 15, 5, 0, 0, time.UTC)
+			sequence := engine.BeginProbe(now).Outbound[0].Message.(Ping).Sequence
+			engine.HandleDirectTimeout(sequence, now.Add(300*time.Millisecond))
+
+			if test.current == nil {
+				delete(engine.table.members, target.NodeID)
+			} else {
+				engine.table.members[target.NodeID] = *test.current
+			}
+
+			effects := engine.HandleIndirectTimeout(sequence, now.Add(time.Second))
+
+			if !reflect.DeepEqual(effects, Effects{}) {
+				t.Fatalf("ineligible target effects = %#v, want zero", effects)
+			}
+			if _, active := engine.activeProbes[sequence]; active {
+				t.Fatal("ineligible target probe remained active")
+			}
+			if test.current == nil {
+				if _, exists := engine.table.Get(target.NodeID); exists {
+					t.Fatal("missing target was recreated")
+				}
+			} else if got := engine.table.MustGet(target.NodeID); got != *test.current {
+				t.Fatalf("current target changed to %#v, want %#v", got, *test.current)
+			}
+			if batch := mustTakeForMembers(t, engine.dissemination, 1, engine.aliveMembers(), countEncoder); len(batch) != 0 {
+				t.Fatalf("ineligible target dissemination = %#v, want empty", batch)
+			}
+		})
+	}
+}
+
+func TestSuspicionStaleIndirectTimeoutCannotRecreateExpiredHigherTerminalGeneration(t *testing.T) {
+	self := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 4, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+	now := time.Date(2026, 8, 29, 15, 7, 0, 0, time.UTC)
+	sequence := engine.BeginProbe(now).Outbound[0].Message.(Ping).Sequence
+	engine.HandleDirectTimeout(sequence, now.Add(300*time.Millisecond))
+
+	terminal := target
+	terminal.Incarnation = 5
+	terminal.Status = Dead
+	terminalEffects := engine.ApplyUpdate(Update{Member: terminal, ReporterID: 3}, now.Add(500*time.Millisecond))
+	tombstoneTimer, ok := timerOfKind(terminalEffects, TimerTombstone)
+	if !ok {
+		t.Fatalf("terminal effects = %#v, want tombstone timer", terminalEffects)
+	}
+	for send := 0; send < RetransmitBudget(3, engine.aliveMembers()); send++ {
+		batch := mustTakeForMembers(t, engine.dissemination, 1, engine.aliveMembers(), countEncoder)
+		if !reflect.DeepEqual(batch, []Update{{Member: terminal, ReporterID: 3}}) {
+			t.Fatalf("terminal dissemination %d = %#v", send+1, batch)
+		}
+	}
+	engine.ExpireTombstone(terminal.NodeID, terminal.Incarnation, terminal.Status, tombstoneTimer.Deadline)
+	if _, exists := engine.table.Get(target.NodeID); exists {
+		t.Fatal("terminal generation remained after tombstone expiry")
+	}
+
+	effects := engine.HandleIndirectTimeout(sequence, tombstoneTimer.Deadline.Add(time.Millisecond))
+
+	if !reflect.DeepEqual(effects, Effects{}) {
+		t.Fatalf("stale indirect timeout effects = %#v, want zero", effects)
+	}
+	if _, exists := engine.table.Get(target.NodeID); exists {
+		t.Fatal("stale indirect timeout recreated expired target generation")
+	}
+	if _, active := engine.activeProbes[sequence]; active {
+		t.Fatal("stale indirect probe remained active")
+	}
+	if batch := mustTakeForMembers(t, engine.dissemination, 1, engine.aliveMembers(), countEncoder); len(batch) != 0 {
+		t.Fatalf("stale indirect timeout dissemination = %#v, want empty", batch)
+	}
+}
+
 func TestSuspicionDistinctReportersShortenWithoutDuplicatesOrExtensions(t *testing.T) {
 	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
 	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}
@@ -266,6 +360,34 @@ func TestTombstoneRetainsUntilExactDeadlineThenExpiresIdempotently(t *testing.T)
 	}
 }
 
+func TestTombstoneRetentionUsesPostTerminalAliveViewAtLogBoundary(t *testing.T) {
+	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	for _, member := range []Member{
+		target,
+		{NodeID: 3, Status: Alive},
+		{NodeID: 4, Status: Alive},
+	} {
+		mustMerge(t, engine.table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	now := time.Date(2026, 8, 29, 16, 15, 0, 0, time.UTC)
+
+	effects := engine.ApplyUpdate(Update{Member: withStatus(target, Dead), ReporterID: 3}, now)
+
+	timer, ok := timerOfKind(effects, TimerTombstone)
+	if !ok {
+		t.Fatalf("terminal effects = %#v, want tombstone timer", effects)
+	}
+	// After the target becomes terminal, three Alive records remain:
+	// ceil(log2(3+1))=2, so suspicion is 10s and retention is exactly 100s.
+	// Using the pre-terminal view of four Alive records would incorrectly yield
+	// a 150s retention and makes this boundary distinguish the count point.
+	if want := now.Add(100 * time.Second); timer.Deadline != want {
+		t.Fatalf("tombstone deadline = %s, want post-terminal boundary %s", timer.Deadline, want)
+	}
+}
+
 func TestTombstoneSeverityReplacementMakesOldTimerHarmless(t *testing.T) {
 	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
 	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}
@@ -388,4 +510,8 @@ func timerOfKind(effects Effects, kind TimerKind) (TimerRequest, bool) {
 		}
 	}
 	return TimerRequest{}, false
+}
+
+func memberPointer(member Member) *Member {
+	return &member
 }
