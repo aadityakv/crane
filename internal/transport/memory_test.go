@@ -186,6 +186,44 @@ func TestMemoryNetworkEndpointMayOwnBothSWIMAddresses(t *testing.T) {
 	}
 }
 
+func TestMemoryDatagramSendFromUsesOwnedAlias(t *testing.T) {
+	network := NewMemoryNetwork()
+	ping := config.Endpoint{Host: "node-1", Port: 8000}
+	ack := config.Endpoint{Host: "node-1", Port: 8001}
+	destination := config.Endpoint{Host: "node-2", Port: 8100}
+	sender, err := network.Endpoint(ping, ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := network.Endpoint(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = sender.Close()
+		_ = receiver.Close()
+	})
+
+	if err := sender.SendFrom(context.Background(), ack, destination, []byte("ack")); err != nil {
+		t.Fatal(err)
+	}
+	if got := network.Advance(); got != 1 {
+		t.Fatalf("Advance delivered = %d, want 1", got)
+	}
+	packet, err := receiver.Receive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.From != ack || string(packet.Data) != "ack" {
+		t.Fatalf("selected-alias packet = %#v, want ack alias", packet)
+	}
+
+	unknown := config.Endpoint{Host: ping.Host, Port: ping.Port + 10}
+	if err := sender.SendFrom(context.Background(), unknown, destination, []byte("forged")); !errors.Is(err, ErrInvalidDatagramEndpoint) {
+		t.Fatalf("unknown alias error = %v, want ErrInvalidDatagramEndpoint", err)
+	}
+}
+
 func memoryPair(t *testing.T, fromAddress, toAddress config.Endpoint) (*MemoryNetwork, *MemoryDatagram, *MemoryDatagram) {
 	t.Helper()
 	network := NewMemoryNetwork()

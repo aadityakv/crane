@@ -111,6 +111,14 @@ func (n *MemoryNetwork) Endpoint(addresses ...config.Endpoint) (*MemoryDatagram,
 
 // Send queues an owned packet according to the link rule active at send time.
 func (d *MemoryDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
+	if d == nil {
+		return ErrDatagramClosed
+	}
+	return d.SendFrom(ctx, d.primary, destination, payload)
+}
+
+// SendFrom queues a packet from one selected alias owned by this endpoint.
+func (d *MemoryDatagram) SendFrom(ctx context.Context, source, destination config.Endpoint, payload []byte) error {
 	if d == nil || d.network == nil {
 		return ErrDatagramClosed
 	}
@@ -129,18 +137,26 @@ func (d *MemoryDatagram) Send(ctx context.Context, destination config.Endpoint, 
 	network := d.network
 	network.mu.Lock()
 	defer network.mu.Unlock()
+	if network.endpoints[source] != d {
+		for _, address := range d.addresses {
+			if address == source {
+				return ErrDatagramClosed
+			}
+		}
+		return fmt.Errorf("%w: source %s is not owned", ErrInvalidDatagramEndpoint, source)
+	}
 	if network.endpoints[d.primary] != d {
 		return ErrDatagramClosed
 	}
 	if len(network.pending) >= network.pendingLimit {
 		return ErrMemoryNetworkFull
 	}
-	rule := network.rules[memoryLink{from: d.primary, to: destination}]
+	rule := network.rules[memoryLink{from: source, to: destination}]
 	if rule == ruleDrop {
 		return nil
 	}
 	packet := scheduledPacket{
-		from:      d.primary,
+		from:      source,
 		to:        destination,
 		data:      append([]byte(nil), payload...),
 		readyStep: network.step + 1,

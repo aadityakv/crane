@@ -106,6 +106,44 @@ func TestDatagramSendCopiesPayloadAndCloseUnblocksReceive(t *testing.T) {
 	}
 }
 
+func TestDatagramSendFromUsesSelectedBoundEndpoint(t *testing.T) {
+	first := freeUDPEndpoint(t)
+	second := freeUDPEndpoint(t)
+	datagram, err := ListenUDP(first, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = datagram.Close() })
+
+	receiver, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = receiver.Close() })
+	receiverAddress := receiver.LocalAddr().(*net.UDPAddr)
+	destination := config.Endpoint{Host: receiverAddress.IP.String(), Port: uint16(receiverAddress.Port)}
+
+	if err := datagram.SendFrom(context.Background(), second, destination, []byte("ack")); err != nil {
+		t.Fatal(err)
+	}
+	if err := receiver.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 16)
+	count, source, err := receiver.ReadFromUDP(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buffer[:count]) != "ack" || source.Port != int(second.Port) {
+		t.Fatalf("selected-source packet = %q from %s, want ack from port %d", buffer[:count], source, second.Port)
+	}
+
+	unknown := config.Endpoint{Host: first.Host, Port: first.Port + 10}
+	if err := datagram.SendFrom(context.Background(), unknown, destination, []byte("forged")); !errors.Is(err, ErrInvalidDatagramEndpoint) {
+		t.Fatalf("unknown source error = %v, want ErrInvalidDatagramEndpoint", err)
+	}
+}
+
 func freeUDPEndpoint(t *testing.T) config.Endpoint {
 	t.Helper()
 	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})

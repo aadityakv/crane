@@ -37,8 +37,17 @@ type Datagram interface {
 	Close() error
 }
 
+// SourceDatagram can select one of its bound local endpoints for a send. It is
+// used by protocols whose authenticated message type determines the expected
+// source port while preserving the minimal Datagram contract for test doubles.
+type SourceDatagram interface {
+	Datagram
+	SendFrom(context.Context, config.Endpoint, config.Endpoint, []byte) error
+}
+
 // UDPDatagram aggregates packets from one or more bound UDP sockets.
 type UDPDatagram struct {
+	endpoints   []config.Endpoint
 	connections []*net.UDPConn
 	packets     chan Packet
 	errors      chan error
@@ -70,6 +79,7 @@ func ListenUDP(endpoints ...config.Endpoint) (*UDPDatagram, error) {
 	}
 
 	datagram := &UDPDatagram{
+		endpoints:   append([]config.Endpoint(nil), endpoints...),
 		connections: connections,
 		packets:     make(chan Packet, udpReceiveQueueSize),
 		errors:      make(chan error, len(connections)),
@@ -87,6 +97,23 @@ func (d *UDPDatagram) Send(ctx context.Context, destination config.Endpoint, pay
 	if d == nil || len(d.connections) == 0 {
 		return ErrDatagramClosed
 	}
+	return d.send(ctx, d.connections[0], destination, payload)
+}
+
+// SendFrom writes from the selected bound endpoint.
+func (d *UDPDatagram) SendFrom(ctx context.Context, source, destination config.Endpoint, payload []byte) error {
+	if d == nil || len(d.connections) == 0 {
+		return ErrDatagramClosed
+	}
+	for index, endpoint := range d.endpoints {
+		if endpoint == source {
+			return d.send(ctx, d.connections[index], destination, payload)
+		}
+	}
+	return fmt.Errorf("%w: source %s is not bound", ErrInvalidDatagramEndpoint, source)
+}
+
+func (d *UDPDatagram) send(ctx context.Context, connection *net.UDPConn, destination config.Endpoint, payload []byte) error {
 	if ctx == nil {
 		return errors.New("send datagram: nil context")
 	}
@@ -107,12 +134,12 @@ func (d *UDPDatagram) Send(ctx context.Context, destination config.Endpoint, pay
 	defer d.writeMu.Unlock()
 	deadline, hasDeadline := ctx.Deadline()
 	if hasDeadline {
-		if err := d.connections[0].SetWriteDeadline(deadline); err != nil {
+		if err := connection.SetWriteDeadline(deadline); err != nil {
 			return fmt.Errorf("set UDP write deadline: %w", err)
 		}
-		defer func() { _ = d.connections[0].SetWriteDeadline(time.Time{}) }()
+		defer func() { _ = connection.SetWriteDeadline(time.Time{}) }()
 	}
-	written, err := d.connections[0].WriteToUDP(payload, address)
+	written, err := connection.WriteToUDP(payload, address)
 	if err != nil {
 		if contextError := ctx.Err(); contextError != nil {
 			return errors.Join(contextError, err)
