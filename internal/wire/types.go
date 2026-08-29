@@ -1,0 +1,81 @@
+// Package wire provides authenticated, fixed-width framing independent of payload schemas.
+package wire
+
+import "errors"
+
+const (
+	// Version1 is the initial canonical wire protocol version.
+	Version1 uint16 = 1
+	// FixedHeaderSize is the byte length of every canonical frame header.
+	FixedHeaderSize = 55
+	// MACSize is the byte length of the trailing HMAC-SHA256 authentication code.
+	MACSize = 32
+
+	defaultMaxFrameSize        = 8 << 20
+	defaultMaxSWIMDatagramSize = 1200
+)
+
+var (
+	// ErrMalformed classifies frames whose fixed layout or declared length is invalid.
+	ErrMalformed = errors.New("malformed wire frame")
+	// ErrTooLarge classifies frames that exceed a configured allocation or datagram bound.
+	ErrTooLarge = errors.New("wire frame too large")
+	// ErrUnsupportedVersion classifies frames using a protocol version this package cannot decode.
+	ErrUnsupportedVersion = errors.New("unsupported wire version")
+	// ErrUnsupportedCodec classifies frames using an unknown payload codec.
+	ErrUnsupportedCodec = errors.New("unsupported wire codec")
+	// ErrAuthentication classifies frames that fail authentication or target another cluster.
+	ErrAuthentication = errors.New("wire authentication failed")
+)
+
+// MessageType identifies the semantic payload type without coupling framing to its Go representation.
+type MessageType uint16
+
+const (
+	// MessageSWIMPing carries a SWIM direct-probe datagram payload.
+	MessageSWIMPing MessageType = 1
+)
+
+// Codec identifies the concrete payload serialization used inside a frame.
+type Codec uint8
+
+const (
+	// CodecGob identifies a payload encoded as one concrete gob value.
+	CodecGob Codec = 1
+)
+
+// RequestID is the fixed-width identifier used for request correlation and replay defense.
+type RequestID [16]byte
+
+// Header contains the authenticated routing and replay metadata of a frame.
+type Header struct {
+	Version         uint16
+	Message         MessageType
+	ClusterID       [16]byte
+	SenderID        uint16
+	RequestID       RequestID
+	TimestampMillis int64
+	Codec           Codec
+}
+
+// Frame is an authenticated header and an independently owned payload byte slice.
+type Frame struct {
+	Header  Header
+	Payload []byte
+}
+
+// Limits bounds complete frame bodies and SWIM UDP datagrams. ExpectedClusterID,
+// when non-nil, rejects otherwise authenticated frames for another cluster.
+type Limits struct {
+	MaxFrameSize        int
+	MaxSWIMDatagramSize int
+	ExpectedClusterID   *[16]byte
+}
+
+// DefaultLimits returns the initial 8 MiB frame and 1200-byte SWIM datagram bounds.
+func DefaultLimits() Limits {
+	return Limits{
+		MaxFrameSize:        defaultMaxFrameSize,
+		MaxSWIMDatagramSize: defaultMaxSWIMDatagramSize,
+	}
+}
