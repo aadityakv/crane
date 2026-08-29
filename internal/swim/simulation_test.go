@@ -419,15 +419,16 @@ func TestSimulationGracefulRestartAndSeedFailure(t *testing.T) {
 	}
 }
 
-func TestSimulationBoundedDisseminationFallsBackToDigest(t *testing.T) {
+func TestSimulationBoundedDisseminationRetriesDigestAndRepairsBySnapshot(t *testing.T) {
 	now := time.Unix(7000, 0)
+	manualClock := clock.NewManual(now)
 	network := transport.NewMemoryNetwork()
-	configuration := serviceTestConfig(t, 1)
-	base := serviceMemoryDatagram(t, network, configuration)
+	seedConfiguration := serviceTestConfig(t, 1)
+	base := serviceMemoryDatagram(t, network, seedConfiguration)
 	authenticator := wire.NewHMACAuthenticator(testServiceKey())
 	recording := newRecordingDatagram(base, authenticator, serviceWireLimits(t))
-	running := startRunningServiceWithDatagram(t, configuration, newServiceStore(1), clock.NewManual(now), recording, &scriptedRandom{uint64s: []uint64{1, 2, 3, 4, 5}})
-	destination, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMPing)
+	seed := startRunningServiceWithDatagram(t, seedConfiguration, newServiceStore(1), manualClock, recording, &scriptedRandom{uint64s: []uint64{1, 2, 3, 4, 5}})
+	seedPing, _ := seedConfiguration.AdvertiseEndpoint(config.ServiceSWIMPing)
 
 	const terminalUpdates = serviceDisseminationMax
 	processed := 0
@@ -449,9 +450,9 @@ func TestSimulationBoundedDisseminationFallsBackToDigest(t *testing.T) {
 				updates = append(updates, Update{Member: member, ReporterID: 1})
 				batchUpdates++
 			}
-			frame := encodeSimulationGossip(t, authenticator, now, requestNumber, GossipMessage{Updates: updates})
+			frame := encodeSimulationGossip(t, authenticator, now, 1, requestNumber, GossipMessage{Updates: updates})
 			requestNumber++
-			if err := recording.SendFrom(context.Background(), destination, destination, frame); err != nil {
+			if err := recording.SendFrom(context.Background(), seedPing, seedPing, frame); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -459,39 +460,133 @@ func TestSimulationBoundedDisseminationFallsBackToDigest(t *testing.T) {
 			t.Fatalf("bounded batch delivered = %d, want %d", delivered, frames)
 		}
 		processed += batchUpdates
-		waitForSnapshot(t, running.service, func(members []Member) bool { return len(members) == processed+1 })
+		waitForSnapshot(t, seed.service, func(members []Member) bool { return len(members) == processed+1 })
 	}
 
-	recording.clear()
-	peer := Member{NodeID: 6000, Host: "127.0.0.6", BasePort: 16000, Incarnation: 1, Status: Alive}
-	peerFrame := encodeSimulationGossip(t, authenticator, now, requestNumber, GossipMessage{Updates: []Update{{Member: peer, ReporterID: 1}}})
-	if err := recording.SendFrom(context.Background(), destination, destination, peerFrame); err != nil {
+	omitted := Member{NodeID: terminalUpdates + 1, Host: "dead.local", BasePort: 10000, Incarnation: 1, Status: Dead}
+	if member, exists := memberFromSnapshot(waitForSnapshot(t, seed.service, func(members []Member) bool { return len(members) == terminalUpdates+1 }), omitted.NodeID); !exists || member != omitted {
+		t.Fatalf("seed omitted-state record = %#v exists:%v, want %#v", member, exists, omitted)
+	}
+
+	peerConfiguration := serviceTestConfig(t, 2)
+	peerBase := serviceMemoryDatagram(t, network, peerConfiguration)
+	peerRecording := newRecordingDatagram(peerBase, authenticator, serviceWireLimits(t))
+	peer := startRunningServiceWithDatagram(t, peerConfiguration, newServiceStore(1), manualClock, peerRecording, &scriptedRandom{uint64s: []uint64{11, 12, 13, 14, 15}})
+	peerPing, _ := peerConfiguration.AdvertiseEndpoint(config.ServiceSWIMPing)
+	peerSelf := waitForSnapshot(t, peer.service, func(members []Member) bool { return len(members) == 1 })[0]
+	seedSelf := waitForSnapshot(t, seed.service, func(members []Member) bool { return len(members) == terminalUpdates+1 })[0]
+
+	// Both nodes are independently admitted seeds. Exchange their identities
+	// through authenticated self-originated gossip, then drop the seed's UDP
+	// path so the receiver cannot begin its authenticated TCP repair.
+	network.Drop(seedPing, peerPing)
+	peerAtSeed := encodeSimulationGossip(t, authenticator, now, 1, requestNumber, GossipMessage{Updates: []Update{{Member: peerSelf, ReporterID: 1}}})
+	requestNumber++
+	if err := recording.SendFrom(context.Background(), seedPing, seedPing, peerAtSeed); err != nil {
 		t.Fatal(err)
 	}
 	network.Advance()
-	waitForSnapshot(t, running.service, func(members []Member) bool { return len(members) == terminalUpdates+2 })
-	peerPing := config.Endpoint{Host: peer.Host, Port: peer.BasePort}
-	if !recording.sentTo(wire.MessageSWIMDigest, peerPing) {
-		t.Fatal("saturated dissemination queue did not send digest fallback to new active peer")
+	waitForSnapshot(t, seed.service, func(members []Member) bool {
+		member, exists := memberFromSnapshot(members, peerSelf.NodeID)
+		return exists && member == peerSelf
+	})
+	seedAtPeer := encodeSimulationGossip(t, authenticator, now, 2, requestNumber, GossipMessage{Updates: []Update{{Member: seedSelf, ReporterID: 2}}})
+	requestNumber++
+	if err := peerRecording.SendFrom(context.Background(), peerPing, peerPing, seedAtPeer); err != nil {
+		t.Fatal(err)
+	}
+	network.Advance()
+	waitForSnapshot(t, peer.service, func(members []Member) bool {
+		member, exists := memberFromSnapshot(members, seedSelf.NodeID)
+		return exists && member == seedSelf
+	})
+
+	recording.clear()
+	for attempt := uint64(0); attempt < 3; attempt++ {
+		ping := encodeSimulationDatagram(t, authenticator, now, 2, requestNumber, wire.MessageSWIMPing, PingMessage{Ping: Ping{OriginID: 2, Sequence: attempt + 1}})
+		requestNumber++
+		if err := peerRecording.SendFrom(context.Background(), peerPing, seedPing, ping); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForRecordedDatagrams(t, network, []*Service{seed.service, peer.service}, recording, wire.MessageSWIMDigest, peerPing, 3)
+	if snapshot, err := peer.service.Snapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	} else if _, exists := memberFromSnapshot(snapshot, omitted.NodeID); exists {
+		t.Fatalf("partitioned peer learned omitted member %d without snapshot repair", omitted.NodeID)
+	}
+
+	// Healing the UDP path delivers a retried digest. The active authenticated
+	// peer then fetches the full TCP snapshot, including state never admitted to
+	// the bounded dissemination queue.
+	network.Heal(seedPing, peerPing)
+	recoveryPing := encodeSimulationDatagram(t, authenticator, now, 2, requestNumber, wire.MessageSWIMPing, PingMessage{Ping: Ping{OriginID: 2, Sequence: 4}})
+	requestNumber++
+	if err := peerRecording.SendFrom(context.Background(), peerPing, seedPing, recoveryPing); err != nil {
+		t.Fatal(err)
+	}
+	priorDigests := recording.count(wire.MessageSWIMDigest, peerPing)
+	waitForRecordedDatagrams(t, network, []*Service{seed.service, peer.service}, recording, wire.MessageSWIMDigest, peerPing, priorDigests+1)
+	// The digest is already queued under the healed rule. Drop only future
+	// reverse UDP dissemination so applying the 4K snapshot does not obscure
+	// the TCP-repair assertion with an unrelated feedback flood.
+	network.Drop(peerPing, seedPing)
+	deadline := time.Now().Add(15 * time.Second)
+	repaired := false
+	for time.Now().Before(deadline) {
+		network.Advance()
+		snapshot, err := peer.service.Snapshot(testContext(t))
+		if err == nil {
+			if member, exists := memberFromSnapshot(snapshot, omitted.NodeID); exists && member == omitted {
+				repaired = true
+				break
+			}
+		}
+		runtime.Gosched()
+	}
+	if !repaired {
+		t.Fatalf("healed peer did not recover omitted member %d through TCP snapshot", omitted.NodeID)
+	}
+	if _, err := seed.service.Snapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The successful authenticated response is the only clearing barrier.
+	network.Heal(seedPing, peerPing)
+	recording.clear()
+	postRepairPing := encodeSimulationDatagram(t, authenticator, now, 2, requestNumber, wire.MessageSWIMPing, PingMessage{Ping: Ping{OriginID: 2, Sequence: 5}})
+	if err := peerRecording.SendFrom(context.Background(), peerPing, seedPing, postRepairPing); err != nil {
+		t.Fatal(err)
+	}
+	peerACK, _ := peerConfiguration.AdvertiseEndpoint(config.ServiceSWIMACK)
+	waitForRecordedDatagrams(t, network, []*Service{seed.service, peer.service}, recording, wire.MessageSWIMAck, peerACK, 1)
+	if got := recording.count(wire.MessageSWIMDigest, peerPing); got != 0 {
+		t.Fatalf("digest fallback sends after authenticated snapshot repair = %d, want 0", got)
 	}
 	select {
-	case err := <-running.result:
+	case err := <-seed.result:
 		t.Fatalf("bounded dissemination stopped service: %v", err)
 	default:
 	}
-	running.stop(t)
+	peer.stop(t)
+	seed.stop(t)
 }
 
-func encodeSimulationGossip(t *testing.T, authenticator wire.Authenticator, now time.Time, requestNumber uint64, message GossipMessage) []byte {
+func encodeSimulationGossip(t *testing.T, authenticator wire.Authenticator, now time.Time, senderID uint16, requestNumber uint64, message GossipMessage) []byte {
+	t.Helper()
+	return encodeSimulationDatagram(t, authenticator, now, senderID, requestNumber, wire.MessageSWIMGossip, message)
+}
+
+func encodeSimulationDatagram(t *testing.T, authenticator wire.Authenticator, now time.Time, senderID uint16, requestNumber uint64, messageType wire.MessageType, message any) []byte {
 	t.Helper()
 	var requestID wire.RequestID
 	binary.BigEndian.PutUint64(requestID[8:], requestNumber)
 	payload := mustEncodeGob(t, message)
 	encoded, err := wire.Encode(wire.Header{
 		Version:         wire.Version1,
-		Message:         wire.MessageSWIMGossip,
+		Message:         messageType,
 		ClusterID:       decodedTestClusterID(t, testClusterID),
-		SenderID:        1,
+		SenderID:        senderID,
 		RequestID:       requestID,
 		TimestampMillis: now.UnixMilli(),
 		Codec:           wire.CodecGob,
@@ -500,6 +595,21 @@ func encodeSimulationGossip(t *testing.T, authenticator wire.Authenticator, now 
 		t.Fatal(err)
 	}
 	return encoded
+}
+
+func waitForRecordedDatagrams(t *testing.T, network *transport.MemoryNetwork, services []*Service, recording *recordingDatagram, message wire.MessageType, destination config.Endpoint, minimum int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for recording.count(message, destination) < minimum && time.Now().Before(deadline) {
+		network.Advance()
+		for _, service := range services {
+			_, _ = service.Snapshot(testContext(t))
+		}
+		runtime.Gosched()
+	}
+	if got := recording.count(message, destination); got < minimum {
+		t.Fatalf("recorded message %d to %s = %d, want at least %d", message, destination, got, minimum)
+	}
 }
 
 type simulationCluster struct {
@@ -797,6 +907,18 @@ func (d *recordingDatagram) sentTo(message wire.MessageType, destination config.
 		}
 	}
 	return false
+}
+
+func (d *recordingDatagram) count(message wire.MessageType, destination config.Endpoint) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	count := 0
+	for _, recorded := range d.sent {
+		if recorded.frame.Header.Message == message && recorded.destination == destination {
+			count++
+		}
+	}
+	return count
 }
 
 func updatesFromRecordedFrame(t *testing.T, frame wire.Frame) []Update {

@@ -272,6 +272,37 @@ func TestDisseminatorOverflowRequiresDigestWithoutEvictingCurrentState(t *testin
 	}
 }
 
+func TestDisseminatorSnapshotRepairClearsOnlyCapturedGeneration(t *testing.T) {
+	d := NewDisseminator(1, 1)
+	d.Enqueue(updateFor(2, 1, Alive), 1)
+	d.Enqueue(updateFor(3, 1, Dead), 1)
+	firstGeneration := d.digestGeneration
+	if firstGeneration == 0 || !d.DigestRequired {
+		t.Fatalf("first overflow state = generation:%d required:%v", firstGeneration, d.DigestRequired)
+	}
+
+	d.Enqueue(updateFor(4, 1, Left), 1)
+	currentGeneration := d.digestGeneration
+	if currentGeneration == firstGeneration {
+		t.Fatalf("new omitted state did not advance digest generation %d", currentGeneration)
+	}
+	if d.markDigestRepaired(firstGeneration) {
+		t.Fatal("stale snapshot generation cleared newer omitted state")
+	}
+	if !d.DigestRequired {
+		t.Fatal("stale snapshot generation cleared digest requirement")
+	}
+	if !d.markDigestRepaired(currentGeneration) {
+		t.Fatal("current snapshot generation did not clear digest requirement")
+	}
+	if d.DigestRequired {
+		t.Fatal("current snapshot repair left digest required")
+	}
+	if d.markDigestRepaired(currentGeneration) {
+		t.Fatal("duplicate snapshot repair reported a second clear")
+	}
+}
+
 func TestDisseminatorRemainsBoundedUnderDistinctUpdates(t *testing.T) {
 	d := NewDisseminator(4, 1)
 	for nodeID := uint16(1); nodeID <= 1_000; nodeID++ {

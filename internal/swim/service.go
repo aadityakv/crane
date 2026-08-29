@@ -390,8 +390,9 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 type serviceEvent interface{ serviceEvent() }
 
 type snapshotResult struct {
-	members []Member
-	err     error
+	members          []Member
+	digestGeneration uint64
+	err              error
 }
 
 type snapshotServiceEvent struct{ response chan<- snapshotResult }
@@ -481,6 +482,13 @@ type snapshotResyncServiceEvent struct {
 
 func (snapshotResyncServiceEvent) serviceEvent() {}
 
+type snapshotServedServiceEvent struct {
+	senderID         uint16
+	digestGeneration uint64
+}
+
+func (snapshotServedServiceEvent) serviceEvent() {}
+
 type serviceLoop struct {
 	service       *Service
 	engine        *Engine
@@ -528,7 +536,7 @@ func (l *serviceLoop) run(parent context.Context) error {
 			case fatalServiceEvent:
 				return event.err
 			case tcpSnapshotServiceEvent:
-				event.response <- snapshotResult{members: l.engine.Snapshot()}
+				event.response <- snapshotResult{members: l.engine.Snapshot(), digestGeneration: l.dissemination.digestGeneration}
 			case joinAdmissionServiceEvent:
 				if err := l.handleJoinAdmission(event); err != nil {
 					return err
@@ -541,6 +549,8 @@ func (l *serviceLoop) run(parent context.Context) error {
 				if err := l.handleSnapshotResync(event); err != nil {
 					return err
 				}
+			case snapshotServedServiceEvent:
+				l.handleSnapshotServed(event)
 			}
 		case <-parent.Done():
 			if l.admitted {
@@ -789,12 +799,15 @@ func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameSt
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
 		return
 	}
-	snapshot, err := s.requestTCPSnapshot(ctx)
-	if err != nil {
-		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
+	result := s.requestTCPSnapshotResult(ctx)
+	if result.err != nil {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, result.err)
 		return
 	}
-	_ = s.writeTCPPayload(ctx, stream, wire.MessageSWIMSnapshotResponse, frame.Header.RequestID, SnapshotResponse{Members: snapshot})
+	if err := s.writeTCPPayload(ctx, stream, wire.MessageSWIMSnapshotResponse, frame.Header.RequestID, SnapshotResponse{Members: result.members}); err != nil {
+		return
+	}
+	s.enqueueWorkerEvent(ctx, snapshotServedServiceEvent{senderID: frame.Header.SenderID, digestGeneration: result.digestGeneration})
 }
 
 func (s *Service) acceptTCPReplay(frame wire.Frame) error {
@@ -805,21 +818,26 @@ func (s *Service) acceptTCPReplay(frame wire.Frame) error {
 }
 
 func (s *Service) requestTCPSnapshot(ctx context.Context) ([]Member, error) {
+	result := s.requestTCPSnapshotResult(ctx)
+	return result.members, result.err
+}
+
+func (s *Service) requestTCPSnapshotResult(ctx context.Context) snapshotResult {
 	response := make(chan snapshotResult, 1)
 	select {
 	case s.events <- tcpSnapshotServiceEvent{response: response}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return snapshotResult{err: ctx.Err()}
 	case <-s.done:
-		return nil, ErrServiceNotRunning
+		return snapshotResult{err: ErrServiceNotRunning}
 	}
 	select {
 	case result := <-response:
-		return result.members, result.err
+		return result
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return snapshotResult{err: ctx.Err()}
 	case <-s.done:
-		return nil, ErrServiceNotRunning
+		return snapshotResult{err: ErrServiceNotRunning}
 	}
 }
 
@@ -1076,6 +1094,14 @@ func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) err
 	return nil
 }
 
+func (l *serviceLoop) handleSnapshotServed(event snapshotServedServiceEvent) {
+	current, exists := l.engine.table.Get(event.senderID)
+	if !exists || (current.Status != Alive && current.Status != Suspect) {
+		return
+	}
+	l.dissemination.markDigestRepaired(event.digestGeneration)
+}
+
 func (l *serviceLoop) handleTimer(event timerServiceEvent) error {
 	now := l.service.options.Clock.Now()
 	if event.probe {
@@ -1156,19 +1182,14 @@ func (l *serviceLoop) sendGossipRound(ctx context.Context) error {
 }
 
 func (l *serviceLoop) sendDigestRound(ctx context.Context) error {
-	sent := false
 	for _, member := range l.activeMembers {
 		if member.NodeID == l.service.options.Config.NodeID {
 			continue
 		}
-		delivered, err := l.sendMessage(ctx, member, DigestMessage{})
+		_, err := l.sendMessage(ctx, member, DigestMessage{})
 		if err != nil {
 			return err
 		}
-		sent = sent || delivered
-	}
-	if sent {
-		l.dissemination.DigestRequired = false
 	}
 	return nil
 }

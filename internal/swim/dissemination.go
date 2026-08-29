@@ -20,12 +20,14 @@ var (
 // and deliberately provides no internal synchronization.
 type Disseminator struct {
 	// DigestRequired is set when current state cannot be admitted to the
-	// bounded queue. The owner clears it after arranging digest delivery.
+	// bounded queue. The owner clears it only after an authenticated snapshot
+	// repair for the current digest generation.
 	DigestRequired bool
 
 	maxItems             int
 	retransmitMultiplier int
 	nextSequence         uint64
+	digestGeneration     uint64
 	items                map[uint16]*disseminationItem
 }
 
@@ -67,12 +69,12 @@ func (d *Disseminator) Enqueue(update Update, aliveMembers int) {
 	budget := RetransmitBudget(d.retransmitMultiplier, aliveMembers)
 	if d.maxItems <= 0 || budget <= 0 {
 		delete(d.items, nodeID)
-		d.DigestRequired = true
+		d.requireDigest()
 		return
 	}
 
 	if _, exists := d.items[nodeID]; !exists && len(d.items) >= d.maxItems {
-		d.DigestRequired = true
+		d.requireDigest()
 		return
 	}
 
@@ -80,6 +82,22 @@ func (d *Disseminator) Enqueue(update Update, aliveMembers int) {
 		update:   update,
 		sequence: d.takeSequence(),
 	}
+}
+
+func (d *Disseminator) requireDigest() {
+	d.DigestRequired = true
+	d.digestGeneration++
+	if d.digestGeneration == 0 {
+		d.digestGeneration = 1
+	}
+}
+
+func (d *Disseminator) markDigestRepaired(generation uint64) bool {
+	if !d.DigestRequired || generation == 0 || generation != d.digestGeneration {
+		return false
+	}
+	d.DigestRequired = false
+	return true
 }
 
 // Take removes items already exhausted under the current aliveMembers view,

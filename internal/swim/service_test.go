@@ -518,6 +518,108 @@ func TestServiceCanceledSubscribeRequestsDoNotLeakOwnerState(t *testing.T) {
 	harness.stop(t)
 }
 
+func TestServiceDigestSendRemainsRequiredWithoutSnapshotRepair(t *testing.T) {
+	now := time.Unix(3900, 0)
+	configuration := serviceTestConfig(t, 1)
+	network := transport.NewMemoryNetwork()
+	base := serviceMemoryDatagram(t, network, configuration)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	recording := newRecordingDatagram(base, authenticator, serviceWireLimits(t))
+	dissemination := NewDisseminator(1, serviceRetransmitFactor)
+	dissemination.DigestRequired = true
+	self := Member{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       3,
+		SuspicionMultiplier:  5,
+	}, NewTable(), dissemination, random.NewLockedSource(44))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.table.Merge(Update{Member: self, ReporterID: self.NodeID})
+	engine.table.Merge(Update{Member: peer, ReporterID: self.NodeID})
+	clusterID := decodedTestClusterID(t, testClusterID)
+	service := &Service{
+		options:   ServiceOptions{Config: configuration, Authenticator: authenticator, Clock: clock.NewManual(now)},
+		clusterID: clusterID,
+		limits:    serviceWireLimits(t),
+	}
+	loop := &serviceLoop{
+		service:       service,
+		engine:        engine,
+		dissemination: dissemination,
+		activeMembers: []Member{self, peer},
+		datagram:      recording,
+		requestPrefix: 1,
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := loop.sendDigestRound(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !dissemination.DigestRequired {
+		t.Fatal("successful UDP sends cleared digest recovery without a TCP snapshot")
+	}
+	peerPing := config.Endpoint{Host: peer.Host, Port: peer.BasePort}
+	if got := recording.count(wire.MessageSWIMDigest, peerPing); got != 2 {
+		t.Fatalf("digest fallback sends = %d, want 2 retries", got)
+	}
+}
+
+func TestServiceFailedSnapshotResponseDoesNotPublishRepairBarrier(t *testing.T) {
+	now := time.Unix(3950, 0)
+	configuration := serviceTestConfig(t, 1)
+	manualClock := clock.NewManual(now)
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+		Clock:         manualClock,
+		Random:        random.NewLockedSource(45),
+		Store:         newServiceStore(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	service.active.Store(map[uint16]Member{peer.NodeID: peer})
+	payload := mustEncodeGob(t, SnapshotRequest{})
+	frame := tcpServiceTestFrameWithPayload(service.clusterID, peer.NodeID, wire.RequestID{92}, now, wire.MessageSWIMSnapshotRequest, payload)
+
+	serverConnection, clientConnection := net.Pipe()
+	if err := clientConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stream := wire.NewTCPFrameStream(serverConnection, service.options.Authenticator, service.limits, time.Second)
+	defer stream.Close()
+	snapshotRequested := make(chan struct{})
+	go func() {
+		event := <-service.events
+		request, ok := event.(tcpSnapshotServiceEvent)
+		if !ok {
+			close(snapshotRequested)
+			return
+		}
+		request.response <- snapshotResult{
+			members:          []Member{{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}, peer},
+			digestGeneration: 7,
+		}
+		close(snapshotRequested)
+	}()
+
+	service.handleTCPSnapshot(testContext(t), stream, frame)
+	<-snapshotRequested
+	select {
+	case event := <-service.events:
+		t.Fatalf("failed snapshot response published repair barrier: %#v", event)
+	default:
+	}
+}
+
 func TestServiceJoinUsesSnapshotPersistAnnounceAcceptOrder(t *testing.T) {
 	now := time.Unix(4000, 0)
 	network := transport.NewMemoryNetwork()
