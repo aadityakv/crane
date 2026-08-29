@@ -187,6 +187,44 @@ func TestSupervisorDoesNotLetEarlierNilCancellationMaskLaterFailure(t *testing.T
 	<-earlier.returned
 }
 
+func TestSupervisorKeepsNilCompletionLinearizedBeforeCancellationUnexpectedWhenDeliveryIsDelayed(t *testing.T) {
+	causality := &supervisorCausality{}
+	ready := make(chan struct{})
+	close(ready)
+	linearized := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	earlierDelivery := make(chan completion, 1)
+	go func() {
+		result := causality.linearizeCompletion(0, nil, ready, context.Background())
+		close(linearized)
+		<-releaseDelivery
+		earlierDelivery <- result
+	}()
+	<-linearized
+
+	laterFailure := errors.New("later listener failed")
+	later := causality.linearizeCompletion(1, laterFailure, ready, context.Background())
+	derivedContext, cancel := context.WithCancelCause(context.Background())
+	causality.initiateCancellation(cancel)
+	if !errors.Is(context.Cause(derivedContext), errSupervisorShutdown) {
+		t.Fatalf("derived context cause = %v, want supervisor shutdown", context.Cause(derivedContext))
+	}
+	close(releaseDelivery)
+	earlier := <-earlierDelivery
+
+	states := []serviceState{
+		{service: newFakeService("earlier")},
+		{service: newFakeService("later")},
+	}
+	err := selectFailure(states, []completion{earlier, later})
+	if err == nil || !strings.Contains(err.Error(), "earlier") || !strings.Contains(err.Error(), "exited unexpectedly") {
+		t.Fatalf("selectFailure error = %v, want earlier unexpected nil completion", err)
+	}
+	if errors.Is(err, laterFailure) {
+		t.Fatalf("selectFailure error = %v, later failure masked earlier unexpected completion", err)
+	}
+}
+
 func TestSupervisorRejectsDuplicateServiceNames(t *testing.T) {
 	first := newFakeService("duplicate")
 	second := newFakeService("duplicate")

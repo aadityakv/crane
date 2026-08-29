@@ -19,13 +19,38 @@ type serviceState struct {
 }
 
 type completion struct {
-	index        int
-	err          error
-	ready        bool
-	contextCause error
+	index                 int
+	err                   error
+	ready                 bool
+	cancellationInitiated bool
+	parentCause           error
 }
 
 var errSupervisorShutdown = errors.New("supervisor initiated shutdown")
+
+type supervisorCausality struct {
+	mu                    sync.Mutex
+	cancellationInitiated bool
+}
+
+func (c *supervisorCausality) linearizeCompletion(index int, err error, ready <-chan struct{}, parent context.Context) completion {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return completion{
+		index:                 index,
+		err:                   err,
+		ready:                 channelClosed(ready),
+		cancellationInitiated: c.cancellationInitiated,
+		parentCause:           context.Cause(parent),
+	}
+}
+
+func (c *supervisorCausality) initiateCancellation(cancel context.CancelCauseFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cancellationInitiated = true
+	cancel(errSupervisorShutdown)
+}
 
 // NewSupervisor constructs a Supervisor for services. It does not start any
 // services; Run validates service names before it starts them.
@@ -45,7 +70,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 
 	serviceCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(errSupervisorShutdown)
+	causality := &supervisorCausality{}
 
 	states := make([]serviceState, len(s.services))
 	for index, service := range s.services {
@@ -67,12 +92,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}()
 		go func() {
 			err := state.service.Run(serviceCtx)
-			completions <- completion{
-				index:        index,
-				err:          err,
-				ready:        channelClosed(state.ready),
-				contextCause: context.Cause(serviceCtx),
-			}
+			completions <- causality.linearizeCompletion(index, err, state.ready, ctx)
 		}()
 	}
 
@@ -117,7 +137,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 	}
 
-	cancel(errSupervisorShutdown)
+	causality.initiateCancellation(cancel)
 	readinessWG.Wait()
 	for completedCount < len(states) {
 		record(<-completions)
@@ -150,7 +170,7 @@ func startupFailure(name string, err error) error {
 func selectFailure(states []serviceState, completed []completion) error {
 	for index, state := range states {
 		result := completed[index]
-		if isCancellation(result.err, result.contextCause) {
+		if isCancellation(result) {
 			continue
 		}
 		if !result.ready {
@@ -168,14 +188,14 @@ func runningFailure(name string, err error) error {
 	return fmt.Errorf("service %q failed: %w", name, err)
 }
 
-func isCancellation(err, contextErr error) bool {
-	if err == nil && contextErr != nil {
+func isCancellation(result completion) bool {
+	if result.err == nil && (result.cancellationInitiated || result.parentCause != nil) {
 		return true
 	}
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(result.err, context.Canceled) {
 		return true
 	}
-	return errors.Is(err, context.DeadlineExceeded) && errors.Is(contextErr, context.DeadlineExceeded)
+	return errors.Is(result.err, context.DeadlineExceeded) && errors.Is(result.parentCause, context.DeadlineExceeded)
 }
 
 func channelClosed(channel <-chan struct{}) bool {
