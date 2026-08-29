@@ -237,23 +237,33 @@ func TestRunClusterProcessesContextCancellationGrantsGracePeriod(t *testing.T) {
 
 func TestRunClusterProcessesSecondSignalEscalatesGracefulShutdown(t *testing.T) {
 	nodeBinary := writeClusterHelperWrapper(t)
-	configPath := filepath.Join(t.TempDir(), "node-1.json")
-	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
-		t.Fatal(err)
+	configDirectory := t.TempDir()
+	configPaths := []string{
+		filepath.Join(configDirectory, "node-1.json"),
+		filepath.Join(configDirectory, "node-2.json"),
 	}
-	if err := os.WriteFile(configPath+".delay-stop", []byte("delay\n"), 0o600); err != nil {
-		t.Fatal(err)
+	for _, configPath := range configPaths {
+		if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath+".delay-stop", []byte("delay\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	signals := make(chan os.Signal, 2)
 	result := make(chan error, 1)
 	go func() {
-		result <- runClusterProcesses(ctx, nodeBinary, []string{configPath}, signals, os.Stderr, os.Stderr)
+		result <- runClusterProcesses(ctx, nodeBinary, configPaths, signals, os.Stderr, os.Stderr)
 	}()
-	waitForFile(t, ctx, configPath+".started")
+	for _, configPath := range configPaths {
+		waitForFile(t, ctx, configPath+".started")
+	}
 	signals <- syscall.SIGTERM
-	waitForFile(t, ctx, configPath+".term-received")
+	for _, configPath := range configPaths {
+		waitForFile(t, ctx, configPath+".term-received")
+	}
 	select {
 	case err := <-result:
 		t.Fatalf("launcher returned during first-signal grace period: %v", err)
@@ -269,8 +279,10 @@ func TestRunClusterProcessesSecondSignalEscalatesGracefulShutdown(t *testing.T) 
 	case <-ctx.Done():
 		t.Fatal("second signal did not escalate shutdown")
 	}
-	if fileExists(configPath + ".stopped") {
-		t.Fatal("child completed graceful barrier after second-signal escalation")
+	for _, configPath := range configPaths {
+		if fileExists(configPath + ".stopped") {
+			t.Fatalf("child %q completed graceful barrier after second-signal escalation", configPath)
+		}
 	}
 }
 
