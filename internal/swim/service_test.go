@@ -595,6 +595,77 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 	harness.stop(t)
 }
 
+func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testing.T) {
+	store := newBarrierServiceStore(1, 99, nil)
+	harness := startPersistenceService(t, store)
+	subscriptionContext, cancelSubscription := context.WithCancel(context.Background())
+	defer cancelSubscription()
+	events, err := harness.service.Subscribe(subscriptionContext, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	third := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
+	fourth := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
+	harness.enqueuePeerGossip([]Update{{Member: third, ReporterID: 2}, {Member: fourth, ReporterID: 2}})
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if event.Cause != EventResyncRequired {
+			t.Fatalf("overflow event = %#v, want resync marker", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resync marker")
+	}
+
+	response := make(chan snapshotResult, 1)
+	harness.service.events <- snapshotServiceEvent{response: response}
+	captured := <-response
+	if captured.revision == 0 {
+		t.Fatal("captured snapshot has zero membership revision")
+	}
+	fifth := Member{NodeID: 5, Host: "127.0.0.5", BasePort: 15000, Incarnation: 1, Status: Alive}
+	harness.enqueuePeerGossip([]Update{{Member: fifth, ReporterID: 2}})
+	harness.service.events <- snapshotDeliveredServiceEvent{revision: captured.revision}
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	sixth := Member{NodeID: 6, Host: "127.0.0.6", BasePort: 16000, Incarnation: 1, Status: Alive}
+	harness.enqueuePeerGossip([]Update{{Member: sixth, ReporterID: 2}})
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("stale snapshot acknowledgment resumed subscriber: %#v", event)
+	default:
+	}
+
+	if _, err := harness.service.Snapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	seventh := Member{NodeID: 7, Host: "127.0.0.7", BasePort: 17000, Incarnation: 1, Status: Alive}
+	harness.enqueuePeerGossip([]Update{{Member: seventh, ReporterID: 2}})
+	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if event.Current != seventh {
+			t.Fatalf("fresh snapshot post-delta = %#v, want %#v", event, seventh)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh current-revision snapshot did not resume subscriber")
+	}
+	harness.stop(t)
+}
+
 func TestServiceCanceledSubscribeRequestsDoNotLeakOwnerState(t *testing.T) {
 	store := newBarrierServiceStore(1, 3, nil)
 	harness := startPersistenceService(t, store)

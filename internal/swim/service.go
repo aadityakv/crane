@@ -152,7 +152,7 @@ func (s *Service) Snapshot(ctx context.Context) ([]Member, error) {
 			return nil, err
 		}
 		select {
-		case s.events <- snapshotDeliveredServiceEvent{}:
+		case s.events <- snapshotDeliveredServiceEvent{revision: result.revision}:
 			return result.members, nil
 		case <-s.done:
 			return nil, ErrServiceNotRunning
@@ -392,6 +392,7 @@ type serviceEvent interface{ serviceEvent() }
 type snapshotResult struct {
 	members          []Member
 	digestGeneration uint64
+	revision         uint64
 	err              error
 }
 
@@ -399,7 +400,7 @@ type snapshotServiceEvent struct{ response chan<- snapshotResult }
 
 func (snapshotServiceEvent) serviceEvent() {}
 
-type snapshotDeliveredServiceEvent struct{}
+type snapshotDeliveredServiceEvent struct{ revision uint64 }
 
 func (snapshotDeliveredServiceEvent) serviceEvent() {}
 
@@ -492,20 +493,21 @@ type snapshotServedServiceEvent struct {
 func (snapshotServedServiceEvent) serviceEvent() {}
 
 type serviceLoop struct {
-	service       *Service
-	engine        *Engine
-	dissemination *Disseminator
-	subscriptions *Subscriptions
-	activeMembers []Member
-	datagram      transport.Datagram
-	runContext    context.Context
-	workerContext context.Context
-	workers       *sync.WaitGroup
-	client        *protocolClient
-	admitted      bool
-	requestPrefix uint64
-	requestCount  uint64
-	resyncing     map[uint16]bool
+	service            *Service
+	engine             *Engine
+	dissemination      *Disseminator
+	subscriptions      *Subscriptions
+	activeMembers      []Member
+	datagram           transport.Datagram
+	runContext         context.Context
+	workerContext      context.Context
+	workers            *sync.WaitGroup
+	client             *protocolClient
+	admitted           bool
+	requestPrefix      uint64
+	requestCount       uint64
+	membershipRevision uint64
+	resyncing          map[uint16]bool
 }
 
 func (l *serviceLoop) run(parent context.Context) error {
@@ -514,9 +516,11 @@ func (l *serviceLoop) run(parent context.Context) error {
 		case event := <-l.service.events:
 			switch event := event.(type) {
 			case snapshotServiceEvent:
-				event.response <- snapshotResult{members: l.engine.Snapshot()}
+				event.response <- snapshotResult{members: l.engine.Snapshot(), revision: l.membershipRevision}
 			case snapshotDeliveredServiceEvent:
-				l.subscriptions.markAllResynchronized()
+				if event.revision == l.membershipRevision {
+					l.subscriptions.markAllResynchronized()
+				}
 			case subscribeServiceEvent:
 				if event.state == nil || !event.state.state.CompareAndSwap(subscribeRequestPending, subscribeRequestAccepted) {
 					continue
@@ -538,7 +542,7 @@ func (l *serviceLoop) run(parent context.Context) error {
 			case fatalServiceEvent:
 				return event.err
 			case tcpSnapshotServiceEvent:
-				event.response <- snapshotResult{members: l.engine.Snapshot(), digestGeneration: l.dissemination.digestGeneration}
+				event.response <- snapshotResult{members: l.engine.Snapshot(), digestGeneration: l.dissemination.digestGeneration, revision: l.membershipRevision}
 			case joinAdmissionServiceEvent:
 				if err := l.handleJoinAdmission(event); err != nil {
 					return err
@@ -1171,6 +1175,12 @@ func (l *serviceLoop) executeEffects(ctx context.Context, effects Effects) error
 		}
 	}
 	if len(effects.Events) > 0 {
+		for range effects.Events {
+			l.membershipRevision++
+			if l.membershipRevision == 0 {
+				l.membershipRevision++
+			}
+		}
 		if eventsChangeActiveMembership(effects.Events) {
 			l.refreshActiveMembership()
 		}
