@@ -115,10 +115,19 @@ func resolveLimits(limits Limits) (Limits, error) {
 
 func effectiveLimit(message MessageType, limits Limits) int {
 	limit := limits.MaxFrameSize
-	if message == MessageSWIMPing && limits.MaxSWIMDatagramSize < limit {
+	if isSWIMDatagramMessage(message) && limits.MaxSWIMDatagramSize < limit {
 		limit = limits.MaxSWIMDatagramSize
 	}
 	return limit
+}
+
+func isSWIMDatagramMessage(message MessageType) bool {
+	switch message {
+	case MessageSWIMPing, MessageSWIMAck, MessageSWIMPingReq, MessageSWIMIndirectAck, MessageSWIMGossip, MessageSWIMDigest:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateHeader(header Header, limits Limits) error {

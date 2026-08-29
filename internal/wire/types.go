@@ -34,6 +34,35 @@ type MessageType uint16
 const (
 	// MessageSWIMPing carries a SWIM direct-probe datagram payload.
 	MessageSWIMPing MessageType = 1
+	// MessageSWIMAck carries a SWIM direct-probe acknowledgement datagram payload.
+	MessageSWIMAck MessageType = 2
+	// MessageSWIMPingReq carries a SWIM indirect-probe request datagram payload.
+	MessageSWIMPingReq MessageType = 3
+	// MessageSWIMIndirectAck carries a relayed SWIM acknowledgement datagram payload.
+	MessageSWIMIndirectAck MessageType = 4
+	// MessageSWIMGossip carries membership updates without a probe payload.
+	MessageSWIMGossip MessageType = 5
+	// MessageSWIMDigest asks an active peer to resynchronize over TCP.
+	MessageSWIMDigest MessageType = 6
+	// MessageSWIMJoinRequest starts the authenticated two-step admission exchange.
+	MessageSWIMJoinRequest MessageType = 7
+	// MessageSWIMJoinSnapshot returns the seed's membership view to a joining node.
+	MessageSWIMJoinSnapshot MessageType = 8
+	// MessageSWIMJoinAnnounce proposes a durably prepared Alive incarnation.
+	MessageSWIMJoinAnnounce MessageType = 9
+	// MessageSWIMJoinAccepted acknowledges the exact admitted incarnation.
+	MessageSWIMJoinAccepted MessageType = 10
+	// MessageSWIMSnapshotRequest asks an active peer for a complete membership view.
+	MessageSWIMSnapshotRequest MessageType = 11
+	// MessageSWIMSnapshotResponse returns a complete membership view to an active peer.
+	MessageSWIMSnapshotResponse MessageType = 12
+	// MessageSWIMError carries an authentication-safe TCP protocol failure.
+	MessageSWIMError MessageType = 13
+
+	// MessageSWIMACK preserves the conventional all-caps ACK spelling.
+	MessageSWIMACK = MessageSWIMAck
+	// MessageSWIMIndirectACK preserves the conventional all-caps ACK spelling.
+	MessageSWIMIndirectACK = MessageSWIMIndirectAck
 )
 
 // Codec identifies the concrete payload serialization used inside a frame.

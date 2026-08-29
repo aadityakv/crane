@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 )
@@ -128,6 +129,50 @@ func TestFrameRejectsSWIMDatagramOver1200Bytes(t *testing.T) {
 	payload := make([]byte, limits.MaxSWIMDatagramSize-overhead+1)
 	if _, err := Encode(testHeader(), payload, NewHMACAuthenticator(testKey), limits); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("oversized SWIM Encode error = %v", err)
+	}
+}
+
+func TestFrameRejectsEverySWIMDatagramTypeOver1200BytesOnDecode(t *testing.T) {
+	auth := NewHMACAuthenticator([]byte("0123456789abcdef0123456789abcdef"))
+	limits := DefaultLimits()
+	overhead := FixedHeaderSize + MACSize
+	payload := make([]byte, limits.MaxSWIMDatagramSize-overhead+1)
+	encodeLimits := limits
+	encodeLimits.MaxSWIMDatagramSize++
+
+	messageTypes := []MessageType{
+		MessageSWIMPing,
+		MessageSWIMAck,
+		MessageSWIMPingReq,
+		MessageSWIMIndirectAck,
+		MessageSWIMGossip,
+		MessageSWIMDigest,
+	}
+	for _, messageType := range messageTypes {
+		t.Run(fmt.Sprint(messageType), func(t *testing.T) {
+			header := Header{Version: Version1, Message: messageType, SenderID: 1, Codec: CodecGob}
+			encoded, err := Encode(header, payload, auth, encodeLimits)
+			if err != nil {
+				t.Fatalf("Encode with enlarged datagram limit: %v", err)
+			}
+			if _, err := Decode(encoded, auth, limits); !errors.Is(err, ErrTooLarge) {
+				t.Fatalf("Decode %d-byte datagram error = %v, want ErrTooLarge", len(encoded), err)
+			}
+		})
+	}
+}
+
+func TestFrameDoesNotApplyDatagramLimitToSWIMTCPMessages(t *testing.T) {
+	auth := NewHMACAuthenticator([]byte("0123456789abcdef0123456789abcdef"))
+	limits := DefaultLimits()
+	payload := make([]byte, limits.MaxSWIMDatagramSize)
+	header := Header{Version: Version1, Message: MessageSWIMJoinRequest, SenderID: 1, Codec: CodecGob}
+	encoded, err := Encode(header, payload, auth, limits)
+	if err != nil {
+		t.Fatalf("Encode TCP message over datagram limit: %v", err)
+	}
+	if _, err := Decode(encoded, auth, limits); err != nil {
+		t.Fatalf("Decode TCP message over datagram limit: %v", err)
 	}
 }
 
