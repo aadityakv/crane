@@ -111,17 +111,19 @@ func (c NodeConfig) Validate() error {
 	if err := validateUUID(c.ClusterID); err != nil {
 		return err
 	}
-	if c.BindHost == "" {
-		return fmt.Errorf("bind host is empty")
+	if err := validateBindHost(c.BindHost); err != nil {
+		return err
 	}
 	if err := validateAdvertiseHost(c.AdvertiseHost); err != nil {
 		return err
 	}
-	if _, err := c.BindEndpoint(ServiceRaftRPC); err != nil {
-		return fmt.Errorf("derive bind endpoint: %w", err)
-	}
-	if _, err := c.AdvertiseEndpoint(ServiceRaftRPC); err != nil {
-		return fmt.Errorf("derive advertise endpoint: %w", err)
+	for _, service := range Services() {
+		if _, err := c.BindEndpoint(service.Service); err != nil {
+			return fmt.Errorf("derive bind endpoint for %s: %w", service.Name, err)
+		}
+		if _, err := c.AdvertiseEndpoint(service.Service); err != nil {
+			return fmt.Errorf("derive advertise endpoint for %s: %w", service.Name, err)
+		}
 	}
 	if _, err := ParseEndpoint(c.Introducer); err != nil {
 		return fmt.Errorf("invalid introducer: %w", err)
@@ -188,13 +190,50 @@ func validateUUID(value string) error {
 }
 
 func validateAdvertiseHost(host string) error {
-	if host == "" {
-		return fmt.Errorf("advertise host is empty")
+	if err := validateHost(host); err != nil {
+		return fmt.Errorf("invalid advertise host: %w", err)
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
 		return fmt.Errorf("advertise host must not be a wildcard address")
 	}
 	return nil
+}
+
+func validateBindHost(host string) error {
+	if err := validateHost(host); err != nil {
+		return fmt.Errorf("invalid bind host: %w", err)
+	}
+	return nil
+}
+
+func validateHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("host is empty")
+	}
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	if len(host) > 253 {
+		return fmt.Errorf("DNS host exceeds 253 characters")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return fmt.Errorf("DNS host contains an invalid label length")
+		}
+		if !isASCIIAlphaNumeric(label[0]) || !isASCIIAlphaNumeric(label[len(label)-1]) {
+			return fmt.Errorf("DNS labels must start and end with an alphanumeric character")
+		}
+		for i := 1; i < len(label)-1; i++ {
+			if label[i] != '-' && !isASCIIAlphaNumeric(label[i]) {
+				return fmt.Errorf("DNS labels may contain only ASCII letters, digits, and hyphens")
+			}
+		}
+	}
+	return nil
+}
+
+func isASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
 
 func validateStorageDir(path string) error {
@@ -222,6 +261,11 @@ func validateSecretFile(path string) error {
 	if info.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("cluster secret file permissions must not grant group or other access")
 	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open cluster secret file: %w", err)
+	}
+	defer file.Close()
 	return nil
 }
 

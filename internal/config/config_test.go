@@ -46,7 +46,16 @@ func TestNodeConfigValidation(t *testing.T) {
 		secret os.FileMode
 	}{
 		{name: "zero_node_id", mutate: func(c *NodeConfig) { c.NodeID = 0 }},
+		{name: "base_port_zero_for_service_offset_zero", mutate: func(c *NodeConfig) {
+			c.BasePort = 0
+			c.RaftVoters[0].Endpoint = "127.0.0.1:8"
+		}},
 		{name: "wildcard_advertise_host", mutate: func(c *NodeConfig) { c.AdvertiseHost = "0.0.0.0" }},
+		{name: "malformed_bind_host", mutate: func(c *NodeConfig) { c.BindHost = "bad host" }},
+		{name: "malformed_advertise_host", mutate: func(c *NodeConfig) {
+			c.AdvertiseHost = "bad host"
+			c.RaftVoters[0].Endpoint = "bad host:8008"
+		}},
 		{name: "base_port_overflow", mutate: func(c *NodeConfig) { c.BasePort = 65535 }},
 		{name: "duplicate_voter_id", mutate: func(c *NodeConfig) { c.RaftVoters[1].NodeID = 1 }},
 		{name: "duplicate_voter_endpoint", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "127.0.0.1:8008" }},
@@ -69,6 +78,28 @@ func TestNodeConfigValidation(t *testing.T) {
 				t.Fatal("Validate succeeded")
 			}
 		})
+	}
+}
+
+func TestNodeConfigRejectsUnreadableSecret(t *testing.T) {
+	secret := createSecret(t, 0o000)
+	if file, err := os.Open(secret); err == nil {
+		file.Close()
+		t.Skip("current user can read a mode 000 file on this filesystem")
+	}
+	cfg := validConfig(secret)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted an unreadable cluster secret")
+	}
+}
+
+func TestNodeConfigAcceptsDNSHost(t *testing.T) {
+	cfg := validConfig(createSecret(t, 0o600))
+	cfg.BindHost = "localhost"
+	cfg.AdvertiseHost = "node-1.example.test"
+	cfg.RaftVoters[0].Endpoint = "node-1.example.test:8008"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }
 

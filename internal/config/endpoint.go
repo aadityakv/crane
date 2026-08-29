@@ -20,8 +20,8 @@ func ParseEndpoint(value string) (Endpoint, error) {
 	if err != nil {
 		return Endpoint{}, fmt.Errorf("split endpoint %q: %w", value, err)
 	}
-	if host == "" {
-		return Endpoint{}, fmt.Errorf("endpoint host is empty")
+	if err := validateHost(host); err != nil {
+		return Endpoint{}, fmt.Errorf("invalid endpoint host: %w", err)
 	}
 	port, err := strconv.ParseUint(portText, 10, 16)
 	if err != nil {
@@ -40,6 +40,9 @@ func (e Endpoint) String() string {
 
 // BindEndpoint derives this node's listener endpoint for a registered service.
 func (c NodeConfig) BindEndpoint(service Service) (Endpoint, error) {
+	if err := validateBindHost(c.BindHost); err != nil {
+		return Endpoint{}, err
+	}
 	return c.deriveEndpoint(c.BindHost, service)
 }
 
