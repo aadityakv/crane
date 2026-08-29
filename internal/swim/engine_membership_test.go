@@ -71,9 +71,14 @@ func TestSuspicionDistinctReportersShortenWithoutDuplicatesOrExtensions(t *testi
 	if got := engine.ApplyUpdate(Update{Member: withStatus(target, Suspect), ReporterID: 3}, now.Add(2*time.Second)); !reflect.DeepEqual(got, Effects{}) {
 		t.Fatalf("duplicate reporter effects = %#v, want zero", got)
 	}
+	third := engine.ApplyUpdate(Update{Member: withStatus(target, Suspect), ReporterID: 4}, now.Add(2*time.Second))
+	wantThirdDeadline := now.Add(2*time.Second + 20*time.Second/3)
+	if len(third.Timers) != 1 || third.Timers[0].Deadline != wantThirdDeadline {
+		t.Fatalf("third distinct reporter timers = %#v, want deadline %s", third.Timers, wantThirdDeadline)
+	}
 
-	deadline := second.Timers[0].Deadline
-	late := engine.ApplyUpdate(Update{Member: withStatus(target, Suspect), ReporterID: 4}, deadline.Add(-500*time.Millisecond))
+	deadline := third.Timers[0].Deadline
+	late := engine.ApplyUpdate(Update{Member: withStatus(target, Suspect), ReporterID: 5}, deadline.Add(-500*time.Millisecond))
 	if !reflect.DeepEqual(late, Effects{}) {
 		t.Fatalf("late corroboration effects = %#v, want no deadline extension", late)
 	}
@@ -171,4 +176,216 @@ func TestSelfSuspicionPersistsBeforePublishingHigherIncarnationAlive(t *testing.
 	if got := engine.ApplyUpdate(Update{Member: withStatus(self, Suspect), ReporterID: 3}, now.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
 		t.Fatalf("stale self suspicion effects = %#v, want zero", got)
 	}
+}
+
+func TestSuspicionTimeoutRejectsEarlyAndWrongGenerationBeforeDeadTombstone(t *testing.T) {
+	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+	now := time.Date(2026, 8, 29, 16, 0, 0, 0, time.UTC)
+	suspect := engine.ApplyUpdate(Update{Member: withStatus(target, Suspect), ReporterID: self.NodeID}, now)
+	deadline := suspect.Timers[0].Deadline
+
+	if got := engine.HandleSuspicionTimeout(target.NodeID, target.Incarnation+1, deadline); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("wrong-generation timeout effects = %#v, want zero", got)
+	}
+	if got := engine.HandleSuspicionTimeout(target.NodeID, target.Incarnation, deadline.Add(-time.Nanosecond)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("early timeout effects = %#v, want zero", got)
+	}
+	if got := engine.table.MustGet(target.NodeID).Status; got != Suspect {
+		t.Fatalf("status before deadline = %v, want Suspect", got)
+	}
+
+	effects := engine.HandleSuspicionTimeout(target.NodeID, target.Incarnation, deadline)
+	if got := engine.table.MustGet(target.NodeID).Status; got != Dead {
+		t.Fatalf("status at deadline = %v, want Dead", got)
+	}
+	if len(effects.Events) != 1 || effects.Events[0].Current.Status != Dead {
+		t.Fatalf("death effects = %#v, want one Dead event", effects)
+	}
+	wantDeadUpdate := Update{Member: withStatus(target, Dead), ReporterID: self.NodeID}
+	if batch := mustTakeForMembers(t, engine.dissemination, 1, 1, countEncoder); !reflect.DeepEqual(batch, []Update{wantDeadUpdate}) {
+		t.Fatalf("disseminated updates = %#v, want %#v", batch, []Update{wantDeadUpdate})
+	}
+	tombstone, ok := timerOfKind(effects, TimerTombstone)
+	if !ok {
+		t.Fatalf("death effects = %#v, want tombstone timer", effects)
+	}
+	wantTombstone := TimerRequest{
+		Kind:        TimerTombstone,
+		NodeID:      target.NodeID,
+		Incarnation: target.Incarnation,
+		Status:      Dead,
+		Deadline:    deadline.Add(50 * time.Second),
+	}
+	if tombstone != wantTombstone {
+		t.Fatalf("tombstone timer = %#v, want %#v", tombstone, wantTombstone)
+	}
+	if got := engine.HandleSuspicionTimeout(target.NodeID, target.Incarnation, deadline.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("duplicate suspicion timeout effects = %#v, want zero", got)
+	}
+}
+
+func TestTombstoneRetainsUntilExactDeadlineThenExpiresIdempotently(t *testing.T) {
+	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+	now := time.Date(2026, 8, 29, 16, 10, 0, 0, time.UTC)
+
+	effects := engine.ApplyUpdate(Update{Member: withStatus(target, Dead), ReporterID: 3}, now)
+	timer, ok := timerOfKind(effects, TimerTombstone)
+	if !ok {
+		t.Fatalf("dead effects = %#v, want tombstone timer", effects)
+	}
+	if timer.Deadline != now.Add(50*time.Second) {
+		t.Fatalf("tombstone deadline = %s, want %s", timer.Deadline, now.Add(50*time.Second))
+	}
+	if got := engine.ApplyUpdate(Update{Member: withStatus(target, Dead), ReporterID: 4}, now.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("duplicate Dead effects = %#v, want zero without retention extension", got)
+	}
+	if tracked := engine.tombstones[target.NodeID].deadline; tracked != timer.Deadline {
+		t.Fatalf("duplicate Dead changed deadline to %s, want %s", tracked, timer.Deadline)
+	}
+	if got := engine.ExpireTombstone(target.NodeID, target.Incarnation, Dead, timer.Deadline.Add(-time.Nanosecond)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("early expiry effects = %#v, want zero", got)
+	}
+	if _, exists := engine.table.Get(target.NodeID); !exists {
+		t.Fatal("tombstone disappeared before its deadline")
+	}
+
+	if got := engine.ExpireTombstone(target.NodeID, target.Incarnation, Dead, timer.Deadline); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("expiry effects = %#v, want zero", got)
+	}
+	if _, exists := engine.table.Get(target.NodeID); exists {
+		t.Fatal("tombstone remained at its deadline")
+	}
+	if got := engine.ExpireTombstone(target.NodeID, target.Incarnation, Dead, timer.Deadline.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("duplicate expiry effects = %#v, want zero", got)
+	}
+}
+
+func TestTombstoneSeverityReplacementMakesOldTimerHarmless(t *testing.T) {
+	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+	now := time.Date(2026, 8, 29, 16, 20, 0, 0, time.UTC)
+	deadEffects := engine.ApplyUpdate(Update{Member: withStatus(target, Dead), ReporterID: 3}, now)
+	deadTimer, _ := timerOfKind(deadEffects, TimerTombstone)
+
+	leftEffects := engine.ApplyUpdate(Update{Member: withStatus(target, Left), ReporterID: 4}, now.Add(time.Second))
+	leftTimer, ok := timerOfKind(leftEffects, TimerTombstone)
+	if !ok || leftTimer.Status != Left || !leftTimer.Deadline.After(deadTimer.Deadline) {
+		t.Fatalf("Left timer = %#v after Dead timer %#v", leftTimer, deadTimer)
+	}
+	if len(engine.tombstones) != 1 {
+		t.Fatalf("tracked tombstones = %d, want one current generation", len(engine.tombstones))
+	}
+	engine.ExpireTombstone(target.NodeID, target.Incarnation, Dead, deadTimer.Deadline)
+	if got := engine.table.MustGet(target.NodeID).Status; got != Left {
+		t.Fatalf("old Dead expiry changed status to %v, want Left", got)
+	}
+	engine.ExpireTombstone(target.NodeID, target.Incarnation, Left, leftTimer.Deadline)
+	if _, exists := engine.table.Get(target.NodeID); exists {
+		t.Fatal("current Left tombstone remained after expiry")
+	}
+}
+
+func TestTombstoneOldGenerationCannotEvictHigherIncarnationRejoin(t *testing.T) {
+	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Host: "old", BasePort: 8002, Incarnation: 4, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+	now := time.Date(2026, 8, 29, 16, 30, 0, 0, time.UTC)
+	deadEffects := engine.ApplyUpdate(Update{Member: withStatus(target, Dead), ReporterID: 3}, now)
+	deadTimer, _ := timerOfKind(deadEffects, TimerTombstone)
+
+	if got := engine.ApplyUpdate(Update{Member: target, ReporterID: target.NodeID}, now.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("equal-incarnation resurrection effects = %#v, want zero", got)
+	}
+	rejoined := Member{NodeID: target.NodeID, Host: "new", BasePort: 8102, Incarnation: 5, Status: Alive}
+	engine.ApplyUpdate(Update{Member: rejoined, ReporterID: target.NodeID}, now.Add(2*time.Second))
+	engine.ExpireTombstone(target.NodeID, target.Incarnation, Dead, deadTimer.Deadline)
+	if got := engine.table.MustGet(target.NodeID); got != rejoined {
+		t.Fatalf("old tombstone timer changed rejoined member to %#v, want %#v", got, rejoined)
+	}
+	if len(engine.tombstones) != 0 {
+		t.Fatalf("tracked tombstones after rejoin = %d, want zero", len(engine.tombstones))
+	}
+}
+
+func TestLeavePersistsHigherIncarnationPublishesLeftAndUsesDerivedDeadline(t *testing.T) {
+	self := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	for nodeID := uint16(2); nodeID <= 8; nodeID++ {
+		mustMerge(t, engine.table, Update{Member: Member{NodeID: nodeID, Status: Alive}, ReporterID: nodeID})
+	}
+	now := time.Date(2026, 8, 29, 16, 40, 0, 0, time.UTC)
+
+	effects := engine.Leave(now)
+
+	want := self
+	want.Incarnation = 8
+	want.Status = Left
+	if got := engine.table.MustGet(self.NodeID); got != want {
+		t.Fatalf("self after leave = %#v, want %#v", got, want)
+	}
+	if effects.PersistIncarnation == nil || *effects.PersistIncarnation != want.Incarnation {
+		t.Fatalf("persist effect = %#v, want %d", effects.PersistIncarnation, want.Incarnation)
+	}
+	if len(effects.Events) != 1 || effects.Events[0].Previous != self || effects.Events[0].Current != want {
+		t.Fatalf("leave events = %#v", effects.Events)
+	}
+	wantUpdate := Update{Member: want, ReporterID: self.NodeID}
+	if batch := mustTakeForMembers(t, engine.dissemination, 1, 7, countEncoder); !reflect.DeepEqual(batch, []Update{wantUpdate}) {
+		t.Fatalf("disseminated updates = %#v, want %#v", batch, []Update{wantUpdate})
+	}
+	leaveTimer, ok := timerOfKind(effects, TimerLeaveDeadline)
+	if !ok || leaveTimer.Deadline != now.Add(12*time.Second) {
+		t.Fatalf("leave deadline timer = %#v, want %s", leaveTimer, now.Add(12*time.Second))
+	}
+	if _, ok := timerOfKind(effects, TimerTombstone); !ok {
+		t.Fatalf("leave effects = %#v, want tombstone timer", effects)
+	}
+	if got := engine.Leave(now.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("duplicate leave effects = %#v, want zero", got)
+	}
+	if got := engine.table.MustGet(self.NodeID); got != want {
+		t.Fatalf("duplicate leave changed self to %#v, want %#v", got, want)
+	}
+}
+
+func TestSelfDeadAndLeftAreSeverityTransitionsNotSuspicionRefutations(t *testing.T) {
+	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	now := time.Date(2026, 8, 29, 16, 50, 0, 0, time.UTC)
+
+	dead := engine.ApplyUpdate(Update{Member: withStatus(self, Dead), ReporterID: 2}, now)
+	if got := engine.table.MustGet(self.NodeID); got.Incarnation != self.Incarnation || got.Status != Dead {
+		t.Fatalf("self after Dead = %#v, want same-incarnation Dead", got)
+	}
+	if dead.PersistIncarnation != nil {
+		t.Fatalf("Dead persist effect = %#v, want nil", dead.PersistIncarnation)
+	}
+	left := engine.ApplyUpdate(Update{Member: withStatus(self, Left), ReporterID: 3}, now.Add(time.Second))
+	if got := engine.table.MustGet(self.NodeID); got.Incarnation != self.Incarnation || got.Status != Left {
+		t.Fatalf("self after Left = %#v, want same-incarnation Left", got)
+	}
+	if left.PersistIncarnation != nil {
+		t.Fatalf("Left persist effect = %#v, want nil", left.PersistIncarnation)
+	}
+	if got := engine.Leave(now.Add(2 * time.Second)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("leave after observed Left effects = %#v, want zero", got)
+	}
+}
+
+func timerOfKind(effects Effects, kind TimerKind) (TimerRequest, bool) {
+	for _, timer := range effects.Timers {
+		if timer.Kind == kind {
+			return timer, true
+		}
+	}
+	return TimerRequest{}, false
 }

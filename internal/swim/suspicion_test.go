@@ -26,3 +26,23 @@ func TestSuspicionDurationUsesExactCeilingLogarithmAndFiveSecondFloor(t *testing
 		})
 	}
 }
+
+func TestLeaveDurationUsesRetransmitBudgetWithFiveSecondFloor(t *testing.T) {
+	tests := []struct {
+		name               string
+		retransmitMultiple int
+		probeInterval      time.Duration
+		aliveMembers       int
+		want               time.Duration
+	}{
+		{name: "floor", retransmitMultiple: 3, probeInterval: time.Second, aliveMembers: 1, want: 5 * time.Second},
+		{name: "cluster scaled", retransmitMultiple: 3, probeInterval: time.Second, aliveMembers: 8, want: 12 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := leaveDuration(test.retransmitMultiple, test.probeInterval, test.aliveMembers); got != test.want {
+				t.Fatalf("leaveDuration(%d, %s, %d) = %s, want %s", test.retransmitMultiple, test.probeInterval, test.aliveMembers, got, test.want)
+			}
+		})
+	}
+}

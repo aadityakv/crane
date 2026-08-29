@@ -40,6 +40,7 @@ type Engine struct {
 	activeProbes  map[uint64]*activeProbe
 	relayProbes   map[relayProbeKey]relayProbe
 	suspicions    map[uint16]*suspicionState
+	tombstones    map[uint16]tombstoneState
 }
 
 type probePhase uint8
@@ -96,6 +97,7 @@ func NewEngine(config EngineConfig, table *Table, dissemination *Disseminator, s
 		activeProbes:  make(map[uint64]*activeProbe),
 		relayProbes:   make(map[relayProbeKey]relayProbe),
 		suspicions:    make(map[uint16]*suspicionState),
+		tombstones:    make(map[uint16]tombstoneState),
 	}, nil
 }
 

@@ -43,6 +43,10 @@ const (
 	TimerIndirectProbe
 	TimerRelayProbe
 	TimerSuspicion
+	TimerTombstone
+	// TimerLeaveDeadline bounds graceful dissemination; it has no engine
+	// callback because the service owner uses it to close its cleanup context.
+	TimerLeaveDeadline
 )
 
 // TimerRequest asks the event-loop owner to invoke a generation-specific
@@ -54,6 +58,7 @@ type TimerRequest struct {
 	Sequence uint64
 	// Incarnation makes membership timers generation-specific.
 	Incarnation uint64
+	Status      Status
 	Deadline    time.Time
 }
 
