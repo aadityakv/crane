@@ -89,3 +89,11 @@ func TestReplayGuardExpiresEntriesFromMessageTimestamp(t *testing.T) {
 		t.Fatalf("unexpired entry error = %v", err)
 	}
 }
+
+func TestReplayGuardWithNilClockFailsClosed(t *testing.T) {
+	guard := NewReplayGuard(nil, 2*time.Minute, 30*time.Second, 100)
+
+	if err := guard.Accept(1, RequestID{1}, time.Unix(1000, 0)); !errors.Is(err, ErrReplayConfiguration) {
+		t.Fatalf("nil-clock error = %v", err)
+	}
+}

@@ -17,6 +17,8 @@ var (
 	ErrTimestamp = errors.New("wire request timestamp outside permitted window")
 	// ErrReplayCacheFull classifies a request that cannot be verified because the bounded cache is full.
 	ErrReplayCacheFull = errors.New("wire replay cache full")
+	// ErrReplayConfiguration classifies a replay guard that cannot verify requests safely.
+	ErrReplayConfiguration = errors.New("wire replay guard misconfigured")
 )
 
 // ReplayGuard rejects duplicate request IDs while bounding retained replay state.
@@ -72,6 +74,9 @@ func NewReplayGuard(source clock.Clock, window, maxFutureSkew time.Duration, max
 
 // Accept records a fresh sender/request pair or returns a classified rejection.
 func (g *ReplayGuard) Accept(senderID uint16, requestID RequestID, timestamp time.Time) error {
+	if g == nil || g.clock == nil {
+		return ErrReplayConfiguration
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
