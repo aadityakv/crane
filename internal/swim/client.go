@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -169,6 +171,9 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := validateSnapshot(snapshot.Members); err != nil {
 		return joinClientResult{}, err
 	}
+	if err := validateJoinResponder(endpoint, frame.Header.SenderID, snapshot.Members); err != nil {
+		return joinClientResult{}, err
+	}
 	if err := c.acceptResponse(frame); err != nil {
 		return joinClientResult{}, err
 	}
@@ -203,6 +208,40 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 		snapshot: append([]Member(nil), snapshot.Members...),
 		accepted: accepted.Member,
 	}, nil
+}
+
+func validateJoinResponder(endpoint config.Endpoint, senderID uint16, members []Member) error {
+	var responder Member
+	found := false
+	for _, member := range members {
+		if member.NodeID == senderID {
+			responder, found = member, true
+			break
+		}
+	}
+	if !found || (responder.Status != Alive && responder.Status != Suspect) {
+		return fmt.Errorf("%w: first responder %d is not a nonterminal snapshot member", ErrSnapshotProtocol, senderID)
+	}
+	advertised, err := (config.NodeConfig{AdvertiseHost: responder.Host, BasePort: responder.BasePort}).AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	if err != nil {
+		return fmt.Errorf("%w: derive first responder endpoint: %v", ErrSnapshotProtocol, err)
+	}
+	if !sameCanonicalLiteralEndpoint(advertised, endpoint) {
+		return fmt.Errorf("%w: first responder %d advertises %s, dialed %s", ErrSnapshotProtocol, senderID, advertised, endpoint)
+	}
+	return nil
+}
+
+func sameCanonicalLiteralEndpoint(left, right config.Endpoint) bool {
+	if left.Port != right.Port {
+		return false
+	}
+	leftAddress, leftError := netip.ParseAddr(left.Host)
+	rightAddress, rightError := netip.ParseAddr(right.Host)
+	if leftError == nil && rightError == nil {
+		return leftAddress.Unmap() == rightAddress.Unmap()
+	}
+	return strings.EqualFold(strings.TrimSuffix(left.Host, "."), strings.TrimSuffix(right.Host, "."))
 }
 
 func (c *protocolClient) dial(ctx context.Context, endpoint config.Endpoint) (*wire.TCPFrameStream, func(), error) {
