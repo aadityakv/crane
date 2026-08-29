@@ -2,6 +2,40 @@ package swim
 
 import "time"
 
+// PingMessage is the concrete authenticated payload for a direct probe.
+type PingMessage struct {
+	Ping    Ping
+	Updates []Update
+}
+
+// AckMessage is the concrete authenticated payload for a direct acknowledgement.
+type AckMessage struct {
+	Ack     Ack
+	Updates []Update
+}
+
+// PingReqMessage is the concrete authenticated payload for an indirect probe request.
+type PingReqMessage struct {
+	PingReq PingReq
+	Updates []Update
+}
+
+// IndirectAckMessage is the concrete authenticated payload for a relayed acknowledgement.
+type IndirectAckMessage struct {
+	IndirectAck IndirectAck
+	Updates     []Update
+}
+
+// GossipMessage carries only bounded piggyback membership updates.
+type GossipMessage struct {
+	Updates []Update
+}
+
+// DigestMessage asks an active peer to fetch a complete TCP snapshot.
+type DigestMessage struct {
+	Updates []Update
+}
+
 // Ping asks one member to acknowledge one origin-scoped probe sequence.
 type Ping struct {
 	OriginID uint16
