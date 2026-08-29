@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -99,6 +100,31 @@ func TestJoinClientBindsFirstResponderToDialedSeedBeforeReplayOrPersistence(t *t
 	seed.stop(t)
 }
 
+func TestJoinClientAcceptsResolvedResponderMatchingNumericConnectionTarget(t *testing.T) {
+	now := time.Unix(4485, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	endpoint := startSuccessfulJoinServer(t, authenticator, clusterID, now, func(endpoint config.Endpoint) Member {
+		return Member{NodeID: 2, Host: "localhost", BasePort: endpoint.Port - 2, Incarnation: 1, Status: Alive}
+	})
+	resolver := &staticAddressResolver{addresses: map[string][]netip.Addr{
+		"localhost": {netip.MustParseAddr("127.0.0.1")},
+	}}
+	client, err := newProtocolClientWithAddressMatcher(configuration, authenticator, clock.NewManual(now), random.NewLockedSource(195), time.Second, newAddressMatcher(resolver))
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := Member{NodeID: configuration.NodeID, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort}
+	result, err := client.join(testContext(t), endpoint, newServiceStore(1), self)
+	if err != nil {
+		t.Fatalf("join through resolved responder endpoint: %v", err)
+	}
+	if result.seedID != 2 || result.accepted.NodeID != self.NodeID {
+		t.Fatalf("resolved responder join result = %#v", result)
+	}
+}
+
 func startScriptedTCPServer(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, scripts []func(wire.Frame) wire.Frame) config.Endpoint {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -191,6 +217,51 @@ func startJoinSnapshotOnlyServer(t *testing.T, authenticator wire.Authenticator,
 			return
 		}
 		_ = stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, claimed.NodeID, request.Header.RequestID, now, wire.MessageSWIMJoinSnapshot, payload))
+	}()
+	return endpoint
+}
+
+func startSuccessfulJoinServer(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, now time.Time, member func(config.Endpoint) Member) config.Endpoint {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	address := listener.Addr().(*net.TCPAddr)
+	endpoint := config.Endpoint{Host: address.IP.String(), Port: uint16(address.Port)}
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		stream := wire.NewTCPFrameStream(connection, authenticator, clientTestWireLimits(clusterID), time.Second)
+		defer stream.Close()
+		request, err := stream.ReadFrame(context.Background())
+		if err != nil {
+			return
+		}
+		seed := member(endpoint)
+		snapshotPayload, err := wire.EncodeGob(JoinSnapshot{Members: []Member{seed}})
+		if err != nil {
+			return
+		}
+		if stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, seed.NodeID, request.Header.RequestID, now, wire.MessageSWIMJoinSnapshot, snapshotPayload)) != nil {
+			return
+		}
+		announceFrame, err := stream.ReadFrame(context.Background())
+		if err != nil {
+			return
+		}
+		var announce JoinAnnounce
+		if wire.DecodeGob(announceFrame.Payload, &announce) != nil {
+			return
+		}
+		acceptedPayload, err := wire.EncodeGob(JoinAccepted{Member: announce.Member})
+		if err != nil {
+			return
+		}
+		_ = stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, seed.NodeID, announceFrame.Header.RequestID, now, wire.MessageSWIMJoinAccepted, acceptedPayload))
 	}()
 	return endpoint
 }

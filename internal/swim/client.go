@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +41,7 @@ type SnapshotClientOptions struct {
 	Clock         clock.Clock
 	Random        random.Source
 	IOTimeout     time.Duration
+	Resolver      AddressResolver
 }
 
 // SnapshotClient fetches authenticated membership snapshots over one owned
@@ -56,7 +55,7 @@ func NewSnapshotClient(options SnapshotClientOptions) (*SnapshotClient, error) {
 	if err := options.Config.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidServiceOptions, err)
 	}
-	client, err := newProtocolClient(options.Config, options.Authenticator, options.Clock, options.Random, options.IOTimeout)
+	client, err := newProtocolClientWithAddressMatcher(options.Config, options.Authenticator, options.Clock, options.Random, options.IOTimeout, newAddressMatcher(options.Resolver))
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +81,7 @@ type protocolClient struct {
 	requestMu     sync.Mutex
 	requestPrefix uint64
 	requestCount  uint64
+	addresses     *addressMatcher
 }
 
 type joinClientResult struct {
@@ -101,6 +101,10 @@ type pendingSnapshot struct {
 }
 
 func newProtocolClient(configuration config.NodeConfig, authenticator wire.Authenticator, sourceClock clock.Clock, source random.Source, ioTimeout time.Duration) (*protocolClient, error) {
+	return newProtocolClientWithAddressMatcher(configuration, authenticator, sourceClock, source, ioTimeout, newAddressMatcher(nil))
+}
+
+func newProtocolClientWithAddressMatcher(configuration config.NodeConfig, authenticator wire.Authenticator, sourceClock clock.Clock, source random.Source, ioTimeout time.Duration, addresses *addressMatcher) (*protocolClient, error) {
 	if authenticator == nil || sourceClock == nil || source == nil || configuration.NodeID == 0 {
 		return nil, fmt.Errorf("%w: incomplete snapshot client dependencies", ErrInvalidServiceOptions)
 	}
@@ -109,6 +113,9 @@ func newProtocolClient(configuration config.NodeConfig, authenticator wire.Authe
 	}
 	if ioTimeout == 0 {
 		ioTimeout = defaultSnapshotIOTimeout
+	}
+	if addresses == nil {
+		return nil, fmt.Errorf("%w: address matcher is nil", ErrInvalidServiceOptions)
 	}
 	clusterID, err := parseClusterID(configuration.ClusterID)
 	if err != nil {
@@ -126,6 +133,7 @@ func newProtocolClient(configuration config.NodeConfig, authenticator wire.Authe
 		ioTimeout:     ioTimeout,
 		requestPrefix: source.Uint64(),
 		requestCount:  source.Uint64(),
+		addresses:     addresses,
 	}, nil
 }
 
@@ -139,7 +147,7 @@ func (c *protocolClient) snapshot(ctx context.Context, endpoint config.Endpoint)
 }
 
 func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endpoint) (_ *pendingSnapshot, err error) {
-	stream, stopCancellation, err := c.dial(ctx, endpoint)
+	stream, _, stopCancellation, err := c.dial(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +204,7 @@ func (p *pendingSnapshot) close() {
 }
 
 func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, store IncarnationStore, self Member) (joinClientResult, error) {
-	stream, stopCancellation, err := c.dial(ctx, endpoint)
+	stream, remoteEndpoint, stopCancellation, err := c.dial(ctx, endpoint)
 	if err != nil {
 		return joinClientResult{}, err
 	}
@@ -218,7 +226,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := validateSnapshot(snapshot.Members); err != nil {
 		return joinClientResult{}, err
 	}
-	if err := validateJoinResponder(endpoint, frame.Header.SenderID, snapshot.Members); err != nil {
+	if err := validateJoinResponder(ctx, c.addresses, remoteEndpoint, frame.Header.SenderID, snapshot.Members); err != nil {
 		return joinClientResult{}, err
 	}
 	if err := c.acceptResponse(frame); err != nil {
@@ -257,7 +265,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	}, nil
 }
 
-func validateJoinResponder(endpoint config.Endpoint, senderID uint16, members []Member) error {
+func validateJoinResponder(ctx context.Context, addresses *addressMatcher, endpoint config.Endpoint, senderID uint16, members []Member) error {
 	var responder Member
 	found := false
 	for _, member := range members {
@@ -273,38 +281,32 @@ func validateJoinResponder(endpoint config.Endpoint, senderID uint16, members []
 	if err != nil {
 		return fmt.Errorf("%w: derive first responder endpoint: %v", ErrSnapshotProtocol, err)
 	}
-	if !sameCanonicalLiteralEndpoint(advertised, endpoint) {
+	if !addresses.matchesSource(ctx, endpoint, advertised) {
 		return fmt.Errorf("%w: first responder %d advertises %s, dialed %s", ErrSnapshotProtocol, senderID, advertised, endpoint)
 	}
 	return nil
 }
 
-func sameCanonicalLiteralEndpoint(left, right config.Endpoint) bool {
-	if left.Port != right.Port {
-		return false
-	}
-	leftAddress, leftError := netip.ParseAddr(left.Host)
-	rightAddress, rightError := netip.ParseAddr(right.Host)
-	if leftError == nil && rightError == nil {
-		return leftAddress.Unmap() == rightAddress.Unmap()
-	}
-	return strings.EqualFold(strings.TrimSuffix(left.Host, "."), strings.TrimSuffix(right.Host, "."))
-}
-
-func (c *protocolClient) dial(ctx context.Context, endpoint config.Endpoint) (*wire.TCPFrameStream, func(), error) {
+func (c *protocolClient) dial(ctx context.Context, endpoint config.Endpoint) (*wire.TCPFrameStream, config.Endpoint, func(), error) {
 	if ctx == nil {
-		return nil, func() {}, errors.New("dial SWIM snapshot: nil context")
+		return nil, config.Endpoint{}, func() {}, errors.New("dial SWIM snapshot: nil context")
 	}
 	if endpoint.Host == "" || endpoint.Port == 0 {
-		return nil, func() {}, fmt.Errorf("%w: invalid snapshot endpoint %s", ErrSnapshotProtocol, endpoint)
+		return nil, config.Endpoint{}, func() {}, fmt.Errorf("%w: invalid snapshot endpoint %s", ErrSnapshotProtocol, endpoint)
 	}
 	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", endpoint.String())
 	if err != nil {
-		return nil, func() {}, fmt.Errorf("dial SWIM snapshot %s: %w", endpoint, err)
+		return nil, config.Endpoint{}, func() {}, fmt.Errorf("dial SWIM snapshot %s: %w", endpoint, err)
 	}
+	remote, ok := connection.RemoteAddr().(*net.TCPAddr)
+	if !ok || remote.Port <= 0 || remote.Port > 65535 {
+		_ = connection.Close()
+		return nil, config.Endpoint{}, func() {}, fmt.Errorf("%w: invalid remote snapshot endpoint %s", ErrSnapshotProtocol, connection.RemoteAddr())
+	}
+	remoteEndpoint := config.Endpoint{Host: remote.IP.String(), Port: uint16(remote.Port)}
 	stream := wire.NewTCPFrameStream(connection, c.authenticator, c.limits, c.ioTimeout)
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
-	return stream, func() { _ = stop() }, nil
+	return stream, remoteEndpoint, func() { _ = stop() }, nil
 }
 
 func (c *protocolClient) writePayload(ctx context.Context, stream *wire.TCPFrameStream, message wire.MessageType, requestID wire.RequestID, value any) error {

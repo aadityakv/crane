@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"strings"
@@ -284,6 +285,85 @@ func TestServiceDatagramBindsSenderIdentityToTypedSourceEndpoint(t *testing.T) {
 	if _, ok := service.decodeDatagram(transport.Packet{From: peerACK, Data: ackFrame}); !ok {
 		t.Fatal("ACK from advertised ACK endpoint was rejected")
 	}
+}
+
+func TestServiceDatagramSourceUsesCanonicalNumericAndResolvedAddresses(t *testing.T) {
+	now := time.Unix(2055, 0)
+	configuration := serviceTestConfig(t, 1)
+	resolver := &staticAddressResolver{addresses: map[string][]netip.Addr{
+		"localhost": {netip.MustParseAddr("127.0.0.1")},
+	}}
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: authenticator,
+		Clock:         clock.NewManual(now),
+		Random:        random.NewLockedSource(303),
+		Store:         newServiceStore(1),
+		Resolver:      resolver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := Member{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}
+	peer := Member{NodeID: 2, Host: "localhost", BasePort: 12000, Incarnation: 3, Status: Alive}
+	service.admitted.Store(true)
+	service.active.Store(map[uint16]Member{self.NodeID: self, peer.NodeID: peer})
+	clusterID := decodedTestClusterID(t, testClusterID)
+	frame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 82, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 1}}))
+
+	wrongIP := config.Endpoint{Host: "127.0.0.2", Port: peer.BasePort}
+	if event, ok := service.decodeDatagram(transport.Packet{From: wrongIP, Data: frame}); ok {
+		t.Fatalf("same-port packet from wrong resolved IP accepted as %#v", event)
+	}
+	resolvedIP := config.Endpoint{Host: "127.0.0.1", Port: peer.BasePort}
+	if _, ok := service.decodeDatagram(transport.Packet{From: resolvedIP, Data: frame}); !ok {
+		t.Fatal("packet from resolved localhost address was rejected")
+	}
+	secondFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 83, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 2}}))
+	if _, ok := service.decodeDatagram(transport.Packet{From: resolvedIP, Data: secondFrame}); !ok {
+		t.Fatal("second packet from cached localhost address was rejected")
+	}
+	if calls := resolver.callCount("localhost"); calls != 1 {
+		t.Fatalf("localhost resolution calls = %d, want one cached lookup", calls)
+	}
+
+	peer.Host = "2001:0db8:0:0:0:0:0:1"
+	service.active.Store(map[uint16]Member{self.NodeID: self, peer.NodeID: peer})
+	ipv6Frame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 84, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 3}}))
+	canonicalIPv6 := config.Endpoint{Host: "2001:db8::1", Port: peer.BasePort}
+	if _, ok := service.decodeDatagram(transport.Packet{From: canonicalIPv6, Data: ipv6Frame}); !ok {
+		t.Fatal("equivalent IPv6 spelling was rejected")
+	}
+
+	peer.Host = "::ffff:127.0.0.1"
+	service.active.Store(map[uint16]Member{self.NodeID: self, peer.NodeID: peer})
+	mappedFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 85, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 4}}))
+	if _, ok := service.decodeDatagram(transport.Packet{From: resolvedIP, Data: mappedFrame}); !ok {
+		t.Fatal("IPv4-mapped advertised address did not match canonical IPv4 source")
+	}
+}
+
+type staticAddressResolver struct {
+	mu        sync.Mutex
+	addresses map[string][]netip.Addr
+	calls     map[string]int
+}
+
+func (r *staticAddressResolver) LookupNetIP(_ context.Context, _ string, host string) ([]netip.Addr, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.calls == nil {
+		r.calls = make(map[string]int)
+	}
+	r.calls[host]++
+	return append([]netip.Addr(nil), r.addresses[host]...), nil
+}
+
+func (r *staticAddressResolver) callCount(host string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[host]
 }
 
 func TestServiceInvalidDatagramsCannotPoisonReplayCapacity(t *testing.T) {

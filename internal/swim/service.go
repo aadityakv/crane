@@ -49,6 +49,7 @@ type ServiceOptions struct {
 	Random        random.Source
 	Store         IncarnationStore
 	Datagram      transport.Datagram
+	Resolver      AddressResolver
 }
 
 const (
@@ -64,6 +65,7 @@ type Service struct {
 	clusterID [16]byte
 	limits    wire.Limits
 	replay    *wire.ReplayGuard
+	addresses *addressMatcher
 
 	ready       chan struct{}
 	readyOnce   sync.Once
@@ -113,9 +115,10 @@ func NewService(options ServiceOptions) (*Service, error) {
 			serviceFutureSkew,
 			serviceReplayEntries,
 		),
-		ready:  make(chan struct{}),
-		done:   make(chan struct{}),
-		events: make(chan serviceEvent, serviceEventQueueSize),
+		addresses: newAddressMatcher(options.Resolver),
+		ready:     make(chan struct{}),
+		done:      make(chan struct{}),
+		events:    make(chan serviceEvent, serviceEventQueueSize),
 	}
 	service.active.Store(map[uint16]Member{})
 	return service, nil
@@ -327,7 +330,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 		requestCount:  s.options.Random.Uint64(),
 		resyncing:     make(map[uint16]bool),
 	}
-	loop.client, err = newProtocolClient(s.options.Config, s.options.Authenticator, s.options.Clock, s.options.Random, serviceTCPIOTimeout)
+	loop.client, err = newProtocolClientWithAddressMatcher(s.options.Config, s.options.Authenticator, s.options.Clock, s.options.Random, serviceTCPIOTimeout, s.addresses)
 	if err != nil {
 		stopWorkers()
 		return err
@@ -690,7 +693,7 @@ func (s *Service) receiveDatagrams(ctx context.Context, datagram transport.Datag
 			s.enqueueWorkerEvent(ctx, fatalServiceEvent{err: fmt.Errorf("receive SWIM datagram: %w", err)})
 			return
 		}
-		event, ok := s.decodeDatagram(packet)
+		event, ok := s.decodeDatagramContext(ctx, packet)
 		if !ok {
 			continue
 		}
@@ -914,6 +917,10 @@ func (s *Service) closeTCPConnections() {
 }
 
 func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent, bool) {
+	return s.decodeDatagramContext(context.Background(), packet)
+}
+
+func (s *Service) decodeDatagramContext(ctx context.Context, packet transport.Packet) (datagramServiceEvent, bool) {
 	if len(packet.Data) > s.limits.MaxSWIMDatagramSize {
 		return datagramServiceEvent{}, false
 	}
@@ -926,7 +933,7 @@ func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent,
 	}
 	active := s.active.Load().(map[uint16]Member)
 	sender, exists := active[frame.Header.SenderID]
-	if !exists || !matchesDatagramSource(packet.From, sender, frame.Header.Message) {
+	if !exists || !s.matchesDatagramSource(ctx, packet.From, sender, frame.Header.Message) {
 		return datagramServiceEvent{}, false
 	}
 	event := datagramServiceEvent{
@@ -1424,7 +1431,7 @@ func knownDatagramType(message wire.MessageType) bool {
 	}
 }
 
-func matchesDatagramSource(source config.Endpoint, sender Member, message wire.MessageType) bool {
+func (s *Service) matchesDatagramSource(ctx context.Context, source config.Endpoint, sender Member, message wire.MessageType) bool {
 	var sourceService config.Service
 	switch message {
 	case wire.MessageSWIMPing, wire.MessageSWIMPingReq, wire.MessageSWIMGossip, wire.MessageSWIMDigest:
@@ -1435,7 +1442,7 @@ func matchesDatagramSource(source config.Endpoint, sender Member, message wire.M
 		return false
 	}
 	expected, err := (config.NodeConfig{AdvertiseHost: sender.Host, BasePort: sender.BasePort}).AdvertiseEndpoint(sourceService)
-	return err == nil && source == expected
+	return err == nil && s.addresses.matchesSource(ctx, source, expected)
 }
 
 func validDatagramMessage(message any, sender Member, active map[uint16]Member, selfID uint16) bool {
