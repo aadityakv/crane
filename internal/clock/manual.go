@@ -131,15 +131,29 @@ func (t *manualTimer) Reset(duration time.Duration) bool {
 	}
 	t.sendMu.Unlock()
 
+	var due *dueTimer
 	t.clock.mu.Lock()
 	if t.generation == generation && t.resetting {
 		t.clock.serial++
 		t.deadline = deadline
 		t.order = t.clock.serial
-		t.active = true
+		if deadline.After(t.clock.now) {
+			t.active = true
+		} else {
+			t.active = false
+			due = &dueTimer{
+				timer:      t,
+				deadline:   deadline,
+				order:      t.order,
+				generation: generation,
+			}
+		}
 		t.resetting = false
 	}
 	t.clock.mu.Unlock()
+	if due != nil {
+		t.deliver(due.deadline, due.generation)
+	}
 	return wasActive
 }
 

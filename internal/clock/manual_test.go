@@ -1,6 +1,7 @@
 package clock
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -113,4 +114,51 @@ func TestManualClockConcurrentUse(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestManualTimerResetDeliversIfDeadlinePassesDuringReset(t *testing.T) {
+	start := time.Unix(100, 0)
+	c := NewManual(start)
+	timer := c.NewTimer(10 * time.Second)
+	manual := timer.(*manualTimer)
+
+	// Hold the delivery lock so Reset has deterministically entered its
+	// resetting state but cannot finish draining its old event yet.
+	manual.sendMu.Lock()
+	resetDone := make(chan bool, 1)
+	go func() {
+		resetDone <- timer.Reset(time.Second)
+	}()
+	for attempts := 0; attempts < 10000; attempts++ {
+		c.mu.Lock()
+		resetting := manual.resetting
+		c.mu.Unlock()
+		if resetting {
+			break
+		}
+		runtime.Gosched()
+		if attempts == 9999 {
+			t.Fatal("Reset did not enter its resetting state")
+		}
+	}
+
+	c.Advance(2 * time.Second)
+	manual.sendMu.Unlock()
+	if !<-resetDone {
+		t.Fatal("Reset reported an inactive timer")
+	}
+
+	select {
+	case got := <-timer.C():
+		if !got.Equal(start.Add(time.Second)) {
+			t.Fatalf("reset timer fired at %v, want %v", got, start.Add(time.Second))
+		}
+	default:
+		t.Fatal("reset timer remained overdue without a delivery")
+	}
+	select {
+	case got := <-timer.C():
+		t.Fatalf("reset timer fired more than once at %v", got)
+	default:
+	}
 }
