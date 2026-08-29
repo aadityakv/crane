@@ -42,6 +42,7 @@ const (
 	TimerDirectProbe TimerKind = iota
 	TimerIndirectProbe
 	TimerRelayProbe
+	TimerSuspicion
 )
 
 // TimerRequest asks the event-loop owner to invoke a generation-specific
@@ -49,13 +50,18 @@ const (
 type TimerRequest struct {
 	Kind     TimerKind
 	OriginID uint16
+	NodeID   uint16
 	Sequence uint64
-	Deadline time.Time
+	// Incarnation makes membership timers generation-specific.
+	Incarnation uint64
+	Deadline    time.Time
 }
 
 // Effects contains only work the single-owner engine asks its caller to
 // perform. Protocol handlers never perform network, timer, persistence, or
-// subscriber I/O directly.
+// subscriber I/O directly. When PersistIncarnation is non-nil, the caller must
+// durably persist it before executing Events or disseminating the queued local
+// membership update.
 type Effects struct {
 	Outbound           []Outbound
 	Timers             []TimerRequest

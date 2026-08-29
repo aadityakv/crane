@@ -292,8 +292,12 @@ func TestEngineProbeWithoutRelaysStillWaitsForIndirectGenerationOnce(t *testing.
 	if len(effects.Timers) != 1 || effects.Timers[0].Kind != TimerIndirectProbe {
 		t.Fatalf("timers without relays = %#v, want one indirect timer", effects.Timers)
 	}
-	if got := engine.HandleIndirectTimeout(sequence, now.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
-		t.Fatalf("indirect timeout effects = %#v, want zero until Task 10", got)
+	failed := engine.HandleIndirectTimeout(sequence, now.Add(time.Second))
+	if got := engine.table.MustGet(target.NodeID).Status; got != Suspect {
+		t.Fatalf("status after indirect timeout = %v, want Suspect; effects=%#v", got, failed)
+	}
+	if len(failed.Events) != 1 || len(failed.Timers) != 1 || failed.Timers[0].Kind != TimerSuspicion {
+		t.Fatalf("indirect timeout effects = %#v, want suspect event and timer", failed)
 	}
 	if got := engine.HandleIndirectTimeout(sequence, now.Add(2*time.Second)); !reflect.DeepEqual(got, Effects{}) {
 		t.Fatalf("duplicate indirect timeout effects = %#v, want zero", got)

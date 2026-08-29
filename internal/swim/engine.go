@@ -39,6 +39,7 @@ type Engine struct {
 	nextSequence  uint64
 	activeProbes  map[uint64]*activeProbe
 	relayProbes   map[relayProbeKey]relayProbe
+	suspicions    map[uint16]*suspicionState
 }
 
 type probePhase uint8
@@ -94,6 +95,7 @@ func NewEngine(config EngineConfig, table *Table, dissemination *Disseminator, s
 		nextSequence:  sequence,
 		activeProbes:  make(map[uint64]*activeProbe),
 		relayProbes:   make(map[relayProbeKey]relayProbe),
+		suspicions:    make(map[uint16]*suspicionState),
 	}, nil
 }
 
@@ -259,15 +261,17 @@ func (e *Engine) HandleRelayTimeout(originID uint16, sequence uint64, _ time.Tim
 	return Effects{}
 }
 
-// HandleIndirectTimeout consumes only a matching indirect-phase generation.
-// Task 10 attaches suspicion effects to this transition.
-func (e *Engine) HandleIndirectTimeout(sequence uint64, _ time.Time) Effects {
+// HandleIndirectTimeout consumes only a matching indirect-phase generation
+// and turns that full-probe failure into a local suspicion update.
+func (e *Engine) HandleIndirectTimeout(sequence uint64, now time.Time) Effects {
 	probe, exists := e.activeProbes[sequence]
 	if !exists || probe.phase != probeIndirect {
 		return Effects{}
 	}
 	delete(e.activeProbes, sequence)
-	return Effects{}
+	suspect := probe.target
+	suspect.Status = Suspect
+	return e.ApplyUpdate(Update{Member: suspect, ReporterID: e.config.SelfID}, now)
 }
 
 // Snapshot returns the engine owner's immutable, sorted membership view.
