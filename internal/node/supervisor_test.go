@@ -115,6 +115,21 @@ func TestSupervisorTreatsCanceledReturnAfterReadinessAsNormalShutdown(t *testing
 	<-sibling.returned
 }
 
+func TestSupervisorTreatsNilReturnAfterParentCancellationAsNormalShutdown(t *testing.T) {
+	service := newFakeService("graceful")
+	service.returnNilAfterCancellation = true
+	service.markReady()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- NewSupervisor(service).Run(ctx) }()
+
+	<-service.started
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run error = %v, want nil after graceful cancellation cleanup", err)
+	}
+}
+
 func TestSupervisorPreservesNonCancellationFailureAfterParentCancellation(t *testing.T) {
 	service := newFakeService("flush")
 	service.markReady()
@@ -285,18 +300,19 @@ func (c *controlledContext) cancel(err error) {
 }
 
 type fakeService struct {
-	name                    string
-	ready                   chan struct{}
-	started                 chan struct{}
-	finish                  chan error
-	canceled                chan struct{}
-	returned                chan struct{}
-	readyOnce               sync.Once
-	canceledOnce            sync.Once
-	returnedOnce            sync.Once
-	waitAfterCancellation   chan struct{}
-	returnAfterCancellation error
-	events                  chan<- lifecycleEvent
+	name                       string
+	ready                      chan struct{}
+	started                    chan struct{}
+	finish                     chan error
+	canceled                   chan struct{}
+	returned                   chan struct{}
+	readyOnce                  sync.Once
+	canceledOnce               sync.Once
+	returnedOnce               sync.Once
+	waitAfterCancellation      chan struct{}
+	returnAfterCancellation    error
+	returnNilAfterCancellation bool
+	events                     chan<- lifecycleEvent
 }
 
 func newFakeService(name string) *fakeService {
@@ -332,6 +348,9 @@ func (s *fakeService) Run(ctx context.Context) error {
 		}
 		if s.returnAfterCancellation != nil {
 			return s.finishWith(s.returnAfterCancellation)
+		}
+		if s.returnNilAfterCancellation {
+			return s.finishWith(nil)
 		}
 		return s.finishWith(ctx.Err())
 	}

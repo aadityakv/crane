@@ -69,7 +69,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 				index:      index,
 				err:        err,
 				ready:      channelClosed(state.ready),
-				contextErr: serviceCtx.Err(),
+				contextErr: ctx.Err(),
 			}
 		}()
 	}
@@ -167,6 +167,9 @@ func runningFailure(name string, err error) error {
 }
 
 func isCancellation(err, contextErr error) bool {
+	if err == nil && contextErr != nil {
+		return true
+	}
 	if errors.Is(err, context.Canceled) {
 		return true
 	}
