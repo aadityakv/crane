@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,83 @@ func TestSnapshotClientInvalidResponseCannotPoisonReplayCapacity(t *testing.T) {
 	}
 	if snapshot, err := client.snapshot(testContext(t), endpoint); err != nil || len(snapshot) != 1 || snapshot[0].NodeID != 2 {
 		t.Fatalf("valid response after invalid = %#v, error = %v", snapshot, err)
+	}
+}
+
+func TestInternalSnapshotResyncRejectsUnexpectedFirstResponderBeforeReplayAcceptance(t *testing.T) {
+	now := time.Unix(4465, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	validMember := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
+	validPayload := mustEncodeGob(t, SnapshotResponse{Members: []Member{validMember}})
+	errorPayload := mustEncodeGob(t, encodeProtocolError(ErrServiceNotAdmitted))
+
+	for _, test := range []struct {
+		name        string
+		messageType wire.MessageType
+		payload     []byte
+	}{
+		{name: "normal response", messageType: wire.MessageSWIMSnapshotResponse, payload: validPayload},
+		{name: "SWIMError", messageType: wire.MessageSWIMError, payload: errorPayload},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			endpoint := startScriptedTCPServer(t, authenticator, clusterID, []func(wire.Frame) wire.Frame{
+				func(request wire.Frame) wire.Frame {
+					return tcpServiceTestFrameWithPayload(clusterID, 3, request.Header.RequestID, now, test.messageType, test.payload)
+				},
+				func(request wire.Frame) wire.Frame {
+					return tcpServiceTestFrameWithPayload(clusterID, 2, request.Header.RequestID, now, wire.MessageSWIMSnapshotResponse, validPayload)
+				},
+			})
+			client, err := newProtocolClient(configuration, authenticator, clock.NewManual(now), random.NewLockedSource(198), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.replay = wire.NewReplayGuard(client.clock, time.Duration(configuration.Timing.ReplayWindow), serviceFutureSkew, 1)
+			service := &Service{events: make(chan serviceEvent, 2), done: make(chan struct{})}
+			workerContext, cancelWorkers := context.WithCancel(context.Background())
+			defer cancelWorkers()
+			var workers sync.WaitGroup
+			loop := &serviceLoop{
+				service:       service,
+				client:        client,
+				workerContext: workerContext,
+				workers:       &workers,
+				resyncing:     make(map[uint16]bool),
+			}
+			expected := Member{NodeID: 2, Host: endpoint.Host, BasePort: endpoint.Port - 2, Incarnation: 1, Status: Alive}
+
+			loop.startSnapshotResync(expected)
+			first := receiveSnapshotResyncEvent(t, service.events)
+			if !errors.Is(first.err, ErrSnapshotProtocol) {
+				t.Fatalf("unexpected %s sender error = %v, want ErrSnapshotProtocol", test.name, first.err)
+			}
+			delete(loop.resyncing, expected.NodeID)
+
+			loop.startSnapshotResync(expected)
+			second := receiveSnapshotResyncEvent(t, service.events)
+			if second.err != nil || len(second.members) != 1 || second.members[0] != validMember || second.applied == nil {
+				t.Fatalf("valid expected response after unexpected %s = %#v", test.name, second)
+			}
+			second.applied <- ErrSnapshotProtocol
+			workers.Wait()
+		})
+	}
+}
+
+func receiveSnapshotResyncEvent(t *testing.T, events <-chan serviceEvent) snapshotResyncServiceEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		result, ok := event.(snapshotResyncServiceEvent)
+		if !ok {
+			t.Fatalf("snapshot resync event type = %T", event)
+		}
+		return result
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for snapshot resync event")
+		return snapshotResyncServiceEvent{}
 	}
 }
 

@@ -1130,7 +1130,7 @@ func (l *serviceLoop) startSnapshotResync(sender Member) {
 	l.workers.Add(1)
 	go func() {
 		defer l.workers.Done()
-		pending, err := l.client.beginSnapshot(l.workerContext, endpoint)
+		pending, err := l.client.beginSnapshot(l.workerContext, endpoint, sender.NodeID)
 		if err != nil {
 			l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, err: err})
 			return

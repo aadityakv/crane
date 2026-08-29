@@ -138,7 +138,7 @@ func newProtocolClientWithAddressMatcher(configuration config.NodeConfig, authen
 }
 
 func (c *protocolClient) snapshot(ctx context.Context, endpoint config.Endpoint) ([]Member, error) {
-	pending, err := c.beginSnapshot(ctx, endpoint)
+	pending, err := c.beginSnapshot(ctx, endpoint, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +146,7 @@ func (c *protocolClient) snapshot(ctx context.Context, endpoint config.Endpoint)
 	return append([]Member(nil), pending.members...), nil
 }
 
-func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endpoint) (_ *pendingSnapshot, err error) {
+func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endpoint, expectedSenderID uint16) (_ *pendingSnapshot, err error) {
 	stream, _, stopCancellation, err := c.dial(ctx, endpoint)
 	if err != nil {
 		return nil, err
@@ -163,7 +163,7 @@ func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endp
 	if err := c.writePayload(ctx, stream, wire.MessageSWIMSnapshotRequest, requestID, SnapshotRequest{}); err != nil {
 		return nil, err
 	}
-	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMSnapshotResponse, 0)
+	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMSnapshotResponse, expectedSenderID)
 	if err != nil {
 		return nil, err
 	}
