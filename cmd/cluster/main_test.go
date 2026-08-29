@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -168,6 +169,143 @@ func TestRunClusterProcessesSeedFailureDoesNotStartPeers(t *testing.T) {
 	}
 }
 
+func TestRunClusterProcessesContextCancellationGrantsGracePeriod(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configDirectory := t.TempDir()
+	configPaths := make([]string, 3)
+	for index := range configPaths {
+		configPaths[index] = filepath.Join(configDirectory, fmt.Sprintf("node-%d.json", index+1))
+		if err := os.WriteFile(configPaths[index], []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPaths[index]+".delay-stop", []byte("delay\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(configPaths[2]+".stay-alive", []byte("stay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadlineContext, cancelDeadline := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDeadline()
+	runContext, cancelRun := context.WithCancel(deadlineContext)
+	signals := make(chan os.Signal, 1)
+	result := make(chan error, 1)
+	go func() {
+		result <- runClusterProcesses(runContext, nodeBinary, configPaths, signals, os.Stderr, os.Stderr)
+	}()
+	defer func() {
+		for _, configPath := range configPaths {
+			_ = os.WriteFile(configPath+".release-stop", []byte("release\n"), 0o600)
+		}
+		select {
+		case <-result:
+		default:
+			select {
+			case signals <- syscall.SIGTERM:
+			default:
+			}
+		}
+	}()
+
+	for _, configPath := range configPaths {
+		waitForFile(t, deadlineContext, configPath+".started")
+	}
+	cancelRun()
+	for _, configPath := range configPaths {
+		waitForFile(t, deadlineContext, configPath+".term-received")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("launcher returned before graceful barriers released: %v", err)
+	default:
+	}
+	for _, configPath := range configPaths {
+		if err := os.WriteFile(configPath+".release-stop", []byte("release\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runClusterProcesses error = %v, want context cancellation", err)
+		}
+	case <-deadlineContext.Done():
+		t.Fatal("timed out waiting for graceful context shutdown")
+	}
+}
+
+func TestRunClusterProcessesSecondSignalEscalatesGracefulShutdown(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configPath := filepath.Join(t.TempDir(), "node-1.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath+".delay-stop", []byte("delay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	signals := make(chan os.Signal, 2)
+	result := make(chan error, 1)
+	go func() {
+		result <- runClusterProcesses(ctx, nodeBinary, []string{configPath}, signals, os.Stderr, os.Stderr)
+	}()
+	waitForFile(t, ctx, configPath+".started")
+	signals <- syscall.SIGTERM
+	waitForFile(t, ctx, configPath+".term-received")
+	select {
+	case err := <-result:
+		t.Fatalf("launcher returned during first-signal grace period: %v", err)
+	default:
+	}
+
+	signals <- syscall.SIGTERM
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runClusterProcesses error = %v, want clean signal shutdown", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("second signal did not escalate shutdown")
+	}
+	if fileExists(configPath + ".stopped") {
+		t.Fatal("child completed graceful barrier after second-signal escalation")
+	}
+}
+
+func TestDrainChildrenReapsChildAfterGraceExpires(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configPath := filepath.Join(t.TempDir(), "node-1.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath+".delay-stop", []byte("delay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan clusterChildResult, 1)
+	child, err := startClusterChild(1, nodeBinary, configPath, os.Stderr, os.Stderr, results)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	waitForFile(t, ctx, configPath+".started")
+	terminateChildren([]*clusterChild{child}, syscall.SIGTERM)
+	waitForFile(t, ctx, configPath+".term-received")
+
+	err = drainChildrenWithin([]*clusterChild{child}, results, 25*time.Millisecond, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "shutdown exceeded") {
+		t.Fatalf("drainChildrenWithin error = %v, want grace timeout", err)
+	}
+	if child.cmd.ProcessState == nil {
+		t.Fatal("child was not Wait-joined after SIGKILL")
+	}
+	if signalErr := child.cmd.Process.Signal(syscall.Signal(0)); signalErr == nil {
+		t.Fatal("child process still exists after drain returned")
+	}
+}
+
 func TestClusterChildHelper(t *testing.T) {
 	if os.Getenv("CS425_CLUSTER_HELPER") != "1" {
 		return
@@ -230,6 +368,15 @@ func TestClusterChildHelper(t *testing.T) {
 	}
 	select {
 	case <-signals:
+		if err := os.WriteFile(configPath+".term-received", []byte("term\n"), 0o600); err != nil {
+			os.Exit(94)
+		}
+		if fileExists(configPath + ".delay-stop") {
+			released, _ := waitForHelperFile(configPath+".release-stop", 5*time.Second, signals)
+			if !released {
+				return
+			}
+		}
 		recordHelperStopped(configPath)
 	case <-time.After(8 * time.Second):
 		os.Exit(95)

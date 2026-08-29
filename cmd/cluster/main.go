@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	clusterStartupDeadline = 10 * time.Second
-	clusterShutdownGrace   = 10 * time.Second
+	clusterStartupDeadline  = 10 * time.Second
+	clusterShutdownGrace    = 10 * time.Second
+	clusterKillDrainTimeout = 5 * time.Second
 )
 
 func main() {
@@ -141,15 +142,32 @@ func runClusterProcesses(ctx context.Context, nodeBinary string, configPaths []s
 	var cause error
 	var graceTimer *time.Timer
 	var graceDeadline <-chan time.Time
+	forceKilling := false
+	contextDone := ctx.Done()
 	beginShutdown := func(sig os.Signal, err error) {
-		if shuttingDown {
-			terminateChildren(children, syscall.SIGKILL)
-			return
-		}
 		shuttingDown = true
 		cause = err
 		terminateChildren(children, sig)
 		graceTimer = time.NewTimer(clusterShutdownGrace)
+		graceDeadline = graceTimer.C
+	}
+	forceKill := func() {
+		terminateChildren(children, syscall.SIGKILL)
+		if forceKilling {
+			return
+		}
+		forceKilling = true
+		if graceTimer == nil {
+			graceTimer = time.NewTimer(clusterKillDrainTimeout)
+		} else {
+			if !graceTimer.Stop() {
+				select {
+				case <-graceTimer.C:
+				default:
+				}
+			}
+			graceTimer.Reset(clusterKillDrainTimeout)
+		}
 		graceDeadline = graceTimer.C
 	}
 	defer func() {
@@ -171,16 +189,25 @@ func runClusterProcesses(ctx context.Context, nodeBinary string, configPaths []s
 			}
 		case sig := <-signals:
 			if sig != nil {
-				beginShutdown(sig, nil)
+				if shuttingDown {
+					forceKill()
+				} else {
+					beginShutdown(sig, nil)
+				}
 			}
-		case <-ctx.Done():
-			beginShutdown(syscall.SIGTERM, ctx.Err())
+		case <-contextDone:
+			contextDone = nil
+			if !shuttingDown {
+				beginShutdown(syscall.SIGTERM, ctx.Err())
+			}
 		case <-graceDeadline:
-			terminateChildren(children, syscall.SIGKILL)
-			graceDeadline = nil
+			if forceKilling {
+				return errors.Join(cause, fmt.Errorf("cluster child wait after SIGKILL exceeded %s", clusterKillDrainTimeout))
+			}
 			if cause == nil {
 				cause = fmt.Errorf("cluster shutdown exceeded %s", clusterShutdownGrace)
 			}
+			forceKill()
 		}
 	}
 	return cause
@@ -244,13 +271,18 @@ func waitClusterChild(child *clusterChild, results chan<- clusterChildResult) {
 }
 
 func drainChildren(children []*clusterChild, results <-chan clusterChildResult) error {
+	return drainChildrenWithin(children, results, clusterShutdownGrace, clusterKillDrainTimeout)
+}
+
+func drainChildrenWithin(children []*clusterChild, results <-chan clusterChildResult, shutdownGrace, killDrainTimeout time.Duration) error {
 	if len(children) == 0 {
 		return nil
 	}
-	timer := time.NewTimer(clusterShutdownGrace)
+	timer := time.NewTimer(shutdownGrace)
 	defer timer.Stop()
 	remaining := len(children)
 	var failures []error
+	forceKilling := false
 	for remaining > 0 {
 		select {
 		case result := <-results:
@@ -259,8 +291,13 @@ func drainChildren(children []*clusterChild, results <-chan clusterChildResult) 
 				failures = append(failures, fmt.Errorf("node %d shutdown: %w", result.nodeID, result.err))
 			}
 		case <-timer.C:
+			if forceKilling {
+				return errors.Join(append(failures, fmt.Errorf("cluster child wait after SIGKILL exceeded %s", killDrainTimeout))...)
+			}
 			terminateChildren(children, syscall.SIGKILL)
-			return errors.Join(append(failures, fmt.Errorf("cluster shutdown exceeded %s", clusterShutdownGrace))...)
+			failures = append(failures, fmt.Errorf("cluster shutdown exceeded %s", shutdownGrace))
+			forceKilling = true
+			timer.Reset(killDrainTimeout)
 		}
 	}
 	return errors.Join(failures...)
