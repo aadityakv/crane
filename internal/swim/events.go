@@ -80,6 +80,14 @@ func (s *Subscriptions) MarkResynchronized(id uint64) {
 	}
 }
 
+func (s *Subscriptions) markAllResynchronized() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, subscriber := range s.subscribers {
+		subscriber.resynchronization = false
+	}
+}
+
 // Unsubscribe removes id and closes its event channel. It is idempotent.
 func (s *Subscriptions) Unsubscribe(id uint64) {
 	s.mu.Lock()

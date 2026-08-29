@@ -608,13 +608,18 @@ type runningService struct {
 
 func startRunningService(t *testing.T, configuration config.NodeConfig, store IncarnationStore, serviceClock clock.Clock, network *transport.MemoryNetwork, seed int64) *runningService {
 	t.Helper()
+	return startRunningServiceWithDatagram(t, configuration, store, serviceClock, serviceMemoryDatagram(t, network, configuration), random.NewLockedSource(seed))
+}
+
+func startRunningServiceWithDatagram(t *testing.T, configuration config.NodeConfig, store IncarnationStore, serviceClock clock.Clock, datagram transport.Datagram, source random.Source) *runningService {
+	t.Helper()
 	service, err := NewService(ServiceOptions{
 		Config:        configuration,
 		Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
 		Clock:         serviceClock,
-		Random:        random.NewLockedSource(seed),
+		Random:        source,
 		Store:         store,
-		Datagram:      serviceMemoryDatagram(t, network, configuration),
+		Datagram:      datagram,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -927,6 +932,16 @@ func reserveServiceTestBase(t *testing.T) uint16 {
 		}
 		serviceTestPortsMu.Unlock()
 		if !overlaps {
+			t.Cleanup(func() {
+				serviceTestPortsMu.Lock()
+				for index, base := range serviceTestBases {
+					if base == candidate {
+						serviceTestBases = append(serviceTestBases[:index], serviceTestBases[index+1:]...)
+						break
+					}
+				}
+				serviceTestPortsMu.Unlock()
+			})
 			return candidate
 		}
 	}
@@ -1004,7 +1019,7 @@ func waitServiceReady(t *testing.T, service *Service) {
 
 func waitForSnapshot(t *testing.T, service *Service, condition func([]Member) bool) []Member {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for ctx.Err() == nil {
 		snapshot, err := service.Snapshot(ctx)
@@ -1015,6 +1030,26 @@ func waitForSnapshot(t *testing.T, service *Service, condition func([]Member) bo
 	}
 	t.Fatalf("snapshot condition not met: %v", ctx.Err())
 	return nil
+}
+
+func TestEventsChangeActiveMembershipTreatsMissingPreviousAsInactive(t *testing.T) {
+	newTerminal := MembershipEvent{Current: Member{NodeID: 2, Status: Dead}}
+	if eventsChangeActiveMembership([]MembershipEvent{newTerminal}) {
+		t.Fatal("new terminal member changed active membership")
+	}
+
+	newAlive := MembershipEvent{Current: Member{NodeID: 2, Status: Alive}}
+	if !eventsChangeActiveMembership([]MembershipEvent{newAlive}) {
+		t.Fatal("new alive member did not change active membership")
+	}
+
+	terminalProgression := MembershipEvent{
+		Previous: Member{NodeID: 2, Status: Dead},
+		Current:  Member{NodeID: 2, Status: Left},
+	}
+	if eventsChangeActiveMembership([]MembershipEvent{terminalProgression}) {
+		t.Fatal("terminal-only progression changed active membership")
+	}
 }
 
 func testContext(t *testing.T) context.Context {

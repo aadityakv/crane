@@ -223,7 +223,7 @@ func (e *Engine) appliedTransition(effects *Effects, event MembershipEvent, repo
 
 func (e *Engine) aliveMembers() int {
 	alive := 0
-	for _, member := range e.table.Snapshot() {
+	for _, member := range e.table.members {
 		if member.Status == Alive {
 			alive++
 		}

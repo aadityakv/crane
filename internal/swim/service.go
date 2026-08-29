@@ -426,6 +426,7 @@ type serviceLoop struct {
 	engine        *Engine
 	dissemination *Disseminator
 	subscriptions *Subscriptions
+	activeMembers []Member
 	datagram      transport.Datagram
 	workerContext context.Context
 	workers       *sync.WaitGroup
@@ -442,7 +443,9 @@ func (l *serviceLoop) run(parent context.Context) error {
 		case event := <-l.service.events:
 			switch event := event.(type) {
 			case snapshotServiceEvent:
-				event.response <- snapshotResult{members: l.engine.Snapshot()}
+				members := l.engine.Snapshot()
+				l.subscriptions.markAllResynchronized()
+				event.response <- snapshotResult{members: members}
 			case subscribeServiceEvent:
 				id, events := l.subscriptions.Subscribe(event.capacity)
 				event.response <- subscriptionResult{id: id, events: events}
@@ -475,7 +478,7 @@ func (l *serviceLoop) run(parent context.Context) error {
 			}
 		case <-parent.Done():
 			if l.admitted {
-				if err := l.executeEffects(l.workerContext, l.engine.Leave(l.service.options.Clock.Now())); err != nil {
+				if err := l.gracefulLeave(l.workerContext); err != nil {
 					return err
 				}
 			}
@@ -486,12 +489,94 @@ func (l *serviceLoop) run(parent context.Context) error {
 	}
 }
 
+func (l *serviceLoop) gracefulLeave(ctx context.Context) error {
+	aliveBefore := l.engine.aliveMembers()
+	effects := l.engine.Leave(l.service.options.Clock.Now())
+	if err := l.executeEffects(ctx, effects); err != nil {
+		return err
+	}
+	if len(effects.Events) == 0 {
+		return nil
+	}
+	left := effects.Events[len(effects.Events)-1].Current
+	if left.NodeID != l.service.options.Config.NodeID || left.Status != Left {
+		return fmt.Errorf("swim: graceful leave produced invalid local transition %#v", left)
+	}
+	deadline := l.service.options.Clock.Now().Add(minimumSuspicionDuration)
+	for _, timer := range effects.Timers {
+		if timer.Kind == TimerLeaveDeadline {
+			deadline = timer.Deadline
+			break
+		}
+	}
+	budget := RetransmitBudget(serviceRetransmitFactor, aliveBefore)
+	peers := make([]Member, 0)
+	for _, member := range l.engine.Snapshot() {
+		if member.NodeID != left.NodeID && (member.Status == Alive || member.Status == Suspect) {
+			peers = append(peers, member)
+		}
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	update := Update{Member: left, ReporterID: left.NodeID}
+	sent := 0
+	for sent < budget && l.service.options.Clock.Now().Before(deadline) {
+		progress := false
+		for _, peer := range peers {
+			if sent >= budget {
+				break
+			}
+			delivered, err := l.sendDirectUpdate(ctx, peer, update)
+			if err != nil {
+				return err
+			}
+			if delivered {
+				sent++
+				progress = true
+			}
+		}
+		if !progress {
+			break
+		}
+	}
+	return nil
+}
+
+func (l *serviceLoop) sendDirectUpdate(ctx context.Context, member Member, update Update) (bool, error) {
+	destinationConfig := config.NodeConfig{AdvertiseHost: member.Host, BasePort: member.BasePort}
+	destination, err := destinationConfig.AdvertiseEndpoint(config.ServiceSWIMPing)
+	if err != nil {
+		return false, err
+	}
+	payload, err := wire.EncodeGob(GossipMessage{Updates: []Update{update}})
+	if err != nil {
+		return false, err
+	}
+	encoded, err := wire.Encode(wire.Header{
+		Version:         wire.Version1,
+		Message:         wire.MessageSWIMGossip,
+		ClusterID:       l.service.clusterID,
+		SenderID:        l.service.options.Config.NodeID,
+		RequestID:       l.nextRequestID(),
+		TimestampMillis: l.service.options.Clock.Now().UnixMilli(),
+		Codec:           wire.CodecGob,
+	}, payload, l.service.options.Authenticator, l.service.limits)
+	if err != nil {
+		return false, err
+	}
+	if err := l.datagram.Send(ctx, destination, encoded); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 func (s *Service) receiveDatagrams(ctx context.Context, datagram transport.Datagram, workers *sync.WaitGroup) {
 	defer workers.Done()
 	for {
 		packet, err := datagram.Receive(ctx)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, transport.ErrDatagramClosed) {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				return
 			}
 			s.enqueueWorkerEvent(ctx, fatalServiceEvent{err: fmt.Errorf("receive SWIM datagram: %w", err)})
@@ -946,7 +1031,9 @@ func (l *serviceLoop) executeEffects(ctx context.Context, effects Effects) error
 		}
 	}
 	if len(effects.Events) > 0 {
-		l.refreshActiveMembership()
+		if eventsChangeActiveMembership(effects.Events) {
+			l.refreshActiveMembership()
+		}
 		for _, event := range effects.Events {
 			l.subscriptions.Publish(event)
 		}
@@ -970,8 +1057,8 @@ func (l *serviceLoop) executeEffects(ctx context.Context, effects Effects) error
 }
 
 func (l *serviceLoop) sendGossipRound(ctx context.Context) error {
-	for _, member := range l.engine.Snapshot() {
-		if member.NodeID == l.service.options.Config.NodeID || member.Status != Alive {
+	for _, member := range l.activeMembers {
+		if member.NodeID == l.service.options.Config.NodeID {
 			continue
 		}
 		if _, err := l.sendMessage(ctx, member, GossipMessage{}); err != nil {
@@ -983,8 +1070,8 @@ func (l *serviceLoop) sendGossipRound(ctx context.Context) error {
 
 func (l *serviceLoop) sendDigestRound(ctx context.Context) error {
 	sent := false
-	for _, member := range l.engine.Snapshot() {
-		if member.NodeID == l.service.options.Config.NodeID || member.Status != Alive {
+	for _, member := range l.activeMembers {
+		if member.NodeID == l.service.options.Config.NodeID {
 			continue
 		}
 		delivered, err := l.sendMessage(ctx, member, DigestMessage{})
@@ -1018,18 +1105,22 @@ func (l *serviceLoop) sendMessage(ctx context.Context, member Member, message an
 		TimestampMillis: l.service.options.Clock.Now().UnixMilli(),
 		Codec:           wire.CodecGob,
 	}
-	encode := func(updates []Update) ([]byte, error) {
+	encodeWithLimits := func(updates []Update, limits wire.Limits) ([]byte, error) {
 		payload, err := wire.EncodeGob(payloadForUpdates(append([]Update(nil), updates...)))
 		if err != nil {
 			return nil, err
 		}
-		return wire.Encode(header, payload, l.service.options.Authenticator, l.service.limits)
+		return wire.Encode(header, payload, l.service.options.Authenticator, limits)
 	}
-	updates, err := l.dissemination.Take(l.service.limits.MaxSWIMDatagramSize, l.engine.aliveMembers(), encode)
+	sizingLimits := l.service.limits
+	sizingLimits.MaxSWIMDatagramSize = sizingLimits.MaxFrameSize
+	updates, err := l.dissemination.Take(l.service.limits.MaxSWIMDatagramSize, l.engine.aliveMembers(), func(updates []Update) ([]byte, error) {
+		return encodeWithLimits(updates, sizingLimits)
+	})
 	if err != nil {
 		return false, err
 	}
-	encoded, err := encode(updates)
+	encoded, err := encodeWithLimits(updates, l.service.limits)
 	if err != nil {
 		return false, err
 	}
@@ -1087,12 +1178,26 @@ func (l *serviceLoop) scheduleClockEvent(deadline time.Time, event timerServiceE
 
 func (l *serviceLoop) refreshActiveMembership() {
 	active := make(map[uint16]Member)
+	activeMembers := make([]Member, 0)
 	for _, member := range l.engine.Snapshot() {
 		if member.Status == Alive || member.Status == Suspect {
 			active[member.NodeID] = member
+			activeMembers = append(activeMembers, member)
 		}
 	}
+	l.activeMembers = activeMembers
 	l.service.active.Store(active)
+}
+
+func eventsChangeActiveMembership(events []MembershipEvent) bool {
+	for _, event := range events {
+		previousActive := event.Previous.NodeID != 0 && (event.Previous.Status == Alive || event.Previous.Status == Suspect)
+		currentActive := event.Current.Status == Alive || event.Current.Status == Suspect
+		if previousActive != currentActive || (currentActive && event.Previous != event.Current) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *serviceLoop) nextRequestID() wire.RequestID {
