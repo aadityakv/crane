@@ -121,6 +121,17 @@ func TestGenerateConfigsRejectsInvalidClusterLayouts(t *testing.T) {
 	}
 }
 
+func TestValidateGeneratedPortRangesRejectsOverlap(t *testing.T) {
+	services := []config.ServiceSpec{
+		{Service: config.ServiceSWIMPing, Name: "first", Offset: 0, Transport: config.TransportUDP},
+		{Service: config.ServiceRaftRPC, Name: "last", Offset: 8, Transport: config.TransportTCP},
+	}
+	err := validateGeneratedPortRanges([]uint64{8000, 8005}, services)
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("validateGeneratedPortRanges error = %v, want overlap rejection", err)
+	}
+}
+
 func TestPrepareClusterFilesWritesStrictConfigsAndTrustworthyInitialState(t *testing.T) {
 	secretContents := []byte("private-local-cluster-secret")
 	secretFile := filepath.Join(t.TempDir(), "cluster.secret")

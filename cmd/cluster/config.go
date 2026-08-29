@@ -89,34 +89,46 @@ func GenerateConfigs(options ClusterOptions) ([]config.NodeConfig, error) {
 
 func generatedBasePorts(nodes int, startingBasePort uint16) ([]uint16, error) {
 	services := config.Services()
+	rawBases := make([]uint64, nodes)
+	for index := range rawBases {
+		base := uint64(startingBasePort) + uint64(index)*localNodePortStride
+		rawBases[index] = base
+	}
+	if err := validateGeneratedPortRanges(rawBases, services); err != nil {
+		return nil, err
+	}
+	bases := make([]uint16, len(rawBases))
+	for index, base := range rawBases {
+		bases[index] = uint16(base)
+	}
+	return bases, nil
+}
+
+func validateGeneratedPortRanges(bases []uint64, services []config.ServiceSpec) error {
 	if len(services) == 0 {
-		return nil, fmt.Errorf("service registry is empty")
+		return fmt.Errorf("service registry is empty")
 	}
 	maxOffset := 0
 	for _, service := range services {
 		if service.Offset < 0 {
-			return nil, fmt.Errorf("service %q has negative port offset", service.Name)
+			return fmt.Errorf("service %q has negative port offset", service.Name)
 		}
 		if service.Offset > maxOffset {
 			maxOffset = service.Offset
 		}
 	}
-
-	bases := make([]uint16, nodes)
 	previousEnd := uint64(0)
-	for index := range bases {
-		base := uint64(startingBasePort) + uint64(index)*localNodePortStride
+	for index, base := range bases {
 		end := base + uint64(maxOffset)
 		if base == 0 || end > math.MaxUint16 {
-			return nil, fmt.Errorf("node %d port range %d-%d exceeds valid port range", index+1, base, end)
+			return fmt.Errorf("node %d port range %d-%d exceeds valid port range", index+1, base, end)
 		}
 		if index > 0 && base <= previousEnd {
-			return nil, fmt.Errorf("node %d port range %d-%d overlaps previous range ending at %d", index+1, base, end, previousEnd)
+			return fmt.Errorf("node %d port range %d-%d overlaps previous range ending at %d", index+1, base, end, previousEnd)
 		}
-		bases[index] = uint16(base)
 		previousEnd = end
 	}
-	return bases, nil
+	return nil
 }
 
 func newClusterID() (string, error) {

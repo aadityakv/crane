@@ -26,7 +26,33 @@ import (
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
-const integrationClusterID = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+const (
+	integrationClusterID      = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+	integrationNodePortStride = 100
+)
+
+func TestTypedPortAllocatorUsesAuthoritativeRegistryBounds(t *testing.T) {
+	snapshotOffset, maxOffset, err := typedServicePortBounds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := config.LookupService(config.ServiceSWIMSnapshot)
+	if !ok {
+		t.Fatal("SWIM snapshot service is not registered")
+	}
+	if snapshotOffset != snapshot.Offset {
+		t.Fatalf("snapshot offset = %d, want registry offset %d", snapshotOffset, snapshot.Offset)
+	}
+	wantMax := 0
+	for _, service := range config.Services() {
+		if service.Offset > wantMax {
+			wantMax = service.Offset
+		}
+	}
+	if maxOffset != wantMax {
+		t.Fatalf("maximum offset = %d, want registry maximum %d", maxOffset, wantMax)
+	}
+}
 
 func TestLocalSWIMCluster(t *testing.T) {
 	repositoryRoot, err := filepath.Abs("..")
@@ -143,7 +169,7 @@ func integrationConfigs(t *testing.T, startingBasePort uint16, secretFile string
 	t.Helper()
 	voters := make([]config.RaftVoter, 3)
 	for index := range voters {
-		base := startingBasePort + uint16(index*100)
+		base := startingBasePort + uint16(index*integrationNodePortStride)
 		endpoint, err := (config.NodeConfig{AdvertiseHost: "127.0.0.1", BasePort: base}).AdvertiseEndpoint(config.ServiceRaftRPC)
 		if err != nil {
 			t.Fatal(err)
@@ -170,7 +196,7 @@ func integrationConfigs(t *testing.T, startingBasePort uint16, secretFile string
 			ClusterID:         integrationClusterID,
 			BindHost:          "127.0.0.1",
 			AdvertiseHost:     "127.0.0.1",
-			BasePort:          startingBasePort + uint16(index*100),
+			BasePort:          startingBasePort + uint16(index*integrationNodePortStride),
 			Introducer:        introducer.String(),
 			StorageDir:        storageDir,
 			ClusterSecretFile: secretFile,
@@ -225,6 +251,10 @@ func (r *portReservation) release() {
 
 func reserveTypedClusterPorts(t *testing.T, nodes int) (uint16, func()) {
 	t.Helper()
+	snapshotOffset, maxOffset, err := typedServicePortBounds()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for attempt := 0; attempt < 100; attempt++ {
 		seed, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -232,14 +262,14 @@ func reserveTypedClusterPorts(t *testing.T, nodes int) (uint16, func()) {
 		}
 		port := seed.Addr().(*net.TCPAddr).Port
 		_ = seed.Close()
-		candidate := port - 2
-		if candidate < 1024 || candidate+100*(nodes-1)+8 > 65535 {
+		candidate := port - snapshotOffset
+		if candidate < 1024 || candidate+integrationNodePortStride*(nodes-1)+maxOffset > 65535 {
 			continue
 		}
 		reservation := &portReservation{}
 		valid := true
 		for nodeIndex := 0; nodeIndex < nodes && valid; nodeIndex++ {
-			base := candidate + nodeIndex*100
+			base := candidate + nodeIndex*integrationNodePortStride
 			for _, service := range config.Services() {
 				address := fmt.Sprintf("127.0.0.1:%d", base+service.Offset)
 				var closer io.Closer
@@ -267,6 +297,30 @@ func reserveTypedClusterPorts(t *testing.T, nodes int) (uint16, func()) {
 	}
 	t.Fatal("could not reserve a free typed three-node port range")
 	return 0, func() {}
+}
+
+func typedServicePortBounds() (int, int, error) {
+	snapshot, ok := config.LookupService(config.ServiceSWIMSnapshot)
+	if !ok {
+		return 0, 0, fmt.Errorf("SWIM snapshot service is not registered")
+	}
+	if snapshot.Offset < 0 {
+		return 0, 0, fmt.Errorf("SWIM snapshot service has negative port offset %d", snapshot.Offset)
+	}
+	services := config.Services()
+	if len(services) == 0 {
+		return 0, 0, fmt.Errorf("service registry is empty")
+	}
+	maxOffset := 0
+	for _, service := range services {
+		if service.Offset < 0 {
+			return 0, 0, fmt.Errorf("service %q has negative port offset", service.Name)
+		}
+		if service.Offset > maxOffset {
+			maxOffset = service.Offset
+		}
+	}
+	return snapshot.Offset, maxOffset, nil
 }
 
 type synchronizedLog struct {
