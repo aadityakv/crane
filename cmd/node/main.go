@@ -56,7 +56,47 @@ func executeNode(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return node.NewSupervisor(service).Run(ctx)
+	return runSupervisedNode(ctx, configuration.NodeID, service, os.Stdout)
+}
+
+func runSupervisedNode(ctx context.Context, nodeID uint16, service node.Service, readyWriter io.Writer) error {
+	if ctx == nil {
+		return errors.New("supervised node context is nil")
+	}
+	if nodeID == 0 {
+		return errors.New("supervised node ID is zero")
+	}
+	if service == nil {
+		return errors.New("supervised node service is nil")
+	}
+	if readyWriter == nil {
+		return errors.New("supervised node readiness writer is nil")
+	}
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- node.NewSupervisor(service).Run(runContext) }()
+
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return <-result
+	case <-service.Ready():
+		select {
+		case err := <-result:
+			return err
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return <-result
+		}
+		if _, err := fmt.Fprintln(readyWriter, node.ReadySignal(nodeID)); err != nil {
+			cancel()
+			return errors.Join(fmt.Errorf("write node readiness signal: %w", err), <-result)
+		}
+		return <-result
+	}
 }
 
 func loadNodeConfiguration(args []string) (config.NodeConfig, error) {

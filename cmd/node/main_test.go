@@ -1,14 +1,50 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/aaditya/cs425mp3/internal/config"
+	internalnode "github.com/aaditya/cs425mp3/internal/node"
 )
+
+func TestRunSupervisedNodeEmitsSignalOnlyAfterServiceReady(t *testing.T) {
+	service := newReadyControlledService()
+	output := &channelWriter{writes: make(chan string, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- runSupervisedNode(ctx, 7, service, output) }()
+
+	<-service.started
+	select {
+	case line := <-output.writes:
+		t.Fatalf("readiness emitted before service ready: %q", line)
+	default:
+	}
+	close(service.ready)
+	select {
+	case line := <-output.writes:
+		if want := internalnode.ReadySignal(7) + "\n"; line != want {
+			t.Fatalf("readiness line = %q, want %q", line, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for readiness line")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runSupervisedNode: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for supervised node shutdown")
+	}
+}
 
 func TestLoadNodeConfigurationAppliesOnlyLocalOverrides(t *testing.T) {
 	configuration := writeNodeTestConfig(t)
@@ -112,4 +148,32 @@ func writeNodeTestConfigFile(t *testing.T, configuration config.NodeConfig) stri
 		t.Fatal(err)
 	}
 	return path
+}
+
+type readyControlledService struct {
+	ready   chan struct{}
+	started chan struct{}
+}
+
+func newReadyControlledService() *readyControlledService {
+	return &readyControlledService{ready: make(chan struct{}), started: make(chan struct{})}
+}
+
+func (*readyControlledService) Name() string { return "controlled" }
+
+func (s *readyControlledService) Ready() <-chan struct{} { return s.ready }
+
+func (s *readyControlledService) Run(ctx context.Context) error {
+	close(s.started)
+	<-ctx.Done()
+	return nil
+}
+
+type channelWriter struct {
+	writes chan string
+}
+
+func (w *channelWriter) Write(content []byte) (int, error) {
+	w.writes <- string(content)
+	return len(content), nil
 }

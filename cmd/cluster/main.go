@@ -10,12 +10,18 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	internalnode "github.com/aaditya/cs425mp3/internal/node"
 )
 
-const clusterShutdownGrace = 10 * time.Second
+const (
+	clusterStartupDeadline = 10 * time.Second
+	clusterShutdownGrace   = 10 * time.Second
+)
 
 func main() {
 	signals := make(chan os.Signal, 2)
@@ -82,6 +88,8 @@ type clusterChild struct {
 	cmd    *exec.Cmd
 	stdout *prefixWriter
 	stderr *prefixWriter
+	ready  chan struct{}
+	once   sync.Once
 }
 
 type clusterChildResult struct {
@@ -109,25 +117,23 @@ func runClusterProcesses(ctx context.Context, nodeBinary string, configPaths []s
 	sharedStderr := &synchronizedWriter{output: stderr}
 	children := make([]*clusterChild, 0, len(configPaths))
 	results := make(chan clusterChildResult, len(configPaths))
-	for index, configPath := range configPaths {
-		nodeID := uint16(index + 1)
-		prefix := fmt.Sprintf("[node-%d] ", nodeID)
-		child := &clusterChild{
-			nodeID: nodeID,
-			cmd:    exec.Command(nodeBinary, "-config", configPath),
-			stdout: newPrefixWriter(sharedStdout, prefix),
-			stderr: newPrefixWriter(sharedStderr, prefix),
-		}
-		child.cmd.Stdout = child.stdout
-		child.cmd.Stderr = child.stderr
-		child.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if err := child.cmd.Start(); err != nil {
-			cause := fmt.Errorf("start node %d: %w", nodeID, err)
+	seed, err := startClusterChild(1, nodeBinary, configPaths[0], sharedStdout, sharedStderr, results)
+	if err != nil {
+		return err
+	}
+	children = append(children, seed)
+	ready, err := waitForSeedReadiness(ctx, seed, children, results, signals, clusterStartupDeadline)
+	if !ready {
+		return err
+	}
+	for index, configPath := range configPaths[1:] {
+		nodeID := uint16(index + 2)
+		child, err := startClusterChild(nodeID, nodeBinary, configPath, sharedStdout, sharedStderr, results)
+		if err != nil {
 			terminateChildren(children, syscall.SIGTERM)
-			return errors.Join(cause, drainChildren(children, results))
+			return errors.Join(err, drainChildren(children, results))
 		}
 		children = append(children, child)
-		go waitClusterChild(child, results)
 	}
 
 	remaining := len(children)
@@ -178,6 +184,57 @@ func runClusterProcesses(ctx context.Context, nodeBinary string, configPaths []s
 		}
 	}
 	return cause
+}
+
+func startClusterChild(nodeID uint16, nodeBinary, configPath string, stdout, stderr io.Writer, results chan<- clusterChildResult) (*clusterChild, error) {
+	child := &clusterChild{
+		nodeID: nodeID,
+		cmd:    exec.Command(nodeBinary, "-config", configPath),
+		ready:  make(chan struct{}),
+	}
+	observe := func(line string) {
+		readyNodeID, ok := internalnode.ParseReadySignal(strings.TrimSuffix(line, "\n"))
+		if ok && readyNodeID == child.nodeID {
+			child.once.Do(func() { close(child.ready) })
+		}
+	}
+	prefix := fmt.Sprintf("[node-%d] ", nodeID)
+	child.stdout = newObservedPrefixWriter(stdout, prefix, observe)
+	child.stderr = newObservedPrefixWriter(stderr, prefix, observe)
+	child.cmd.Stdout = child.stdout
+	child.cmd.Stderr = child.stderr
+	child.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start node %d: %w", nodeID, err)
+	}
+	go waitClusterChild(child, results)
+	return child, nil
+}
+
+func waitForSeedReadiness(ctx context.Context, seed *clusterChild, children []*clusterChild, results <-chan clusterChildResult, signals <-chan os.Signal, startupDeadline time.Duration) (bool, error) {
+	timer := time.NewTimer(startupDeadline)
+	defer timer.Stop()
+	select {
+	case <-seed.ready:
+		return true, nil
+	case result := <-results:
+		if result.err == nil {
+			return false, fmt.Errorf("seed node %d exited before readiness", result.nodeID)
+		}
+		return false, fmt.Errorf("seed node %d failed before readiness: %w", result.nodeID, result.err)
+	case signal := <-signals:
+		if signal == nil {
+			return false, errors.New("seed readiness signal channel closed")
+		}
+		terminateChildren(children, signal)
+		return false, drainChildren(children, results)
+	case <-ctx.Done():
+		terminateChildren(children, syscall.SIGTERM)
+		return false, errors.Join(ctx.Err(), drainChildren(children, results))
+	case <-timer.C:
+		terminateChildren(children, syscall.SIGTERM)
+		return false, errors.Join(fmt.Errorf("seed node %d readiness exceeded %s", seed.nodeID, startupDeadline), drainChildren(children, results))
+	}
 }
 
 func waitClusterChild(child *clusterChild, results chan<- clusterChildResult) {
@@ -239,10 +296,15 @@ type prefixWriter struct {
 	output  io.Writer
 	prefix  []byte
 	pending bytes.Buffer
+	observe func(string)
 }
 
 func newPrefixWriter(output io.Writer, prefix string) *prefixWriter {
-	return &prefixWriter{output: output, prefix: []byte(prefix)}
+	return newObservedPrefixWriter(output, prefix, nil)
+}
+
+func newObservedPrefixWriter(output io.Writer, prefix string, observe func(string)) *prefixWriter {
+	return &prefixWriter{output: output, prefix: []byte(prefix), observe: observe}
 }
 
 func (w *prefixWriter) Write(content []byte) (int, error) {
@@ -256,6 +318,9 @@ func (w *prefixWriter) Write(content []byte) (int, error) {
 		if err != nil {
 			_, _ = w.pending.WriteString(line)
 			break
+		}
+		if w.observe != nil {
+			w.observe(line)
 		}
 		if _, err := w.output.Write(w.prefix); err != nil {
 			return 0, err

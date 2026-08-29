@@ -11,6 +11,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	internalnode "github.com/aaditya/cs425mp3/internal/node"
+	"github.com/aaditya/cs425mp3/internal/testutil"
 )
 
 func TestParseClusterFlagsUsesSpecifiedLocalLayout(t *testing.T) {
@@ -55,6 +58,116 @@ func TestRunClusterProcessesCancelsPeersAfterChildFailure(t *testing.T) {
 	}
 }
 
+func TestRunClusterProcessesWaitsForSeedReadinessBeforeStartingPeers(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configDirectory := t.TempDir()
+	configPaths := make([]string, 3)
+	for index := range configPaths {
+		configPaths[index] = filepath.Join(configDirectory, fmt.Sprintf("node-%d.json", index+1))
+		if err := os.WriteFile(configPaths[index], []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(configPaths[0]+".delay-ready", []byte("delay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPaths[2]+".stay-alive", []byte("stay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	signals := make(chan os.Signal, 1)
+	result := make(chan error, 1)
+	go func() { result <- runClusterProcesses(ctx, nodeBinary, configPaths, signals, os.Stderr, os.Stderr) }()
+	stop := func() error {
+		select {
+		case err := <-result:
+			return err
+		default:
+		}
+		signals <- syscall.SIGTERM
+		select {
+		case err := <-result:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	waitForFile(t, ctx, configPaths[0]+".started")
+	if err := os.WriteFile(configPaths[0]+".check-peers", []byte("check\n"), 0o600); err != nil {
+		_ = stop()
+		t.Fatal(err)
+	}
+	waitForFile(t, ctx, configPaths[0]+".check-ack")
+	if fileExists(configPaths[1]+".started") || fileExists(configPaths[2]+".started") {
+		err := stop()
+		t.Fatalf("peers started before seed readiness (shutdown error %v)", err)
+	}
+	if err := os.WriteFile(configPaths[0]+".release-ready", []byte("release\n"), 0o600); err != nil {
+		_ = stop()
+		t.Fatal(err)
+	}
+	waitForFile(t, ctx, configPaths[1]+".started")
+	waitForFile(t, ctx, configPaths[2]+".started")
+	if err := stop(); err != nil {
+		t.Fatalf("runClusterProcesses shutdown error = %v", err)
+	}
+}
+
+func TestWaitForSeedReadinessTimeoutTerminatesAndJoinsSeed(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configPath := filepath.Join(t.TempDir(), "node-1.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath+".delay-ready", []byte("delay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan clusterChildResult, 1)
+	seed, err := startClusterChild(1, nodeBinary, configPath, os.Stderr, os.Stderr, results)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ready, err := waitForSeedReadiness(ctx, seed, []*clusterChild{seed}, results, nil, 50*time.Millisecond)
+	if ready || err == nil || !strings.Contains(err.Error(), "readiness exceeded") {
+		t.Fatalf("waitForSeedReadiness = %v, %v", ready, err)
+	}
+	if seed.cmd.ProcessState == nil {
+		t.Fatal("seed was not Wait-joined before timeout returned")
+	}
+	if signalErr := seed.cmd.Process.Signal(syscall.Signal(0)); signalErr == nil {
+		t.Fatal("seed process still exists after timeout cleanup")
+	}
+}
+
+func TestRunClusterProcessesSeedFailureDoesNotStartPeers(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configDirectory := t.TempDir()
+	configPaths := make([]string, 3)
+	for index := range configPaths {
+		configPaths[index] = filepath.Join(configDirectory, fmt.Sprintf("node-%d.json", index+1))
+		if err := os.WriteFile(configPaths[index], []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(configPaths[0]+".exit-before-ready", []byte("exit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := runClusterProcesses(ctx, nodeBinary, configPaths, nil, os.Stderr, os.Stderr)
+	if err == nil || !strings.Contains(err.Error(), "seed node 1 failed before readiness") {
+		t.Fatalf("runClusterProcesses error = %v", err)
+	}
+	if fileExists(configPaths[1]+".started") || fileExists(configPaths[2]+".started") {
+		t.Fatal("peer process started after seed failed before readiness")
+	}
+}
+
 func TestClusterChildHelper(t *testing.T) {
 	if os.Getenv("CS425_CLUSTER_HELPER") != "1" {
 		return
@@ -70,7 +183,34 @@ func TestClusterChildHelper(t *testing.T) {
 	if err := os.WriteFile(configPath+".started", []byte("started\n"), 0o600); err != nil {
 		os.Exit(92)
 	}
-	if filepath.Base(configPath) == "node-3.json" {
+	if filepath.Base(configPath) == "node-1.json" {
+		if fileExists(configPath + ".exit-before-ready") {
+			os.Exit(99)
+		}
+		if fileExists(configPath + ".delay-ready") {
+			ready, stopped := waitForHelperFile(configPath+".check-peers", 5*time.Second, signals)
+			if stopped {
+				recordHelperStopped(configPath)
+				return
+			}
+			if !ready {
+				os.Exit(96)
+			}
+			if err := os.WriteFile(configPath+".check-ack", []byte("checked\n"), 0o600); err != nil {
+				os.Exit(97)
+			}
+			ready, stopped = waitForHelperFile(configPath+".release-ready", 5*time.Second, signals)
+			if stopped {
+				recordHelperStopped(configPath)
+				return
+			}
+			if !ready {
+				os.Exit(98)
+			}
+		}
+		fmt.Println(internalnode.ReadySignal(1))
+	}
+	if filepath.Base(configPath) == "node-3.json" && !fileExists(configPath+".stay-alive") {
 		deadline := time.NewTimer(5 * time.Second)
 		defer deadline.Stop()
 		ticker := time.NewTicker(10 * time.Millisecond)
@@ -90,9 +230,7 @@ func TestClusterChildHelper(t *testing.T) {
 	}
 	select {
 	case <-signals:
-		if err := os.WriteFile(configPath+".stopped", []byte("stopped\n"), 0o600); err != nil {
-			os.Exit(94)
-		}
+		recordHelperStopped(configPath)
 	case <-time.After(8 * time.Second):
 		os.Exit(95)
 	}
@@ -115,4 +253,38 @@ func writeClusterHelperWrapper(t *testing.T) string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func waitForFile(t *testing.T, ctx context.Context, path string) {
+	t.Helper()
+	if err := testutil.WaitFor(ctx, 5*time.Millisecond, func() (bool, error) {
+		return fileExists(path), nil
+	}); err != nil {
+		t.Fatalf("wait for file %q: %v", path, err)
+	}
+}
+
+func waitForHelperFile(path string, timeout time.Duration, signals <-chan os.Signal) (bool, bool) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if fileExists(path) {
+			return true, false
+		}
+		select {
+		case <-ticker.C:
+		case <-signals:
+			return false, true
+		case <-deadline.C:
+			return false, false
+		}
+	}
+}
+
+func recordHelperStopped(configPath string) {
+	if err := os.WriteFile(configPath+".stopped", []byte("stopped\n"), 0o600); err != nil {
+		os.Exit(94)
+	}
 }
