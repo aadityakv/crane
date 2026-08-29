@@ -275,6 +275,30 @@ func TestEngineProbeWithoutRelaysStillWaitsForIndirectGenerationOnce(t *testing.
 	}
 }
 
+func TestIndirectProbeRelaySelectionExcludesSelfTargetAndNonAliveMembers(t *testing.T) {
+	self := Member{NodeID: 1, Status: Alive}
+	target := Member{NodeID: 2, Status: Alive}
+	relay := Member{NodeID: 3, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	for _, member := range []Member{
+		target,
+		relay,
+		{NodeID: 4, Status: Suspect},
+		{NodeID: 5, Status: Dead},
+		{NodeID: 6, Status: Left},
+	} {
+		mustMerge(t, engine.table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	now := time.Date(2026, 8, 29, 14, 28, 30, 0, time.UTC)
+	sequence := engine.BeginProbe(now).Outbound[0].Message.(Ping).Sequence
+
+	effects := engine.HandleDirectTimeout(sequence, now.Add(300*time.Millisecond))
+
+	if len(effects.Outbound) != 1 || effects.Outbound[0].To != relay {
+		t.Fatalf("relay outbound = %#v, want only %#v", effects.Outbound, relay)
+	}
+}
+
 func TestEngineProbeStaleTimeoutCannotAdvanceNewGeneration(t *testing.T) {
 	self := Member{NodeID: 1, Status: Alive}
 	target := Member{NodeID: 2, Status: Alive}
