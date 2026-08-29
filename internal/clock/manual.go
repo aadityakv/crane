@@ -29,6 +29,14 @@ func (c *Manual) Now() time.Time {
 	return c.now
 }
 
+// PendingTimers reports the number of timers currently registered to fire.
+// Fired and stopped timers are not retained by the manual clock.
+func (c *Manual) PendingTimers() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.timers)
+}
+
 // NewTimer returns a timer scheduled relative to the current manual time.
 func (c *Manual) NewTimer(duration time.Duration) Timer {
 	c.mu.Lock()

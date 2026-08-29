@@ -298,6 +298,32 @@ func TestSimulationCancellationClosesListenersTimersAndGoroutines(t *testing.T) 
 	}
 }
 
+func TestSimulationManualTimerStateRemainsBounded(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(8050, 0))
+	network := transport.NewMemoryNetwork()
+	configuration := serviceTestConfig(t, 1)
+	running := startRunningService(t, configuration, newServiceStore(1), manualClock, network, 191)
+
+	for cycle := 0; cycle < 500; cycle++ {
+		manualClock.Advance(time.Duration(configuration.Timing.ProbeInterval))
+		deadline := time.Now().Add(time.Second)
+		for manualClock.PendingTimers() == 0 && time.Now().Before(deadline) {
+			if _, err := running.service.Snapshot(testContext(t)); err != nil {
+				t.Fatal(err)
+			}
+			runtime.Gosched()
+		}
+		if got := manualClock.PendingTimers(); got != 1 {
+			t.Fatalf("pending service timers after probe cycle %d = %d, want 1", cycle, got)
+		}
+	}
+
+	running.stop(t)
+	if got := manualClock.PendingTimers(); got != 0 {
+		t.Fatalf("pending service timers after shutdown = %d, want 0", got)
+	}
+}
+
 func TestSimulationUnexpectedDatagramClosureFailsService(t *testing.T) {
 	network := transport.NewMemoryNetwork()
 	configuration := serviceTestConfig(t, 1)

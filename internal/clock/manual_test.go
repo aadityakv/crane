@@ -222,6 +222,30 @@ func TestManualTimerResetReregistersAfterFireAndStop(t *testing.T) {
 	assertManualTimerRegistrySize(t, c, 0)
 }
 
+func TestManualPendingTimersReportsOnlyRegisteredTimers(t *testing.T) {
+	c := NewManual(time.Unix(400, 0))
+	first := c.NewTimer(time.Second)
+	second := c.NewTimer(2 * time.Second)
+	if got := c.PendingTimers(); got != 2 {
+		t.Fatalf("pending timers after creation = %d, want 2", got)
+	}
+
+	first.Stop()
+	if got := c.PendingTimers(); got != 1 {
+		t.Fatalf("pending timers after stop = %d, want 1", got)
+	}
+	c.Advance(2 * time.Second)
+	if got := c.PendingTimers(); got != 0 {
+		t.Fatalf("pending timers after fire = %d, want 0", got)
+	}
+	if second.Reset(time.Second) {
+		t.Fatal("Reset after fire reported active")
+	}
+	if got := c.PendingTimers(); got != 1 {
+		t.Fatalf("pending timers after reset = %d, want 1", got)
+	}
+}
+
 func assertManualTimerRegistrySize(t *testing.T, c *Manual, want int) {
 	t.Helper()
 	c.mu.Lock()
