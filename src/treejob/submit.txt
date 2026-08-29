@@ -1,0 +1,4 @@
+treejob/belowten.so belowten.so
+treejob/numspout.so numspout.so
+treejob/passeven.so passeven.so
+treejob/topology.so topology.so
