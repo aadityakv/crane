@@ -36,6 +36,20 @@ type DigestMessage struct {
 	Updates []Update
 }
 
+// SnapshotRequest asks an active member for a complete immutable membership view.
+type SnapshotRequest struct{}
+
+// SnapshotResponse returns the responder's complete membership value set.
+type SnapshotResponse struct {
+	Members []Member
+}
+
+// ProtocolErrorMessage is an authentication-safe TCP failure response.
+type ProtocolErrorMessage struct {
+	Code    string
+	Message string
+}
+
 // Ping asks one member to acknowledge one origin-scoped probe sequence.
 type Ping struct {
 	OriginID uint16

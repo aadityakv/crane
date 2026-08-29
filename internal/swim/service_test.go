@@ -276,6 +276,419 @@ func TestServicePersistenceFailureAbortsEffectsAndFailsRun(t *testing.T) {
 	}
 }
 
+func TestServiceJoinUsesSnapshotPersistAnnounceAcceptOrder(t *testing.T) {
+	now := time.Unix(4000, 0)
+	network := transport.NewMemoryNetwork()
+	seedConfig := serviceTestConfig(t, 1)
+	seed := startRunningService(t, seedConfig, newServiceStore(1), clock.NewManual(now), network, 11)
+	joinConfig := serviceTestConfig(t, 2)
+	seedEndpoint, err := seedConfig.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinConfig.Introducer = seedEndpoint.String()
+	if err := joinConfig.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	joinStore := newServiceStore(1)
+	joining := startRunningService(t, joinConfig, joinStore, clock.NewManual(now), network, 12)
+
+	seedMembers := waitForSnapshot(t, seed.service, func(members []Member) bool {
+		return len(members) == 2 && members[0].NodeID == 1 && members[1].NodeID == 2
+	})
+	joiningMembers := waitForSnapshot(t, joining.service, func(members []Member) bool {
+		return len(members) == 2 && members[0].NodeID == 1 && members[1].NodeID == 2
+	})
+	if seedMembers[1] != joiningMembers[1] || seedMembers[1].Incarnation != 2 || seedMembers[1].Status != Alive {
+		t.Fatalf("admitted member seed=%#v joining=%#v", seedMembers[1], joiningMembers[1])
+	}
+	if got, _ := joinStore.Load(); got != 2 {
+		t.Fatalf("durable joining incarnation = %d, want 2", got)
+	}
+
+	joining.stop(t)
+	seed.stop(t)
+}
+
+func TestServiceRejectsJoinAnnounceBeforeSnapshotWithoutMutation(t *testing.T) {
+	now := time.Unix(4100, 0)
+	network := transport.NewMemoryNetwork()
+	seedConfig := serviceTestConfig(t, 1)
+	seed := startRunningService(t, seedConfig, newServiceStore(1), clock.NewManual(now), network, 13)
+	endpoint, err := seedConfig.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := net.Dial("tcp", endpoint.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := wire.NewTCPFrameStream(connection, wire.NewHMACAuthenticator(testServiceKey()), serviceWireLimits(t), time.Second)
+	defer stream.Close()
+	announce := JoinAnnounce{Member: Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 2, Status: Alive}}
+	requestID := wire.RequestID{31}
+	if err := stream.WriteFrame(testContext(t), wire.Frame{Header: wire.Header{
+		Version:         wire.Version1,
+		Message:         wire.MessageSWIMJoinAnnounce,
+		ClusterID:       decodedTestClusterID(t, testClusterID),
+		SenderID:        2,
+		RequestID:       requestID,
+		TimestampMillis: now.UnixMilli(),
+		Codec:           wire.CodecGob,
+	}, Payload: mustEncodeGob(t, announce)}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := stream.ReadFrame(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.Message != wire.MessageSWIMError || response.Header.RequestID != requestID {
+		t.Fatalf("response header = %#v, want correlated protocol error", response.Header)
+	}
+	var protocolError ProtocolErrorMessage
+	if err := wire.DecodeGob(response.Payload, &protocolError); err != nil {
+		t.Fatal(err)
+	}
+	if protocolError.Code != protocolErrorUnexpectedMessage {
+		t.Fatalf("protocol error = %#v, want unexpected-message code", protocolError)
+	}
+	snapshot, err := seed.service.Snapshot(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].NodeID != 1 {
+		t.Fatalf("announce-first mutated seed snapshot: %#v", snapshot)
+	}
+	seed.stop(t)
+}
+
+func TestServiceJoinPersistenceFailureNeverAnnounces(t *testing.T) {
+	now := time.Unix(4200, 0)
+	network := transport.NewMemoryNetwork()
+	seedConfig := serviceTestConfig(t, 1)
+	seed := startRunningService(t, seedConfig, newServiceStore(1), clock.NewManual(now), network, 14)
+	joinConfig := serviceTestConfig(t, 2)
+	seedEndpoint, _ := seedConfig.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	joinConfig.Introducer = seedEndpoint.String()
+	if err := joinConfig.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	persistError := errors.New("join incarnation unavailable")
+	joinStore := newBarrierServiceStore(1, 2, persistError)
+	close(joinStore.release)
+	joining := startRunningService(t, joinConfig, joinStore, clock.NewManual(now), network, 15)
+
+	if err := waitServiceResult(t, joining.result); !errors.Is(err, persistError) {
+		t.Fatalf("joining Run error = %v, want persistence failure", err)
+	}
+	joining.markStopped()
+	select {
+	case <-joinStore.started:
+	default:
+		t.Fatal("joiner never attempted its persistence barrier")
+	}
+	snapshot, err := seed.service.Snapshot(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].NodeID != 1 {
+		t.Fatalf("failed join appeared at seed: %#v", snapshot)
+	}
+	seed.stop(t)
+}
+
+func TestSnapshotClientRequiresActiveAuthenticatedSender(t *testing.T) {
+	now := time.Unix(4300, 0)
+	network := transport.NewMemoryNetwork()
+	seedConfig := serviceTestConfig(t, 1)
+	seed := startRunningService(t, seedConfig, newServiceStore(1), clock.NewManual(now), network, 16)
+	endpoint, _ := seedConfig.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	client, err := NewSnapshotClient(SnapshotClientOptions{
+		Config:        seedConfig,
+		Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+		Clock:         clock.NewManual(now),
+		Random:        random.NewLockedSource(17),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := client.Snapshot(testContext(t), endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].NodeID != 1 || snapshot[0].Status != Alive {
+		t.Fatalf("snapshot client response = %#v", snapshot)
+	}
+	snapshot[0].Status = Dead
+	fresh, err := client.Snapshot(testContext(t), endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh[0].Status != Alive {
+		t.Fatalf("snapshot client exposed shared state: %#v", fresh)
+	}
+
+	unknownConfig := serviceTestConfig(t, 77)
+	unknownClient, err := NewSnapshotClient(SnapshotClientOptions{
+		Config:        unknownConfig,
+		Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+		Clock:         clock.NewManual(now),
+		Random:        random.NewLockedSource(18),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unknownClient.Snapshot(testContext(t), endpoint); !errors.Is(err, ErrServiceNotAdmitted) {
+		t.Fatalf("unknown sender snapshot error = %v, want ErrServiceNotAdmitted", err)
+	}
+	seed.stop(t)
+}
+
+func TestServiceTCPBoundaryFailuresDoNotMutateOrStopService(t *testing.T) {
+	now := time.Unix(4400, 0)
+	network := transport.NewMemoryNetwork()
+	seedConfig := serviceTestConfig(t, 1)
+	seed := startRunningService(t, seedConfig, newServiceStore(1), clock.NewManual(now), network, 19)
+	endpoint, _ := seedConfig.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	clusterID := decodedTestClusterID(t, testClusterID)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+
+	wrongCluster := clusterID
+	wrongCluster[0] ^= 0xff
+	for _, test := range []struct {
+		name      string
+		auth      wire.Authenticator
+		clusterID [16]byte
+	}{
+		{name: "wrong HMAC", auth: wire.NewHMACAuthenticator([]byte("wrong-wrong-wrong-wrong-wrong-key")), clusterID: clusterID},
+		{name: "wrong cluster", auth: authenticator, clusterID: wrongCluster},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stream := dialServiceTestStream(t, endpoint, test.auth, test.clusterID)
+			defer stream.Close()
+			frame := tcpServiceTestFrame(t, test.clusterID, 1, 50, now, wire.MessageSWIMSnapshotRequest, SnapshotRequest{})
+			if err := stream.WriteFrame(testContext(t), frame); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := stream.ReadFrame(testContext(t)); err == nil {
+				t.Fatal("authentication failure received a detailed response")
+			}
+		})
+	}
+
+	invalidGobStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	invalidGobID := wire.RequestID{51}
+	invalidGobFrame := tcpServiceTestFrameWithPayload(clusterID, 1, invalidGobID, now, wire.MessageSWIMSnapshotRequest, []byte("not-gob"))
+	if err := invalidGobStream.WriteFrame(testContext(t), invalidGobFrame); err != nil {
+		t.Fatal(err)
+	}
+	invalidResponse, err := invalidGobStream.ReadFrame(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeServiceProtocolError(t, invalidResponse); got.Code != protocolErrorInvalidPayload {
+		t.Fatalf("invalid gob protocol error = %#v, want invalid-payload code", got)
+	}
+	_ = invalidGobStream.Close()
+
+	unknownStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	unknownFrame := tcpServiceTestFrame(t, clusterID, 1, 52, now, wire.MessageType(999), SnapshotRequest{})
+	if err := unknownStream.WriteFrame(testContext(t), unknownFrame); err != nil {
+		t.Fatal(err)
+	}
+	unknownResponse, err := unknownStream.ReadFrame(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeServiceProtocolError(t, unknownResponse); got.Code != protocolErrorUnexpectedMessage {
+		t.Fatalf("unknown type protocol error = %#v, want unexpected-message code", got)
+	}
+	_ = unknownStream.Close()
+
+	replayID := byte(53)
+	firstStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	replayFrame := tcpServiceTestFrame(t, clusterID, 1, replayID, now, wire.MessageSWIMSnapshotRequest, SnapshotRequest{})
+	if err := firstStream.WriteFrame(testContext(t), replayFrame); err != nil {
+		t.Fatal(err)
+	}
+	if response, err := firstStream.ReadFrame(testContext(t)); err != nil || response.Header.Message != wire.MessageSWIMSnapshotResponse {
+		t.Fatalf("first request response = %#v, error = %v", response, err)
+	}
+	_ = firstStream.Close()
+	secondStream := dialServiceTestStream(t, endpoint, authenticator, clusterID)
+	if err := secondStream.WriteFrame(testContext(t), replayFrame); err != nil {
+		t.Fatal(err)
+	}
+	replayResponse, err := secondStream.ReadFrame(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeServiceProtocolError(t, replayResponse); got.Code != protocolErrorReplay {
+		t.Fatalf("replay protocol error = %#v, want replay code", got)
+	}
+	_ = secondStream.Close()
+
+	snapshot, err := seed.service.Snapshot(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].NodeID != 1 || snapshot[0].Status != Alive {
+		t.Fatalf("TCP boundary failures mutated snapshot: %#v", snapshot)
+	}
+	select {
+	case err := <-seed.result:
+		t.Fatalf("TCP boundary failure stopped service: %v", err)
+	default:
+	}
+	seed.stop(t)
+}
+
+func TestServiceDigestTriggersAuthenticatedSnapshotResync(t *testing.T) {
+	now := time.Unix(4500, 0)
+	network := transport.NewMemoryNetwork()
+	seedConfig := serviceTestConfig(t, 1)
+	seed := startRunningService(t, seedConfig, newServiceStore(1), clock.NewManual(now), network, 20)
+	joinConfig := serviceTestConfig(t, 2)
+	seedSnapshot, _ := seedConfig.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	joinConfig.Introducer = seedSnapshot.String()
+	if err := joinConfig.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	joining := startRunningService(t, joinConfig, newServiceStore(1), clock.NewManual(now), network, 21)
+	waitForSnapshot(t, joining.service, func(members []Member) bool { return len(members) == 2 })
+
+	seedPing, _ := seedConfig.AdvertiseEndpoint(config.ServiceSWIMPing)
+	joinPing, _ := joinConfig.AdvertiseEndpoint(config.ServiceSWIMPing)
+	network.Drop(seedPing, joinPing)
+	injector, err := network.Endpoint(config.Endpoint{Host: "injector", Port: 9200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer injector.Close()
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	missing := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
+	updateFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 60, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: missing, ReporterID: 1}}}))
+	if err := injector.Send(context.Background(), seedPing, updateFrame); err != nil {
+		t.Fatal(err)
+	}
+	if got := network.Advance(); got < 1 {
+		t.Fatalf("Advance delivered update packets = %d, want the injector packet", got)
+	}
+	waitForSnapshot(t, seed.service, func(members []Member) bool { return len(members) == 3 && members[2] == missing })
+	joiningSnapshot, err := joining.service.Snapshot(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(joiningSnapshot) != 2 {
+		t.Fatalf("dropped UDP update reached joining node: %#v", joiningSnapshot)
+	}
+
+	digestFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 61, now, wire.MessageSWIMDigest, mustEncodeGob(t, DigestMessage{}))
+	if err := injector.Send(context.Background(), joinPing, digestFrame); err != nil {
+		t.Fatal(err)
+	}
+	if got := network.Advance(); got < 1 {
+		t.Fatalf("Advance delivered digest packets = %d, want the injector packet", got)
+	}
+	resynchronized := waitForSnapshot(t, joining.service, func(members []Member) bool { return len(members) == 3 && members[2] == missing })
+	if resynchronized[2] != missing {
+		t.Fatalf("resynchronized snapshot = %#v", resynchronized)
+	}
+	joining.stop(t)
+	seed.stop(t)
+}
+
+type runningService struct {
+	service  *Service
+	cancel   context.CancelFunc
+	result   chan error
+	stopOnce sync.Once
+}
+
+func startRunningService(t *testing.T, configuration config.NodeConfig, store IncarnationStore, serviceClock clock.Clock, network *transport.MemoryNetwork, seed int64) *runningService {
+	t.Helper()
+	service, err := NewService(ServiceOptions{
+		Config:        configuration,
+		Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+		Clock:         serviceClock,
+		Random:        random.NewLockedSource(seed),
+		Store:         store,
+		Datagram:      serviceMemoryDatagram(t, network, configuration),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	running := &runningService{service: service, cancel: cancel, result: make(chan error, 1)}
+	go func() { running.result <- service.Run(ctx) }()
+	waitServiceReady(t, service)
+	t.Cleanup(func() { running.stop(t) })
+	return running
+}
+
+func (s *runningService) stop(t *testing.T) {
+	t.Helper()
+	s.stopOnce.Do(func() {
+		s.cancel()
+		if err := waitServiceResult(t, s.result); err != nil {
+			t.Errorf("Run cancellation error = %v", err)
+		}
+	})
+}
+
+func (s *runningService) markStopped() {
+	s.stopOnce.Do(func() {})
+}
+
+func serviceWireLimits(t *testing.T) wire.Limits {
+	t.Helper()
+	clusterID := decodedTestClusterID(t, testClusterID)
+	limits := wire.DefaultLimits()
+	limits.ExpectedClusterID = &clusterID
+	return limits
+}
+
+func dialServiceTestStream(t *testing.T, endpoint config.Endpoint, authenticator wire.Authenticator, clusterID [16]byte) *wire.TCPFrameStream {
+	t.Helper()
+	connection, err := net.Dial("tcp", endpoint.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := wire.DefaultLimits()
+	limits.ExpectedClusterID = &clusterID
+	return wire.NewTCPFrameStream(connection, authenticator, limits, time.Second)
+}
+
+func tcpServiceTestFrame(t *testing.T, clusterID [16]byte, senderID uint16, requestByte byte, now time.Time, message wire.MessageType, value any) wire.Frame {
+	t.Helper()
+	return tcpServiceTestFrameWithPayload(clusterID, senderID, wire.RequestID{requestByte}, now, message, mustEncodeGob(t, value))
+}
+
+func tcpServiceTestFrameWithPayload(clusterID [16]byte, senderID uint16, requestID wire.RequestID, now time.Time, message wire.MessageType, payload []byte) wire.Frame {
+	return wire.Frame{Header: wire.Header{
+		Version:         wire.Version1,
+		Message:         message,
+		ClusterID:       clusterID,
+		SenderID:        senderID,
+		RequestID:       requestID,
+		TimestampMillis: now.UnixMilli(),
+		Codec:           wire.CodecGob,
+	}, Payload: payload}
+}
+
+func decodeServiceProtocolError(t *testing.T, frame wire.Frame) ProtocolErrorMessage {
+	t.Helper()
+	if frame.Header.Message != wire.MessageSWIMError {
+		t.Fatalf("response type = %d, want MessageSWIMError", frame.Header.Message)
+	}
+	var response ProtocolErrorMessage
+	if err := wire.DecodeGob(frame.Payload, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
 type serviceStore struct {
 	mu    sync.Mutex
 	value uint64
@@ -450,18 +863,7 @@ func (h *persistenceHarness) stop(t *testing.T) {
 
 func serviceTestConfig(t *testing.T, nodeID uint16) config.NodeConfig {
 	t.Helper()
-	snapshotListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshotPort := snapshotListener.Addr().(*net.TCPAddr).Port
-	if err := snapshotListener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if snapshotPort < 1027 || snapshotPort > 65529 {
-		t.Fatalf("ephemeral snapshot port %d cannot produce a valid base", snapshotPort)
-	}
-	basePort := uint16(snapshotPort - 2)
+	basePort := reserveServiceTestBase(t)
 	secretPath := t.TempDir() + "/cluster.secret"
 	if err := os.WriteFile(secretPath, testServiceKey(), 0o600); err != nil {
 		t.Fatal(err)
@@ -490,6 +892,46 @@ func serviceTestConfig(t *testing.T, nodeID uint16) config.NodeConfig {
 		t.Fatal(err)
 	}
 	return configuration
+}
+
+var (
+	serviceTestPortsMu sync.Mutex
+	serviceTestBases   []uint16
+)
+
+func reserveServiceTestBase(t *testing.T) uint16 {
+	t.Helper()
+	for attempts := 0; attempts < 100; attempts++ {
+		snapshotListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshotPort := snapshotListener.Addr().(*net.TCPAddr).Port
+		if err := snapshotListener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if snapshotPort < 1027 || snapshotPort > 65529 {
+			continue
+		}
+		candidate := uint16(snapshotPort - 2)
+		serviceTestPortsMu.Lock()
+		overlaps := false
+		for _, used := range serviceTestBases {
+			if uint32(candidate) <= uint32(used)+8 && uint32(used) <= uint32(candidate)+8 {
+				overlaps = true
+				break
+			}
+		}
+		if !overlaps {
+			serviceTestBases = append(serviceTestBases, candidate)
+		}
+		serviceTestPortsMu.Unlock()
+		if !overlaps {
+			return candidate
+		}
+	}
+	t.Fatal("could not reserve a non-overlapping service test port range")
+	return 0
 }
 
 func serviceMemoryDatagram(t *testing.T, network *transport.MemoryNetwork, configuration config.NodeConfig) *transport.MemoryDatagram {

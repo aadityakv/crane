@@ -25,6 +25,8 @@ const (
 	serviceDisseminationMax = 4096
 	serviceRetransmitFactor = 3
 	serviceFutureSkew       = 30 * time.Second
+	serviceTCPConnections   = 64
+	serviceTCPIOTimeout     = 5 * time.Second
 )
 
 var (
@@ -63,13 +65,14 @@ type Service struct {
 	limits    wire.Limits
 	replay    *wire.ReplayGuard
 
-	ready     chan struct{}
-	readyOnce sync.Once
-	done      chan struct{}
-	events    chan serviceEvent
-	state     atomic.Uint32
-	admitted  atomic.Bool
-	active    atomic.Value
+	ready       chan struct{}
+	readyOnce   sync.Once
+	done        chan struct{}
+	events      chan serviceEvent
+	state       atomic.Uint32
+	admitted    atomic.Bool
+	active      atomic.Value
+	connections sync.Map
 }
 
 // NewService validates dependencies and returns a side-effect-free service.
@@ -272,6 +275,12 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 		workers:       &workers,
 		requestPrefix: s.options.Random.Uint64(),
 		requestCount:  s.options.Random.Uint64(),
+		resyncing:     make(map[uint16]bool),
+	}
+	loop.client, err = newProtocolClient(s.options.Config, s.options.Authenticator, s.options.Clock, s.options.Random, serviceTCPIOTimeout)
+	if err != nil {
+		stopWorkers()
+		return err
 	}
 	defer loop.subscriptions.Close()
 
@@ -306,14 +315,28 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 
 	workers.Add(1)
 	go s.receiveDatagrams(workerContext, datagram, &workers)
+	workers.Add(1)
+	go s.acceptTCPConnections(workerContext, listener, &workers)
 	s.readyOnce.Do(func() { close(s.ready) })
 	if loop.admitted {
 		loop.scheduleProbe()
+	} else {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			result, err := loop.client.join(workerContext, seed, s.options.Store, Member{
+				NodeID:   s.options.Config.NodeID,
+				Host:     s.options.Config.AdvertiseHost,
+				BasePort: s.options.Config.BasePort,
+			})
+			s.enqueueWorkerEvent(workerContext, joinCompletedServiceEvent{result: result, err: err})
+		}()
 	}
 
 	runError = loop.run(ctx)
 	stopWorkers()
 	_ = listener.Close()
+	s.closeTCPConnections()
 	_ = datagram.Close()
 	workers.Wait()
 	s.admitted.Store(false)
@@ -367,6 +390,37 @@ type fatalServiceEvent struct{ err error }
 
 func (fatalServiceEvent) serviceEvent() {}
 
+type tcpSnapshotServiceEvent struct{ response chan<- snapshotResult }
+
+func (tcpSnapshotServiceEvent) serviceEvent() {}
+
+type joinAdmissionResult struct {
+	accepted Member
+	err      error
+}
+
+type joinAdmissionServiceEvent struct {
+	announce JoinAnnounce
+	response chan<- joinAdmissionResult
+}
+
+func (joinAdmissionServiceEvent) serviceEvent() {}
+
+type joinCompletedServiceEvent struct {
+	result joinClientResult
+	err    error
+}
+
+func (joinCompletedServiceEvent) serviceEvent() {}
+
+type snapshotResyncServiceEvent struct {
+	senderID uint16
+	members  []Member
+	err      error
+}
+
+func (snapshotResyncServiceEvent) serviceEvent() {}
+
 type serviceLoop struct {
 	service       *Service
 	engine        *Engine
@@ -375,9 +429,11 @@ type serviceLoop struct {
 	datagram      transport.Datagram
 	workerContext context.Context
 	workers       *sync.WaitGroup
+	client        *protocolClient
 	admitted      bool
 	requestPrefix uint64
 	requestCount  uint64
+	resyncing     map[uint16]bool
 }
 
 func (l *serviceLoop) run(parent context.Context) error {
@@ -402,6 +458,20 @@ func (l *serviceLoop) run(parent context.Context) error {
 				}
 			case fatalServiceEvent:
 				return event.err
+			case tcpSnapshotServiceEvent:
+				event.response <- snapshotResult{members: l.engine.Snapshot()}
+			case joinAdmissionServiceEvent:
+				if err := l.handleJoinAdmission(event); err != nil {
+					return err
+				}
+			case joinCompletedServiceEvent:
+				if err := l.handleJoinCompleted(event); err != nil {
+					return err
+				}
+			case snapshotResyncServiceEvent:
+				if err := l.handleSnapshotResync(event); err != nil {
+					return err
+				}
 			}
 		case <-parent.Done():
 			if l.admitted {
@@ -435,6 +505,199 @@ func (s *Service) receiveDatagrams(ctx context.Context, datagram transport.Datag
 			return
 		}
 	}
+}
+
+func (s *Service) acceptTCPConnections(ctx context.Context, listener net.Listener, workers *sync.WaitGroup) {
+	defer workers.Done()
+	capacity := make(chan struct{}, serviceTCPConnections)
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			s.enqueueWorkerEvent(ctx, fatalServiceEvent{err: fmt.Errorf("accept SWIM snapshot TCP: %w", err)})
+			return
+		}
+		select {
+		case capacity <- struct{}{}:
+			s.connections.Store(connection, struct{}{})
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				defer func() { <-capacity }()
+				defer s.connections.Delete(connection)
+				s.handleTCPConnection(ctx, connection)
+			}()
+		default:
+			_ = connection.Close()
+		}
+	}
+}
+
+func (s *Service) handleTCPConnection(ctx context.Context, connection net.Conn) {
+	stream := wire.NewTCPFrameStream(connection, s.options.Authenticator, s.limits, serviceTCPIOTimeout)
+	defer stream.Close()
+	frame, err := stream.ReadFrame(ctx)
+	if err != nil {
+		return
+	}
+	if err := s.validateTCPRequest(frame); err != nil {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
+		return
+	}
+	if !s.admitted.Load() {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, ErrServiceNotAdmitted)
+		return
+	}
+
+	switch frame.Header.Message {
+	case wire.MessageSWIMJoinRequest:
+		s.handleTCPJoin(ctx, stream, frame)
+	case wire.MessageSWIMSnapshotRequest:
+		s.handleTCPSnapshot(ctx, stream, frame)
+	default:
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, fmt.Errorf("%w: first message %d", ErrSnapshotProtocol, frame.Header.Message))
+	}
+}
+
+func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream, requestFrame wire.Frame) {
+	var request JoinRequest
+	if err := wire.DecodeGob(requestFrame.Payload, &request); err != nil || request.NodeID == 0 || request.NodeID != requestFrame.Header.SenderID {
+		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, fmt.Errorf("%w: invalid join request", ErrInvalidJoinAnnouncement))
+		return
+	}
+	snapshot, err := s.requestTCPSnapshot(ctx)
+	if err != nil {
+		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, err)
+		return
+	}
+	if err := s.writeTCPPayload(ctx, stream, wire.MessageSWIMJoinSnapshot, requestFrame.Header.RequestID, JoinSnapshot{Members: snapshot}); err != nil {
+		return
+	}
+
+	announceFrame, err := stream.ReadFrame(ctx)
+	if err != nil {
+		return
+	}
+	if err := s.validateTCPRequest(announceFrame); err != nil {
+		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, err)
+		return
+	}
+	if announceFrame.Header.SenderID != requestFrame.Header.SenderID || announceFrame.Header.Message != wire.MessageSWIMJoinAnnounce {
+		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, fmt.Errorf("%w: join announcement must follow snapshot", ErrSnapshotProtocol))
+		return
+	}
+	var announce JoinAnnounce
+	if err := wire.DecodeGob(announceFrame.Payload, &announce); err != nil || announce.Member.NodeID != announceFrame.Header.SenderID {
+		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, fmt.Errorf("%w: invalid join announcement payload", ErrInvalidJoinAnnouncement))
+		return
+	}
+	result := s.requestJoinAdmission(ctx, announce)
+	if result.err != nil {
+		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, result.err)
+		return
+	}
+	_ = s.writeTCPPayload(ctx, stream, wire.MessageSWIMJoinAccepted, announceFrame.Header.RequestID, JoinAccepted{Member: result.accepted})
+}
+
+func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameStream, frame wire.Frame) {
+	active := s.active.Load().(map[uint16]Member)
+	if _, exists := active[frame.Header.SenderID]; !exists {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, ErrServiceNotAdmitted)
+		return
+	}
+	var request SnapshotRequest
+	if err := wire.DecodeGob(frame.Payload, &request); err != nil {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, fmt.Errorf("%w: invalid snapshot request", ErrInvalidSnapshotPayload))
+		return
+	}
+	snapshot, err := s.requestTCPSnapshot(ctx)
+	if err != nil {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
+		return
+	}
+	_ = s.writeTCPPayload(ctx, stream, wire.MessageSWIMSnapshotResponse, frame.Header.RequestID, SnapshotResponse{Members: snapshot})
+}
+
+func (s *Service) validateTCPRequest(frame wire.Frame) error {
+	if frame.Header.SenderID == 0 {
+		return fmt.Errorf("%w: zero sender ID", ErrSnapshotProtocol)
+	}
+	switch frame.Header.Message {
+	case wire.MessageSWIMJoinRequest, wire.MessageSWIMJoinAnnounce, wire.MessageSWIMSnapshotRequest:
+	default:
+		return fmt.Errorf("%w: unsupported request type %d", ErrSnapshotProtocol, frame.Header.Message)
+	}
+	if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) requestTCPSnapshot(ctx context.Context) ([]Member, error) {
+	response := make(chan snapshotResult, 1)
+	select {
+	case s.events <- tcpSnapshotServiceEvent{response: response}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.done:
+		return nil, ErrServiceNotRunning
+	}
+	select {
+	case result := <-response:
+		return result.members, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.done:
+		return nil, ErrServiceNotRunning
+	}
+}
+
+func (s *Service) requestJoinAdmission(ctx context.Context, announce JoinAnnounce) joinAdmissionResult {
+	response := make(chan joinAdmissionResult, 1)
+	select {
+	case s.events <- joinAdmissionServiceEvent{announce: announce, response: response}:
+	case <-ctx.Done():
+		return joinAdmissionResult{err: ctx.Err()}
+	case <-s.done:
+		return joinAdmissionResult{err: ErrServiceNotRunning}
+	}
+	select {
+	case result := <-response:
+		return result
+	case <-ctx.Done():
+		return joinAdmissionResult{err: ctx.Err()}
+	case <-s.done:
+		return joinAdmissionResult{err: ErrServiceNotRunning}
+	}
+}
+
+func (s *Service) writeTCPPayload(ctx context.Context, stream *wire.TCPFrameStream, message wire.MessageType, requestID wire.RequestID, value any) error {
+	payload, err := wire.EncodeGob(value)
+	if err != nil {
+		return err
+	}
+	return stream.WriteFrame(ctx, wire.Frame{Header: wire.Header{
+		Version:         wire.Version1,
+		Message:         message,
+		ClusterID:       s.clusterID,
+		SenderID:        s.options.Config.NodeID,
+		RequestID:       requestID,
+		TimestampMillis: s.options.Clock.Now().UnixMilli(),
+		Codec:           wire.CodecGob,
+	}, Payload: payload})
+}
+
+func (s *Service) writeTCPError(ctx context.Context, stream *wire.TCPFrameStream, requestID wire.RequestID, err error) error {
+	return s.writeTCPPayload(ctx, stream, wire.MessageSWIMError, requestID, encodeProtocolError(err))
+}
+
+func (s *Service) closeTCPConnections() {
+	s.connections.Range(func(connection, _ any) bool {
+		_ = connection.(net.Conn).Close()
+		return true
+	})
 }
 
 func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent, bool) {
@@ -544,12 +807,101 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 		effects = l.engine.HandlePingReq(sender, message.PingReq, now)
 	case IndirectAckMessage:
 		effects = l.engine.HandleIndirectAck(sender, message.IndirectAck, now)
-	case GossipMessage, DigestMessage:
+	case GossipMessage:
+		return nil
+	case DigestMessage:
+		l.startSnapshotResync(sender)
 		return nil
 	default:
 		return nil
 	}
 	return l.executeEffects(l.workerContext, effects)
+}
+
+func (l *serviceLoop) handleJoinAdmission(event joinAdmissionServiceEvent) error {
+	if !l.admitted {
+		event.response <- joinAdmissionResult{err: ErrServiceNotAdmitted}
+		return nil
+	}
+	if err := ValidateJoinAnnouncement(l.engine.table, event.announce); err != nil {
+		event.response <- joinAdmissionResult{err: err}
+		return nil
+	}
+	effects := l.engine.ApplyUpdate(Update{Member: event.announce.Member, ReporterID: event.announce.Member.NodeID}, l.service.options.Clock.Now())
+	if err := l.executeEffects(l.workerContext, effects); err != nil {
+		event.response <- joinAdmissionResult{err: err}
+		return err
+	}
+	event.response <- joinAdmissionResult{accepted: event.announce.Member}
+	return nil
+}
+
+func (l *serviceLoop) handleJoinCompleted(event joinCompletedServiceEvent) error {
+	if event.err != nil {
+		return fmt.Errorf("join SWIM cluster: %w", event.err)
+	}
+	result := event.result
+	if result.seedID == 0 || result.seedID == l.service.options.Config.NodeID {
+		return fmt.Errorf("%w: invalid seed sender ID %d", ErrSnapshotProtocol, result.seedID)
+	}
+	if result.accepted.NodeID != l.service.options.Config.NodeID || result.accepted.Host != l.service.options.Config.AdvertiseHost || result.accepted.BasePort != l.service.options.Config.BasePort || result.accepted.Status != Alive || result.accepted.Incarnation == 0 {
+		return fmt.Errorf("%w: seed accepted invalid local member %#v", ErrSnapshotProtocol, result.accepted)
+	}
+	seedPresent := false
+	for _, member := range result.snapshot {
+		if member.NodeID == result.seedID && (member.Status == Alive || member.Status == Suspect) {
+			seedPresent = true
+		}
+		if err := l.executeEffects(l.workerContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: result.seedID}, l.service.options.Clock.Now())); err != nil {
+			return err
+		}
+	}
+	if !seedPresent {
+		return fmt.Errorf("%w: join snapshot omitted active seed %d", ErrSnapshotProtocol, result.seedID)
+	}
+	if err := l.executeEffects(l.workerContext, l.engine.ApplyUpdate(Update{Member: result.accepted, ReporterID: result.accepted.NodeID}, l.service.options.Clock.Now())); err != nil {
+		return err
+	}
+	l.admitted = true
+	l.service.admitted.Store(true)
+	l.refreshActiveMembership()
+	l.scheduleProbe()
+	return nil
+}
+
+func (l *serviceLoop) startSnapshotResync(sender Member) {
+	if l.resyncing[sender.NodeID] {
+		return
+	}
+	endpointConfig := config.NodeConfig{AdvertiseHost: sender.Host, BasePort: sender.BasePort}
+	endpoint, err := endpointConfig.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+	if err != nil {
+		return
+	}
+	l.resyncing[sender.NodeID] = true
+	l.workers.Add(1)
+	go func() {
+		defer l.workers.Done()
+		members, err := l.client.snapshot(l.workerContext, endpoint)
+		l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{senderID: sender.NodeID, members: members, err: err})
+	}()
+}
+
+func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) error {
+	delete(l.resyncing, event.senderID)
+	if event.err != nil {
+		return nil
+	}
+	current, exists := l.engine.table.Get(event.senderID)
+	if !exists || (current.Status != Alive && current.Status != Suspect) {
+		return nil
+	}
+	for _, member := range event.members {
+		if err := l.executeEffects(l.workerContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.senderID}, l.service.options.Clock.Now())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (l *serviceLoop) handleTimer(event timerServiceEvent) error {
@@ -774,4 +1126,25 @@ func parseClusterID(value string) ([16]byte, error) {
 	var clusterID [16]byte
 	copy(clusterID[:], decoded)
 	return clusterID, nil
+}
+
+func encodeProtocolError(err error) ProtocolErrorMessage {
+	response := ProtocolErrorMessage{Code: protocolErrorInternal, Message: "internal service failure"}
+	switch {
+	case errors.Is(err, ErrDuplicateNodeID):
+		response.Code, response.Message = protocolErrorDuplicateNodeID, err.Error()
+	case errors.Is(err, ErrStaleJoinIncarnation):
+		response.Code, response.Message = protocolErrorStaleIncarnation, err.Error()
+	case errors.Is(err, ErrInvalidJoinAnnouncement):
+		response.Code, response.Message = protocolErrorInvalidPayload, err.Error()
+	case errors.Is(err, ErrInvalidSnapshotPayload):
+		response.Code, response.Message = protocolErrorInvalidPayload, err.Error()
+	case errors.Is(err, ErrServiceNotAdmitted):
+		response.Code, response.Message = protocolErrorNotAdmitted, ErrServiceNotAdmitted.Error()
+	case errors.Is(err, wire.ErrReplay), errors.Is(err, wire.ErrReplayCacheFull), errors.Is(err, wire.ErrTimestamp):
+		response.Code, response.Message = protocolErrorReplay, "request rejected by replay defense"
+	case errors.Is(err, ErrSnapshotProtocol):
+		response.Code, response.Message = protocolErrorUnexpectedMessage, err.Error()
+	}
+	return response
 }
