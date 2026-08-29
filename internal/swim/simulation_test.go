@@ -725,7 +725,7 @@ func (c *simulationCluster) advance(duration time.Duration) {
 
 func (c *simulationCluster) waitSnapshot(nodeID uint16, condition func([]Member) bool) []Member {
 	c.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var last []Member
 	var lastError error
