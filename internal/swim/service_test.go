@@ -2,6 +2,7 @@ package swim
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"net"
@@ -887,6 +888,60 @@ func TestServiceTCPBoundaryFailuresDoNotMutateOrStopService(t *testing.T) {
 	seed.stop(t)
 }
 
+func TestServiceBoundsTCPBodiesAndConnections(t *testing.T) {
+	now := time.Unix(4425, 0)
+	network := transport.NewMemoryNetwork()
+	configuration := serviceTestConfig(t, 1)
+	running := startRunningService(t, configuration, newServiceStore(1), clock.NewManual(now), network, 191)
+	endpoint, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
+
+	oversized, err := net.Dial("tcp", endpoint.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefix [4]byte
+	binary.BigEndian.PutUint32(prefix[:], uint32(running.service.limits.MaxFrameSize+1))
+	if _, err := oversized.Write(prefix[:]); err != nil {
+		t.Fatal(err)
+	}
+	assertConnectionClosedPromptly(t, oversized, "oversized TCP body")
+	waitServiceTCPConnectionCount(t, running.service, 0)
+
+	connections := make([]net.Conn, 0, serviceTCPConnections)
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+	for index := 0; index < serviceTCPConnections; index++ {
+		connection, err := net.Dial("tcp", endpoint.String())
+		if err != nil {
+			t.Fatalf("dial held TCP connection %d: %v", index+1, err)
+		}
+		connections = append(connections, connection)
+	}
+	waitServiceTCPConnectionCount(t, running.service, serviceTCPConnections)
+
+	overLimit, err := net.Dial("tcp", endpoint.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConnectionClosedPromptly(t, overLimit, "65th TCP connection")
+	if got := serviceTCPConnectionCount(running.service); got != serviceTCPConnections {
+		t.Fatalf("held TCP connections after rejecting over-limit connection = %d, want %d", got, serviceTCPConnections)
+	}
+
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+	connections = nil
+	waitServiceTCPConnectionCount(t, running.service, 0)
+	if _, err := running.service.Snapshot(testContext(t)); err != nil {
+		t.Fatalf("service stopped after bounded TCP inputs: %v", err)
+	}
+	running.stop(t)
+}
+
 func TestServiceInvalidTCPRequestsCannotPoisonReplayCapacity(t *testing.T) {
 	now := time.Unix(4450, 0)
 	configuration := serviceTestConfig(t, 1)
@@ -1475,6 +1530,39 @@ func waitServiceReady(t *testing.T, service *Service) {
 	case <-service.Ready():
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for service readiness")
+	}
+}
+
+func serviceTCPConnectionCount(service *Service) int {
+	count := 0
+	service.connections.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func waitServiceTCPConnectionCount(t *testing.T, service *Service, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for serviceTCPConnectionCount(service) != want && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if got := serviceTCPConnectionCount(service); got != want {
+		t.Fatalf("owned TCP connections = %d, want %d", got, want)
+	}
+}
+
+func assertConnectionClosedPromptly(t *testing.T, connection net.Conn, label string) {
+	t.Helper()
+	defer connection.Close()
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Read(make([]byte, 1)); err == nil {
+		t.Fatalf("%s remained open", label)
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatalf("%s was not closed before read deadline: %v", label, err)
 	}
 }
 
