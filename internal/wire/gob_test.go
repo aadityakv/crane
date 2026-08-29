@@ -61,8 +61,19 @@ func TestGobDecodeRejectsBytesAfterOneValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var decoded gobTestMessage
-	if err := DecodeGob(bytes.Join([][]byte{first, second}, nil), &decoded); err == nil {
-		t.Fatal("DecodeGob accepted a second gob value")
+	tests := []struct {
+		name    string
+		encoded []byte
+	}{
+		{name: "second_value", encoded: bytes.Join([][]byte{first, second}, nil)},
+		{name: "zero_byte", encoded: append(append([]byte(nil), first...), 0)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var decoded gobTestMessage
+			if err := DecodeGob(tt.encoded, &decoded); err == nil {
+				t.Fatal("DecodeGob accepted bytes after the first gob value")
+			}
+		})
 	}
 }

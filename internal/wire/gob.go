@@ -28,9 +28,13 @@ func DecodeGob(encoded []byte, destination any) error {
 		return errors.New("gob destination must point to a concrete type")
 	}
 
-	decoder := gob.NewDecoder(bytes.NewReader(encoded))
+	reader := bytes.NewReader(encoded)
+	decoder := gob.NewDecoder(reader)
 	if err := decoder.Decode(destination); err != nil {
 		return fmt.Errorf("decode gob value: %w", err)
+	}
+	if reader.Len() != 0 {
+		return fmt.Errorf("gob payload contains %d trailing bytes", reader.Len())
 	}
 	var trailing struct{}
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
