@@ -162,3 +162,71 @@ func TestManualTimerResetDeliversIfDeadlinePassesDuringReset(t *testing.T) {
 	default:
 	}
 }
+
+func TestManualClockReclaimsFiredAndStoppedTimers(t *testing.T) {
+	c := NewManual(time.Unix(200, 0))
+	const timerCount = 1_000
+	for index := 0; index < timerCount; index++ {
+		timer := c.NewTimer(time.Second)
+		if index%2 == 0 {
+			timer.Stop()
+		}
+	}
+
+	c.Advance(time.Second)
+	c.mu.Lock()
+	retained := len(c.timers)
+	c.mu.Unlock()
+	if retained != 0 {
+		t.Fatalf("retained fired/stopped timers = %d, want 0", retained)
+	}
+}
+
+func TestManualTimerResetReregistersAfterFireAndStop(t *testing.T) {
+	start := time.Unix(300, 0)
+	c := NewManual(start)
+	timer := c.NewTimer(time.Second)
+	c.Advance(time.Second)
+	if got := <-timer.C(); !got.Equal(start.Add(time.Second)) {
+		t.Fatalf("first firing = %v", got)
+	}
+	assertManualTimerRegistrySize(t, c, 0)
+
+	if timer.Reset(time.Second) {
+		t.Fatal("Reset after firing reported active")
+	}
+	assertManualTimerRegistrySize(t, c, 1)
+	c.Advance(time.Second)
+	if got := <-timer.C(); !got.Equal(start.Add(2 * time.Second)) {
+		t.Fatalf("reset firing = %v", got)
+	}
+	assertManualTimerRegistrySize(t, c, 0)
+
+	if timer.Reset(time.Second) {
+		t.Fatal("Reset after second firing reported active")
+	}
+	assertManualTimerRegistrySize(t, c, 1)
+	if !timer.Stop() {
+		t.Fatal("Stop after reset reported inactive")
+	}
+	assertManualTimerRegistrySize(t, c, 0)
+
+	if timer.Reset(time.Second) {
+		t.Fatal("Reset after stop reported active")
+	}
+	assertManualTimerRegistrySize(t, c, 1)
+	c.Advance(time.Second)
+	if got := <-timer.C(); !got.Equal(start.Add(3 * time.Second)) {
+		t.Fatalf("post-stop reset firing = %v", got)
+	}
+	assertManualTimerRegistrySize(t, c, 0)
+}
+
+func assertManualTimerRegistrySize(t *testing.T, c *Manual, want int) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if got := len(c.timers); got != want {
+		t.Fatalf("manual timer registry size = %d, want %d", got, want)
+	}
+}

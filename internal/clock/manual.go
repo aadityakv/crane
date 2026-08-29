@@ -61,6 +61,7 @@ func (c *Manual) Advance(duration time.Duration) {
 	for timer := range c.timers {
 		if timer.active && !timer.resetting && !timer.deadline.After(c.now) {
 			timer.active = false
+			delete(c.timers, timer)
 			due = append(due, dueTimer{
 				timer:      timer,
 				deadline:   timer.deadline,
@@ -105,6 +106,7 @@ func (t *manualTimer) Stop() bool {
 	t.active = false
 	t.generation++
 	t.resetting = false
+	delete(t.clock.timers, t)
 	t.clock.mu.Unlock()
 	return wasActive
 }
@@ -120,6 +122,7 @@ func (t *manualTimer) Reset(duration time.Duration) bool {
 	t.active = false
 	t.resetting = true
 	t.generation++
+	delete(t.clock.timers, t)
 	generation := t.generation
 	deadline := t.clock.now.Add(duration)
 	t.clock.mu.Unlock()
@@ -139,6 +142,7 @@ func (t *manualTimer) Reset(duration time.Duration) bool {
 		t.order = t.clock.serial
 		if deadline.After(t.clock.now) {
 			t.active = true
+			t.clock.timers[t] = struct{}{}
 		} else {
 			t.active = false
 			due = &dueTimer{
