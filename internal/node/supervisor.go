@@ -13,6 +13,18 @@ type Supervisor struct {
 	services []Service
 }
 
+type serviceState struct {
+	service Service
+	ready   <-chan struct{}
+}
+
+type completion struct {
+	index      int
+	err        error
+	ready      bool
+	contextErr error
+}
+
 // NewSupervisor constructs a Supervisor for services. It does not start any
 // services; Run validates service names before it starts them.
 func NewSupervisor(services ...Service) *Supervisor {
@@ -30,15 +42,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	serviceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	type serviceState struct {
-		service Service
-		ready   <-chan struct{}
-	}
-	type completion struct {
-		index int
-		err   error
-	}
-
 	states := make([]serviceState, len(s.services))
 	for index, service := range s.services {
 		states[index] = serviceState{service: service, ready: service.Ready()}
@@ -48,82 +51,73 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	completions := make(chan completion, len(states))
 	var readinessWG sync.WaitGroup
 	for index, state := range states {
-		readinessWG.Go(func() {
+		readinessWG.Add(1)
+		go func() {
+			defer readinessWG.Done()
 			select {
 			case <-state.ready:
 				readyEvents <- index
 			case <-serviceCtx.Done():
 			}
-		})
+		}()
 		go func() {
-			completions <- completion{index: index, err: state.service.Run(serviceCtx)}
+			err := state.service.Run(serviceCtx)
+			completions <- completion{
+				index:      index,
+				err:        err,
+				ready:      channelClosed(state.ready),
+				contextErr: serviceCtx.Err(),
+			}
 		}()
 	}
 
 	ready := make([]bool, len(states))
 	readyCount := 0
+	completed := make([]completion, len(states))
 	completedCount := 0
+	shutdown := false
 	markReady := func(index int) {
 		if !ready[index] {
 			ready[index] = true
 			readyCount++
 		}
 	}
-	readyNow := func(index int) bool {
-		select {
-		case <-states[index].ready:
-			markReady(index)
-			return true
-		default:
-			return false
+	record := func(result completion) {
+		completed[result.index] = result
+		completedCount++
+		if result.ready {
+			markReady(result.index)
 		}
-	}
-	join := func(cause error) error {
-		cancel()
-		readinessWG.Wait()
-		for completedCount < len(states) {
-			<-completions
-			completedCount++
-		}
-		return cause
 	}
 
-	for readyCount < len(states) {
+	for !shutdown && readyCount < len(states) {
 		select {
 		case index := <-readyEvents:
 			markReady(index)
 		case result := <-completions:
-			completedCount++
-			if readyNow(result.index) {
-				if err := runningFailure(states[result.index].service.Name(), result.err, serviceCtx.Err()); err != nil {
-					return join(err)
-				}
-				return join(nil)
-			}
-			if serviceCtx.Err() != nil {
-				return join(nil)
-			}
-			return join(startupFailure(states[result.index].service.Name(), result.err))
+			record(result)
+			shutdown = true
 		case <-ctx.Done():
-			return join(nil)
+			shutdown = true
 		}
 	}
 
-	readinessWG.Wait()
-	for completedCount < len(states) {
+	for !shutdown {
 		select {
 		case result := <-completions:
-			completedCount++
-			if err := runningFailure(states[result.index].service.Name(), result.err, serviceCtx.Err()); err != nil {
-				return join(err)
-			}
-			return join(nil)
+			record(result)
+			shutdown = true
 		case <-ctx.Done():
-			return join(nil)
+			shutdown = true
 		}
 	}
 
-	return join(nil)
+	cancel()
+	readinessWG.Wait()
+	for completedCount < len(states) {
+		record(<-completions)
+	}
+	return selectFailure(states, completed)
 }
 
 func validateServices(services []Service) error {
@@ -148,19 +142,39 @@ func startupFailure(name string, err error) error {
 	return fmt.Errorf("service %q failed before reporting ready: %w", name, err)
 }
 
-func runningFailure(name string, err, contextErr error) error {
-	if contextErr != nil && isCancellation(err) {
-		return nil
+func selectFailure(states []serviceState, completed []completion) error {
+	for index, state := range states {
+		result := completed[index]
+		if isCancellation(result.err, result.contextErr) {
+			continue
+		}
+		if !result.ready {
+			return startupFailure(state.service.Name(), result.err)
+		}
+		return runningFailure(state.service.Name(), result.err)
 	}
+	return nil
+}
+
+func runningFailure(name string, err error) error {
 	if err == nil {
 		return fmt.Errorf("service %q exited unexpectedly", name)
-	}
-	if isCancellation(err) {
-		return fmt.Errorf("service %q exited unexpectedly: %w", name, err)
 	}
 	return fmt.Errorf("service %q failed: %w", name, err)
 }
 
-func isCancellation(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+func isCancellation(err, contextErr error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) && errors.Is(contextErr, context.DeadlineExceeded)
+}
+
+func channelClosed(channel <-chan struct{}) bool {
+	select {
+	case <-channel:
+		return true
+	default:
+		return false
+	}
 }
