@@ -20,7 +20,7 @@ jobs:
         with:
           go-version: '1.26.x'
           cache: true
-      - run: make build
+      - run: make build clean-build
       - run: make fmt-check test race vet integration
       - if: runner.os == 'Linux'
         run: make staticcheck
