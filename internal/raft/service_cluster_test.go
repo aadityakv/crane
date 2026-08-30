@@ -97,6 +97,30 @@ func TestTask10StateMachineSnapshotDurablyDeduplicatesConflictingRetry(t *testin
 	}
 }
 
+func TestTask10DurableRetryEvidenceWaitsForExactSuccessfulAttempt(t *testing.T) {
+	evidence := []task10DuplicateApply{
+		{ID: "initial-01", Index: 30, FirstIndex: 2, CommandValue: "conflict", CachedResult: "value-01"},
+		{ID: "other", Index: 31, FirstIndex: 4, CommandValue: "unrelated", CachedResult: "other-value"},
+	}
+	if task10HasDuplicateEvidence(evidence, 0, "initial-01", "conflict", "value-01", 32) {
+		t.Fatal("an earlier ambiguous retry satisfied the successful result index")
+	}
+	evidence = append(evidence, task10DuplicateApply{
+		ID: "initial-01", Index: 32, FirstIndex: 2, CommandValue: "conflict", CachedResult: "value-01",
+	})
+	if !task10HasDuplicateEvidence(evidence, 0, "initial-01", "conflict", "value-01", 32) {
+		t.Fatal("exact successful retry evidence was not matched")
+	}
+	if task10HasDuplicateEvidence(evidence, len(evidence), "initial-01", "conflict", "value-01", 32) {
+		t.Fatal("evidence before the phase boundary was reused")
+	}
+	invalid := append([]task10DuplicateApply(nil), evidence...)
+	invalid = append(invalid, task10DuplicateApply{ID: "same-index", Index: 9, FirstIndex: 9})
+	if err := validateTask10DuplicateEvidence(invalid); err == nil {
+		t.Fatal("exact retry filtering hid a same-index violation")
+	}
+}
+
 func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	configurations, secret, reservations := task10ClusterConfigurations(t)
 	nodes := make([]*task10ClusterNode, 3)
@@ -233,9 +257,10 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 		t.Fatalf("durable conflicting retry result = %q, want cached value-01", retryResult.Result)
 	}
 	awaitTask10State(t, nodes, expected, 5*time.Second)
-	awaitTask10(t, nodes, 5*time.Second, "cumulative durable retry evidence on every voter", func() bool {
+	attempts := task10ProposalAttempts(trackers)
+	awaitTask10(t, nodes, 5*time.Second, fmt.Sprintf("successful durable retry index on every voter; attempts=%#v", attempts), func() bool {
 		for index, tracker := range trackers {
-			if len(tracker.duplicateEvidence()) <= duplicatesBefore[index] {
+			if !task10HasDuplicateEvidence(tracker.duplicateEvidence(), duplicatesBefore[index], durableRetryID, conflictingRetry.Value, "value-01", retryResult.Index) {
 				return false
 			}
 		}
@@ -246,17 +271,16 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 			t.Fatalf("node %d durable retry mutations = %d, before %d", node.configuration.NodeID, got, mutationsBefore[index])
 		}
 		newEvidence := trackers[index].duplicateEvidence()[duplicatesBefore[index]:]
-		matchedResultIndex := false
+		if err := validateTask10DuplicateEvidence(newEvidence); err != nil {
+			t.Fatalf("node %d invalid durable retry evidence: %v; evidence=%#v; attempts=%#v", node.configuration.NodeID, err, newEvidence, attempts)
+		}
 		for _, duplicate := range newEvidence {
-			if duplicate.ID != durableRetryID || duplicate.FirstIndex == duplicate.Index || duplicate.CachedResult != "value-01" || duplicate.CommandValue != conflictingRetry.Value {
-				t.Fatalf("node %d durable retry evidence = %#v", node.configuration.NodeID, duplicate)
-			}
-			if duplicate.Index == retryResult.Index {
-				matchedResultIndex = true
+			if duplicate.ID == durableRetryID && duplicate.CommandValue == conflictingRetry.Value && duplicate.CachedResult != "value-01" {
+				t.Fatalf("node %d deliberate durable retry returned uncached result: %#v; attempts=%#v", node.configuration.NodeID, duplicate, attempts)
 			}
 		}
-		if !matchedResultIndex {
-			t.Fatalf("node %d evidence %#v omitted successful retry index %d", node.configuration.NodeID, newEvidence, retryResult.Index)
+		if !task10HasDuplicateEvidence(newEvidence, 0, durableRetryID, conflictingRetry.Value, "value-01", retryResult.Index) {
+			t.Fatalf("node %d evidence %#v omitted successful retry index %d; attempts=%#v", node.configuration.NodeID, newEvidence, retryResult.Index, attempts)
 		}
 	}
 	assertTask10IdempotencyEvidence(t, nodes, trackers, "durable conflicting retry")
@@ -678,6 +702,28 @@ func (tracker *task10KVTracker) duplicateEvidence() []task10DuplicateApply {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	return append([]task10DuplicateApply(nil), tracker.duplicates...)
+}
+
+func task10HasDuplicateEvidence(evidence []task10DuplicateApply, start int, id, commandValue, cachedResult string, index uint64) bool {
+	if start < 0 || start > len(evidence) {
+		return false
+	}
+	for _, duplicate := range evidence[start:] {
+		if duplicate.ID == id && duplicate.CommandValue == commandValue && duplicate.CachedResult == cachedResult && duplicate.Index == index {
+			return true
+		}
+	}
+	return false
+}
+
+func task10ProposalAttempts(trackers []*task10KVTracker) []task10ProposalAttempt {
+	var attempts []task10ProposalAttempt
+	for _, tracker := range trackers {
+		tracker.mu.Lock()
+		attempts = append(attempts, tracker.proposalAttempts...)
+		tracker.mu.Unlock()
+	}
+	return attempts
 }
 
 func (tracker *task10KVTracker) snapshotRestoreCount() int {

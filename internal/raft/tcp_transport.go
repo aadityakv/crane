@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	// TransportReplayEntries bounds accepted request identities across every peer reconnect.
+	// TransportReplayEntries bounds accepted request identities per remote voter across reconnects.
 	TransportReplayEntries = 8192
 	// TransportFutureSkew is the accepted authenticated wire-clock lead.
 	TransportFutureSkew = 30 * time.Second
@@ -24,6 +24,7 @@ const (
 	TransportMaxInboundConnections = 64
 	transportBackoffMinimum        = 50 * time.Millisecond
 	transportBackoffMaximum        = time.Second
+	transportMaxReplayWindow       = time.Duration(1<<63-1) - TransportFutureSkew
 )
 
 const (
@@ -59,7 +60,7 @@ type TCPTransportOptions struct {
 	ClusterID [16]byte
 	// Authenticator verifies and signs canonical frames.
 	Authenticator wire.Authenticator
-	// Clock timestamps frames and drives service-global replay validation.
+	// Clock timestamps frames and drives per-remote replay validation.
 	Clock clock.Clock
 	// ReplayWindow bounds accepted request age and replay retention.
 	ReplayWindow time.Duration
@@ -77,19 +78,20 @@ type TCPTransportOptions struct {
 
 // TCPTransport owns one bounded outbound worker per remote voter and bounded inbound handlers.
 type TCPTransport struct {
-	localID       uint16
-	voters        VoterSet
-	clusterID     [16]byte
-	authenticator wire.Authenticator
-	clock         clock.Clock
-	replayWindow  time.Duration
-	rpcTimeout    time.Duration
-	codecLimits   CodecLimits
-	limits        wire.Limits
-	replay        *wire.ReplayGuard
-	requestIDs    RequestIDSource
-	dialContext   TCPDialContext
-	backoff       BackoffFunc
+	localID         uint16
+	voters          VoterSet
+	clusterID       [16]byte
+	authenticator   wire.Authenticator
+	clock           clock.Clock
+	replayWindow    time.Duration
+	replayRetention time.Duration
+	rpcTimeout      time.Duration
+	codecLimits     CodecLimits
+	limits          wire.Limits
+	replayGuards    map[uint16]*wire.ReplayGuard
+	requestIDs      RequestIDSource
+	dialContext     TCPDialContext
+	backoff         BackoffFunc
 
 	state  atomic.Uint32
 	ready  chan struct{}
@@ -115,9 +117,10 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 	if err := options.Voters.ValidateLocalID(options.LocalID); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTransportInvariant, err)
 	}
-	if options.ClusterID == ([16]byte{}) || options.Authenticator == nil || options.Clock == nil || options.ReplayWindow <= 0 || options.RPCTimeout <= 0 {
+	if options.ClusterID == ([16]byte{}) || options.Authenticator == nil || options.Clock == nil || options.ReplayWindow <= 0 || options.ReplayWindow > transportMaxReplayWindow || options.RPCTimeout <= 0 {
 		return nil, fmt.Errorf("%w: invalid TCP transport options", ErrTransportInvariant)
 	}
+	replayRetention := options.ReplayWindow + TransportFutureSkew
 	resolvedCodec, err := resolveCodecLimits(options.CodecLimits)
 	if err != nil {
 		return nil, err
@@ -140,18 +143,20 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 	limits.ExpectedClusterID = &clusterID
 	queues := make(map[uint16]*peerIntentQueue, len(options.Voters.voters)-1)
 	requestTrackers := make(map[uint16]*outgoingRequestTracker, len(options.Voters.voters)-1)
+	replayGuards := make(map[uint16]*wire.ReplayGuard, len(options.Voters.voters)-1)
 	for _, voter := range options.Voters.Voters() {
 		if voter.ID != options.LocalID {
 			queues[voter.ID] = newPeerIntentQueue(PeerQueueCapacity)
 			requestTrackers[voter.ID] = &outgoingRequestTracker{issued: make(map[wire.RequestID]time.Time)}
+			replayGuards[voter.ID] = wire.NewReplayGuard(options.Clock, options.ReplayWindow, TransportFutureSkew, TransportReplayEntries)
 		}
 	}
 	transport := &TCPTransport{
 		localID: options.LocalID, voters: options.Voters, clusterID: clusterID,
-		authenticator: options.Authenticator, clock: options.Clock, replayWindow: options.ReplayWindow,
+		authenticator: options.Authenticator, clock: options.Clock, replayWindow: options.ReplayWindow, replayRetention: replayRetention,
 		rpcTimeout: options.RPCTimeout, codecLimits: resolvedCodec, limits: limits,
-		replay:     wire.NewReplayGuard(options.Clock, options.ReplayWindow, TransportFutureSkew, TransportReplayEntries),
-		requestIDs: requestIDs, dialContext: dialContext, backoff: backoff,
+		replayGuards: replayGuards,
+		requestIDs:   requestIDs, dialContext: dialContext, backoff: backoff,
 		ready: make(chan struct{}), done: make(chan struct{}), queues: queues,
 		requestTrackers: requestTrackers,
 	}
@@ -380,10 +385,6 @@ func (transport *TCPTransport) acceptHandshakeAck(frame wire.Frame, peerID uint1
 	return nil
 }
 
-func (transport *TCPTransport) outboundHeader(message wire.MessageType, requestID wire.RequestID) wire.Header {
-	return transport.outboundHeaderAt(message, requestID, transport.clock.Now())
-}
-
 func (transport *TCPTransport) outboundHeaderAt(message wire.MessageType, requestID wire.RequestID, timestamp time.Time) wire.Header {
 	return wire.Header{
 		Version: wire.Version1, Message: message, ClusterID: transport.clusterID,
@@ -452,11 +453,15 @@ func (transport *TCPTransport) handleInboundConnection(ctx context.Context, conn
 	}
 	handshake := rpc.(Handshake)
 	boundID := handshake.SenderID
+	ackTimestamp, err := transport.reserveCorrelatedRequestIDForPeer(boundID, frame.Header.RequestID)
+	if err != nil {
+		return
+	}
 	messageType, payload, err := EncodeRPC(HandshakeAck{ResponderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint()}, transport.codecLimits)
 	if err != nil {
 		return
 	}
-	ack := wire.Frame{Header: transport.outboundHeader(messageType, frame.Header.RequestID), Payload: payload}
+	ack := wire.Frame{Header: transport.outboundHeaderAt(messageType, frame.Header.RequestID, ackTimestamp), Payload: payload}
 	if err := stream.WriteFrame(ctx, ack); err != nil {
 		return
 	}
@@ -518,16 +523,39 @@ func isNodeRPCMessage(message wire.MessageType) bool {
 }
 
 func (transport *TCPTransport) preflightFrame(frame wire.Frame) (bool, error) {
-	err := transport.replay.Preflight(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+	guard, err := transport.replayGuard(frame.Header.SenderID)
+	if err != nil {
+		return false, err
+	}
+	err = guard.Preflight(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
 	return err == nil, err
 }
 
 func (transport *TCPTransport) commitFrame(frame wire.Frame) error {
-	return transport.replay.Commit(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+	guard, err := transport.replayGuard(frame.Header.SenderID)
+	if err != nil {
+		return err
+	}
+	return guard.Commit(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
 }
 
 func (transport *TCPTransport) recordInvalidFrame(frame wire.Frame) {
-	transport.replay.RecordInvalid(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+	guard, err := transport.replayGuard(frame.Header.SenderID)
+	if err != nil {
+		return
+	}
+	guard.RecordInvalid(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+}
+
+func (transport *TCPTransport) replayGuard(senderID uint16) (*wire.ReplayGuard, error) {
+	if senderID == transport.localID || !transport.voters.Contains(senderID) {
+		return nil, fmt.Errorf("%w: invalid replay sender %d", ErrTransportProtocol, senderID)
+	}
+	guard := transport.replayGuards[senderID]
+	if guard == nil {
+		return nil, fmt.Errorf("%w: missing replay guard for voter %d", ErrTransportInvariant, senderID)
+	}
+	return guard, nil
 }
 
 func (transport *TCPTransport) nextRequestIDForPeer(ctx context.Context, peerID uint16) (wire.RequestID, time.Time, error) {
@@ -546,13 +574,10 @@ func (transport *TCPTransport) nextRequestIDForPeer(ctx context.Context, peerID 
 				transport.requestMu.Unlock()
 				return wire.RequestID{}, time.Time{}, fmt.Errorf("%w: %v", ErrRequestIDExhausted, err)
 			}
-			if _, reused := tracker.issued[id]; reused {
+			if err := tracker.record(id, timestamp, transport.replayRetention); err != nil {
 				transport.requestMu.Unlock()
-				return wire.RequestID{}, time.Time{}, ErrRequestIDExhausted
+				return wire.RequestID{}, time.Time{}, err
 			}
-			expiresAt := timestamp.Add(transport.replayWindow + TransportFutureSkew)
-			tracker.issued[id] = expiresAt
-			heap.Push(&tracker.expires, outgoingRequestExpiry{id: id, expiresAt: expiresAt})
 			transport.requestMu.Unlock()
 			return id, timestamp, nil
 		}
@@ -570,9 +595,37 @@ func (transport *TCPTransport) nextRequestIDForPeer(ctx context.Context, peerID 
 	}
 }
 
+func (transport *TCPTransport) reserveCorrelatedRequestIDForPeer(peerID uint16, id wire.RequestID) (time.Time, error) {
+	transport.requestMu.Lock()
+	defer transport.requestMu.Unlock()
+	tracker := transport.requestTrackers[peerID]
+	if tracker == nil {
+		return time.Time{}, fmt.Errorf("%w: invalid request-ID destination %d", ErrTransportInvariant, peerID)
+	}
+	timestamp := time.UnixMilli(transport.clock.Now().UnixMilli())
+	tracker.purgeExpired(timestamp)
+	if err := tracker.record(id, timestamp, transport.replayRetention); err != nil {
+		return time.Time{}, err
+	}
+	return timestamp, nil
+}
+
 type outgoingRequestTracker struct {
 	issued  map[wire.RequestID]time.Time
 	expires outgoingRequestExpiryHeap
+}
+
+func (tracker *outgoingRequestTracker) record(id wire.RequestID, timestamp time.Time, retention time.Duration) error {
+	if id == (wire.RequestID{}) {
+		return ErrRequestIDExhausted
+	}
+	if _, reused := tracker.issued[id]; reused || len(tracker.issued) >= TransportReplayEntries {
+		return ErrRequestIDExhausted
+	}
+	expiresAt := timestamp.Add(retention)
+	tracker.issued[id] = expiresAt
+	heap.Push(&tracker.expires, outgoingRequestExpiry{id: id, expiresAt: expiresAt})
+	return nil
 }
 
 func (tracker *outgoingRequestTracker) purgeExpired(now time.Time) {

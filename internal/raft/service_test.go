@@ -3,12 +3,14 @@ package raft
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -314,6 +316,76 @@ func TestServiceReportedFatalWinsConcurrentCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("fatal/cancellation race did not join children")
+	}
+}
+
+func TestServiceReturnsStateMachineContextCancellationAsFatalAfterReady(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+	for _, test := range []struct {
+		name     string
+		applyErr error
+		wantText string
+	}{
+		{name: "exact", applyErr: context.Canceled, wantText: "context canceled"},
+		{name: "wrapped", applyErr: fmt.Errorf("application checkpoint: %w", context.Canceled), wantText: "application checkpoint"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for attempt := 0; attempt < 10; attempt++ {
+				configuration, secret := task10ServiceConfig(t, 1, uint16(33572+attempt*10))
+				machine := &task8StateMachine{applyErrAt: 1, applyErr: test.applyErr}
+				service, err := NewService(ServiceOptions{
+					Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+					Random: task8ZeroOffsetRandom{}, StateMachine: machine,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				service.listen = func(string, string) (net.Listener, error) { return newBlockingListener(), nil }
+				transport := newTask10ServiceTransport(nil)
+				service.newTransport = func(TCPTransportOptions) (serviceTransport, error) { return transport, nil }
+				resultPublished := make(chan struct{})
+				releaseResult := make(chan struct{})
+				var publishedOnce sync.Once
+				service.afterChildResultPublished = func(name string) {
+					if name == "Raft Node" {
+						publishedOnce.Do(func() { close(resultPublished) })
+						<-releaseResult
+					}
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan error, 1)
+				go func() { done <- service.Run(ctx) }()
+				awaitClosed(t, service.Ready())
+				entry, err := NewEntry(1, 1, EntryCommand, []byte("fail during Apply"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				submitDone := make(chan error, 1)
+				go func() {
+					submitDone <- service.node.Load().SubmitRPC(context.Background(), 2, AppendEntriesRequest{
+						LeaderID: 2, Term: 1, Generation: 1, LeaderCommit: 1, Entries: []Entry{entry},
+					})
+				}()
+				awaitClosed(t, resultPublished)
+				cancel()
+				close(releaseResult)
+				select {
+				case runErr := <-done:
+					if !errors.Is(runErr, context.Canceled) || !strings.Contains(runErr.Error(), test.wantText) || !strings.Contains(runErr.Error(), "Raft Node failed: apply committed entry 1") {
+						t.Fatalf("attempt %d Service Run error = %v, want first application fatal wrapping context.Canceled", attempt, runErr)
+					}
+				case <-time.After(time.Second):
+					t.Fatalf("attempt %d Service did not join after application fatal", attempt)
+				}
+				awaitClosed(t, transport.done)
+				select {
+				case <-submitDone:
+				case <-time.After(time.Second):
+					t.Fatalf("attempt %d SubmitRPC caller did not unblock", attempt)
+				}
+			}
+		})
 	}
 }
 

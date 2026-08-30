@@ -4,7 +4,6 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -302,7 +301,7 @@ func (service *Service) lifecycleError() error {
 }
 
 func childError(name string, err error) error {
-	if err == nil || errors.Is(err, context.Canceled) {
+	if err == nil {
 		return nil
 	}
 	return fmt.Errorf("%s failed: %w", name, err)

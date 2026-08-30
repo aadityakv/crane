@@ -112,6 +112,7 @@ type task8StateMachine struct {
 	mu           sync.Mutex
 	restoreErr   error
 	applyErrAt   uint64
+	applyErr     error
 	restoreCalls int
 	restoreBytes [][]byte
 	applyCalls   []task8ApplyCall
@@ -130,6 +131,9 @@ func (machine *task8StateMachine) Apply(index, term uint64, command []byte) ([]b
 		command[0] ^= 0xff
 	}
 	if index == machine.applyErrAt {
+		if machine.applyErr != nil {
+			return nil, machine.applyErr
+		}
 		return nil, errors.New("injected application failure")
 	}
 	machine.lastResult = []byte(fmt.Sprintf("result:%d", index))

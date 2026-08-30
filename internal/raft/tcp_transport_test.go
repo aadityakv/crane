@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"reflect"
 	"runtime"
 	"sync"
 	"testing"
@@ -59,6 +60,57 @@ func TestTCPHandshakeBindsConfiguredHeaderAndPayloadSender(t *testing.T) {
 	awaitClosed(t, done)
 }
 
+func TestTCPHandshakeAckReservesCorrelatedRequestIDForOutboundReplayWindow(t *testing.T) {
+	id := wire.RequestID{0x51}
+	transport := newTask10Transport(t, task10TransportOptions{requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{id}}})
+	client, server := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		transport.handleInboundConnection(context.Background(), server, task10Ingress{})
+		close(done)
+	}()
+	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
+	handshake := transportFrame(t, transport, 2, id, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+	if err := writeFrameForTest(stream, handshake); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := readFrameOrError(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackTime := time.UnixMilli(ack.Header.TimestampMillis)
+	if got, want := task10TrackedRequestExpiry(transport, 2, id), ackTime.Add(transport.replayRetention); !got.Equal(want) {
+		t.Fatalf("correlated ACK expiry = %s, want exact ACK timestamp retention %s", got, want)
+	}
+	if got := task10TrackedRequestCount(transport, 2); got != 1 {
+		t.Fatalf("correlated ACK request map entries = %d, want 1", got)
+	}
+	if got := task10TrackedExpiryCount(transport, 2); got != 1 {
+		t.Fatalf("correlated ACK request heap entries = %d, want 1", got)
+	}
+	if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); !errors.Is(err, ErrRequestIDExhausted) {
+		t.Fatalf("generated reuse after correlated ACK error = %v, want ErrRequestIDExhausted", err)
+	}
+	_ = stream.Close()
+	awaitClosed(t, done)
+}
+
+func TestTCPHandshakeAckRejectsRequestIDAlreadyUsedOutboundToPeer(t *testing.T) {
+	id := wire.RequestID{0x52}
+	transport := newTask10Transport(t, task10TransportOptions{requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{id}}})
+	if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
+	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
+	handshake := transportFrame(t, transport, 2, id, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+	if err := writeFrameForTest(stream, handshake); err != nil {
+		t.Fatal(err)
+	}
+	expectClosedStream(t, stream)
+}
+
 func TestTCPHandshakeRejectsPayloadMismatchAndReplayAcrossReconnect(t *testing.T) {
 	transport := newTask10Transport(t, task10TransportOptions{})
 	bad := Handshake{SenderID: 3, VoterFingerprint: transport.voters.Fingerprint()}
@@ -91,7 +143,7 @@ func TestTCPHandshakeRejectsPayloadMismatchAndReplayAcrossReconnect(t *testing.T
 
 func TestTCPInvalidPayloadDoesNotConsumeAcceptedReplayCapacity(t *testing.T) {
 	transport := newTask10Transport(t, task10TransportOptions{})
-	transport.replay = wire.NewReplayGuard(transport.clock, transport.replayWindow, TransportFutureSkew, 1)
+	transport.replayGuards[2] = wire.NewReplayGuard(transport.clock, transport.replayWindow, TransportFutureSkew, 1)
 	client, server := net.Pipe()
 	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
@@ -109,6 +161,130 @@ func TestTCPInvalidPayloadDoesNotConsumeAcceptedReplayCapacity(t *testing.T) {
 	if _, err := readFrameOrError(stream); err != nil {
 		t.Fatalf("valid handshake after invalid capacity entry: %v", err)
 	}
+}
+
+func TestTCPInboundReplayCapacityIsIndependentPerConfiguredRemoteSender(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(1500, 0))
+	transport := newTask10Transport(t, task10TransportOptions{clock: manualClock})
+	heartbeats := int((transport.replayWindow+TransportFutureSkew)/(20*time.Millisecond)) + 1
+	for heartbeat := 0; heartbeat < heartbeats; heartbeat++ {
+		requestID := task10InboundRequestID(uint64(heartbeat + 1))
+		for _, senderID := range []uint16{2, 3} {
+			frame := wire.Frame{Header: transportHeader(transport, senderID, requestID, wire.MessageRaftAppendEntriesResponse)}
+			if preflighted, err := transport.preflightFrame(frame); err != nil || !preflighted {
+				t.Fatalf("heartbeat %d sender %d preflight = (%t, %v)", heartbeat, senderID, preflighted, err)
+			}
+			if err := transport.commitFrame(frame); err != nil {
+				t.Fatalf("heartbeat %d sender %d commit: %v", heartbeat, senderID, err)
+			}
+		}
+		manualClock.Advance(20 * time.Millisecond)
+	}
+	if got := task10InboundReplayGuardCount(t, transport); got != 2 {
+		t.Fatalf("inbound replay guards = %d, want one for each of two remote voters", got)
+	}
+	for _, senderID := range []uint16{2, 3} {
+		accepted, acceptedHeap, invalid, invalidHeap := task10InboundReplayCounts(t, transport, senderID)
+		if accepted > TransportReplayEntries || acceptedHeap > TransportReplayEntries || invalid > TransportReplayEntries || invalidHeap > TransportReplayEntries {
+			t.Fatalf("sender %d replay bounds = accepted %d/%d invalid %d/%d, cap %d", senderID, accepted, acceptedHeap, invalid, invalidHeap, TransportReplayEntries)
+		}
+	}
+}
+
+func TestTCPInboundInvalidReplayCacheIsIndependentPerConfiguredRemoteSender(t *testing.T) {
+	transport := newTask10Transport(t, task10TransportOptions{})
+	firstSenderID := wire.RequestID{0xff}
+	firstFrame := wire.Frame{Header: transportHeader(transport, 2, firstSenderID, wire.MessageRaftAppendEntriesResponse)}
+	if preflighted, err := transport.preflightFrame(firstFrame); err != nil || !preflighted {
+		t.Fatalf("sender 2 invalid candidate preflight = (%t, %v)", preflighted, err)
+	}
+	transport.recordInvalidFrame(firstFrame)
+	for index := 1; index <= TransportReplayEntries; index++ {
+		frame := wire.Frame{Header: transportHeader(transport, 3, task10InboundRequestID(uint64(index)), wire.MessageRaftAppendEntriesResponse)}
+		if preflighted, err := transport.preflightFrame(frame); err != nil || !preflighted {
+			t.Fatalf("sender 3 invalid candidate %d preflight = (%t, %v)", index, preflighted, err)
+		}
+		transport.recordInvalidFrame(frame)
+	}
+	if _, err := transport.preflightFrame(firstFrame); !errors.Is(err, wire.ErrReplay) {
+		t.Fatalf("sender 2 invalid replay after sender 3 pressure = %v, want ErrReplay", err)
+	}
+	for _, senderID := range []uint16{2, 3} {
+		_, _, invalid, invalidHeap := task10InboundReplayCounts(t, transport, senderID)
+		if invalid > TransportReplayEntries || invalidHeap > TransportReplayEntries {
+			t.Fatalf("sender %d invalid replay bounds = map %d heap %d, cap %d", senderID, invalid, invalidHeap, TransportReplayEntries)
+		}
+	}
+}
+
+func TestTCPInboundReplayGuardFailsClosedAtPerSenderCapacityAndRecoversAtExpiry(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(1600, 0))
+	transport := newTask10Transport(t, task10TransportOptions{clock: manualClock})
+	for index := 1; index <= TransportReplayEntries; index++ {
+		frame := wire.Frame{Header: transportHeader(transport, 2, task10InboundRequestID(uint64(index)), wire.MessageRaftAppendEntriesResponse)}
+		if err := transport.commitFrame(frame); err != nil {
+			t.Fatalf("sender 2 commit %d/%d: %v", index, TransportReplayEntries, err)
+		}
+	}
+	full := wire.Frame{Header: transportHeader(transport, 2, task10InboundRequestID(TransportReplayEntries+1), wire.MessageRaftAppendEntriesResponse)}
+	if _, err := transport.preflightFrame(full); !errors.Is(err, wire.ErrReplayCacheFull) {
+		t.Fatalf("sender 2 capacity+1 preflight = %v, want ErrReplayCacheFull", err)
+	}
+	independent := wire.Frame{Header: transportHeader(transport, 3, task10InboundRequestID(1), wire.MessageRaftAppendEntriesResponse)}
+	if err := transport.commitFrame(independent); err != nil {
+		t.Fatalf("sender 3 first commit while sender 2 is full: %v", err)
+	}
+	manualClock.Advance(transport.replayWindow)
+	reused := wire.Frame{Header: transportHeader(transport, 2, task10InboundRequestID(1), wire.MessageRaftAppendEntriesResponse)}
+	if err := transport.commitFrame(reused); err != nil {
+		t.Fatalf("sender 2 reuse at exact expiry: %v", err)
+	}
+	accepted, acceptedHeap, _, _ := task10InboundReplayCounts(t, transport, 2)
+	if accepted != 1 || acceptedHeap != 1 {
+		t.Fatalf("sender 2 post-expiry replay state = map %d heap %d, want 1/1", accepted, acceptedHeap)
+	}
+}
+
+func TestTCPInboundReplayRejectsBeforeAllocatingForUnconfiguredSender(t *testing.T) {
+	transport := newTask10Transport(t, task10TransportOptions{})
+	for _, senderID := range []uint16{0, 1, 4} {
+		frame := wire.Frame{Header: transportHeader(transport, senderID, wire.RequestID{1}, wire.MessageRaftAppendEntriesResponse)}
+		if preflighted, err := transport.preflightFrame(frame); err == nil || preflighted {
+			t.Fatalf("sender %d preflight = (%t, %v), want rejected before replay guard", senderID, preflighted, err)
+		}
+	}
+	if got := task10InboundReplayGuardCount(t, transport); got != 2 {
+		t.Fatalf("replay guard map grew after invalid senders: %d", got)
+	}
+}
+
+func task10InboundRequestID(value uint64) wire.RequestID {
+	var requestID wire.RequestID
+	binary.BigEndian.PutUint64(requestID[len(requestID)-8:], value)
+	return requestID
+}
+
+func task10InboundReplayGuardCount(t *testing.T, transport *TCPTransport) int {
+	t.Helper()
+	guards := reflect.ValueOf(transport).Elem().FieldByName("replayGuards")
+	if !guards.IsValid() {
+		t.Fatal("TCPTransport has no per-sender inbound replay guard map")
+	}
+	return guards.Len()
+}
+
+func task10InboundReplayCounts(t *testing.T, transport *TCPTransport, senderID uint16) (int, int, int, int) {
+	t.Helper()
+	guards := reflect.ValueOf(transport).Elem().FieldByName("replayGuards")
+	if !guards.IsValid() {
+		t.Fatal("TCPTransport has no per-sender inbound replay guard map")
+	}
+	guard := guards.MapIndex(reflect.ValueOf(senderID))
+	if !guard.IsValid() || guard.IsNil() {
+		t.Fatalf("TCPTransport has no inbound replay guard for sender %d", senderID)
+	}
+	state := guard.Elem()
+	return state.FieldByName("seen").Len(), state.FieldByName("expirations").Len(), state.FieldByName("invalid").Len(), state.FieldByName("invalidExpiry").Len()
 }
 
 func TestTCPBoundStreamRejectsSenderChangeAndGob(t *testing.T) {
@@ -307,7 +483,7 @@ func TestTCPOutboundHandshakeRejectsEveryUncorrelatedAck(t *testing.T) {
 							return
 						}
 						if test.seedReplay {
-							err = transport.replay.Commit(2, handshake.Header.RequestID, transport.clock.Now())
+							err = transport.replayGuards[2].Commit(2, handshake.Header.RequestID, transport.clock.Now())
 						}
 						if err == nil {
 							err = writeFrameForTest(stream, test.build(transport, handshake))
@@ -513,6 +689,47 @@ func TestTCPRejectsZeroOrReusedGeneratedRequestID(t *testing.T) {
 				t.Fatalf("reused request ID error = %v", err)
 			}
 		}
+	}
+}
+
+func TestTCPReplayRetentionRejectsDurationOverflowAtConstruction(t *testing.T) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	maxReplayWindow := maxDuration - TransportFutureSkew
+	base := TCPTransportOptions{
+		LocalID:       1,
+		Voters:        task10Voters(t),
+		ClusterID:     [16]byte{1},
+		Authenticator: wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901")),
+		Clock:         &task10PanicClock{},
+		ReplayWindow:  maxReplayWindow + time.Nanosecond,
+		RPCTimeout:    time.Second,
+	}
+	if _, err := NewTCPTransport(base); !errors.Is(err, ErrTransportInvariant) {
+		t.Fatalf("overflowing replay retention constructor error = %v, want ErrTransportInvariant", err)
+	}
+
+	manualClock := clock.NewManual(time.Unix(2000, 0))
+	id := wire.RequestID{0x44}
+	base.Clock = manualClock
+	base.ReplayWindow = maxReplayWindow
+	base.RequestIDs = &fixedTask10RequestIDs{ids: []wire.RequestID{id, id}}
+	transport, err := NewTCPTransport(base)
+	if err != nil {
+		t.Fatalf("max-safe replay window rejected: %v", err)
+	}
+	if transport.replayRetention != maxDuration {
+		t.Fatalf("stored replay retention = %s, want %s", transport.replayRetention, maxDuration)
+	}
+	first, timestamp, err := task10AllocateRequestID(context.Background(), transport, 2)
+	if err != nil || first != id {
+		t.Fatalf("max-safe first allocation = (%x, %v), want %x", first, err, id)
+	}
+	expiresAt := task10TrackedRequestExpiry(transport, 2, id)
+	if !expiresAt.After(timestamp) || expiresAt.Sub(timestamp) != maxDuration {
+		t.Fatalf("max-safe retention = timestamp %s expiry %s duration %s, want positive %s", timestamp, expiresAt, expiresAt.Sub(timestamp), maxDuration)
+	}
+	if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); !errors.Is(err, ErrRequestIDExhausted) {
+		t.Fatalf("immediate near-max reuse error = %v, want ErrRequestIDExhausted", err)
 	}
 }
 
@@ -839,6 +1056,13 @@ type task10AdvancingClock struct {
 	mu   sync.Mutex
 	now  time.Time
 	step time.Duration
+}
+
+type task10PanicClock struct{}
+
+func (*task10PanicClock) Now() time.Time { panic("overflowing constructor read clock") }
+func (*task10PanicClock) NewTimer(time.Duration) clock.Timer {
+	panic("overflowing constructor started timer")
 }
 
 func (source *task10AdvancingClock) Now() time.Time {
