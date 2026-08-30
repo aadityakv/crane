@@ -176,7 +176,7 @@ type InstallSnapshotRequest struct {
 	// LastIncludedTerm is the term at LastIncludedIndex.
 	LastIncludedTerm uint64
 	// StateMachineSchemaVersion identifies the application snapshot encoding.
-	StateMachineSchemaVersion uint16
+	StateMachineSchemaVersion uint32
 	// TotalLength is the complete bounded snapshot state length.
 	TotalLength uint64
 	// Checksum authenticates the complete snapshot state after transfer.

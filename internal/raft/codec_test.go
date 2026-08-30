@@ -6,6 +6,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/aaditya/cs425mp3/internal/config"
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
@@ -46,8 +47,8 @@ func TestCodecRejectsHostileCountsLengthsOffsetsAndTrailingData(t *testing.T) {
 	}
 
 	overflow := rawSnapshotWithOffset(math.MaxUint64, math.MaxUint64, []byte{1})
-	if _, err := DecodeRPC(wire.MessageRaftInstallSnapshotRequest, overflow, CodecLimits{MaxSnapshotBytes: math.MaxUint64}); !errors.Is(err, ErrInvalidRPC) {
-		t.Fatalf("offset overflow error = %v, want ErrInvalidRPC", err)
+	if _, err := DecodeRPC(wire.MessageRaftInstallSnapshotRequest, overflow, DefaultCodecLimits()); !errors.Is(err, ErrRPCTooLarge) {
+		t.Fatalf("offset overflow error = %v, want ErrRPCTooLarge", err)
 	}
 
 	message, valid, err := EncodeRPC(Handshake{SenderID: 1, VoterFingerprint: VoterFingerprint{1}}, DefaultCodecLimits())
@@ -69,6 +70,127 @@ func TestCodecRejectsDeclaredCollectionsBeforeAllocation(t *testing.T) {
 	})
 	if allocations > 12 {
 		t.Fatalf("impossible count used %.1f allocations, want at most 12 bounded error allocations", allocations)
+	}
+}
+
+func TestCodecRejectsHostileAppendSemanticsBeforeVariableAllocation(t *testing.T) {
+	largeCommand := make([]byte, 128<<10)
+	oneEntry := encodedRPCPayload(t, AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, Entries: []Entry{mustEntry(t, 1, 3, EntryCommand, largeCommand)}})
+	twoEntries := encodedRPCPayload(t, AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, Entries: []Entry{mustEntry(t, 1, 3, EntryCommand, largeCommand), mustEntry(t, 2, 3, EntryNoOp, nil)}})
+	manyEntries := make([]Entry, 64)
+	manyEntries[0] = mustEntry(t, 1, 3, EntryCommand, largeCommand)
+	for index := 1; index < len(manyEntries); index++ {
+		manyEntries[index] = mustEntry(t, uint64(index+1), 3, EntryNoOp, nil)
+	}
+	manyEntryPayload := encodedRPCPayload(t, AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, Entries: manyEntries})
+
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "zero_generation", payload: mutateUint64(manyEntryPayload, 12, 0)},
+		{name: "zero_leader_correlation", payload: mutateUint16(oneEntry, 2, 0)},
+		{name: "invalid_previous_position", payload: mutateUint64(oneEntry, 20, 1)},
+		{name: "entry_ordering", payload: mutateUint64(twoEntries, 46, 2)},
+		{name: "entry_kind", payload: mutateByte(oneEntry, 62, 99)},
+		{name: "entry_term_above_leader", payload: mutateUint64(oneEntry, 54, 4)},
+		{name: "trailing_data", payload: append(append([]byte(nil), oneEntry...), 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertRejectedWithoutVariableAllocation(t, wire.MessageRaftAppendEntriesRequest, test.payload)
+		})
+	}
+}
+
+func TestCodecRejectsHostileSnapshotSemanticsBeforeVariableAllocation(t *testing.T) {
+	chunk := make([]byte, 128<<10)
+	valid := encodedRPCPayload(t, InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: TransferID{1}, SnapshotID: SnapshotID{1}, LastIncludedIndex: 2, LastIncludedTerm: 2, StateMachineSchemaVersion: 1, TotalLength: uint64(len(chunk)), Checksum: SnapshotChecksum{1}, Chunk: chunk, Done: true})
+
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "zero_leader_correlation", payload: mutateUint16(valid, 2, 0)},
+		{name: "zero_transfer", payload: mutateZeroRange(valid, 12, 28)},
+		{name: "zero_snapshot_identity", payload: mutateZeroRange(valid, 28, 44)},
+		{name: "included_term_above_leader", payload: mutateUint64(valid, 52, 4)},
+		{name: "offset_plus_length_range", payload: mutateUint64(valid, 104, 1)},
+		{name: "done_mismatch", payload: mutateByte(valid, len(valid)-1, 0)},
+		{name: "trailing_data", payload: append(append([]byte(nil), valid...), 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertRejectedWithoutVariableAllocation(t, wire.MessageRaftInstallSnapshotRequest, test.payload)
+		})
+	}
+}
+
+func TestCodecAbsoluteCeilingsCannotBeRaised(t *testing.T) {
+	rpc := Handshake{SenderID: 1, VoterFingerprint: VoterFingerprint{1}}
+	tests := []struct {
+		name   string
+		limits CodecLimits
+	}{
+		{name: "command", limits: CodecLimits{MaxCommandBytes: config.MaxRaftCommandBytes + 1}},
+		{name: "snapshot_chunk", limits: CodecLimits{MaxSnapshotChunkBytes: config.MaxRaftSnapshotChunkBytes + 1}},
+		{name: "snapshot_total", limits: CodecLimits{MaxSnapshotBytes: config.MaxRaftSnapshotBytes + 1}},
+		{name: "encoded_payload", limits: CodecLimits{MaxEncodedBytes: MaxRPCPayloadBytes + 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := EncodeRPC(rpc, test.limits); !errors.Is(err, ErrRPCTooLarge) {
+				t.Fatalf("EncodeRPC error = %v, want ErrRPCTooLarge", err)
+			}
+		})
+	}
+}
+
+func TestCodecAbsoluteCeilingBoundariesAreAccepted(t *testing.T) {
+	command := make([]byte, config.MaxRaftCommandBytes)
+	appendRPC := AppendEntriesRequest{LeaderID: 1, Term: 1, Generation: 1, Entries: []Entry{mustEntry(t, 1, 1, EntryCommand, command)}}
+	if _, _, err := EncodeRPC(appendRPC, DefaultCodecLimits()); err != nil {
+		t.Fatalf("EncodeRPC command boundary: %v", err)
+	}
+
+	chunk := make([]byte, config.MaxRaftSnapshotChunkBytes)
+	snapshotRPC := InstallSnapshotRequest{LeaderID: 1, Term: 1, TransferID: TransferID{1}, SnapshotID: SnapshotID{1}, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, TotalLength: uint64(len(chunk)), Checksum: SnapshotChecksum{1}, Chunk: chunk, Done: true}
+	if _, _, err := EncodeRPC(snapshotRPC, DefaultCodecLimits()); err != nil {
+		t.Fatalf("EncodeRPC chunk boundary: %v", err)
+	}
+
+	snapshotRPC.TotalLength = config.MaxRaftSnapshotBytes
+	snapshotRPC.Chunk = []byte{1}
+	snapshotRPC.Done = false
+	if _, _, err := EncodeRPC(snapshotRPC, DefaultCodecLimits()); err != nil {
+		t.Fatalf("EncodeRPC snapshot boundary: %v", err)
+	}
+
+	limits := DefaultCodecLimits()
+	limits.MaxEncodedBytes = MaxRPCPayloadBytes
+	if _, _, err := EncodeRPC(Handshake{SenderID: 1, VoterFingerprint: VoterFingerprint{1}}, limits); err != nil {
+		t.Fatalf("EncodeRPC encoded boundary: %v", err)
+	}
+}
+
+func TestCodecAbsoluteDataCeilingsRejectOneAbove(t *testing.T) {
+	command := make([]byte, config.MaxRaftCommandBytes+1)
+	appendRPC := AppendEntriesRequest{LeaderID: 1, Term: 1, Generation: 1, Entries: []Entry{mustEntry(t, 1, 1, EntryCommand, command)}}
+	if _, _, err := EncodeRPC(appendRPC, CodecLimits{MaxCommandBytes: config.MaxRaftCommandBytes + 1}); !errors.Is(err, ErrRPCTooLarge) {
+		t.Fatalf("command one-above error = %v, want ErrRPCTooLarge", err)
+	}
+
+	chunk := make([]byte, config.MaxRaftSnapshotChunkBytes+1)
+	snapshotRPC := InstallSnapshotRequest{LeaderID: 1, Term: 1, TransferID: TransferID{1}, SnapshotID: SnapshotID{1}, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, TotalLength: uint64(len(chunk)), Checksum: SnapshotChecksum{1}, Chunk: chunk, Done: true}
+	if _, _, err := EncodeRPC(snapshotRPC, CodecLimits{MaxSnapshotChunkBytes: config.MaxRaftSnapshotChunkBytes + 1}); !errors.Is(err, ErrRPCTooLarge) {
+		t.Fatalf("chunk one-above error = %v, want ErrRPCTooLarge", err)
+	}
+
+	snapshotRPC.TotalLength = config.MaxRaftSnapshotBytes + 1
+	snapshotRPC.Chunk = []byte{1}
+	snapshotRPC.Done = false
+	if _, _, err := EncodeRPC(snapshotRPC, CodecLimits{MaxSnapshotBytes: config.MaxRaftSnapshotBytes + 1}); !errors.Is(err, ErrRPCTooLarge) {
+		t.Fatalf("snapshot one-above error = %v, want ErrRPCTooLarge", err)
 	}
 }
 
@@ -146,7 +268,7 @@ func rawSnapshotWithOffset(offset, total uint64, chunk []byte) []byte {
 }
 
 func rawSnapshotWithOffsetAndDeclaredLength(offset, total uint64, length uint32, chunk []byte) []byte {
-	payload := make([]byte, 114+len(chunk)+1)
+	payload := make([]byte, 116+len(chunk)+1)
 	binary.BigEndian.PutUint16(payload[0:2], RPCSchemaVersion)
 	binary.BigEndian.PutUint16(payload[2:4], 1)
 	binary.BigEndian.PutUint64(payload[4:12], 1)
@@ -154,12 +276,60 @@ func rawSnapshotWithOffsetAndDeclaredLength(offset, total uint64, length uint32,
 	payload[28] = 1
 	binary.BigEndian.PutUint64(payload[44:52], 1)
 	binary.BigEndian.PutUint64(payload[52:60], 1)
-	binary.BigEndian.PutUint16(payload[60:62], 1)
-	binary.BigEndian.PutUint64(payload[62:70], total)
-	payload[70] = 1
-	binary.BigEndian.PutUint64(payload[102:110], offset)
-	binary.BigEndian.PutUint32(payload[110:114], length)
-	copy(payload[114:], chunk)
+	binary.BigEndian.PutUint32(payload[60:64], 1)
+	binary.BigEndian.PutUint64(payload[64:72], total)
+	payload[72] = 1
+	binary.BigEndian.PutUint64(payload[104:112], offset)
+	binary.BigEndian.PutUint32(payload[112:116], length)
+	copy(payload[116:], chunk)
 	payload[len(payload)-1] = 1
 	return payload
+}
+
+func encodedRPCPayload(t *testing.T, rpc RPC) []byte {
+	t.Helper()
+	_, payload, err := EncodeRPC(rpc, DefaultCodecLimits())
+	if err != nil {
+		t.Fatalf("EncodeRPC(%T): %v", rpc, err)
+	}
+	return payload
+}
+
+func assertRejectedWithoutVariableAllocation(t *testing.T, message wire.MessageType, payload []byte) {
+	t.Helper()
+	if _, err := DecodeRPC(message, payload, DefaultCodecLimits()); err == nil {
+		t.Fatal("DecodeRPC accepted hostile payload")
+	}
+	result := testing.Benchmark(func(b *testing.B) {
+		for range b.N {
+			_, _ = DecodeRPC(message, payload, DefaultCodecLimits())
+		}
+	})
+	if allocated := result.AllocedBytesPerOp(); allocated > 512 {
+		t.Fatalf("rejected decode allocated %d bytes/op, want at most 512 fixed error bytes", allocated)
+	}
+}
+
+func mutateUint16(payload []byte, offset int, value uint16) []byte {
+	mutated := append([]byte(nil), payload...)
+	binary.BigEndian.PutUint16(mutated[offset:offset+2], value)
+	return mutated
+}
+
+func mutateUint64(payload []byte, offset int, value uint64) []byte {
+	mutated := append([]byte(nil), payload...)
+	binary.BigEndian.PutUint64(mutated[offset:offset+8], value)
+	return mutated
+}
+
+func mutateByte(payload []byte, offset int, value byte) []byte {
+	mutated := append([]byte(nil), payload...)
+	mutated[offset] = value
+	return mutated
+}
+
+func mutateZeroRange(payload []byte, start, end int) []byte {
+	mutated := append([]byte(nil), payload...)
+	clear(mutated[start:end])
+	return mutated
 }

@@ -79,7 +79,7 @@ type SnapshotMetadata struct {
 	// LastIncludedTerm is the term at LastIncludedIndex.
 	LastIncludedTerm uint64
 	// StateMachineSchemaVersion identifies the application snapshot schema.
-	StateMachineSchemaVersion uint16
+	StateMachineSchemaVersion uint32
 }
 
 // Status is a point-in-time, non-linearizable diagnostic view of a voter.

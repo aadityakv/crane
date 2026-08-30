@@ -164,6 +164,18 @@ func resolveCodecLimits(limits CodecLimits) (CodecLimits, error) {
 	if limits.MaxEncodedBytes == 0 {
 		limits.MaxEncodedBytes = defaults.MaxEncodedBytes
 	}
+	if limits.MaxCommandBytes > defaults.MaxCommandBytes {
+		return CodecLimits{}, fmt.Errorf("%w: command limit %d exceeds absolute maximum %d", ErrRPCTooLarge, limits.MaxCommandBytes, defaults.MaxCommandBytes)
+	}
+	if limits.MaxSnapshotChunkBytes > defaults.MaxSnapshotChunkBytes {
+		return CodecLimits{}, fmt.Errorf("%w: snapshot chunk limit %d exceeds absolute maximum %d", ErrRPCTooLarge, limits.MaxSnapshotChunkBytes, defaults.MaxSnapshotChunkBytes)
+	}
+	if limits.MaxSnapshotBytes > defaults.MaxSnapshotBytes {
+		return CodecLimits{}, fmt.Errorf("%w: snapshot limit %d exceeds absolute maximum %d", ErrRPCTooLarge, limits.MaxSnapshotBytes, defaults.MaxSnapshotBytes)
+	}
+	if limits.MaxEncodedBytes > defaults.MaxEncodedBytes {
+		return CodecLimits{}, fmt.Errorf("%w: encoded limit %d exceeds absolute maximum %d", ErrRPCTooLarge, limits.MaxEncodedBytes, defaults.MaxEncodedBytes)
+	}
 	if limits.MaxCommandBytes > math.MaxUint32 || limits.MaxSnapshotChunkBytes > math.MaxUint32 {
 		return CodecLimits{}, fmt.Errorf("%w: byte-string limit exceeds uint32 length domain", ErrRPCTooLarge)
 	}
@@ -184,19 +196,19 @@ func validateRPC(rpc RPC, limits CodecLimits) error {
 			return fmt.Errorf("%w: handshake acknowledgement requires responder and voter fingerprint", ErrInvalidRPC)
 		}
 	case PreVoteRequest:
-		if message.CandidateID == 0 || !isNextTerm(message.CurrentTerm, message.ProspectiveTerm) || !validLogPosition(message.LastLogIndex, message.LastLogTerm) {
+		if message.CandidateID == 0 || !isNextTerm(message.CurrentTerm, message.ProspectiveTerm) || !validLogPosition(message.LastLogIndex, message.LastLogTerm) || message.LastLogTerm > message.CurrentTerm {
 			return fmt.Errorf("%w: invalid pre-vote request", ErrInvalidRPC)
 		}
 	case PreVoteResponse:
-		if !validDistinctIDs(message.ResponderID, message.CandidateID) || !isNextTerm(message.RequestCurrentTerm, message.ProspectiveTerm) || message.Term < message.RequestCurrentTerm {
+		if !validDistinctIDs(message.ResponderID, message.CandidateID) || !isNextTerm(message.RequestCurrentTerm, message.ProspectiveTerm) || (message.Term > message.ProspectiveTerm && message.Granted) {
 			return fmt.Errorf("%w: invalid pre-vote response", ErrInvalidRPC)
 		}
 	case RequestVoteRequest:
-		if message.CandidateID == 0 || message.Term == 0 || !validLogPosition(message.LastLogIndex, message.LastLogTerm) {
+		if message.CandidateID == 0 || message.Term == 0 || !validLogPosition(message.LastLogIndex, message.LastLogTerm) || message.LastLogTerm > message.Term {
 			return fmt.Errorf("%w: invalid vote request", ErrInvalidRPC)
 		}
 	case RequestVoteResponse:
-		if !validDistinctIDs(message.ResponderID, message.CandidateID) || message.RequestTerm == 0 || message.Term < message.RequestTerm {
+		if !validDistinctIDs(message.ResponderID, message.CandidateID) || message.RequestTerm == 0 || message.Term < message.RequestTerm || (message.Term > message.RequestTerm && message.Granted) {
 			return fmt.Errorf("%w: invalid vote response", ErrInvalidRPC)
 		}
 	case AppendEntriesRequest:
@@ -226,21 +238,23 @@ func validateRPC(rpc RPC, limits CodecLimits) error {
 }
 
 func validateAppendRequest(message AppendEntriesRequest, limits CodecLimits) error {
-	if message.LeaderID == 0 || message.Term == 0 || message.Generation == 0 || !validLogPosition(message.PrevLogIndex, message.PrevLogTerm) {
+	if message.LeaderID == 0 || message.Term == 0 || message.Generation == 0 || !validLogPosition(message.PrevLogIndex, message.PrevLogTerm) || message.PrevLogTerm > message.Term {
 		return fmt.Errorf("%w: invalid append request metadata", ErrInvalidRPC)
 	}
 	if len(message.Entries) > int(limits.MaxAppendEntries) {
 		return fmt.Errorf("%w: append count %d exceeds %d", ErrRPCTooLarge, len(message.Entries), limits.MaxAppendEntries)
 	}
 	expected := message.PrevLogIndex
+	previousTerm := message.PrevLogTerm
 	for index, entry := range message.Entries {
 		if expected == math.MaxUint64 {
 			return fmt.Errorf("%w: append index overflow", ErrInvalidRPC)
 		}
 		expected++
-		if entry.Index != expected || entry.Term == 0 || (entry.Kind != EntryCommand && entry.Kind != EntryNoOp) {
+		if entry.Index != expected || entry.Term == 0 || entry.Term < previousTerm || entry.Term > message.Term || (entry.Kind != EntryCommand && entry.Kind != EntryNoOp) {
 			return fmt.Errorf("%w: invalid entry %d ordering or metadata", ErrInvalidRPC, index)
 		}
+		previousTerm = entry.Term
 		commandLength := uint64(len(entry.command))
 		if commandLength > limits.MaxCommandBytes {
 			return fmt.Errorf("%w: command is %d bytes, maximum is %d", ErrRPCTooLarge, commandLength, limits.MaxCommandBytes)
@@ -257,6 +271,9 @@ func validateAppendResponse(message AppendEntriesResponse) error {
 		return fmt.Errorf("%w: invalid append response correlation", ErrInvalidRPC)
 	}
 	if message.Success {
+		if message.Term > message.RequestTerm {
+			return fmt.Errorf("%w: higher-term append response cannot succeed", ErrInvalidRPC)
+		}
 		if message.ConflictTerm != 0 || message.ConflictIndex != 0 {
 			return fmt.Errorf("%w: successful append carries conflict hint", ErrInvalidRPC)
 		}
@@ -270,7 +287,7 @@ func validateSnapshotRequest(message InstallSnapshotRequest, limits CodecLimits)
 	if message.LeaderID == 0 || message.Term == 0 || message.TransferID.IsZero() || message.SnapshotID == (SnapshotID{}) || message.Checksum == (SnapshotChecksum{}) {
 		return fmt.Errorf("%w: invalid snapshot identity", ErrInvalidRPC)
 	}
-	if message.LastIncludedIndex == 0 || message.LastIncludedTerm == 0 || message.StateMachineSchemaVersion == 0 {
+	if message.LastIncludedIndex == 0 || message.LastIncludedTerm == 0 || message.LastIncludedTerm > message.Term || message.StateMachineSchemaVersion == 0 {
 		return fmt.Errorf("%w: invalid snapshot metadata", ErrInvalidRPC)
 	}
 	if message.TotalLength > limits.MaxSnapshotBytes {
@@ -302,6 +319,9 @@ func validateSnapshotResponse(message InstallSnapshotResponse, limits CodecLimit
 	}
 	if message.Done && !message.Success {
 		return fmt.Errorf("%w: rejected snapshot response cannot be done", ErrInvalidRPC)
+	}
+	if message.Term > message.RequestTerm && message.Success {
+		return fmt.Errorf("%w: higher-term snapshot response cannot succeed", ErrInvalidRPC)
 	}
 	return nil
 }
@@ -438,7 +458,7 @@ func (d *payloadDecoder) fixed(destination []byte) error {
 	return nil
 }
 
-func (d *payloadDecoder) bytes32(maximum uint64) ([]byte, error) {
+func (d *payloadDecoder) bytes32Borrowed(maximum uint64) ([]byte, error) {
 	length, err := d.uint32()
 	if err != nil {
 		return nil, err
@@ -452,11 +472,7 @@ func (d *payloadDecoder) bytes32(maximum uint64) ([]byte, error) {
 	if length == 0 {
 		return nil, nil
 	}
-	bytes, err := d.take(int(length))
-	if err != nil {
-		return nil, err
-	}
-	return cloneBytes(bytes), nil
+	return d.take(int(length))
 }
 
 func encodeHandshake(e *payloadEncoder, m Handshake) error {
@@ -560,7 +576,7 @@ func encodeInstallSnapshotRequest(e *payloadEncoder, m InstallSnapshotRequest) e
 	if err := encodeUint64s(e, m.LastIncludedIndex, m.LastIncludedTerm); err != nil {
 		return err
 	}
-	if err := e.uint16(m.StateMachineSchemaVersion); err != nil {
+	if err := e.uint32(m.StateMachineSchemaVersion); err != nil {
 		return err
 	}
 	if err := e.uint64(m.TotalLength); err != nil {
@@ -727,23 +743,67 @@ func decodeAppendEntriesRequest(d *payloadDecoder, limits CodecLimits) (RPC, err
 	if uint64(count)*minimumEntryBytes > uint64(d.remaining()) {
 		return nil, fmt.Errorf("%w: append count cannot fit remaining payload", ErrMalformedRPC)
 	}
-	entries := make([]Entry, int(count))
-	for index := range entries {
-		entryFields, err := decodeUint64s(d, 2)
-		if err != nil {
-			return nil, err
-		}
-		kind, err := d.uint8()
-		if err != nil {
-			return nil, err
-		}
-		command, err := d.bytes32(limits.MaxCommandBytes)
-		if err != nil {
-			return nil, err
-		}
-		entries[index] = Entry{Index: entryFields[0], Term: entryFields[1], Kind: EntryKind(kind), command: command}
+	message := AppendEntriesRequest{LeaderID: leaderID, Term: fields[0], Generation: RequestGeneration(fields[1]), PrevLogIndex: fields[2], PrevLogTerm: fields[3], LeaderCommit: fields[4]}
+	if err := validateAppendRequest(message, limits); err != nil {
+		return nil, err
 	}
-	return AppendEntriesRequest{LeaderID: leaderID, Term: fields[0], Generation: RequestGeneration(fields[1]), PrevLogIndex: fields[2], PrevLogTerm: fields[3], LeaderCommit: fields[4], Entries: entries}, nil
+
+	entriesOffset := d.offset
+	scan := *d
+	expectedIndex := message.PrevLogIndex
+	previousTerm := message.PrevLogTerm
+	for index := 0; index < int(count); index++ {
+		entry, err := decodeBorrowedEntry(&scan, limits.MaxCommandBytes)
+		if err != nil {
+			return nil, err
+		}
+		if expectedIndex == math.MaxUint64 {
+			return nil, fmt.Errorf("%w: append index overflow", ErrInvalidRPC)
+		}
+		expectedIndex++
+		if entry.Index != expectedIndex || entry.Term == 0 || entry.Term < previousTerm || entry.Term > message.Term || (entry.Kind != EntryCommand && entry.Kind != EntryNoOp) {
+			return nil, fmt.Errorf("%w: invalid entry %d ordering or metadata", ErrInvalidRPC, index)
+		}
+		if entry.Kind == EntryNoOp && len(entry.command) != 0 {
+			return nil, fmt.Errorf("%w: no-op entry carries command bytes", ErrInvalidRPC)
+		}
+		previousTerm = entry.Term
+	}
+	if scan.remaining() != 0 {
+		return nil, fmt.Errorf("%w: %d trailing bytes", ErrMalformedRPC, scan.remaining())
+	}
+
+	d.offset = entriesOffset
+	message.Entries = make([]Entry, int(count))
+	for index := range message.Entries {
+		entry, err := decodeBorrowedEntry(d, limits.MaxCommandBytes)
+		if err != nil {
+			return nil, err
+		}
+		entry.command = cloneBytes(entry.command)
+		message.Entries[index] = entry
+	}
+	return message, nil
+}
+
+func decodeBorrowedEntry(d *payloadDecoder, maximumCommandBytes uint64) (Entry, error) {
+	index, err := d.uint64()
+	if err != nil {
+		return Entry{}, err
+	}
+	term, err := d.uint64()
+	if err != nil {
+		return Entry{}, err
+	}
+	kind, err := d.uint8()
+	if err != nil {
+		return Entry{}, err
+	}
+	command, err := d.bytes32Borrowed(maximumCommandBytes)
+	if err != nil {
+		return Entry{}, err
+	}
+	return Entry{Index: index, Term: term, Kind: EntryKind(kind), command: command}, nil
 }
 
 func decodeAppendEntriesResponse(d *payloadDecoder) (RPC, error) {
@@ -787,7 +847,7 @@ func decodeInstallSnapshotRequest(d *payloadDecoder, limits CodecLimits) (RPC, e
 		return nil, err
 	}
 	message.LastIncludedIndex, message.LastIncludedTerm = metadata[0], metadata[1]
-	message.StateMachineSchemaVersion, err = d.uint16()
+	message.StateMachineSchemaVersion, err = d.uint32()
 	if err != nil {
 		return nil, err
 	}
@@ -805,7 +865,7 @@ func decodeInstallSnapshotRequest(d *payloadDecoder, limits CodecLimits) (RPC, e
 	if err != nil {
 		return nil, err
 	}
-	message.Chunk, err = d.bytes32(limits.MaxSnapshotChunkBytes)
+	message.Chunk, err = d.bytes32Borrowed(limits.MaxSnapshotChunkBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -813,6 +873,13 @@ func decodeInstallSnapshotRequest(d *payloadDecoder, limits CodecLimits) (RPC, e
 	if err != nil {
 		return nil, err
 	}
+	if d.remaining() != 0 {
+		return nil, fmt.Errorf("%w: %d trailing bytes", ErrMalformedRPC, d.remaining())
+	}
+	if err := validateSnapshotRequest(message, limits); err != nil {
+		return nil, err
+	}
+	message.Chunk = cloneBytes(message.Chunk)
 	return message, nil
 }
 

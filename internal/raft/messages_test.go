@@ -3,6 +3,7 @@ package raft
 import (
 	"encoding/hex"
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 
@@ -27,12 +28,12 @@ func TestMessageExactV1CanonicalLayouts(t *testing.T) {
 		{name: "handshake", rpc: Handshake{SenderID: 1, VoterFingerprint: fingerprint}, message: wire.MessageRaftHandshake, wantHex: "000100010100000000000000000000000000000000000000000000000000000000000000"},
 		{name: "handshake_ack", rpc: HandshakeAck{ResponderID: 2, VoterFingerprint: fingerprint}, message: wire.MessageRaftHandshakeAck, wantHex: "000100020100000000000000000000000000000000000000000000000000000000000000"},
 		{name: "pre_vote_request", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: 2, ProspectiveTerm: 3, LastLogIndex: 4, LastLogTerm: 2}, message: wire.MessageRaftPreVoteRequest, wantHex: "000100010000000000000002000000000000000300000000000000040000000000000002"},
-		{name: "pre_vote_response", rpc: PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 4, RequestCurrentTerm: 2, ProspectiveTerm: 3, Granted: true}, message: wire.MessageRaftPreVoteResponse, wantHex: "00010002000100000000000000040000000000000002000000000000000301"},
+		{name: "pre_vote_response", rpc: PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 1, RequestCurrentTerm: 2, ProspectiveTerm: 3, Granted: true}, message: wire.MessageRaftPreVoteResponse, wantHex: "00010002000100000000000000010000000000000002000000000000000301"},
 		{name: "vote_request", rpc: RequestVoteRequest{CandidateID: 1, Term: 3, LastLogIndex: 4, LastLogTerm: 2}, message: wire.MessageRaftRequestVoteRequest, wantHex: "00010001000000000000000300000000000000040000000000000002"},
 		{name: "vote_response", rpc: RequestVoteResponse{ResponderID: 2, CandidateID: 1, Term: 3, RequestTerm: 3, Granted: true}, message: wire.MessageRaftRequestVoteResponse, wantHex: "0001000200010000000000000003000000000000000301"},
 		{name: "append_request", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 9, PrevLogIndex: 4, PrevLogTerm: 2, LeaderCommit: 4, Entries: entries}, message: wire.MessageRaftAppendEntriesRequest, wantHex: "0001000100000000000000030000000000000009000000000000000400000000000000020000000000000004000200000000000000050000000000000003020000000000000000000000060000000000000003010000000178"},
 		{name: "append_response", rpc: AppendEntriesResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, Generation: 9, Success: true, MatchIndex: 6}, message: wire.MessageRaftAppendEntriesResponse, wantHex: "00010002000100000000000000030000000000000003000000000000000901000000000000000600000000000000000000000000000000"},
-		{name: "snapshot_request", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 4, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 10, LastIncludedTerm: 3, StateMachineSchemaVersion: 1, TotalLength: 3, Checksum: checksum, Offset: 0, Chunk: []byte("abc"), Done: true}, message: wire.MessageRaftInstallSnapshotRequest, wantHex: "0001000100000000000000040100000000000000000000000000000002000000000000000000000000000000000000000000000a000000000000000300010000000000000003030000000000000000000000000000000000000000000000000000000000000000000000000000000000000361626301"},
+		{name: "snapshot_request", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 4, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 10, LastIncludedTerm: 3, StateMachineSchemaVersion: 1, TotalLength: 3, Checksum: checksum, Offset: 0, Chunk: []byte("abc"), Done: true}, message: wire.MessageRaftInstallSnapshotRequest, wantHex: "0001000100000000000000040100000000000000000000000000000002000000000000000000000000000000000000000000000a0000000000000003000000010000000000000003030000000000000000000000000000000000000000000000000000000000000000000000000000000000000361626301"},
 		{name: "snapshot_response", rpc: InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4, TransferID: transferID, SnapshotID: snapshotID, NextOffset: 3, Success: true, Done: true}, message: wire.MessageRaftInstallSnapshotResponse, wantHex: "00010002000100000000000000040000000000000004010000000000000000000000000000000200000000000000000000000000000000000000000000030101"},
 		{name: "protocol_error", rpc: ErrorResponse{Code: ProtocolErrorMalformed, ResponderID: 2, Term: 4}, message: wire.MessageRaftError, wantHex: "0001000100020000000000000004"},
 	}
@@ -70,14 +71,18 @@ func TestMessageValidAndInvalidDomains(t *testing.T) {
 		Handshake{SenderID: 1, VoterFingerprint: fingerprint},
 		HandshakeAck{ResponderID: 2, VoterFingerprint: fingerprint},
 		PreVoteRequest{CandidateID: 1, CurrentTerm: 0, ProspectiveTerm: 1, LastLogIndex: 0, LastLogTerm: 0},
+		PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 1, RequestCurrentTerm: 2, ProspectiveTerm: 3, Granted: true},
 		PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 4, RequestCurrentTerm: 2, ProspectiveTerm: 3},
 		RequestVoteRequest{CandidateID: 1, Term: 3, LastLogIndex: 4, LastLogTerm: 2},
 		RequestVoteResponse{ResponderID: 2, CandidateID: 1, Term: 4, RequestTerm: 3},
+		AppendEntriesRequest{LeaderID: 1, Term: 5, Generation: 8, PrevLogIndex: 1, PrevLogTerm: 2, Entries: []Entry{mustEntry(t, 2, 2, EntryNoOp, nil), mustEntry(t, 3, 4, EntryNoOp, nil), mustEntry(t, 4, 5, EntryNoOp, nil)}},
 		AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 7, PrevLogIndex: 0, PrevLogTerm: 0},
 		AppendEntriesResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, Generation: 7, Success: true},
 		AppendEntriesResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, Generation: 7, ConflictIndex: 1},
+		AppendEntriesResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 3, Generation: 7, ConflictIndex: 1},
 		InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 4, LastIncludedTerm: 2, StateMachineSchemaVersion: 1, TotalLength: 0, Checksum: checksum, Done: true},
 		InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID, Success: true, Done: true},
+		InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID},
 		ErrorResponse{Code: ProtocolErrorMalformed, ResponderID: 2, Term: 3},
 	}
 	for _, rpc := range valid {
@@ -104,24 +109,34 @@ func TestMessageValidAndInvalidDomains(t *testing.T) {
 		{name: "pre_vote_term_overflow", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: ^uint64(0), ProspectiveTerm: 0}},
 		{name: "pre_vote_bad_log_pair", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: 2, ProspectiveTerm: 3, LastLogTerm: 1}},
 		{name: "pre_vote_response_zero_candidate", rpc: PreVoteResponse{ResponderID: 2, Term: 2, RequestCurrentTerm: 2, ProspectiveTerm: 3}},
-		{name: "pre_vote_response_current_before_request", rpc: PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 1, RequestCurrentTerm: 2, ProspectiveTerm: 3}},
+		{name: "pre_vote_response_higher_term_grant", rpc: PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 4, RequestCurrentTerm: 2, ProspectiveTerm: 3, Granted: true}},
+		{name: "pre_vote_last_log_term_above_current", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: 2, ProspectiveTerm: 3, LastLogIndex: 1, LastLogTerm: 3}},
 		{name: "vote_zero_term", rpc: RequestVoteRequest{CandidateID: 1}},
 		{name: "vote_response_current_before_request", rpc: RequestVoteResponse{ResponderID: 2, CandidateID: 1, Term: 2, RequestTerm: 3}},
+		{name: "vote_response_higher_term_grant", rpc: RequestVoteResponse{ResponderID: 2, CandidateID: 1, Term: 4, RequestTerm: 3, Granted: true}},
+		{name: "vote_last_log_term_above_candidate", rpc: RequestVoteRequest{CandidateID: 1, Term: 2, LastLogIndex: 1, LastLogTerm: 3}},
 		{name: "append_zero_generation", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3}},
 		{name: "append_bad_previous_pair", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, PrevLogTerm: 1}},
+		{name: "append_previous_term_above_leader", rpc: AppendEntriesRequest{LeaderID: 1, Term: 2, Generation: 1, PrevLogIndex: 1, PrevLogTerm: 3}},
 		{name: "append_entry_gap", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, Entries: []Entry{mustEntry(t, 2, 3, EntryNoOp, nil)}}},
+		{name: "append_entry_term_above_leader", rpc: AppendEntriesRequest{LeaderID: 1, Term: 2, Generation: 1, Entries: []Entry{mustEntry(t, 1, 3, EntryNoOp, nil)}}},
+		{name: "append_entry_term_below_previous", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, PrevLogIndex: 1, PrevLogTerm: 2, Entries: []Entry{mustEntry(t, 2, 1, EntryNoOp, nil)}}},
+		{name: "append_entry_terms_decrease", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, Entries: []Entry{mustEntry(t, 1, 3, EntryNoOp, nil), mustEntry(t, 2, 2, EntryNoOp, nil)}}},
 		{name: "append_entry_count_cap", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, Entries: []Entry{mustEntry(t, 1, 3, EntryNoOp, nil), mustEntry(t, 2, 3, EntryNoOp, nil)}}, limits: CodecLimits{MaxAppendEntries: 1}},
 		{name: "append_command_cap", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1, Entries: []Entry{mustEntry(t, 1, 3, EntryCommand, oversizedCommand)}}, limits: CodecLimits{MaxCommandBytes: 4}},
 		{name: "append_encoded_byte_cap", rpc: AppendEntriesRequest{LeaderID: 1, Term: 3, Generation: 1}, limits: CodecLimits{MaxEncodedBytes: 10}},
 		{name: "append_success_with_conflict", rpc: AppendEntriesResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, Generation: 1, Success: true, ConflictIndex: 1}},
 		{name: "append_failure_without_hint", rpc: AppendEntriesResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, Generation: 1}},
+		{name: "append_higher_term_success", rpc: AppendEntriesResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 3, Generation: 1, Success: true}},
 		{name: "snapshot_zero_transfer", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 3, SnapshotID: snapshotID, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, Checksum: checksum, Done: true}},
 		{name: "snapshot_zero_identity", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: transferID, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, Checksum: checksum, Done: true}},
 		{name: "snapshot_offset_gap", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, TotalLength: 3, Checksum: checksum, Offset: 2, Chunk: []byte("ab"), Done: true}},
 		{name: "snapshot_done_before_end", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, TotalLength: 3, Checksum: checksum, Chunk: []byte("ab"), Done: true}},
+		{name: "snapshot_included_term_above_leader", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 2, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 1, LastIncludedTerm: 3, StateMachineSchemaVersion: 1, Checksum: checksum, Done: true}},
 		{name: "snapshot_chunk_cap", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, TotalLength: 5, Checksum: checksum, Chunk: oversizedChunk, Done: true}, limits: CodecLimits{MaxSnapshotChunkBytes: 4}},
 		{name: "snapshot_response_missing_request_term", rpc: InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID}},
 		{name: "snapshot_response_done_rejection", rpc: InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID, Done: true}},
+		{name: "snapshot_response_higher_term_success", rpc: InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID, Success: true}},
 		{name: "unknown_protocol_error", rpc: ErrorResponse{Code: 99, ResponderID: 2, Term: 3}},
 	}
 	for _, test := range invalid {
@@ -194,6 +209,31 @@ func TestRPCMessageTypesUseStableWireIDsAndBinaryCodec(t *testing.T) {
 	}
 	if wire.CodecBinary != 2 {
 		t.Fatalf("CodecBinary = %d, want 2", wire.CodecBinary)
+	}
+}
+
+func TestMessageStateMachineSchemaUsesUint32Domain(t *testing.T) {
+	rpc := InstallSnapshotRequest{
+		LeaderID:                  1,
+		Term:                      2,
+		TransferID:                TransferID{1},
+		SnapshotID:                SnapshotID{1},
+		LastIncludedIndex:         1,
+		LastIncludedTerm:          1,
+		StateMachineSchemaVersion: math.MaxUint32,
+		Checksum:                  SnapshotChecksum{1},
+		Done:                      true,
+	}
+	message, encoded, err := EncodeRPC(rpc, DefaultCodecLimits())
+	if err != nil {
+		t.Fatalf("EncodeRPC: %v", err)
+	}
+	decoded, err := DecodeRPC(message, encoded, DefaultCodecLimits())
+	if err != nil {
+		t.Fatalf("DecodeRPC: %v", err)
+	}
+	if got := decoded.(InstallSnapshotRequest).StateMachineSchemaVersion; got != math.MaxUint32 {
+		t.Fatalf("StateMachineSchemaVersion = %d, want %d", got, uint64(math.MaxUint32))
 	}
 }
 
