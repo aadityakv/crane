@@ -375,6 +375,54 @@ func TestServiceQueuedDatagramCannotCrossSenderGeneration(t *testing.T) {
 	}
 }
 
+func TestServiceQueuedNonACKCannotConsumeReplacementGenerationReplayCapacity(t *testing.T) {
+	now := time.Unix(2053, 0)
+	service, oldSender, oldSource, authenticator := newDatagramDecoderService(t, now, 1)
+	self := service.active.Load().(map[uint16]Member)[service.options.Config.NodeID]
+	requestID := wire.RequestID{89}
+	clusterID := decodedTestClusterID(t, testClusterID)
+	oldFrame := encodeServiceTestFrameWithRequestID(t, authenticator, clusterID, oldSender.NodeID, requestID, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{}))
+	queued, accepted := service.decodeDatagram(transport.Packet{From: oldSource, Data: oldFrame})
+	if !accepted {
+		t.Fatal("old exact sender generation was not validated by the reader")
+	}
+
+	table := NewTable()
+	mustMerge(t, table, Update{Member: self, ReporterID: self.NodeID})
+	mustMerge(t, table, Update{Member: oldSender, ReporterID: oldSender.NodeID})
+	newSender := oldSender
+	newSender.Host = "127.0.0.22"
+	newSender.BasePort += 100
+	newSender.Incarnation++
+	mustMerge(t, table, Update{Member: newSender, ReporterID: newSender.NodeID})
+	dissemination := NewDisseminator(8, serviceRetransmitFactor)
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       3,
+		SuspicionMultiplier:  5,
+	}, table, dissemination, random.NewLockedSource(306))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := &serviceLoop{service: service, engine: engine, dissemination: dissemination, admitted: true, runContext: context.Background()}
+	if err := loop.handleDatagram(queued); err != nil {
+		t.Fatal(err)
+	}
+
+	service.active.Store(map[uint16]Member{self.NodeID: self, newSender.NodeID: newSender})
+	newSource, err := (config.NodeConfig{AdvertiseHost: newSender.Host, BasePort: newSender.BasePort}).AdvertiseEndpoint(config.ServiceSWIMPing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFrame := encodeServiceTestFrameWithRequestID(t, authenticator, clusterID, newSender.NodeID, requestID, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{}))
+	if _, accepted := service.decodeDatagram(transport.Packet{From: newSource, Data: newFrame}); !accepted {
+		t.Fatal("replacement generation could not reuse replay capacity after stale queued non-ACK frame")
+	}
+}
+
 func TestServiceDatagramSourceUsesCanonicalNumericAndResolvedAddresses(t *testing.T) {
 	now := time.Unix(2055, 0)
 	configuration := serviceTestConfig(t, 1)

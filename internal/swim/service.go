@@ -1204,15 +1204,6 @@ func (s *Service) decodeDatagramContextWithDecoder(ctx context.Context, packet t
 	if !validDatagramMessage(event.message, sender, active, s.options.Config.NodeID) {
 		return datagramServiceEvent{}, false
 	}
-	switch frame.Header.Message {
-	case wire.MessageSWIMAck, wire.MessageSWIMIndirectAck:
-		// Exact probe/relay correlation is owner-confined and runs immediately
-		// before replay acceptance and any state mutation.
-	default:
-		if err := s.replay.Commit(frame.Header.SenderID, frame.Header.RequestID, event.timestamp); err != nil {
-			return datagramServiceEvent{}, false
-		}
-	}
 	return event, true
 }
 
@@ -1249,6 +1240,10 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 			l.service.replay.RecordInvalid(event.senderID, event.requestID, event.timestamp)
 			return nil
 		}
+		if err := l.service.replay.Commit(event.senderID, event.requestID, event.timestamp); err != nil {
+			return nil
+		}
+	default:
 		if err := l.service.replay.Commit(event.senderID, event.requestID, event.timestamp); err != nil {
 			return nil
 		}
