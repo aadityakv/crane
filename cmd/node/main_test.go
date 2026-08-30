@@ -122,6 +122,25 @@ func TestNewSWIMServiceReloadsAndValidatesSecretAfterConfigValidation(t *testing
 	}
 }
 
+func TestNewSWIMServiceRejectsUnsafeExistingStorageDirectory(t *testing.T) {
+	configuration := writeNodeTestConfig(t)
+	if err := os.Chmod(configuration.StorageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	service, err := newSWIMService(configuration)
+	if err == nil || service != nil {
+		t.Fatalf("newSWIMService accepted permissive storage directory: service=%v err=%v", service, err)
+	}
+	info, statErr := os.Stat(configuration.StorageDir)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("newSWIMService silently changed storage mode to %o", got)
+	}
+}
+
 func writeNodeTestConfig(t *testing.T) config.NodeConfig {
 	t.Helper()
 	secretFile := filepath.Join(t.TempDir(), "cluster.secret")

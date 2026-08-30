@@ -144,17 +144,19 @@ func newClusterID() (string, error) {
 
 func prepareClusterFiles(dataRoot string, configurations []config.NodeConfig) ([]string, error) {
 	configDirectory := filepath.Join(dataRoot, "configs")
-	if err := os.MkdirAll(configDirectory, 0o700); err != nil {
-		return nil, fmt.Errorf("create cluster config directory: %w", err)
+	if err := swim.EnsureStorageDirectory(configDirectory); err != nil {
+		return nil, fmt.Errorf("prepare cluster config directory: %w", err)
 	}
-	paths := make([]string, len(configurations))
-	for index, configuration := range configurations {
+	for _, configuration := range configurations {
 		if err := configuration.Validate(); err != nil {
 			return nil, fmt.Errorf("validate node %d config: %w", configuration.NodeID, err)
 		}
-		if err := os.MkdirAll(configuration.StorageDir, 0o700); err != nil {
-			return nil, fmt.Errorf("create node %d storage directory: %w", configuration.NodeID, err)
+		if err := swim.EnsureStorageDirectory(configuration.StorageDir); err != nil {
+			return nil, fmt.Errorf("prepare node %d storage directory: %w", configuration.NodeID, err)
 		}
+	}
+	paths := make([]string, len(configurations))
+	for index, configuration := range configurations {
 		store := swim.NewFileIncarnationStore(filepath.Join(configuration.StorageDir, swim.IncarnationStateFilename))
 		incarnation, err := store.Load()
 		if err != nil {

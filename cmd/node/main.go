@@ -49,9 +49,6 @@ func executeNode(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(configuration.StorageDir, 0o700); err != nil {
-		return fmt.Errorf("create storage directory %q: %w", configuration.StorageDir, err)
-	}
 	service, err := newSWIMService(configuration)
 	if err != nil {
 		return err
@@ -160,6 +157,9 @@ func parseNodeFlags(args []string) (nodeFlags, error) {
 func newSWIMService(configuration config.NodeConfig) (*swim.Service, error) {
 	if err := configuration.Validate(); err != nil {
 		return nil, fmt.Errorf("validate node configuration: %w", err)
+	}
+	if err := swim.EnsureStorageDirectory(configuration.StorageDir); err != nil {
+		return nil, fmt.Errorf("prepare node storage: %w", err)
 	}
 	secret, err := config.LoadClusterSecret(configuration.ClusterSecretFile)
 	if err != nil {

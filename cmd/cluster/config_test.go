@@ -213,6 +213,42 @@ func TestPrepareClusterFilesWritesStrictConfigsAndTrustworthyInitialState(t *tes
 	}
 }
 
+func TestPrepareClusterFilesRejectsUnsafeExistingStorageDirectory(t *testing.T) {
+	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
+	if err := os.WriteFile(secretFile, []byte("private-local-cluster-secret-32bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(t.TempDir(), "cluster-data")
+	configs, err := GenerateConfigs(ClusterOptions{
+		Nodes:            3,
+		Voters:           3,
+		Host:             "127.0.0.1",
+		StartingBasePort: 8000,
+		DataRoot:         dataRoot,
+		SecretFile:       secretFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(configs[1].StorageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(configs[1].StorageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if paths, err := prepareClusterFiles(dataRoot, configs); err == nil || paths != nil {
+		t.Fatalf("prepareClusterFiles accepted permissive storage directory: paths=%v err=%v", paths, err)
+	}
+	info, err := os.Stat(configs[1].StorageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("prepareClusterFiles silently changed storage mode to %o", got)
+	}
+}
+
 func TestPrefixWriterPrefixesEveryLineAcrossChunkBoundaries(t *testing.T) {
 	var output bytes.Buffer
 	writer := newPrefixWriter(&output, "[node-2] ")

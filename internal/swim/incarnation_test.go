@@ -5,8 +5,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestFileIncarnationLoadMissingReturnsZero(t *testing.T) {
@@ -58,6 +61,176 @@ func TestFileIncarnationLoadRejectsCorruptOrPartialState(t *testing.T) {
 
 			if _, err := NewFileIncarnationStore(path).Load(); !errors.Is(err, ErrInvalidIncarnationState) {
 				t.Fatalf("Load() error = %v, want ErrInvalidIncarnationState", err)
+			}
+		})
+	}
+}
+
+func TestFileIncarnationLoadRejectsFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "incarnation")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := NewFileIncarnationStore(path).Load()
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrInvalidIncarnationState) {
+			t.Fatalf("Load() error = %v, want ErrInvalidIncarnationState", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		// Release an implementation that incorrectly performs a blocking FIFO
+		// read so the failed test does not strand a syscall during cleanup.
+		writer, _ := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if writer != nil {
+			_ = writer.Close()
+		}
+		t.Fatal("Load() blocked while opening a FIFO")
+	}
+}
+
+func TestFileIncarnationLoadRejectsSymlink(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "target")
+	if err := os.WriteFile(target, []byte("7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "incarnation")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewFileIncarnationStore(path).Load(); !errors.Is(err, ErrInvalidIncarnationState) {
+		t.Fatalf("Load() error = %v, want ErrInvalidIncarnationState", err)
+	}
+}
+
+func TestFileIncarnationLoadRejectsPermissiveState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "incarnation")
+	if err := os.WriteFile(path, []byte("7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewFileIncarnationStore(path).Load(); !errors.Is(err, ErrInvalidIncarnationState) {
+		t.Fatalf("Load() error = %v, want ErrInvalidIncarnationState", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("Load() silently changed state mode to %o", got)
+	}
+}
+
+func TestFileIncarnationLoadRejectsOversizedStateBeforeParsing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "incarnation")
+	if err := os.WriteFile(path, []byte(strings.Repeat("1", 128)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := NewFileIncarnationStore(path).Load()
+	if !errors.Is(err, ErrInvalidIncarnationState) || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("Load() error = %v, want bounded-size ErrInvalidIncarnationState", err)
+	}
+}
+
+func TestFileIncarnationLoadRejectsDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "incarnation")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewFileIncarnationStore(path).Load(); !errors.Is(err, ErrInvalidIncarnationState) {
+		t.Fatalf("Load() error = %v, want ErrInvalidIncarnationState", err)
+	}
+}
+
+func TestEnsureStorageDirectoryCreatesOwnerOnlyDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "node-1")
+	if err := EnsureStorageDirectory(path); err != nil {
+		t.Fatalf("EnsureStorageDirectory() error = %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("storage directory mode = %v, want directory 0700", info.Mode())
+	}
+}
+
+func TestEnsureStorageDirectoryAcceptsSecureExistingDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node-1")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureStorageDirectory(path); err != nil {
+		t.Fatalf("EnsureStorageDirectory() error = %v", err)
+	}
+}
+
+func TestEnsureStorageDirectoryRejectsUnsafeExistingPathWithoutRepair(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{
+			name: "permissive_directory",
+			setup: func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "regular_file",
+			setup: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			setup: func(t *testing.T, path string) {
+				target := filepath.Join(filepath.Dir(path), "target")
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "node-1")
+			test.setup(t, path)
+			if err := EnsureStorageDirectory(path); !errors.Is(err, ErrInvalidStorageDirectory) {
+				t.Fatalf("EnsureStorageDirectory() error = %v, want ErrInvalidStorageDirectory", err)
+			}
+			if test.name == "permissive_directory" {
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := info.Mode().Perm(); got != 0o755 {
+					t.Fatalf("unsafe existing permissions silently changed to %o", got)
+				}
 			}
 		})
 	}
