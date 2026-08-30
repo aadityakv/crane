@@ -1,0 +1,323 @@
+package raft
+
+import (
+	"context"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aaditya/cs425mp3/internal/clock"
+	"github.com/aaditya/cs425mp3/internal/config"
+)
+
+func TestServiceConstructorIsSideEffectFreeAndRequiresLocalVoter(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33000)
+	machine := &task8StateMachine{}
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: machine,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.Name() != "raft" {
+		t.Fatalf("Name = %q, want raft", service.Name())
+	}
+	if machine.restoreCalls != 0 {
+		t.Fatalf("constructor Restore calls = %d, want zero", machine.restoreCalls)
+	}
+	if _, err := os.Stat(filepath.Join(configuration.StorageDir, RaftStorageDirectoryName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("constructor created raft storage: %v", err)
+	}
+	select {
+	case <-service.Ready():
+		t.Fatal("constructor closed Ready")
+	default:
+	}
+
+	nonvoter := configuration
+	nonvoter.NodeID = 4
+	nonvoter.BasePort = 33030
+	if _, err := NewService(ServiceOptions{
+		Config: nonvoter, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	}); !errors.Is(err, ErrNotVoter) {
+		t.Fatalf("nonvoter constructor error = %v, want ErrNotVoter", err)
+	}
+}
+
+func TestServiceRunOrdersRecoveryBindWorkersOwnerAndIsolatedReady(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33100)
+	events := &task8EventLog{}
+	manualClock := clock.NewManual(time.Unix(1000, 0))
+	serviceClock := &task10RecordingClock{Clock: manualClock, events: events}
+	machine := &task8StateMachine{events: events}
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: serviceClock,
+		Random: task8ZeroOffsetRandom{}, StateMachine: machine,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := newBlockingListener()
+	service.listen = func(network, address string) (net.Listener, error) {
+		if network != "tcp" {
+			t.Fatalf("listen network = %q, want tcp", network)
+		}
+		want, _ := configuration.BindEndpoint(config.ServiceRaftRPC)
+		if address != want.String() {
+			t.Fatalf("listen address = %q, want exact +8 %q", address, want)
+		}
+		events.add("bind")
+		return listener, nil
+	}
+	fakeTransport := newTask10ServiceTransport(events)
+	service.newTransport = func(TCPTransportOptions) (serviceTransport, error) { return fakeTransport, nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	awaitClosed(t, service.Ready())
+	if got, want := events.snapshot(), []string{"restore", "bind", "workers", "owner"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("startup events = %v, want %v", got, want)
+	}
+	if status := service.Status(); status.Role != RoleFollower || status.LeaderID != 0 {
+		t.Fatalf("isolated ready status = %#v", status)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Service did not join children")
+	}
+	if _, err := service.Propose(context.Background(), []byte("after")); !errors.Is(err, ErrStopped) {
+		t.Fatalf("post-stop Propose error = %v, want ErrStopped", err)
+	}
+	if err := service.Run(context.Background()); !errors.Is(err, ErrStopped) {
+		t.Fatalf("second Run error = %v, want ErrStopped", err)
+	}
+}
+
+func TestServiceBindFailureOccursBeforeReadyAndReleasesStore(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33200)
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindErr := errors.New("injected bind failure")
+	service.listen = func(string, string) (net.Listener, error) { return nil, bindErr }
+	if err := service.Run(context.Background()); !errors.Is(err, bindErr) {
+		t.Fatalf("Run error = %v, want bind failure", err)
+	}
+	select {
+	case <-service.Ready():
+		t.Fatal("bind failure closed Ready")
+	default:
+	}
+	voters, err := NewVoterSet(configuration.RaftVoters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := NewStorageIdentity(StorageFormatVersion1, service.clusterID, configuration.NodeID, voters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenFileStoreWithOptions(configuration.StorageDir, identity, voters, StoreOptions{MaxSnapshotBytes: configuration.Raft.MaxSnapshotBytes})
+	if err != nil {
+		t.Fatalf("bind failure retained store lock: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServiceStorageAndRestoreFailuresOccurBeforeBindAndReady(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want error
+	}{
+		{name: "storage open", want: errors.New("injected storage open failure")},
+		{name: "application restore", want: errors.New("injected application restore failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configuration, secret := task10ServiceConfig(t, 1, 33400)
+			machine := &task8StateMachine{}
+			service, err := NewService(ServiceOptions{
+				Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+				Random: task8ZeroOffsetRandom{}, StateMachine: machine,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.name == "storage open" {
+				service.openStore = func(string, StorageIdentity, VoterSet, StoreOptions) (StableStore, error) {
+					return nil, test.want
+				}
+			} else {
+				machine.restoreErr = test.want
+			}
+			bound := false
+			service.listen = func(string, string) (net.Listener, error) {
+				bound = true
+				return newBlockingListener(), nil
+			}
+			if err := service.Run(context.Background()); !errors.Is(err, test.want) {
+				t.Fatalf("Run error = %v, want %v", err, test.want)
+			}
+			if bound {
+				t.Fatal("early failure bound the Raft listener")
+			}
+			select {
+			case <-service.Ready():
+				t.Fatal("early failure closed Ready")
+			default:
+			}
+		})
+	}
+}
+
+func TestServiceRuntimeListenerFailureIsFatalAndStopsNode(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33500)
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := newBlockingListener()
+	service.listen = func(string, string) (net.Listener, error) { return listener, nil }
+	done := make(chan error, 1)
+	go func() { done <- service.Run(context.Background()) }()
+	awaitClosed(t, service.Ready())
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("runtime listener failure = %v, want fatal net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime listener failure did not stop Service")
+	}
+	if _, err := service.Barrier(context.Background()); !errors.Is(err, ErrStopped) {
+		t.Fatalf("post-fatal Barrier error = %v, want ErrStopped", err)
+	}
+}
+
+func TestServiceDelegatesPublicAPIWhileReady(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33300)
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := newBlockingListener()
+	service.listen = func(string, string) (net.Listener, error) { return listener, nil }
+	service.newTransport = func(TCPTransportOptions) (serviceTransport, error) {
+		return newTask10ServiceTransport(nil), nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	awaitClosed(t, service.Ready())
+	if _, err := service.Propose(context.Background(), []byte("not-leader")); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("Propose error = %v, want ErrNotLeader", err)
+	}
+	subscriptionContext, cancelSubscription := context.WithCancel(context.Background())
+	subscription, err := service.SubscribeLeadership(subscriptionContext, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := subscription.Snapshot(); snapshot.LocalID != 1 || snapshot.Role != RoleFollower {
+		t.Fatalf("leadership snapshot = %#v", snapshot)
+	}
+	cancelSubscription()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type task10RecordingClock struct {
+	clock.Clock
+	events *task8EventLog
+	once   sync.Once
+}
+
+func (source *task10RecordingClock) NewTimer(duration time.Duration) clock.Timer {
+	source.once.Do(func() { source.events.add("owner") })
+	return source.Clock.NewTimer(duration)
+}
+
+type task10ServiceTransport struct {
+	ready     chan struct{}
+	done      chan struct{}
+	events    *task8EventLog
+	readyOnce sync.Once
+}
+
+func newTask10ServiceTransport(events *task8EventLog) *task10ServiceTransport {
+	return &task10ServiceTransport{ready: make(chan struct{}), done: make(chan struct{}), events: events}
+}
+
+func (*task10ServiceTransport) Handoff(PeerMessage) (TransportHandoff, error) {
+	return TransportUnavailable, nil
+}
+
+func (transport *task10ServiceTransport) Ready() <-chan struct{} { return transport.ready }
+
+func (transport *task10ServiceTransport) Run(ctx context.Context, _ net.Listener, _ RPCIngress) error {
+	if transport.events != nil {
+		transport.events.add("workers")
+	}
+	transport.readyOnce.Do(func() { close(transport.ready) })
+	<-ctx.Done()
+	close(transport.done)
+	return nil
+}
+
+func task10ServiceConfig(t *testing.T, localID, basePort uint16) (config.NodeConfig, []byte) {
+	t.Helper()
+	secret := []byte("01234567890123456789012345678901")
+	secretPath := filepath.Join(t.TempDir(), "cluster.secret")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storage := t.TempDir()
+	configuration := config.NodeConfig{
+		NodeID: localID, ClusterID: "00112233-4455-6677-8899-aabbccddeeff",
+		BindHost: "127.0.0.1", AdvertiseHost: "127.0.0.1", BasePort: basePort,
+		Introducer: net.JoinHostPort("127.0.0.1", "1"), StorageDir: storage, ClusterSecretFile: secretPath,
+		Timing: config.DefaultTimingConfig(), Raft: config.DefaultRaftConfig(),
+		RaftVoters: []config.RaftVoter{
+			{NodeID: 1, Endpoint: net.JoinHostPort("127.0.0.1", task10Port(basePort, 1))},
+			{NodeID: 2, Endpoint: net.JoinHostPort("127.0.0.1", task10Port(basePort, 2))},
+			{NodeID: 3, Endpoint: net.JoinHostPort("127.0.0.1", task10Port(basePort, 3))},
+		},
+	}
+	if err := configuration.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return configuration, secret
+}
+
+func task10Port(base uint16, voter uint16) string {
+	port := uint32(base) + uint32(voter-1)*10 + 8
+	return strconv.FormatUint(uint64(port), 10)
+}

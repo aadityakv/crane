@@ -94,9 +94,7 @@ func TestTCPInvalidPayloadDoesNotConsumeAcceptedReplayCapacity(t *testing.T) {
 	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
 	invalid := wire.Frame{Header: transportHeader(transport, 2, wire.RequestID{1}, wire.MessageRaftHandshake), Payload: []byte{0}}
-	if err := writeFrameForTest(stream, invalid); err != nil {
-		t.Fatal(err)
-	}
+	_ = writeFrameForTest(stream, invalid)
 	expectClosedStream(t, stream)
 
 	client, server = net.Pipe()
@@ -128,7 +126,12 @@ func TestTCPBoundStreamRejectsSenderChangeAndGob(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			transport := newTask10Transport(t, task10TransportOptions{})
 			client, server := net.Pipe()
-			go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
+			done := make(chan struct{})
+			called := make(chan RPC, 1)
+			go func() {
+				transport.handleInboundConnection(context.Background(), server, task10Ingress{called: called})
+				close(done)
+			}()
 			stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
 			handshake := transportFrame(t, transport, 2, wire.RequestID{1}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
 			if err := writeFrameForTest(stream, handshake); err != nil {
@@ -138,6 +141,12 @@ func TestTCPBoundStreamRejectsSenderChangeAndGob(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = writeFrameForTest(stream, test.frame(transport))
+			select {
+			case rpc := <-called:
+				t.Fatalf("rejected stream submitted %#v", rpc)
+			case <-time.After(20 * time.Millisecond):
+			}
+			awaitClosed(t, done)
 			expectClosedStream(t, stream)
 		})
 	}

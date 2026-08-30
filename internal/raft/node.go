@@ -154,7 +154,9 @@ type Node struct {
 	// afterResult is a same-package ordering seam invoked after a result is published.
 	afterResult func(ProposalID)
 
-	watchers sync.WaitGroup
+	prepareOnce sync.Once
+	prepareErr  error
+	watchers    sync.WaitGroup
 }
 
 // NewNode validates options without opening storage, mutating the application,
@@ -310,67 +312,7 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 	if ctx == nil || ctx.Err() != nil {
 		return nil
 	}
-
-	recovered, err := node.options.Store.Recover()
-	if err != nil {
-		return fmt.Errorf("recover raft stable store: %w", err)
-	}
-	if err := validateRecoveredStateWithSnapshotLimit(recovered, node.options.Identity, node.options.Voters, node.options.MaxSnapshotBytes); err != nil {
-		return err
-	}
-	if recovered.SnapshotBase.LastIncludedIndex != 0 && recovered.Snapshot == nil {
-		return fmt.Errorf("%w: recovered snapshot index=%d schema=%d", ErrSnapshotUnavailable, recovered.SnapshotBase.LastIncludedIndex, recovered.SnapshotBase.StateMachineSchemaVersion)
-	}
-	if recovered.Snapshot != nil {
-		decoded, snapshotErr := DecodeSnapshotEnvelope(recovered.Snapshot.EnvelopeBytes(), node.options.Identity, node.options.MaxSnapshotBytes)
-		if snapshotErr != nil || decoded.Metadata != recovered.SnapshotBase || decoded.ID != recovered.Snapshot.ID {
-			return fmt.Errorf("%w: recovered snapshot validation failed: %v", ErrSnapshotUnavailable, snapshotErr)
-		}
-		recovered.Snapshot = &decoded
-	}
-	recoveryApplied := recovered.SnapshotBase.LastIncludedIndex
-	log, err := NewLog(
-		recovered.SnapshotBase.LastIncludedIndex,
-		recovered.SnapshotBase.LastIncludedTerm,
-		recovered.HardState.CommitIndex,
-		recoveryApplied,
-		recovered.Entries,
-	)
-	if err != nil {
-		return fmt.Errorf("build recovered raft log: %w", err)
-	}
-	node.core, err = node.newCore(CoreOptions{
-		LocalID: node.options.LocalID, Voters: node.options.Voters,
-		HardState: recovered.HardState, Log: log, AppliedIndex: recoveryApplied,
-		ElectionTimeoutMin: uint64(node.options.ElectionTimeoutMin),
-		ElectionTimeoutMax: uint64(node.options.ElectionTimeoutMax),
-		HeartbeatInterval:  uint64(node.options.HeartbeatInterval),
-		MaxAppendEntries:   node.options.MaxAppendEntries,
-		MaxAppendBytes:     node.options.MaxAppendBytes,
-		Random:             node.options.Random,
-	})
-	if err != nil {
-		return err
-	}
-	node.durableState = recovered.Clone()
-	restoreSchema := uint32(0)
-	var restoreBytes []byte
-	if recovered.Snapshot != nil {
-		restoreSchema = recovered.Snapshot.Metadata.StateMachineSchemaVersion
-		restoreBytes = recovered.Snapshot.StateBytes()
-	}
-	if err := node.options.StateMachine.Restore(restoreSchema, restoreBytes); err != nil {
-		return fmt.Errorf("restore raft application snapshot: %w", err)
-	}
-	if err := node.replayRecovered(recovered); err != nil {
-		return err
-	}
-	if err := node.core.log.AdvanceApplied(recovered.HardState.CommitIndex); err != nil {
-		return fmt.Errorf("establish recovered application seam: %w", err)
-	}
-	node.pendingLocal = make(map[ProposalID]pendingLocalRequest)
-	node.subscribers = make(map[uint64]*leadershipSubscriber)
-	if err := node.publishStatus(); err != nil {
+	if err := node.prepare(); err != nil {
 		return err
 	}
 	node.epoch = node.options.Clock.Now()
@@ -513,6 +455,81 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 			}
 		}
 	}
+}
+
+// prepare recovers durable/application state exactly once without starting a
+// timer, campaign, goroutine, or lifecycle-ready signal.
+func (node *Node) prepare() error {
+	node.prepareOnce.Do(func() {
+		node.prepareErr = node.recoverPreparedState()
+	})
+	return node.prepareErr
+}
+
+func (node *Node) recoverPreparedState() error {
+	recovered, err := node.options.Store.Recover()
+	if err != nil {
+		return fmt.Errorf("recover raft stable store: %w", err)
+	}
+	if err := validateRecoveredStateWithSnapshotLimit(recovered, node.options.Identity, node.options.Voters, node.options.MaxSnapshotBytes); err != nil {
+		return err
+	}
+	if recovered.SnapshotBase.LastIncludedIndex != 0 && recovered.Snapshot == nil {
+		return fmt.Errorf("%w: recovered snapshot index=%d schema=%d", ErrSnapshotUnavailable, recovered.SnapshotBase.LastIncludedIndex, recovered.SnapshotBase.StateMachineSchemaVersion)
+	}
+	if recovered.Snapshot != nil {
+		decoded, snapshotErr := DecodeSnapshotEnvelope(recovered.Snapshot.EnvelopeBytes(), node.options.Identity, node.options.MaxSnapshotBytes)
+		if snapshotErr != nil || decoded.Metadata != recovered.SnapshotBase || decoded.ID != recovered.Snapshot.ID {
+			return fmt.Errorf("%w: recovered snapshot validation failed: %v", ErrSnapshotUnavailable, snapshotErr)
+		}
+		recovered.Snapshot = &decoded
+	}
+	recoveryApplied := recovered.SnapshotBase.LastIncludedIndex
+	log, err := NewLog(
+		recovered.SnapshotBase.LastIncludedIndex,
+		recovered.SnapshotBase.LastIncludedTerm,
+		recovered.HardState.CommitIndex,
+		recoveryApplied,
+		recovered.Entries,
+	)
+	if err != nil {
+		return fmt.Errorf("build recovered raft log: %w", err)
+	}
+	node.core, err = node.newCore(CoreOptions{
+		LocalID: node.options.LocalID, Voters: node.options.Voters,
+		HardState: recovered.HardState, Log: log, AppliedIndex: recoveryApplied,
+		ElectionTimeoutMin: uint64(node.options.ElectionTimeoutMin),
+		ElectionTimeoutMax: uint64(node.options.ElectionTimeoutMax),
+		HeartbeatInterval:  uint64(node.options.HeartbeatInterval),
+		MaxAppendEntries:   node.options.MaxAppendEntries,
+		MaxAppendBytes:     node.options.MaxAppendBytes,
+		Random:             node.options.Random,
+	})
+	if err != nil {
+		return err
+	}
+	node.durableState = recovered.Clone()
+	restoreSchema := uint32(0)
+	var restoreBytes []byte
+	if recovered.Snapshot != nil {
+		restoreSchema = recovered.Snapshot.Metadata.StateMachineSchemaVersion
+		restoreBytes = recovered.Snapshot.StateBytes()
+	}
+	if err := node.options.StateMachine.Restore(restoreSchema, restoreBytes); err != nil {
+		return fmt.Errorf("restore raft application snapshot: %w", err)
+	}
+	if err := node.replayRecovered(recovered); err != nil {
+		return err
+	}
+	if err := node.core.log.AdvanceApplied(recovered.HardState.CommitIndex); err != nil {
+		return fmt.Errorf("establish recovered application seam: %w", err)
+	}
+	node.pendingLocal = make(map[ProposalID]pendingLocalRequest)
+	node.subscribers = make(map[uint64]*leadershipSubscriber)
+	if err := node.publishStatus(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (node *Node) replayRecovered(recovered RecoveredState) error {
