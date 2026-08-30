@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 const (
 	udpReceiveQueueSize = 256
 	maxUDPDatagramSize  = 65535
+	udpResolveTimeout   = 5 * time.Second
 )
 
 var (
@@ -45,6 +47,12 @@ type SourceDatagram interface {
 	SendFrom(context.Context, config.Endpoint, config.Endpoint, []byte) error
 }
 
+// IPResolver resolves DNS names for context-bounded UDP operations.
+// *net.Resolver implements this interface.
+type IPResolver interface {
+	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
+}
+
 // UDPDatagram aggregates packets from one or more bound UDP sockets.
 type UDPDatagram struct {
 	endpoints   []config.Endpoint
@@ -56,16 +64,28 @@ type UDPDatagram struct {
 	closeError  error
 	readers     sync.WaitGroup
 	writeMu     sync.Mutex
+	resolver    IPResolver
 }
 
 // ListenUDP binds every endpoint and returns one aggregate datagram transport.
 func ListenUDP(endpoints ...config.Endpoint) (*UDPDatagram, error) {
+	return ListenUDPWithResolver(nil, endpoints...)
+}
+
+// ListenUDPWithResolver binds every endpoint and uses resolver for
+// context-aware outbound DNS resolution.
+func ListenUDPWithResolver(resolver IPResolver, endpoints ...config.Endpoint) (*UDPDatagram, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("%w: no bind endpoints", ErrInvalidDatagramEndpoint)
 	}
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
 	connections := make([]*net.UDPConn, 0, len(endpoints))
 	for _, endpoint := range endpoints {
-		address, err := resolveUDP(endpoint)
+		resolveContext, cancelResolve := context.WithTimeout(context.Background(), udpResolveTimeout)
+		address, err := resolveUDP(resolveContext, resolver, endpoint)
+		cancelResolve()
 		if err != nil {
 			closeUDPConnections(connections)
 			return nil, err
@@ -84,6 +104,7 @@ func ListenUDP(endpoints ...config.Endpoint) (*UDPDatagram, error) {
 		packets:     make(chan Packet, udpReceiveQueueSize),
 		errors:      make(chan error, len(connections)),
 		done:        make(chan struct{}),
+		resolver:    resolver,
 	}
 	for _, connection := range connections {
 		datagram.readers.Add(1)
@@ -125,7 +146,7 @@ func (d *UDPDatagram) send(ctx context.Context, connection *net.UDPConn, destina
 		return ErrDatagramClosed
 	default:
 	}
-	address, err := resolveUDP(destination)
+	address, err := resolveUDP(ctx, d.resolver, destination)
 	if err != nil {
 		return err
 	}
@@ -233,15 +254,29 @@ func (d *UDPDatagram) read(connection *net.UDPConn) {
 	}
 }
 
-func resolveUDP(endpoint config.Endpoint) (*net.UDPAddr, error) {
+func resolveUDP(ctx context.Context, resolver IPResolver, endpoint config.Endpoint) (*net.UDPAddr, error) {
 	if endpoint.Host == "" || endpoint.Port == 0 {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidDatagramEndpoint, endpoint)
 	}
-	address, err := net.ResolveUDPAddr("udp", endpoint.String())
-	if err != nil {
-		return nil, fmt.Errorf("%w %s: %v", ErrInvalidDatagramEndpoint, endpoint, err)
+	if address, err := netip.ParseAddr(endpoint.Host); err == nil {
+		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(address.Unmap(), endpoint.Port)), nil
 	}
-	return address, nil
+	if ctx == nil {
+		return nil, errors.New("resolve UDP endpoint: nil context")
+	}
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	addresses, err := resolver.LookupNetIP(ctx, "ip", endpoint.Host)
+	if err != nil {
+		return nil, fmt.Errorf("%w %s: %w", ErrInvalidDatagramEndpoint, endpoint, err)
+	}
+	for _, address := range addresses {
+		if address.IsValid() {
+			return net.UDPAddrFromAddrPort(netip.AddrPortFrom(address.Unmap(), endpoint.Port)), nil
+		}
+	}
+	return nil, fmt.Errorf("%w %s: DNS returned no addresses", ErrInvalidDatagramEndpoint, endpoint)
 }
 
 func closeUDPConnections(connections []*net.UDPConn) {

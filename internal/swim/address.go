@@ -1,6 +1,7 @@
 package swim
 
 import (
+	"container/list"
 	"context"
 	"net"
 	"net/netip"
@@ -8,12 +9,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aaditya/cs425mp3/internal/clock"
 	"github.com/aaditya/cs425mp3/internal/config"
 )
 
 const (
 	serviceAddressCacheEntries  = 4096
 	serviceAddressLookupTimeout = time.Second
+	serviceAddressPositiveTTL   = 30 * time.Second
+	serviceAddressNegativeTTL   = time.Second
 )
 
 // AddressResolver is the bounded DNS seam used to authenticate advertised
@@ -23,24 +27,44 @@ type AddressResolver interface {
 }
 
 type addressMatcher struct {
-	resolver AddressResolver
-	timeout  time.Duration
-	capacity int
+	resolver    AddressResolver
+	clock       clock.Clock
+	timeout     time.Duration
+	positiveTTL time.Duration
+	negativeTTL time.Duration
+	capacity    int
 
 	mu    sync.Mutex
-	cache map[string][]netip.Addr
-	order []string
+	cache map[string]*addressCacheEntry
+	order list.List
+}
+
+type addressCacheEntry struct {
+	addresses []netip.Addr
+	err       error
+	expires   time.Time
+	element   *list.Element
 }
 
 func newAddressMatcher(resolver AddressResolver) *addressMatcher {
+	return newAddressMatcherWithClock(resolver, clock.NewReal())
+}
+
+func newAddressMatcherWithClock(resolver AddressResolver, sourceClock clock.Clock) *addressMatcher {
 	if resolver == nil {
 		resolver = net.DefaultResolver
 	}
+	if sourceClock == nil {
+		sourceClock = clock.NewReal()
+	}
 	return &addressMatcher{
-		resolver: resolver,
-		timeout:  serviceAddressLookupTimeout,
-		capacity: serviceAddressCacheEntries,
-		cache:    make(map[string][]netip.Addr),
+		resolver:    resolver,
+		clock:       sourceClock,
+		timeout:     serviceAddressLookupTimeout,
+		positiveTTL: serviceAddressPositiveTTL,
+		negativeTTL: serviceAddressNegativeTTL,
+		capacity:    serviceAddressCacheEntries,
+		cache:       make(map[string]*addressCacheEntry),
 	}
 }
 
@@ -72,13 +96,9 @@ func (m *addressMatcher) resolve(ctx context.Context, host string) ([]netip.Addr
 		return []netip.Addr{address.Unmap()}, nil
 	}
 	key := strings.ToLower(strings.TrimSuffix(host, "."))
-	m.mu.Lock()
-	if cached, ok := m.cache[key]; ok {
-		result := append([]netip.Addr(nil), cached...)
-		m.mu.Unlock()
-		return result, nil
+	if addresses, err, ok := m.cached(key); ok {
+		return addresses, err
 	}
-	m.mu.Unlock()
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -87,6 +107,9 @@ func (m *addressMatcher) resolve(ctx context.Context, host string) ([]netip.Addr
 	defer cancel()
 	addresses, err := m.resolver.LookupNetIP(lookupContext, "ip", host)
 	if err != nil {
+		if ctx.Err() == nil {
+			m.store(key, nil, err, m.negativeTTL)
+		}
 		return nil, err
 	}
 	canonical := make([]netip.Addr, 0, len(addresses))
@@ -103,20 +126,76 @@ func (m *addressMatcher) resolve(ctx context.Context, host string) ([]netip.Addr
 		canonical = append(canonical, address)
 	}
 	if len(canonical) == 0 {
-		return nil, &net.DNSError{Name: host, Err: "no addresses"}
-	}
-
-	m.mu.Lock()
-	if cached, ok := m.cache[key]; ok {
-		canonical = append([]netip.Addr(nil), cached...)
-	} else {
-		if len(m.cache) >= m.capacity && len(m.order) != 0 {
-			delete(m.cache, m.order[0])
-			m.order = m.order[1:]
+		err := &net.DNSError{Name: host, Err: "no addresses"}
+		if ctx.Err() == nil {
+			m.store(key, nil, err, m.negativeTTL)
 		}
-		m.cache[key] = append([]netip.Addr(nil), canonical...)
-		m.order = append(m.order, key)
+		return nil, err
 	}
-	m.mu.Unlock()
-	return canonical, nil
+	m.store(key, canonical, nil, m.positiveTTL)
+	return append([]netip.Addr(nil), canonical...), nil
+}
+
+func (m *addressMatcher) cached(key string) ([]netip.Addr, error, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, exists := m.cache[key]
+	if !exists {
+		return nil, nil, false
+	}
+	if !m.clock.Now().Before(entry.expires) {
+		m.removeLocked(key, entry)
+		return nil, nil, false
+	}
+	m.order.MoveToBack(entry.element)
+	return append([]netip.Addr(nil), entry.addresses...), entry.err, true
+}
+
+func (m *addressMatcher) store(key string, addresses []netip.Addr, err error, ttl time.Duration) {
+	if ttl <= 0 || m.capacity <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.cache[key]; ok {
+		m.removeLocked(key, existing)
+	}
+	for len(m.cache) >= m.capacity {
+		oldest := m.order.Front()
+		if oldest == nil {
+			break
+		}
+		oldestKey := oldest.Value.(string)
+		m.removeLocked(oldestKey, m.cache[oldestKey])
+	}
+	element := m.order.PushBack(key)
+	m.cache[key] = &addressCacheEntry{
+		addresses: append([]netip.Addr(nil), addresses...),
+		err:       err,
+		expires:   m.clock.Now().Add(ttl),
+		element:   element,
+	}
+}
+
+func (m *addressMatcher) invalidate(host string) {
+	if m == nil {
+		return
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return
+	}
+	key := strings.ToLower(strings.TrimSuffix(host, "."))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry, exists := m.cache[key]; exists {
+		m.removeLocked(key, entry)
+	}
+}
+
+func (m *addressMatcher) removeLocked(key string, entry *addressCacheEntry) {
+	if entry == nil {
+		return
+	}
+	delete(m.cache, key)
+	m.order.Remove(entry.element)
 }

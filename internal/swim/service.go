@@ -29,6 +29,8 @@ const (
 	serviceTCPIOTimeout     = 5 * time.Second
 	serviceResyncWorkers    = 4
 	serviceResyncQueueSize  = 64
+	serviceSendWorkers      = 4
+	serviceSendQueueSize    = 4096
 )
 
 var (
@@ -117,7 +119,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 			serviceFutureSkew,
 			serviceReplayEntries,
 		),
-		addresses: newAddressMatcher(options.Resolver),
+		addresses: newAddressMatcherWithClock(options.Resolver, options.Clock),
 		ready:     make(chan struct{}),
 		done:      make(chan struct{}),
 		events:    make(chan serviceEvent, serviceEventQueueSize),
@@ -270,7 +272,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 			stopWorkers()
 			return err
 		}
-		datagram, err = transport.ListenUDP(pingEndpoint, ackEndpoint)
+		datagram, err = transport.ListenUDPWithResolver(s.options.Resolver, pingEndpoint, ackEndpoint)
 		if err != nil {
 			stopWorkers()
 			return err
@@ -339,6 +341,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 	}
 	loop.beginSnapshot = loop.client.beginSnapshot
 	loop.resyncJobs = make(chan snapshotResyncJob, serviceResyncQueueSize)
+	loop.sendJobs = make(chan datagramSendJob, serviceSendQueueSize)
 	defer loop.subscriptions.Close()
 
 	seed, err := config.ParseEndpoint(s.options.Config.Introducer)
@@ -371,6 +374,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 	}
 
 	loop.startSnapshotResyncWorkers()
+	loop.startDatagramSendWorkers()
 	workers.Add(1)
 	go s.receiveDatagrams(workerContext, datagram, &workers)
 	workers.Add(1)
@@ -460,6 +464,12 @@ type datagramServiceEvent struct {
 
 func (datagramServiceEvent) serviceEvent() {}
 
+type datagramSendJob struct {
+	source      config.Endpoint
+	destination config.Endpoint
+	payload     []byte
+}
+
 type timerServiceEvent struct {
 	request TimerRequest
 	probe   bool
@@ -536,6 +546,7 @@ type serviceLoop struct {
 	resyncing          map[uint16]bool
 	resyncJobs         chan snapshotResyncJob
 	beginSnapshot      beginSnapshotFunc
+	sendJobs           chan datagramSendJob
 	timerScheduler     serviceTimerScheduler
 	clockTimer         clock.Timer
 }
@@ -700,7 +711,7 @@ func (l *serviceLoop) sendDirectUpdate(ctx context.Context, member Member, updat
 	if err != nil {
 		return false, err
 	}
-	if err := l.sendDatagram(ctx, config.ServiceSWIMPing, destination, encoded); err != nil {
+	if err := l.sendDatagramDirect(ctx, config.ServiceSWIMPing, destination, encoded); err != nil {
 		return false, nil
 	}
 	return true, nil
@@ -1300,6 +1311,10 @@ func (l *serviceLoop) executeEffects(ctx context.Context, effects Effects) error
 		}
 	}
 	for _, event := range effects.Events {
+		if event.Previous.NodeID != 0 && (event.Current.Incarnation > event.Previous.Incarnation || event.Current.Host != event.Previous.Host || event.Current.BasePort != event.Previous.BasePort) {
+			l.service.addresses.invalidate(event.Previous.Host)
+			l.service.addresses.invalidate(event.Current.Host)
+		}
 		nodeID := event.Current.NodeID
 		switch event.Current.Status {
 		case Alive:
@@ -1430,7 +1445,48 @@ func (l *serviceLoop) sendDatagram(ctx context.Context, sourceService config.Ser
 	if err != nil {
 		return err
 	}
+	if l.sendJobs == nil {
+		return l.datagram.SendFrom(ctx, source, destination, encoded)
+	}
+	job := datagramSendJob{source: source, destination: destination, payload: encoded}
+	select {
+	case l.sendJobs <- job:
+		return nil
+	case <-l.workerContext.Done():
+		return l.workerContext.Err()
+	default:
+		return errors.New("swim: outbound datagram queue full")
+	}
+}
+
+func (l *serviceLoop) sendDatagramDirect(ctx context.Context, sourceService config.Service, destination config.Endpoint, encoded []byte) error {
+	source, err := l.service.options.Config.BindEndpoint(sourceService)
+	if err != nil {
+		return err
+	}
 	return l.datagram.SendFrom(ctx, source, destination, encoded)
+}
+
+func (l *serviceLoop) startDatagramSendWorkers() {
+	for range serviceSendWorkers {
+		l.workers.Add(1)
+		go func() {
+			defer l.workers.Done()
+			for {
+				select {
+				case <-l.workerContext.Done():
+					return
+				default:
+				}
+				select {
+				case job := <-l.sendJobs:
+					_ = l.datagram.SendFrom(l.workerContext, job.source, job.destination, job.payload)
+				case <-l.workerContext.Done():
+					return
+				}
+			}
+		}()
+	}
 }
 
 func datagramMessageDescriptor(message any) (wire.MessageType, config.Service, func([]Update) any, error) {

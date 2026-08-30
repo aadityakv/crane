@@ -55,7 +55,7 @@ func NewSnapshotClient(options SnapshotClientOptions) (*SnapshotClient, error) {
 	if err := options.Config.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidServiceOptions, err)
 	}
-	client, err := newProtocolClientWithAddressMatcher(options.Config, options.Authenticator, options.Clock, options.Random, options.IOTimeout, newAddressMatcher(options.Resolver))
+	client, err := newProtocolClientWithAddressMatcher(options.Config, options.Authenticator, options.Clock, options.Random, options.IOTimeout, newAddressMatcherWithClock(options.Resolver, options.Clock))
 	if err != nil {
 		return nil, err
 	}

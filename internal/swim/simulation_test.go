@@ -394,6 +394,12 @@ func TestSimulationCancellationInterruptsNormalSendAndLeaveAtClockDeadline(t *te
 	if call := receiveBlockingSendCall(t, datagram.started); call != 1 {
 		t.Fatalf("first blocked send call = %d, want 1", call)
 	}
+	snapshotContext, cancelSnapshot := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	if _, err := service.Snapshot(snapshotContext); err != nil {
+		cancelSnapshot()
+		t.Fatalf("owner loop blocked behind outbound datagram I/O: %v", err)
+	}
+	cancelSnapshot()
 
 	cancel()
 	if call := receiveBlockingSendCall(t, datagram.returned); call != 1 {

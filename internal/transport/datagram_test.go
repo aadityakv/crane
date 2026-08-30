@@ -4,11 +4,41 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/config"
 )
+
+func TestDatagramDNSResolutionHonorsSendCancellation(t *testing.T) {
+	source := freeUDPEndpoint(t)
+	resolver := &blockingIPResolver{started: make(chan struct{})}
+	datagram, err := ListenUDPWithResolver(resolver, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = datagram.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- datagram.Send(ctx, config.Endpoint{Host: "blocked.test", Port: 12000}, []byte("frame"))
+	}()
+	select {
+	case <-resolver.started:
+	case <-time.After(time.Second):
+		t.Fatal("outbound DNS resolution did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled DNS send error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("outbound DNS resolution ignored cancellation")
+	}
+}
 
 func TestDatagramListensOnEveryConfiguredEndpoint(t *testing.T) {
 	first := freeUDPEndpoint(t)
@@ -156,4 +186,18 @@ func freeUDPEndpoint(t *testing.T) config.Endpoint {
 		t.Fatal(err)
 	}
 	return endpoint
+}
+
+type blockingIPResolver struct {
+	started chan struct{}
+}
+
+func (r *blockingIPResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	select {
+	case <-r.started:
+	default:
+		close(r.started)
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
