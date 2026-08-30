@@ -144,6 +144,67 @@ func TestSuspicionStaleIndirectTimeoutCannotRecreateExpiredHigherTerminalGenerat
 	}
 }
 
+func TestExpiredTombstoneRejectsFreshlyReportedOldAliveWithoutRegossip(t *testing.T) {
+	self := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 5, Status: Dead}
+	engine := newTestEngineWithSelf(self)
+	now := time.Date(2026, 8, 29, 15, 8, 0, 0, time.UTC)
+	effects := engine.ApplyUpdate(Update{Member: target, ReporterID: 3}, now)
+	timer, ok := timerOfKind(effects, TimerTombstone)
+	if !ok {
+		t.Fatalf("terminal effects = %#v, want tombstone timer", effects)
+	}
+	for {
+		batch := mustTakeForMembers(t, engine.dissemination, 1, engine.aliveMembers(), countEncoder)
+		if len(batch) == 0 {
+			break
+		}
+	}
+	engine.ExpireTombstone(target.NodeID, target.Incarnation, target.Status, timer.Deadline)
+
+	staleAlive := target
+	staleAlive.Status = Alive
+	for reporter := uint16(3); reporter <= 5; reporter++ {
+		if got := engine.ApplyUpdate(Update{Member: staleAlive, ReporterID: reporter}, timer.Deadline.Add(time.Duration(reporter)*time.Millisecond)); !reflect.DeepEqual(got, Effects{}) {
+			t.Fatalf("fresh report from %d effects = %#v, want zero", reporter, got)
+		}
+	}
+	if _, exists := engine.table.Get(target.NodeID); exists {
+		t.Fatal("freshly reported old Alive became visible after tombstone expiry")
+	}
+	if batch := mustTakeForMembers(t, engine.dissemination, 1, engine.aliveMembers(), countEncoder); len(batch) != 0 {
+		t.Fatalf("freshly reported old Alive was re-gossiped: %#v", batch)
+	}
+}
+
+func TestEngineAppliesSnapshotFloorAndExportsItAfterVisibleExpiry(t *testing.T) {
+	self := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	stale := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 3, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: stale, ReporterID: stale.NodeID})
+	floor := stale
+	floor.Incarnation = 6
+	floor.Status = Dead
+	now := time.Date(2026, 8, 29, 15, 9, 0, 0, time.UTC)
+
+	effects := engine.ApplyIncarnationFloor(floor, 3, now)
+	if len(effects.Events) != 1 || effects.Events[0].Previous != stale || effects.Events[0].Current != floor {
+		t.Fatalf("snapshot floor effects = %#v, want stale-to-terminal transition", effects)
+	}
+	timer, ok := timerOfKind(effects, TimerTombstone)
+	if !ok {
+		t.Fatalf("snapshot floor effects = %#v, want tombstone timer", effects)
+	}
+	engine.ExpireTombstone(floor.NodeID, floor.Incarnation, floor.Status, timer.Deadline)
+
+	if got := engine.Snapshot(); !reflect.DeepEqual(got, []Member{self}) {
+		t.Fatalf("visible snapshot after expiry = %#v, want only self", got)
+	}
+	if got := engine.IncarnationFloors(); !reflect.DeepEqual(got, []Member{floor}) {
+		t.Fatalf("exported floors = %#v, want %#v", got, []Member{floor})
+	}
+}
+
 func TestSuspicionDistinctReportersShortenWithoutDuplicatesOrExtensions(t *testing.T) {
 	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
 	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}

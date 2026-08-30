@@ -401,6 +401,7 @@ type serviceEvent interface{ serviceEvent() }
 
 type snapshotResult struct {
 	members          []Member
+	floors           []Member
 	digestGeneration uint64
 	revision         uint64
 	err              error
@@ -490,6 +491,7 @@ func (joinCompletedServiceEvent) serviceEvent() {}
 type snapshotResyncServiceEvent struct {
 	sender  Member
 	members []Member
+	floors  []Member
 	applied chan<- error
 	err     error
 }
@@ -553,7 +555,7 @@ func (l *serviceLoop) run(parent context.Context) error {
 			case fatalServiceEvent:
 				return event.err
 			case tcpSnapshotServiceEvent:
-				event.response <- snapshotResult{members: l.engine.Snapshot(), digestGeneration: l.dissemination.digestGeneration, revision: l.membershipRevision}
+				event.response <- snapshotResult{members: l.engine.Snapshot(), floors: l.engine.IncarnationFloors(), digestGeneration: l.dissemination.digestGeneration, revision: l.membershipRevision}
 			case joinAdmissionServiceEvent:
 				if err := l.handleJoinAdmission(event); err != nil {
 					return err
@@ -767,12 +769,12 @@ func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream
 		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, err)
 		return
 	}
-	snapshot, err := s.requestTCPSnapshot(ctx)
-	if err != nil {
-		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, err)
+	snapshot := s.requestTCPSnapshotResult(ctx)
+	if snapshot.err != nil {
+		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, snapshot.err)
 		return
 	}
-	if err := s.writeTCPPayload(ctx, stream, wire.MessageSWIMJoinSnapshot, requestFrame.Header.RequestID, JoinSnapshot{Members: snapshot}); err != nil {
+	if err := s.writeTCPPayload(ctx, stream, wire.MessageSWIMJoinSnapshot, requestFrame.Header.RequestID, JoinSnapshot{Members: snapshot.members, Floors: snapshot.floors}); err != nil {
 		return
 	}
 
@@ -822,7 +824,7 @@ func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameSt
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, result.err)
 		return
 	}
-	if err := s.writeTCPPayload(ctx, stream, wire.MessageSWIMSnapshotResponse, frame.Header.RequestID, SnapshotResponse{Members: result.members}); err != nil {
+	if err := s.writeTCPPayload(ctx, stream, wire.MessageSWIMSnapshotResponse, frame.Header.RequestID, SnapshotResponse{Members: result.members, Floors: result.floors}); err != nil {
 		return
 	}
 	appliedFrame, err := stream.ReadFrame(ctx)
@@ -1096,6 +1098,11 @@ func (l *serviceLoop) handleJoinCompleted(event joinCompletedServiceEvent) error
 		return fmt.Errorf("%w: seed accepted invalid local member %#v", ErrSnapshotProtocol, result.accepted)
 	}
 	seedPresent := false
+	for _, floor := range result.floors {
+		if err := l.executeEffects(l.runContext, l.engine.ApplyIncarnationFloor(floor, result.seedID, l.service.options.Clock.Now())); err != nil {
+			return err
+		}
+	}
 	for _, member := range result.snapshot {
 		if member.NodeID == result.seedID && (member.Status == Alive || member.Status == Suspect) {
 			seedPresent = true
@@ -1141,7 +1148,7 @@ func (l *serviceLoop) startSnapshotResync(sender Member) {
 			return
 		}
 		applied := make(chan error, 1)
-		if !l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, members: pending.members, applied: applied}) {
+		if !l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, members: pending.members, floors: pending.floors, applied: applied}) {
 			return
 		}
 		select {
@@ -1165,6 +1172,14 @@ func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) err
 			event.applied <- ErrSnapshotProtocol
 		}
 		return nil
+	}
+	for _, floor := range event.floors {
+		if err := l.executeEffects(l.runContext, l.engine.ApplyIncarnationFloor(floor, event.sender.NodeID, l.service.options.Clock.Now())); err != nil {
+			if event.applied != nil {
+				event.applied <- err
+			}
+			return err
+		}
 	}
 	for _, member := range event.members {
 		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.sender.NodeID}, l.service.options.Clock.Now())); err != nil {

@@ -128,7 +128,7 @@ func (e *Engine) ExpireTombstone(nodeID uint16, incarnation uint64, status Statu
 		return Effects{}
 	}
 	delete(e.tombstones, nodeID)
-	delete(e.table.members, nodeID)
+	e.table.ExpireTerminal(member)
 	return Effects{}
 }
 

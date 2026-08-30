@@ -46,6 +46,29 @@ func TestSnapshotClientInvalidResponseCannotPoisonReplayCapacity(t *testing.T) {
 	}
 }
 
+func TestValidateSnapshotStateAcceptsOnlyUniqueTerminalFloors(t *testing.T) {
+	member := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 5, Status: Alive}
+	floor := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 7, Status: Dead}
+	if err := validateSnapshotState([]Member{member}, []Member{floor}); err != nil {
+		t.Fatalf("valid snapshot state error = %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		floors []Member
+	}{
+		{name: "nonterminal", floors: []Member{{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 8, Status: Alive}}},
+		{name: "duplicate member", floors: []Member{{NodeID: member.NodeID, Host: member.Host, BasePort: member.BasePort, Incarnation: 4, Status: Dead}}},
+		{name: "duplicate floor", floors: []Member{floor, floor}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateSnapshotState([]Member{member}, test.floors); !errors.Is(err, ErrSnapshotProtocol) {
+				t.Fatalf("validation error = %v, want ErrSnapshotProtocol", err)
+			}
+		})
+	}
+}
+
 func TestInternalSnapshotResyncRejectsUnexpectedFirstResponderBeforeReplayAcceptance(t *testing.T) {
 	now := time.Unix(4465, 0)
 	configuration := serviceTestConfig(t, 1)

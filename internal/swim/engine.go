@@ -312,6 +312,27 @@ func (e *Engine) Snapshot() []Member {
 	return e.table.Snapshot()
 }
 
+// IncarnationFloors returns copied hidden terminal floors for join and repair
+// snapshots. The owner goroutine must call it just like Snapshot.
+func (e *Engine) IncarnationFloors() []Member {
+	return e.table.IncarnationFloors()
+}
+
+// ApplyIncarnationFloor incorporates terminal knowledge from an authenticated
+// join or repair snapshot. Advancing a visible member produces the same event,
+// dissemination, and tombstone effects as a terminal membership update;
+// retaining an already-hidden floor produces no visible effects.
+func (e *Engine) ApplyIncarnationFloor(floor Member, reporterID uint16, now time.Time) Effects {
+	changed, event := e.table.MergeIncarnationFloor(floor, reporterID)
+	if !changed || event.Current.NodeID == 0 {
+		return Effects{}
+	}
+	delete(e.suspicions, event.Current.NodeID)
+	effects := Effects{Timers: []TimerRequest{e.beginTombstone(event.Current, now)}}
+	e.appliedTransition(&effects, event, reporterID)
+	return effects
+}
+
 func (e *Engine) takeSequence() uint64 {
 	sequence := e.nextSequence
 	e.nextSequence++

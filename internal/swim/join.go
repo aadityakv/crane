@@ -33,6 +33,9 @@ type JoinRequest struct {
 // JoinSnapshot is the seed's immutable membership value set at request time.
 type JoinSnapshot struct {
 	Members []Member
+	// Floors carries terminal generations retained after visible expiry so a
+	// joining identity must advance past them.
+	Floors []Member
 }
 
 // JoinAnnounce proposes the durably prepared Alive generation for admission.
@@ -48,6 +51,12 @@ type JoinAccepted struct {
 // PrepareJoin recovers the highest trustworthy incarnation, durably advances
 // it, and only then returns an Alive membership value.
 func PrepareJoin(store IncarnationStore, snapshot []Member, self Member) (Member, error) {
+	return PrepareJoinWithFloors(store, snapshot, nil, self)
+}
+
+// PrepareJoinWithFloors is PrepareJoin with the retained terminal floors from
+// the seed's join snapshot included in incarnation recovery.
+func PrepareJoinWithFloors(store IncarnationStore, snapshot, floors []Member, self Member) (Member, error) {
 	if store == nil {
 		return Member{}, fmt.Errorf("%w: incarnation store is nil", ErrInvalidJoinAnnouncement)
 	}
@@ -66,6 +75,11 @@ func PrepareJoin(store IncarnationStore, snapshot []Member, self Member) (Member
 	for _, member := range snapshot {
 		if member.NodeID == self.NodeID && member.Incarnation > highest {
 			highest = member.Incarnation
+		}
+	}
+	for _, floor := range floors {
+		if floor.NodeID == self.NodeID && (floor.Status == Dead || floor.Status == Left) && floor.Incarnation > highest {
+			highest = floor.Incarnation
 		}
 	}
 	if highest == 0 {
@@ -106,6 +120,9 @@ func ValidateJoinAnnouncement(table *Table, announce JoinAnnounce) error {
 
 	current, exists := table.Get(joining.NodeID)
 	if !exists {
+		if floor, retained := table.IncarnationFloor(joining.NodeID); retained && joining.Incarnation <= floor.Incarnation {
+			return fmt.Errorf("%w: node %d floor is %d, proposed %d", ErrStaleJoinIncarnation, joining.NodeID, floor.Incarnation, joining.Incarnation)
+		}
 		return nil
 	}
 	switch current.Status {

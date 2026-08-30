@@ -87,6 +87,7 @@ type protocolClient struct {
 type joinClientResult struct {
 	seedID   uint16
 	snapshot []Member
+	floors   []Member
 	accepted Member
 }
 
@@ -97,6 +98,7 @@ type pendingSnapshot struct {
 	requestID        wire.RequestID
 	senderID         uint16
 	members          []Member
+	floors           []Member
 	closeOnce        sync.Once
 }
 
@@ -171,7 +173,7 @@ func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endp
 	if err := wire.DecodeGob(frame.Payload, &response); err != nil {
 		return nil, fmt.Errorf("%w: decode snapshot response: %v", ErrSnapshotProtocol, err)
 	}
-	if err := validateSnapshot(response.Members); err != nil {
+	if err := validateSnapshotState(response.Members, response.Floors); err != nil {
 		return nil, err
 	}
 	if err := c.acceptResponse(frame); err != nil {
@@ -179,6 +181,7 @@ func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endp
 	}
 	pending.senderID = frame.Header.SenderID
 	pending.members = append([]Member(nil), response.Members...)
+	pending.floors = append([]Member(nil), response.Floors...)
 	return pending, nil
 }
 
@@ -223,7 +226,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := wire.DecodeGob(frame.Payload, &snapshot); err != nil {
 		return joinClientResult{}, fmt.Errorf("%w: decode join snapshot: %v", ErrSnapshotProtocol, err)
 	}
-	if err := validateSnapshot(snapshot.Members); err != nil {
+	if err := validateSnapshotState(snapshot.Members, snapshot.Floors); err != nil {
 		return joinClientResult{}, err
 	}
 	if err := validateJoinResponder(ctx, c.addresses, remoteEndpoint, c.senderID, frame.Header.SenderID, snapshot.Members); err != nil {
@@ -232,7 +235,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	if err := c.acceptResponse(frame); err != nil {
 		return joinClientResult{}, err
 	}
-	prepared, err := PrepareJoin(store, snapshot.Members, self)
+	prepared, err := PrepareJoinWithFloors(store, snapshot.Members, snapshot.Floors, self)
 	if err != nil {
 		return joinClientResult{}, err
 	}
@@ -261,6 +264,7 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	return joinClientResult{
 		seedID:   frame.Header.SenderID,
 		snapshot: append([]Member(nil), snapshot.Members...),
+		floors:   append([]Member(nil), snapshot.Floors...),
 		accepted: accepted.Member,
 	}, nil
 }
@@ -394,6 +398,29 @@ func validateSnapshot(members []Member) error {
 		seen[member.NodeID] = struct{}{}
 		if err := validateAdvertisedEndpoint(member); err != nil {
 			return fmt.Errorf("%w: %v", ErrSnapshotProtocol, err)
+		}
+	}
+	return nil
+}
+
+func validateSnapshotState(members, floors []Member) error {
+	if err := validateSnapshot(members); err != nil {
+		return err
+	}
+	seen := make(map[uint16]struct{}, len(members)+len(floors))
+	for _, member := range members {
+		seen[member.NodeID] = struct{}{}
+	}
+	for _, floor := range floors {
+		if floor.NodeID == 0 || floor.Incarnation == 0 || (floor.Status != Dead && floor.Status != Left) {
+			return fmt.Errorf("%w: invalid incarnation floor %#v", ErrSnapshotProtocol, floor)
+		}
+		if _, duplicate := seen[floor.NodeID]; duplicate {
+			return fmt.Errorf("%w: duplicate snapshot identity %d", ErrSnapshotProtocol, floor.NodeID)
+		}
+		seen[floor.NodeID] = struct{}{}
+		if err := validateAdvertisedEndpoint(floor); err != nil {
+			return fmt.Errorf("%w: invalid incarnation floor: %v", ErrSnapshotProtocol, err)
 		}
 	}
 	return nil

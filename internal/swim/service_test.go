@@ -410,6 +410,65 @@ func TestServiceRejectsZeroIncarnationBeforeReplayAcceptance(t *testing.T) {
 	}
 }
 
+func TestServiceFreshFramesCannotRegossipAliveBelowExpiredFloor(t *testing.T) {
+	now := time.Unix(2100, 0)
+	service, reporter, source, authenticator := newDatagramDecoderService(t, now, 16)
+	self := service.active.Load().(map[uint16]Member)[service.options.Config.NodeID]
+	target := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 9, Status: Dead}
+	dissemination := NewDisseminator(32, serviceRetransmitFactor)
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       3,
+		SuspicionMultiplier:  5,
+	}, NewTable(), dissemination, random.NewLockedSource(309))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMerge(t, engine.table, Update{Member: self, ReporterID: self.NodeID})
+	mustMerge(t, engine.table, Update{Member: reporter, ReporterID: reporter.NodeID})
+	effects := engine.ApplyUpdate(Update{Member: target, ReporterID: reporter.NodeID}, now)
+	timer, ok := timerOfKind(effects, TimerTombstone)
+	if !ok {
+		t.Fatalf("terminal effects = %#v, want tombstone timer", effects)
+	}
+	for {
+		batch := mustTakeForMembers(t, dissemination, 1, engine.aliveMembers(), countEncoder)
+		if len(batch) == 0 {
+			break
+		}
+	}
+	engine.ExpireTombstone(target.NodeID, target.Incarnation, target.Status, timer.Deadline)
+
+	loop := &serviceLoop{
+		service:       service,
+		engine:        engine,
+		dissemination: dissemination,
+		admitted:      true,
+		runContext:    context.Background(),
+	}
+	staleAlive := target
+	staleAlive.Status = Alive
+	for requestNumber := uint64(1); requestNumber <= 3; requestNumber++ {
+		frame := encodeSimulationDatagram(t, authenticator, now, reporter.NodeID, requestNumber, wire.MessageSWIMGossip, GossipMessage{Updates: []Update{{Member: staleAlive, ReporterID: reporter.NodeID}}})
+		event, accepted := service.decodeDatagram(transport.Packet{From: source, Data: frame})
+		if !accepted {
+			t.Fatalf("fresh authenticated frame %d was rejected before owner merge", requestNumber)
+		}
+		if err := loop.handleDatagram(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, exists := engine.table.Get(target.NodeID); exists {
+		t.Fatal("fresh frames resurrected Alive below the retained floor")
+	}
+	if batch := mustTakeForMembers(t, dissemination, 1, engine.aliveMembers(), countEncoder); len(batch) != 0 {
+		t.Fatalf("fresh frames re-gossiped Alive below the retained floor: %#v", batch)
+	}
+}
+
 func TestServiceStateDependentACKsCannotPoisonReplayCapacity(t *testing.T) {
 	now := time.Unix(2250, 0)
 	for _, test := range []struct {

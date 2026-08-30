@@ -57,6 +57,23 @@ func TestPrepareJoinUsesHighestMatchingSnapshotRecord(t *testing.T) {
 	}
 }
 
+func TestPrepareJoinUsesRetainedIncarnationFloor(t *testing.T) {
+	store := &recordingIncarnationStore{loaded: 3}
+	self := Member{NodeID: 7, Host: "node7.example", BasePort: 8700}
+	floors := []Member{{NodeID: 7, Host: "old-node7.example", BasePort: 8600, Incarnation: 11, Status: Left}}
+
+	got, err := PrepareJoinWithFloors(store, nil, floors, self)
+	if err != nil {
+		t.Fatalf("PrepareJoinWithFloors() error = %v", err)
+	}
+	if got.Incarnation != 12 || got.Status != Alive {
+		t.Fatalf("prepared member = %#v, want Alive incarnation 12", got)
+	}
+	if !reflect.DeepEqual(store.stored, []uint64{12}) {
+		t.Fatalf("stored incarnations = %v, want [12]", store.stored)
+	}
+}
+
 func TestPrepareJoinRequiresRecoverableIdentityState(t *testing.T) {
 	store := &recordingIncarnationStore{}
 	self := Member{NodeID: 2, Host: "node2", BasePort: 8200}
@@ -228,15 +245,33 @@ func TestValidateJoinAcceptsHigherGenerationThanTerminalRecordWithoutMutation(t 
 	}
 }
 
+func TestValidateJoinRequiresHigherGenerationThanExpiredTerminalFloor(t *testing.T) {
+	table := NewTable()
+	terminal := Member{NodeID: 2, Host: "old", BasePort: 8100, Incarnation: 8, Status: Dead}
+	mustMerge(t, table, Update{Member: terminal, ReporterID: 1})
+	if !table.ExpireTerminal(terminal) {
+		t.Fatal("terminal record did not expire")
+	}
+	if _, exists := table.Get(terminal.NodeID); exists {
+		t.Fatal("expired terminal record remained visible")
+	}
+
+	announce := JoinAnnounce{Member: Member{NodeID: 2, Host: "new", BasePort: 8200, Incarnation: 8, Status: Alive}}
+	if err := ValidateJoinAnnouncement(table, announce); !errors.Is(err, ErrStaleJoinIncarnation) {
+		t.Fatalf("join error = %v, want ErrStaleJoinIncarnation", err)
+	}
+}
+
 func TestJoinMessagesRoundTripThroughGob(t *testing.T) {
 	member := Member{NodeID: 2, Host: "2001:db8::2", BasePort: 8200, Incarnation: 5, Status: Alive}
+	floor := Member{NodeID: 3, Host: "2001:db8::3", BasePort: 8300, Incarnation: 8, Status: Left}
 	tests := []struct {
 		name  string
 		value any
 		fresh func() any
 	}{
 		{name: "request", value: JoinRequest{NodeID: 2}, fresh: func() any { return new(JoinRequest) }},
-		{name: "snapshot", value: JoinSnapshot{Members: []Member{member}}, fresh: func() any { return new(JoinSnapshot) }},
+		{name: "snapshot", value: JoinSnapshot{Members: []Member{member}, Floors: []Member{floor}}, fresh: func() any { return new(JoinSnapshot) }},
 		{name: "announce", value: JoinAnnounce{Member: member}, fresh: func() any { return new(JoinAnnounce) }},
 		{name: "accepted", value: JoinAccepted{Member: member}, fresh: func() any { return new(JoinAccepted) }},
 	}

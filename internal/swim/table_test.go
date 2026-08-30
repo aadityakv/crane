@@ -179,6 +179,67 @@ func TestTableSnapshotIsSortedAndIsolated(t *testing.T) {
 	}
 }
 
+func TestTableTerminalFloorSurvivesVisibleExpiryAndRejectsOldAlive(t *testing.T) {
+	table := NewTable()
+	terminal := Member{NodeID: 12, Host: "node12", BasePort: 8012, Incarnation: 9, Status: Dead}
+	mustMerge(t, table, Update{Member: terminal, ReporterID: 3})
+
+	if !table.ExpireTerminal(terminal) {
+		t.Fatal("ExpireTerminal did not remove the exact visible tombstone")
+	}
+	if _, exists := table.Get(terminal.NodeID); exists {
+		t.Fatal("visible tombstone remained after expiry")
+	}
+	if got := table.IncarnationFloors(); !reflect.DeepEqual(got, []Member{terminal}) {
+		t.Fatalf("incarnation floors = %#v, want %#v", got, []Member{terminal})
+	}
+
+	staleAlive := terminal
+	staleAlive.Status = Alive
+	if changed, event := table.Merge(Update{Member: staleAlive, ReporterID: staleAlive.NodeID}); changed || event != (MembershipEvent{}) {
+		t.Fatalf("old Alive crossed retained floor: changed=%v event=%#v", changed, event)
+	}
+	if _, exists := table.Get(terminal.NodeID); exists {
+		t.Fatal("old Alive recreated a visible member")
+	}
+
+	newerAlive := staleAlive
+	newerAlive.Incarnation++
+	mustMerge(t, table, Update{Member: newerAlive, ReporterID: newerAlive.NodeID})
+	if got := table.MustGet(newerAlive.NodeID); got != newerAlive {
+		t.Fatalf("newer Alive = %#v, want %#v", got, newerAlive)
+	}
+}
+
+func TestTableMergeIncarnationFloorRepairsStaleVisibleMember(t *testing.T) {
+	table := NewTable()
+	stale := Member{NodeID: 13, Host: "node13", BasePort: 8013, Incarnation: 4, Status: Alive}
+	mustMerge(t, table, Update{Member: stale, ReporterID: stale.NodeID})
+	floor := stale
+	floor.Incarnation = 6
+	floor.Status = Left
+
+	changed, event := table.MergeIncarnationFloor(floor, 2)
+	if !changed {
+		t.Fatal("newer snapshot floor was not retained")
+	}
+	if event.Previous != stale || event.Current != floor {
+		t.Fatalf("floor repair transition = %#v -> %#v, want %#v -> %#v", event.Previous, event.Current, stale, floor)
+	}
+	if got := table.MustGet(floor.NodeID); got != floor {
+		t.Fatalf("visible repaired member = %#v, want %#v", got, floor)
+	}
+
+	if !table.ExpireTerminal(floor) {
+		t.Fatal("repaired terminal record did not expire")
+	}
+	copyOfFloors := table.IncarnationFloors()
+	copyOfFloors[0].Incarnation = 1
+	if got := table.IncarnationFloors(); len(got) != 1 || got[0] != floor {
+		t.Fatalf("floor snapshot mutation leaked into table: %#v", got)
+	}
+}
+
 func withStatus(member Member, status Status) Member {
 	member.Status = status
 	return member

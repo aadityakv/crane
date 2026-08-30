@@ -42,6 +42,8 @@ type SnapshotRequest struct{}
 // SnapshotResponse returns the responder's complete membership value set.
 type SnapshotResponse struct {
 	Members []Member
+	// Floors carries terminal generations whose visible tombstones expired.
+	Floors []Member
 }
 
 // SnapshotApplied acknowledges that the correlated snapshot was validated and
