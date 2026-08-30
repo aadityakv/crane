@@ -92,6 +92,120 @@ func TestTCPReadFrameRejectsDeclaredBodyAboveLimit(t *testing.T) {
 	}
 }
 
+func TestTCPReadFrameRejectsBodyShorterThanFixedHeaderAndMAC(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	prefix := make([]byte, tcpLengthPrefixSize)
+	binary.BigEndian.PutUint32(prefix, FixedHeaderSize+MACSize-1)
+	written := make(chan error, 1)
+	go func() {
+		_, err := client.Write(prefix)
+		written <- err
+	}()
+
+	if _, err := ReadTCPFrame(context.Background(), server, NewHMACAuthenticator(testKey), DefaultLimits(), time.Second); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("short declared body error = %v, want ErrMalformed", err)
+	}
+	if err := <-written; err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+}
+
+func TestTCPReadFrameRejectsTruncatedFixedHeader(t *testing.T) {
+	prefix := make([]byte, tcpLengthPrefixSize)
+	binary.BigEndian.PutUint32(prefix, FixedHeaderSize+MACSize)
+	input := append(prefix, make([]byte, FixedHeaderSize-1)...)
+	conn := newReadOnlyConn(input)
+
+	if _, err := ReadTCPFrame(context.Background(), conn, NewHMACAuthenticator(testKey), DefaultLimits(), time.Second); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated fixed header error = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+func TestTCPReadFrameValidatesHeaderBeforeDeclaredBodyAllocation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func([]byte)
+		want   error
+	}{
+		{
+			name: "malformed_magic",
+			mutate: func(header []byte) {
+				header[magicOffset] ^= 0xff
+			},
+			want: ErrMalformed,
+		},
+		{
+			name: "unsupported_version",
+			mutate: func(header []byte) {
+				binary.BigEndian.PutUint16(header[versionOffset:messageOffset], Version1+1)
+			},
+			want: ErrUnsupportedVersion,
+		},
+		{
+			name: "unsupported_codec",
+			mutate: func(header []byte) {
+				header[codecOffset] = 0xff
+			},
+			want: ErrUnsupportedCodec,
+		},
+		{
+			name: "wrong_cluster",
+			mutate: func(header []byte) {
+				header[clusterIDOffset] ^= 0xff
+			},
+			want: ErrAuthentication,
+		},
+		{
+			name: "embedded_length_disagrees_with_outer_length",
+			mutate: func(header []byte) {
+				binary.BigEndian.PutUint32(header[payloadLengthOffset:FixedHeaderSize], 0)
+			},
+			want: ErrMalformed,
+		},
+	}
+
+	const declaredBodyLength = defaultMaxFrameSize
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := make([]byte, FixedHeaderSize)
+			encodeHeader(header, testHeader(), uint32(declaredBodyLength-FixedHeaderSize-MACSize))
+			tt.mutate(header)
+			prefix := make([]byte, tcpLengthPrefixSize)
+			binary.BigEndian.PutUint32(prefix, declaredBodyLength)
+			conn := newReadOnlyConn(append(prefix, header...))
+			limits := DefaultLimits()
+			expectedClusterID := testHeader().ClusterID
+			limits.ExpectedClusterID = &expectedClusterID
+
+			if _, err := ReadTCPFrame(context.Background(), conn, NewHMACAuthenticator(testKey), limits, time.Second); !errors.Is(err, tt.want) {
+				t.Fatalf("ReadTCPFrame error = %v, want %v", err, tt.want)
+			}
+			if conn.maximumReadRequest > FixedHeaderSize {
+				t.Fatalf("largest body read request = %d bytes, want at most fixed header size %d", conn.maximumReadRequest, FixedHeaderSize)
+			}
+		})
+	}
+}
+
+func TestTCPReadFrameRejectsBadMACAfterBoundedRead(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	header := testHeader()
+	header.Message = MessageRaftAppendEntriesRequest
+	header.Codec = CodecBinary
+	body, err := Encode(header, []byte("payload"), auth, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body[len(body)-1] ^= 0xff
+	input := append(tcpPrefix(body), body...)
+
+	if _, err := ReadTCPFrame(context.Background(), newReadOnlyConn(input), auth, DefaultLimits(), time.Second); !errors.Is(err, ErrAuthentication) {
+		t.Fatalf("bad MAC error = %v, want ErrAuthentication", err)
+	}
+}
+
 func TestTCPReadFramePreservesTruncatedBodyError(t *testing.T) {
 	auth := NewHMACAuthenticator(testKey)
 	body, err := Encode(testHeader(), []byte("payload"), auth, DefaultLimits())
@@ -122,6 +236,18 @@ func TestTCPReadFrameHonorsContextDeadline(t *testing.T) {
 
 	if _, err := ReadTCPFrame(ctx, server, NewHMACAuthenticator(testKey), DefaultLimits(), time.Second); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("context deadline error = %v", err)
+	}
+}
+
+func TestTCPReadFrameHonorsContextCancellation(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := ReadTCPFrame(ctx, server, NewHMACAuthenticator(testKey), DefaultLimits(), time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("context cancellation error = %v, want context.Canceled", err)
 	}
 }
 
@@ -268,6 +394,32 @@ func TestTCPFrameStreamSerializesWritesAndDeadlines(t *testing.T) {
 type limitedWriteConn struct {
 	net.Conn
 	maximum int
+}
+
+type readOnlyConn struct {
+	*bytes.Reader
+	maximumReadRequest int
+}
+
+func newReadOnlyConn(payload []byte) *readOnlyConn {
+	return &readOnlyConn{Reader: bytes.NewReader(payload)}
+}
+
+func (c *readOnlyConn) Read(payload []byte) (int, error) {
+	if len(payload) > c.maximumReadRequest {
+		c.maximumReadRequest = len(payload)
+	}
+	return c.Reader.Read(payload)
+}
+
+func (*readOnlyConn) Write([]byte) (int, error)       { return 0, io.ErrClosedPipe }
+func (*readOnlyConn) Close() error                    { return nil }
+func (*readOnlyConn) LocalAddr() net.Addr             { return nil }
+func (*readOnlyConn) RemoteAddr() net.Addr            { return nil }
+func (*readOnlyConn) SetDeadline(time.Time) error     { return nil }
+func (*readOnlyConn) SetReadDeadline(time.Time) error { return nil }
+func (*readOnlyConn) SetWriteDeadline(time.Time) error {
+	return nil
 }
 
 func (c *limitedWriteConn) Write(payload []byte) (int, error) {

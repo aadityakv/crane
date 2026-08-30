@@ -60,6 +60,28 @@ const (
 	MessageSWIMError MessageType = 13
 	// MessageSWIMSnapshotApplied acknowledges owner-validated snapshot application.
 	MessageSWIMSnapshotApplied MessageType = 14
+	// MessageRaftHandshake authenticates and binds a voter stream to its sender.
+	MessageRaftHandshake MessageType = 100
+	// MessageRaftHandshakeAck acknowledges an authenticated voter stream handshake.
+	MessageRaftHandshakeAck MessageType = 101
+	// MessageRaftPreVoteRequest asks whether a prospective election could succeed.
+	MessageRaftPreVoteRequest MessageType = 102
+	// MessageRaftPreVoteResponse reports one voter's pre-vote decision.
+	MessageRaftPreVoteResponse MessageType = 103
+	// MessageRaftRequestVoteRequest asks for a vote in an active election term.
+	MessageRaftRequestVoteRequest MessageType = 104
+	// MessageRaftRequestVoteResponse reports one voter's election decision.
+	MessageRaftRequestVoteResponse MessageType = 105
+	// MessageRaftAppendEntriesRequest replicates log entries or carries a heartbeat.
+	MessageRaftAppendEntriesRequest MessageType = 106
+	// MessageRaftAppendEntriesResponse reports the result of a replication request.
+	MessageRaftAppendEntriesResponse MessageType = 107
+	// MessageRaftInstallSnapshotRequest carries one bounded snapshot chunk.
+	MessageRaftInstallSnapshotRequest MessageType = 108
+	// MessageRaftInstallSnapshotResponse reports durable snapshot chunk progress.
+	MessageRaftInstallSnapshotResponse MessageType = 109
+	// MessageRaftError carries a typed authentication-safe protocol failure.
+	MessageRaftError MessageType = 110
 
 	// MessageSWIMACK preserves the conventional all-caps ACK spelling.
 	MessageSWIMACK = MessageSWIMAck
@@ -73,6 +95,8 @@ type Codec uint8
 const (
 	// CodecGob identifies a payload encoded as one concrete gob value.
 	CodecGob Codec = 1
+	// CodecBinary identifies an explicitly encoded canonical binary payload.
+	CodecBinary Codec = 2
 )
 
 // RequestID is the fixed-width identifier used for request correlation and replay defense.

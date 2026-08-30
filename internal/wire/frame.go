@@ -134,7 +134,7 @@ func validateHeader(header Header, limits Limits) error {
 	if header.Version != Version1 {
 		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, header.Version)
 	}
-	if header.Codec != CodecGob {
+	if header.Codec != CodecGob && header.Codec != CodecBinary {
 		return fmt.Errorf("%w: %d", ErrUnsupportedCodec, header.Codec)
 	}
 	if limits.ExpectedClusterID != nil && header.ClusterID != *limits.ExpectedClusterID {

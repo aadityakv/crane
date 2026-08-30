@@ -88,13 +88,40 @@ func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits
 		return Frame{}, fmt.Errorf("read TCP frame prefix: %w", contextualIOError(ctx, err))
 	}
 	bodyLength := binary.BigEndian.Uint32(prefix[:])
+	minimumBodyLength := uint32(FixedHeaderSize + MACSize)
+	if bodyLength < minimumBodyLength {
+		return Frame{}, fmt.Errorf("%w: declared TCP body is shorter than fixed header and MAC", ErrMalformed)
+	}
 	if uint64(bodyLength) > uint64(resolved.MaxFrameSize) {
 		return Frame{}, fmt.Errorf("%w: declared TCP body is %d bytes, maximum is %d", ErrTooLarge, bodyLength, resolved.MaxFrameSize)
 	}
 
+	var fixedHeader [FixedHeaderSize]byte
+	if _, err := io.ReadFull(conn, fixedHeader[:]); err != nil {
+		return Frame{}, fmt.Errorf("read TCP frame fixed header: %w", contextualIOError(ctx, err))
+	}
+	if string(fixedHeader[magicOffset:versionOffset]) != frameMagic {
+		return Frame{}, fmt.Errorf("%w: invalid magic", ErrMalformed)
+	}
+	header := decodeHeader(fixedHeader[:])
+	if err := validateHeader(header, resolved); err != nil {
+		return Frame{}, err
+	}
+
+	payloadLength := binary.BigEndian.Uint32(fixedHeader[payloadLengthOffset:FixedHeaderSize])
+	declaredLength := uint64(FixedHeaderSize) + uint64(payloadLength) + uint64(MACSize)
+	limit := effectiveLimit(header.Message, resolved)
+	if declaredLength > uint64(limit) {
+		return Frame{}, fmt.Errorf("%w: declared body is %d bytes, maximum is %d", ErrTooLarge, declaredLength, limit)
+	}
+	if declaredLength != uint64(bodyLength) {
+		return Frame{}, fmt.Errorf("%w: embedded body is %d bytes, outer prefix declares %d", ErrMalformed, declaredLength, bodyLength)
+	}
+
 	body := make([]byte, int(bodyLength))
-	if _, err := io.ReadFull(conn, body); err != nil {
-		return Frame{}, fmt.Errorf("read TCP frame body: %w", contextualIOError(ctx, err))
+	copy(body[:FixedHeaderSize], fixedHeader[:])
+	if _, err := io.ReadFull(conn, body[FixedHeaderSize:]); err != nil {
+		return Frame{}, fmt.Errorf("read TCP frame payload and MAC: %w", contextualIOError(ctx, err))
 	}
 	frame, err := Decode(body, auth, resolved)
 	if err != nil {

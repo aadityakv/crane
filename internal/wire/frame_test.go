@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -53,6 +54,25 @@ func TestFrameEncodingUsesExactCanonicalBytes(t *testing.T) {
 	const wantHex = "435334320001000101020300000000000000000000000000000709080700000000000000000000000000000000000001e24001000000077061796c6f61646056bc837993f056b5d1994fd21493c2da899022e0877d9d0ab460f08b6a86b3"
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("encoded frame = %s, want %s", got, wantHex)
+	}
+}
+
+func TestFrameAcceptsAuthenticatedBinaryCodec(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	header := testHeader()
+	header.Message = MessageRaftPreVoteRequest
+	header.Codec = CodecBinary
+
+	encoded, err := Encode(header, []byte{0, 1, 2, 3}, auth, DefaultLimits())
+	if err != nil {
+		t.Fatalf("Encode binary frame: %v", err)
+	}
+	frame, err := Decode(encoded, auth, DefaultLimits())
+	if err != nil {
+		t.Fatalf("Decode binary frame: %v", err)
+	}
+	if frame.Header != header || !bytes.Equal(frame.Payload, []byte{0, 1, 2, 3}) {
+		t.Fatalf("decoded binary frame = %#v", frame)
 	}
 }
 
