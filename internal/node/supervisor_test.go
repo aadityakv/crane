@@ -10,12 +10,133 @@ import (
 )
 
 func TestSupervisorReturnsImmediatelyWithNoServices(t *testing.T) {
+	supervisor := NewSupervisor()
 	result := make(chan error, 1)
-	go func() { result <- NewSupervisor().Run(context.Background()) }()
+	go func() { result <- supervisor.Run(context.Background()) }()
 
 	if err := <-result; err != nil {
 		t.Fatalf("Run error = %v, want nil for an empty service set", err)
 	}
+	assertChannelClosed(t, supervisor.Ready(), "empty supervisor readiness")
+}
+
+func TestSupervisorReadyClosesOnlyAfterEveryServiceIsCausallyReady(t *testing.T) {
+	first := newFakeService("first")
+	second := newFakeService("second")
+	supervisor := NewSupervisor(first, second)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Run(ctx) }()
+
+	<-first.started
+	<-second.started
+	first.markReady()
+	assertChannelOpen(t, supervisor.Ready(), "aggregate readiness after only first service")
+	second.markReady()
+	assertChannelClosed(t, supervisor.Ready(), "aggregate readiness after every service")
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run error = %v, want nil after parent cancellation", err)
+	}
+}
+
+func TestSupervisorReadyAcceptsPreclosedChildReadiness(t *testing.T) {
+	first := newFakeService("first")
+	second := newFakeService("second")
+	first.markReady()
+	second.markReady()
+	supervisor := NewSupervisor(first, second)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Run(ctx) }()
+
+	<-first.started
+	<-second.started
+	assertChannelClosed(t, supervisor.Ready(), "aggregate readiness for preclosed children")
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run error = %v, want nil after parent cancellation", err)
+	}
+}
+
+func TestSupervisorReadyRemainsOpenWhenServiceFailsBeforeReadiness(t *testing.T) {
+	failed := newFakeService("failed")
+	sibling := newFakeService("sibling")
+	sibling.markReady()
+	sibling.waitAfterCancellation = make(chan struct{})
+	supervisor := NewSupervisor(failed, sibling)
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Run(context.Background()) }()
+
+	<-failed.started
+	<-sibling.started
+	failure := errors.New("bind failed")
+	failed.fail(failure)
+	<-sibling.canceled
+	assertChannelOpen(t, supervisor.Ready(), "aggregate readiness after early startup failure")
+	assertChannelOpen(t, sibling.returned, "sibling return before release")
+	close(sibling.waitAfterCancellation)
+	if err := <-result; !errors.Is(err, failure) {
+		t.Fatalf("Run error = %v, want startup failure %v", err, failure)
+	}
+	assertChannelOpen(t, supervisor.Ready(), "aggregate readiness after failed Run")
+	assertChannelClosed(t, sibling.returned, "sibling joined before supervisor return")
+}
+
+func TestSupervisorCausalityRejectsAggregateReadyAfterCompletionBeforeBufferedReadiness(t *testing.T) {
+	causality := &supervisorCausality{}
+	childReady := make(chan struct{})
+	aggregateReady := make(chan struct{})
+	result := causality.linearizeCompletion(0, errors.New("startup failed"), childReady, context.Background())
+	close(childReady)
+
+	if result.ready {
+		t.Fatal("completion observed child ready even though completion linearized first")
+	}
+	if causality.publishReady(context.Background(), func() { close(aggregateReady) }) {
+		t.Fatal("aggregate readiness published after a completion was already linearized")
+	}
+	assertChannelOpen(t, aggregateReady, "aggregate readiness after causally early completion")
+}
+
+func TestSupervisorCancellationAfterReadyJoinsEveryService(t *testing.T) {
+	first := newFakeService("first")
+	second := newFakeService("second")
+	first.markReady()
+	second.markReady()
+	first.waitAfterCancellation = make(chan struct{})
+	second.waitAfterCancellation = make(chan struct{})
+	supervisor := NewSupervisor(first, second)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Run(ctx) }()
+
+	<-first.started
+	<-second.started
+	assertChannelClosed(t, supervisor.Ready(), "aggregate readiness before cancellation")
+	cancel()
+	<-first.canceled
+	<-second.canceled
+	close(first.waitAfterCancellation)
+	assertChannelOpen(t, result, "supervisor return while second service drains")
+	close(second.waitAfterCancellation)
+	if err := <-result; err != nil {
+		t.Fatalf("Run error = %v, want nil after cancellation", err)
+	}
+	assertChannelClosed(t, first.returned, "first joined")
+	assertChannelClosed(t, second.returned, "second joined")
+}
+
+func TestSupervisorValidationFailureLeavesReadyOpenAndStartsNothing(t *testing.T) {
+	first := newFakeService("duplicate")
+	second := newFakeService("duplicate")
+	supervisor := NewSupervisor(first, second)
+	if err := supervisor.Run(context.Background()); err == nil {
+		t.Fatal("Run succeeded with duplicate service names")
+	}
+	assertChannelOpen(t, supervisor.Ready(), "aggregate readiness after validation failure")
+	assertChannelOpen(t, first.started, "first service start")
+	assertChannelOpen(t, second.started, "second service start")
 }
 
 func TestSupervisorWaitsForEveryServiceToBecomeReady(t *testing.T) {
@@ -312,6 +433,24 @@ func assertRunBlockedBefore(t *testing.T, result <-chan error, release func()) {
 		t.Fatalf("Run returned before release with error %v", outcome.err)
 	}
 	release()
+}
+
+func assertChannelOpen[T any](t *testing.T, channel <-chan T, description string) {
+	t.Helper()
+	select {
+	case <-channel:
+		t.Fatalf("%s is closed or readable, want open and blocked", description)
+	default:
+	}
+}
+
+func assertChannelClosed[T any](t *testing.T, channel <-chan T, description string) {
+	t.Helper()
+	select {
+	case <-channel:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
 }
 
 func TestSupervisorTreatsDeadlineReturnFromCanceledParentAsNormalShutdown(t *testing.T) {

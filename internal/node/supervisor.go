@@ -10,7 +10,9 @@ import (
 // Supervisor starts related services, waits for their readiness, and stops
 // every service when its parent context is canceled or a service fails.
 type Supervisor struct {
-	services []Service
+	services  []Service
+	ready     chan struct{}
+	readyOnce sync.Once
 }
 
 type serviceState struct {
@@ -31,11 +33,13 @@ var errSupervisorShutdown = errors.New("supervisor initiated shutdown")
 type supervisorCausality struct {
 	mu                    sync.Mutex
 	cancellationInitiated bool
+	completionInitiated   bool
 }
 
 func (c *supervisorCausality) linearizeCompletion(index int, err error, ready <-chan struct{}, parent context.Context) completion {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.completionInitiated = true
 	return completion{
 		index:                 index,
 		err:                   err,
@@ -43,6 +47,16 @@ func (c *supervisorCausality) linearizeCompletion(index int, err error, ready <-
 		cancellationInitiated: c.cancellationInitiated,
 		parentCause:           context.Cause(parent),
 	}
+}
+
+func (c *supervisorCausality) publishReady(parent context.Context, publish func()) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.completionInitiated || c.cancellationInitiated || context.Cause(parent) != nil {
+		return false
+	}
+	publish()
+	return true
 }
 
 func (c *supervisorCausality) initiateCancellation(cancel context.CancelCauseFunc) {
@@ -55,7 +69,16 @@ func (c *supervisorCausality) initiateCancellation(cancel context.CancelCauseFun
 // NewSupervisor constructs a Supervisor for services. It does not start any
 // services; Run validates service names before it starts them.
 func NewSupervisor(services ...Service) *Supervisor {
-	return &Supervisor{services: append([]Service(nil), services...)}
+	return &Supervisor{services: append([]Service(nil), services...), ready: make(chan struct{})}
+}
+
+// Ready closes exactly once after every declared service has causally reported
+// readiness during a successful Run startup.
+func (s *Supervisor) Ready() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.ready
 }
 
 // Run starts every service and waits until each reports readiness. It cancels
@@ -66,6 +89,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return err
 	}
 	if len(s.services) == 0 {
+		s.readyOnce.Do(func() { close(s.ready) })
 		return nil
 	}
 
@@ -123,6 +147,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			record(result)
 			shutdown = true
 		case <-ctx.Done():
+			shutdown = true
+		}
+	}
+	if !shutdown && readyCount == len(states) {
+		if !causality.publishReady(ctx, func() { s.readyOnce.Do(func() { close(s.ready) }) }) {
 			shutdown = true
 		}
 	}
