@@ -162,7 +162,7 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	setTask10Phase(trackers, "failover proposals")
 	for index := 1; index <= 2; index++ {
 		command := task10KVCommand{ID: fmt.Sprintf("failover-%02d", index), Key: fmt.Sprintf("failover-key-%02d", index), Value: fmt.Sprintf("failover-value-%02d", index)}
-		leader = proposeTask10Command(t, task10RunningNodes(nodes), command)
+		_ = proposeTask10Command(t, task10RunningNodes(nodes), command)
 		expected[command.Key] = command.Value
 	}
 
@@ -199,7 +199,7 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	awaitTask10File(t, filepath.Join(configurations[laggingIndex].StorageDir, RaftStorageDirectoryName, RaftSnapshotFilename), 5*time.Second)
 	postSnapshot := task10KVCommand{ID: "post-snapshot", Key: "post-snapshot-key", Value: "post-snapshot-value"}
 	setTask10Phase(trackers, "post-snapshot append")
-	leader = proposeTask10Command(t, nodes, postSnapshot)
+	_ = proposeTask10Command(t, nodes, postSnapshot)
 	expected[postSnapshot.Key] = postSnapshot.Value
 	awaitTask10State(t, nodes, expected, 5*time.Second)
 	if got := nodes[laggingIndex].machine.applyCount(postSnapshot.ID); got != 1 {
@@ -252,7 +252,7 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	setTask10Phase(trackers, "durable conflicting retry")
 	conflictingRetry := task10KVCommand{ID: durableRetryID, Key: "must-not-appear", Value: "must-not-replace-original"}
 	var retryResult ProposalResult
-	leader, retryResult = proposeTask10CommandWithResult(t, nodes, conflictingRetry)
+	_, retryResult = proposeTask10CommandWithResult(t, nodes, conflictingRetry)
 	if string(retryResult.Result) != "value-01" {
 		t.Fatalf("durable conflicting retry result = %q, want cached value-01", retryResult.Result)
 	}
