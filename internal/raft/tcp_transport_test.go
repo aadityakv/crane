@@ -106,9 +106,7 @@ func TestTCPHandshakeAckRejectsRequestIDAlreadyUsedOutboundToPeer(t *testing.T) 
 	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
 	handshake := transportFrame(t, transport, 2, id, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
-	if err := writeFrameForTest(stream, handshake); err != nil {
-		t.Fatal(err)
-	}
+	writeRejectedFrameForTest(t, stream, handshake)
 	expectClosedStream(t, stream)
 }
 
