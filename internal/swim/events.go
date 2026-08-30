@@ -71,13 +71,16 @@ func (s *Subscriptions) Publish(event MembershipEvent) {
 }
 
 // MarkResynchronized resumes delta delivery after the subscriber has fetched
-// and installed a complete membership snapshot.
-func (s *Subscriptions) MarkResynchronized(id uint64) {
+// and installed a complete membership snapshot. It reports whether id still
+// names a live subscription.
+func (s *Subscriptions) MarkResynchronized(id uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if subscriber, ok := s.subscribers[id]; ok {
 		subscriber.resynchronization = false
+		return true
 	}
+	return false
 }
 
 // Unsubscribe removes id and closes its event channel. It is idempotent.

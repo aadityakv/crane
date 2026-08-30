@@ -1219,7 +1219,7 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 	harness.stop(t)
 }
 
-func TestSubscriptionSnapshotReportsRevisionRaceAndRemainsPaused(t *testing.T) {
+func TestSubscriptionSnapshotAcknowledgmentReportsOwnerRejection(t *testing.T) {
 	now := time.Unix(2260, 0)
 	configuration := config.NodeConfig{NodeID: 1, BindHost: "127.0.0.1", AdvertiseHost: "127.0.0.1", BasePort: 11000}
 	self := Member{NodeID: 1, Host: "127.0.0.1", BasePort: 11000, Incarnation: 1, Status: Alive}
@@ -1331,6 +1331,37 @@ func TestSubscriptionSnapshotReportsRevisionRaceAndRemainsPaused(t *testing.T) {
 	case event := <-events:
 		t.Fatalf("superseded Snapshot resumed paused subscription: %#v", event)
 	default:
+	}
+
+	removedID, removedEvents := subscriptions.Subscribe(1)
+	subscriptions.Publish(MembershipEvent{Current: Member{NodeID: 7, Incarnation: 1, Status: Alive}})
+	subscriptions.Publish(MembershipEvent{Current: Member{NodeID: 8, Incarnation: 1, Status: Alive}})
+	if event := <-removedEvents; event.Cause != EventResyncRequired {
+		t.Fatalf("removed subscription overflow event = %#v, want resync marker", event)
+	}
+	removedBlocker := make(chan snapshotResult)
+	service.events <- snapshotServiceEvent{response: removedBlocker}
+	deadline = time.Now().Add(time.Second)
+	for len(service.events) != 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if len(service.events) != 0 {
+		t.Fatal("owner did not enter second blocking snapshot response")
+	}
+	removedSubscription := &Subscription{service: service, id: removedID, events: removedEvents}
+	removedSnapshotErr := make(chan error, 1)
+	go func() {
+		_, err := removedSubscription.Snapshot(testContext(t))
+		removedSnapshotErr <- err
+	}()
+	waitServiceEventQueue(t, service, 1)
+	service.events <- unsubscribeServiceEvent{id: removedID}
+	<-removedBlocker
+	if err := <-removedSnapshotErr; !errors.Is(err, ErrSubscriptionClosed) {
+		t.Fatalf("removed subscription Snapshot error = %v, want ErrSubscriptionClosed", err)
+	}
+	if _, open := <-removedEvents; open {
+		t.Fatal("removed subscription event channel remained open")
 	}
 }
 

@@ -48,6 +48,9 @@ var (
 	// ErrSnapshotSuperseded reports that membership changed between a scoped
 	// subscription snapshot and its owner-confined delivery acknowledgment.
 	ErrSnapshotSuperseded = errors.New("swim: subscription snapshot superseded by membership change")
+	// ErrSubscriptionClosed reports that a scoped subscription was removed
+	// before its snapshot recovery acknowledgment reached the owner.
+	ErrSubscriptionClosed = errors.New("swim: subscription is closed")
 )
 
 // ServiceOptions supplies the validated identity and deterministic seams used
@@ -696,7 +699,10 @@ func (l *serviceLoop) run(parent context.Context) error {
 					event.response <- ErrSnapshotSuperseded
 					continue
 				}
-				l.subscriptions.MarkResynchronized(event.subscriptionID)
+				if !l.subscriptions.MarkResynchronized(event.subscriptionID) {
+					event.response <- ErrSubscriptionClosed
+					continue
+				}
 				event.response <- nil
 			case subscribeServiceEvent:
 				if event.state == nil || !event.state.state.CompareAndSwap(subscribeRequestPending, subscribeRequestAccepted) {
