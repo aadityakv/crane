@@ -468,6 +468,7 @@ func TestSupervisorTreatsDeadlineReturnFromCanceledParentAsNormalShutdown(t *tes
 }
 
 type controlledContext struct {
+	mu   sync.Mutex
 	done chan struct{}
 	err  error
 }
@@ -485,6 +486,8 @@ func (c *controlledContext) Done() <-chan struct{} {
 }
 
 func (c *controlledContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.err
 }
 
@@ -493,7 +496,9 @@ func (c *controlledContext) Value(key any) any {
 }
 
 func (c *controlledContext) cancel(err error) {
+	c.mu.Lock()
 	c.err = err
+	c.mu.Unlock()
 	close(c.done)
 }
 

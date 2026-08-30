@@ -249,6 +249,10 @@ func waitForLauncherConfigs(t *testing.T, ctx context.Context, harness *processH
 }
 
 func integrationConfigs(t *testing.T, startingBasePort uint16, secretFile string) []config.NodeConfig {
+	return integrationConfigsForNodes(t, startingBasePort, secretFile, 3)
+}
+
+func integrationConfigsForNodes(t *testing.T, startingBasePort uint16, secretFile string, nodes int) []config.NodeConfig {
 	t.Helper()
 	voters := make([]config.RaftVoter, 3)
 	for index := range voters {
@@ -264,7 +268,7 @@ func integrationConfigs(t *testing.T, startingBasePort uint16, secretFile string
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	configurations := make([]config.NodeConfig, 3)
+	configurations := make([]config.NodeConfig, nodes)
 	for index := range configurations {
 		storageDir := filepath.Join(root, fmt.Sprintf("node-%d", index+1))
 		if err := os.MkdirAll(storageDir, 0o700); err != nil {
@@ -379,7 +383,7 @@ func reserveTypedClusterPorts(t *testing.T, nodes int) (uint16, func()) {
 		}
 		reservation.release()
 	}
-	t.Fatal("could not reserve a free typed three-node port range")
+	t.Fatalf("could not reserve a free typed %d-node port range", nodes)
 	return 0, func() {}
 }
 

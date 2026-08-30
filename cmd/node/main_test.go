@@ -3,22 +3,27 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/config"
 	internalnode "github.com/aaditya/cs425mp3/internal/node"
+	"github.com/aaditya/cs425mp3/internal/raft"
 )
 
 func TestRunSupervisedNodeEmitsSignalOnlyAfterServiceReady(t *testing.T) {
-	service := newReadyControlledService()
+	service := newReadyControlledService("controlled")
 	output := &channelWriter{writes: make(chan string, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
-	go func() { result <- runSupervisedNode(ctx, 7, service, output) }()
+	go func() { result <- runSupervisedNode(ctx, 7, []internalnode.Service{service}, output) }()
 
 	<-service.started
 	select {
@@ -43,6 +48,206 @@ func TestRunSupervisedNodeEmitsSignalOnlyAfterServiceReady(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for supervised node shutdown")
+	}
+}
+
+func TestRunSupervisedNodeEmitsOneSignalAfterEveryServiceReady(t *testing.T) {
+	first := newReadyControlledService("swim")
+	second := newReadyControlledService("raft")
+	output := &channelWriter{writes: make(chan string, 2)}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- runSupervisedNode(ctx, 9, []internalnode.Service{first, second}, output)
+	}()
+
+	<-first.started
+	<-second.started
+	close(first.ready)
+	select {
+	case line := <-output.writes:
+		t.Fatalf("readiness emitted before Raft ready: %q", line)
+	default:
+	}
+	close(second.ready)
+	select {
+	case line := <-output.writes:
+		if want := internalnode.ReadySignal(9) + "\n"; line != want {
+			t.Fatalf("readiness line = %q, want %q", line, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for aggregate readiness line")
+	}
+	select {
+	case duplicate := <-output.writes:
+		t.Fatalf("duplicate readiness line %q", duplicate)
+	default:
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("runSupervisedNode: %v", err)
+	}
+}
+
+func TestRunSupervisedNodeRejectsEmptyOrNilServicesBeforeWriting(t *testing.T) {
+	tests := []struct {
+		name     string
+		services []internalnode.Service
+	}{
+		{name: "nil slice", services: nil},
+		{name: "empty slice", services: []internalnode.Service{}},
+		{name: "nil service", services: []internalnode.Service{nil}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output := &channelWriter{writes: make(chan string, 1)}
+			if err := runSupervisedNode(context.Background(), 1, test.services, output); err == nil {
+				t.Fatal("runSupervisedNode succeeded")
+			}
+			select {
+			case line := <-output.writes:
+				t.Fatalf("wrote readiness for invalid services: %q", line)
+			default:
+			}
+		})
+	}
+}
+
+func TestRunSupervisedNodeOutputFailureCancelsAndJoinsEveryService(t *testing.T) {
+	first := newReadyControlledService("swim")
+	second := newReadyControlledService("raft")
+	close(first.ready)
+	close(second.ready)
+	writeFailure := errors.New("stdout unavailable")
+	result := make(chan error, 1)
+	go func() {
+		result <- runSupervisedNode(context.Background(), 2, []internalnode.Service{first, second}, failingWriter{err: writeFailure})
+	}()
+
+	<-first.started
+	<-second.started
+	if err := <-result; !errors.Is(err, writeFailure) {
+		t.Fatalf("runSupervisedNode error = %v, want output failure %v", err, writeFailure)
+	}
+	select {
+	case <-first.returned:
+	default:
+		t.Fatal("first service was not joined before return")
+	}
+	select {
+	case <-second.returned:
+	default:
+		t.Fatal("second service was not joined before return")
+	}
+}
+
+func TestNewLocalRuntimeComposesOnlyConfiguredVotersWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name      string
+		nodeID    uint16
+		wantNames []string
+		wantRaft  bool
+	}{
+		{name: "voter", nodeID: 1, wantNames: []string{"swim", "raft"}, wantRaft: true},
+		{name: "nonvoter", nodeID: 4, wantNames: []string{"swim"}, wantRaft: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configuration := writeNodeTestConfig(t)
+			configuration.NodeID = test.nodeID
+			reservedRaftListener := reserveConfiguredRaftEndpoint(t, &configuration)
+			defer reservedRaftListener.Close()
+			if err := configuration.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			raftDirectory := filepath.Join(configuration.StorageDir, raft.RaftStorageDirectoryName)
+			if _, err := os.Stat(raftDirectory); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Raft directory exists before construction: %v", err)
+			}
+
+			runtime, err := newLocalRuntime(configuration)
+			if err != nil {
+				t.Fatalf("newLocalRuntime: %v", err)
+			}
+			if runtime == nil || runtime.swim == nil || (runtime.raft != nil) != test.wantRaft {
+				t.Fatalf("runtime composition = %#v, wantRaft=%t", runtime, test.wantRaft)
+			}
+			gotNames := make([]string, len(runtime.services))
+			for index, service := range runtime.services {
+				gotNames[index] = service.Name()
+			}
+			if !reflect.DeepEqual(gotNames, test.wantNames) {
+				t.Fatalf("service names = %v, want %v", gotNames, test.wantNames)
+			}
+			if _, err := os.Stat(raftDirectory); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("construction created Raft durable state: %v", err)
+			}
+		})
+	}
+}
+
+func reserveConfiguredRaftEndpoint(t *testing.T, configuration *config.NodeConfig) net.Listener {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		if port <= 1032 {
+			_ = listener.Close()
+			continue
+		}
+		configuration.BasePort = uint16(port - 8)
+		if _, voter := configuration.RaftVoterByID(configuration.NodeID); voter {
+			for index := range configuration.RaftVoters {
+				if configuration.RaftVoters[index].NodeID == configuration.NodeID {
+					configuration.RaftVoters[index].Endpoint = net.JoinHostPort(configuration.AdvertiseHost, fmt.Sprint(port))
+				}
+			}
+		}
+		return listener
+	}
+	t.Fatal("could not reserve a Raft endpoint")
+	return nil
+}
+
+func TestBootstrapStateMachineAcceptsOnlyVersionedEmptyState(t *testing.T) {
+	machine := &bootstrapStateMachine{}
+	if err := machine.Restore(0, nil); err != nil {
+		t.Fatalf("Restore(initial empty): %v", err)
+	}
+	capture, err := machine.Capture(7, 3)
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if capture.SchemaVersion() != bootstrapSnapshotSchemaVersion {
+		t.Fatalf("snapshot schema = %d, want %d", capture.SchemaVersion(), bootstrapSnapshotSchemaVersion)
+	}
+	encoded, err := capture.MarshalBinary()
+	if err != nil || len(encoded) != 0 {
+		t.Fatalf("snapshot bytes = %x, err=%v; want deterministic empty snapshot", encoded, err)
+	}
+	if err := machine.Restore(capture.SchemaVersion(), encoded); err != nil {
+		t.Fatalf("Restore(own snapshot): %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		schema  uint32
+		payload []byte
+	}{
+		{name: "unknown schema", schema: bootstrapSnapshotSchemaVersion + 1},
+		{name: "nonempty initial", payload: []byte{1}},
+		{name: "nonempty versioned", schema: bootstrapSnapshotSchemaVersion, payload: []byte{1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := machine.Restore(test.schema, test.payload); err == nil {
+				t.Fatal("Restore accepted unsupported snapshot")
+			}
+		})
+	}
+	if result, err := machine.Apply(1, 1, []byte("unexpected")); err == nil || result != nil || !strings.Contains(err.Error(), "bootstrap") {
+		t.Fatalf("Apply result=%x err=%v, want fail-closed bootstrap error", result, err)
 	}
 }
 
@@ -184,20 +389,23 @@ func writeNodeTestConfigFile(t *testing.T, configuration config.NodeConfig) stri
 }
 
 type readyControlledService struct {
-	ready   chan struct{}
-	started chan struct{}
+	name     string
+	ready    chan struct{}
+	started  chan struct{}
+	returned chan struct{}
 }
 
-func newReadyControlledService() *readyControlledService {
-	return &readyControlledService{ready: make(chan struct{}), started: make(chan struct{})}
+func newReadyControlledService(name string) *readyControlledService {
+	return &readyControlledService{name: name, ready: make(chan struct{}), started: make(chan struct{}), returned: make(chan struct{})}
 }
 
-func (*readyControlledService) Name() string { return "controlled" }
+func (s *readyControlledService) Name() string { return s.name }
 
 func (s *readyControlledService) Ready() <-chan struct{} { return s.ready }
 
 func (s *readyControlledService) Run(ctx context.Context) error {
 	close(s.started)
+	defer close(s.returned)
 	<-ctx.Done()
 	return nil
 }
@@ -210,3 +418,7 @@ func (w *channelWriter) Write(content []byte) (int, error) {
 	w.writes <- string(content)
 	return len(content), nil
 }
+
+type failingWriter struct{ err error }
+
+func (writer failingWriter) Write([]byte) (int, error) { return 0, writer.err }

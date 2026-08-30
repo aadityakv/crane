@@ -90,6 +90,40 @@ func TestGenerateConfigsBuildsStrictSharedLocalLayout(t *testing.T) {
 	}
 }
 
+func TestGenerateConfigsBuildsFourNodesWithThreeOwnedFixedVoters(t *testing.T) {
+	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
+	if err := os.WriteFile(secretFile, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configs, err := GenerateConfigs(ClusterOptions{
+		Nodes: 4, Voters: 3, Host: "127.0.0.1", StartingBasePort: 9000,
+		DataRoot: filepath.Join(t.TempDir(), "data"), SecretFile: secretFile,
+	})
+	if err != nil {
+		t.Fatalf("GenerateConfigs: %v", err)
+	}
+	if len(configs) != 4 {
+		t.Fatalf("len(configs) = %d, want 4", len(configs))
+	}
+	want := []config.RaftVoter{
+		{NodeID: 1, Endpoint: "127.0.0.1:9008"},
+		{NodeID: 2, Endpoint: "127.0.0.1:9108"},
+		{NodeID: 3, Endpoint: "127.0.0.1:9208"},
+	}
+	for index := range configs {
+		if !reflect.DeepEqual(configs[index].RaftVoters, want) {
+			t.Fatalf("config %d voters = %#v, want %#v", index+1, configs[index].RaftVoters, want)
+		}
+		if err := configs[index].Validate(); err != nil {
+			t.Fatalf("config %d validation: %v", index+1, err)
+		}
+	}
+	configs[0].RaftVoters[0].Endpoint = "127.0.0.1:9999"
+	if !reflect.DeepEqual(configs[1].RaftVoters, want) || !reflect.DeepEqual(configs[3].RaftVoters, want) {
+		t.Fatalf("mutating config 1 voter slice altered another config: config2=%#v config4=%#v", configs[1].RaftVoters, configs[3].RaftVoters)
+	}
+}
+
 func TestGenerateConfigsRejectsInvalidClusterLayouts(t *testing.T) {
 	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
 	if err := os.WriteFile(secretFile, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {

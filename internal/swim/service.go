@@ -26,7 +26,7 @@ const (
 	serviceReplayEntries    = 65536
 	serviceDisseminationMax = 4096
 	serviceRetransmitFactor = 3
-	serviceFutureSkew       = 30 * time.Second
+	serviceFutureSkew       = config.ReplayFutureSkewAllowance
 	serviceTCPConnections   = 64
 	serviceTCPIOTimeout     = 5 * time.Second
 	serviceResyncWorkers    = 4
