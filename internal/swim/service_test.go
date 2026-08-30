@@ -757,6 +757,46 @@ func TestServiceFailedDatagramDoesNotCommitDissemination(t *testing.T) {
 	}
 }
 
+func TestServiceAsyncFanoutReservesDisseminationBudgetWhileSendIsInFlight(t *testing.T) {
+	now := time.Unix(2098, 0)
+	configuration := config.NodeConfig{NodeID: 1, BindHost: "127.0.0.1", BasePort: 11000}
+	self := Member{NodeID: 1, Host: "127.0.0.1", BasePort: 11000, Incarnation: 1, Status: Alive}
+	table := NewTable()
+	mustMerge(t, table, Update{Member: self, ReporterID: self.NodeID})
+	dissemination := NewDisseminator(8, 1)
+	update := Update{Member: Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}, ReporterID: self.NodeID}
+	dissemination.Enqueue(update, 1)
+	service := &Service{
+		options:   ServiceOptions{Config: configuration, Authenticator: wire.NewHMACAuthenticator(testServiceKey()), Clock: clock.NewManual(now)},
+		clusterID: decodedTestClusterID(t, testClusterID),
+		limits:    wire.DefaultLimits(),
+	}
+	loop := &serviceLoop{
+		service:       service,
+		engine:        &Engine{table: table},
+		dissemination: dissemination,
+		sendJobs:      make(chan datagramSendJob, 2),
+		workerContext: context.Background(),
+	}
+	peers := []Member{
+		{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive},
+		{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive},
+	}
+	for _, peer := range peers {
+		if delivered, err := loop.sendMessage(context.Background(), peer, GossipMessage{}); err != nil || !delivered {
+			t.Fatalf("queue send to node %d delivered=%v error=%v", peer.NodeID, delivered, err)
+		}
+	}
+	first := <-loop.sendJobs
+	second := <-loop.sendJobs
+	if !reflect.DeepEqual(first.batch.Updates, []Update{update}) {
+		t.Fatalf("first in-flight batch = %#v, want %#v", first.batch.Updates, []Update{update})
+	}
+	if len(second.batch.Updates) != 0 {
+		t.Fatalf("second in-flight batch reused reserved update = %#v, want empty", second.batch.Updates)
+	}
+}
+
 func TestServiceFreshFramesCannotRegossipAliveBelowExpiredFloor(t *testing.T) {
 	now := time.Unix(2100, 0)
 	service, reporter, source, authenticator := newDatagramDecoderService(t, now, 16)

@@ -215,6 +215,80 @@ func TestSimulationGracefulLeaveSendsOneRetransmitBudget(t *testing.T) {
 	second.stop(t)
 }
 
+func TestGracefulLeaveSuspectDeliveryDoesNotConsumeHealthyBudget(t *testing.T) {
+	now := time.Unix(5110, 0)
+	manualClock := clock.NewManual(now)
+	self := Member{NodeID: 1, Host: "127.0.0.1", BasePort: 11000, Incarnation: 1, Status: Alive}
+	healthy := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	suspect := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Suspect}
+	table := NewTable()
+	for _, member := range []Member{self, healthy, suspect} {
+		mustMerge(t, table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	dissemination := NewDisseminator(16, serviceRetransmitFactor)
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       1,
+		SuspicionMultiplier:  5,
+	}, table, dissemination, random.NewLockedSource(312))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	delivery := &capturingSourceDatagram{}
+	service := &Service{
+		options: ServiceOptions{
+			Config:        config.NodeConfig{NodeID: self.NodeID, BindHost: self.Host, BasePort: self.BasePort},
+			Authenticator: authenticator,
+			Clock:         manualClock,
+			Store:         newServiceStore(1),
+		},
+		clusterID: decodedTestClusterID(t, testClusterID),
+		limits:    wire.DefaultLimits(),
+		addresses: newAddressMatcherWithClock(nil, manualClock),
+	}
+	loop := &serviceLoop{
+		service:       service,
+		engine:        engine,
+		dissemination: dissemination,
+		subscriptions: NewSubscriptions(),
+		datagram:      delivery,
+		runContext:    context.Background(),
+		admitted:      true,
+	}
+	defer loop.subscriptions.Close()
+	if err := loop.gracefulLeave(); err != nil {
+		t.Fatal(err)
+	}
+
+	healthyEndpoint, err := (config.NodeConfig{AdvertiseHost: healthy.Host, BasePort: healthy.BasePort}).AdvertiseEndpoint(config.ServiceSWIMPing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthyLeftDeliveries := 0
+	for _, send := range delivery.snapshot() {
+		if send.destination != healthyEndpoint {
+			continue
+		}
+		frame, err := wire.Decode(send.payload, authenticator, wire.DefaultLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, update := range updatesFromRecordedFrame(t, frame) {
+			if update.Member.NodeID == self.NodeID && update.Member.Status == Left {
+				healthyLeftDeliveries++
+			}
+		}
+	}
+	want := RetransmitBudget(serviceRetransmitFactor, 2)
+	if healthyLeftDeliveries < want {
+		t.Fatalf("healthy Left deliveries = %d, want at least full healthy budget %d", healthyLeftDeliveries, want)
+	}
+}
+
 func TestGracefulLeaveRetriesAfterNoProgressUntilClockBackoff(t *testing.T) {
 	now := time.Unix(5125, 0)
 	manualClock := clock.NewManual(now)

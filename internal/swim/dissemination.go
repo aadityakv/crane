@@ -35,6 +35,7 @@ type disseminationItem struct {
 	update        Update
 	sequence      uint64
 	transmissions int
+	inFlight      int
 }
 
 type disseminationToken struct {
@@ -45,9 +46,10 @@ type disseminationToken struct {
 // DisseminationBatch is a non-mutating encoded-size selection. The owner calls
 // Commit only after the datagram carrying Updates succeeds to a healthy peer.
 type DisseminationBatch struct {
-	Updates []Update
-	tokens  []disseminationToken
-	budget  int
+	Updates  []Update
+	tokens   []disseminationToken
+	budget   int
+	reserved bool
 }
 
 // NewDisseminator returns an empty bounded dissemination queue. Non-positive
@@ -147,6 +149,9 @@ func (d *Disseminator) Peek(maxBytes int, aliveMembers int, encode func([]Update
 			delete(d.items, nodeID)
 			continue
 		}
+		if item.transmissions+item.inFlight >= currentBudget {
+			continue
+		}
 		candidates = append(candidates, item)
 	}
 	if maxBytes == 0 || len(candidates) == 0 {
@@ -184,6 +189,49 @@ func (d *Disseminator) Peek(maxBytes int, aliveMembers int, encode func([]Update
 	return DisseminationBatch{Updates: selected, tokens: tokens, budget: currentBudget}, nil
 }
 
+// Reserve marks a selected batch as in flight so another asynchronous send
+// cannot select the same update beyond its retransmission budget. The owner
+// must eventually call Commit after healthy delivery or Release otherwise.
+func (d *Disseminator) Reserve(batch *DisseminationBatch) bool {
+	if batch == nil {
+		return false
+	}
+	if len(batch.tokens) == 0 {
+		return true
+	}
+	if batch.budget <= 0 {
+		return false
+	}
+	reserved := make([]*disseminationItem, 0, len(batch.tokens))
+	for _, token := range batch.tokens {
+		item, exists := d.items[token.nodeID]
+		if !exists || item.sequence != token.sequence || item.transmissions+item.inFlight >= batch.budget {
+			for _, previous := range reserved {
+				previous.inFlight--
+			}
+			return false
+		}
+		item.inFlight++
+		reserved = append(reserved, item)
+	}
+	batch.reserved = true
+	return true
+}
+
+// Release returns one reserved batch to the pending queue after an
+// unsuccessful or non-healthy delivery.
+func (d *Disseminator) Release(batch DisseminationBatch) {
+	if !batch.reserved {
+		return
+	}
+	for _, token := range batch.tokens {
+		item, exists := d.items[token.nodeID]
+		if exists && item.sequence == token.sequence && item.inFlight > 0 {
+			item.inFlight--
+		}
+	}
+}
+
 // Commit charges one successful healthy delivery for every still-current item
 // selected by batch. Replaced items are ignored by sequence.
 func (d *Disseminator) Commit(batch DisseminationBatch) {
@@ -194,6 +242,12 @@ func (d *Disseminator) Commit(batch DisseminationBatch) {
 		item, exists := d.items[token.nodeID]
 		if !exists || item.sequence != token.sequence {
 			continue
+		}
+		if batch.reserved {
+			if item.inFlight == 0 {
+				continue
+			}
+			item.inFlight--
 		}
 		item.transmissions++
 		if item.transmissions >= batch.budget {

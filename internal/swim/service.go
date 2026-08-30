@@ -764,23 +764,23 @@ func (l *serviceLoop) gracefulLeave() error {
 		return nil
 	}
 	update := Update{Member: left, ReporterID: left.NodeID}
-	sent := 0
-	for sent < budget && cleanupContext.Err() == nil {
-		progress := false
+	healthySent := 0
+	for healthySent < budget && cleanupContext.Err() == nil {
+		healthyProgress := false
 		for _, peer := range peers {
-			if sent >= budget {
+			if healthySent >= budget {
 				break
 			}
 			delivered, err := l.sendDirectUpdate(cleanupContext, peer, update)
 			if err != nil {
 				return err
 			}
-			if delivered {
-				sent++
-				progress = true
+			if delivered && peer.Status == Alive {
+				healthySent++
+				healthyProgress = true
 			}
 		}
-		if !progress {
+		if !healthyProgress {
 			if !l.waitForLeaveRetry(cleanupContext, deadline) {
 				break
 			}
@@ -1288,6 +1288,7 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 
 func (l *serviceLoop) handleDatagramSendCompleted(event datagramSendCompletedServiceEvent) {
 	if event.err != nil {
+		l.dissemination.Release(event.batch)
 		l.service.recordTransientSendFailure(event.err)
 		return
 	}
@@ -1296,6 +1297,7 @@ func (l *serviceLoop) handleDatagramSendCompleted(event datagramSendCompletedSer
 	}
 	current, exists := l.engine.table.Get(event.recipient.NodeID)
 	if !exists || current != event.recipient || current.Status != Alive {
+		l.dissemination.Release(event.batch)
 		return
 	}
 	l.dissemination.Commit(event.batch)
@@ -1650,8 +1652,12 @@ func (l *serviceLoop) sendMessage(ctx context.Context, member Member, message an
 	if err != nil {
 		return false, err
 	}
+	if !l.dissemination.Reserve(&batch) {
+		return false, errors.New("swim: dissemination batch could not be reserved")
+	}
 	encoded, err := encodeWithLimits(batch.Updates, l.service.limits)
 	if err != nil {
+		l.dissemination.Release(batch)
 		return false, err
 	}
 	if err := l.sendDatagram(ctx, endpointService, destination, encoded, member, batch); err != nil {
@@ -1675,10 +1681,12 @@ func (l *serviceLoop) sendDatagram(ctx context.Context, sourceService config.Ser
 	case l.sendJobs <- job:
 		return nil
 	case <-l.workerContext.Done():
-		return l.workerContext.Err()
+		err := l.workerContext.Err()
+		l.handleDatagramSendCompleted(datagramSendCompletedServiceEvent{recipient: recipient, batch: batch, err: err})
+		return err
 	default:
 		err := errors.New("swim: outbound datagram queue full")
-		l.service.recordTransientSendFailure(err)
+		l.handleDatagramSendCompleted(datagramSendCompletedServiceEvent{recipient: recipient, batch: batch, err: err})
 		return err
 	}
 }
