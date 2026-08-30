@@ -1009,19 +1009,29 @@ func (core *Core) handleInstallSnapshotResponse(response InstallSnapshotResponse
 		return nil
 	}
 	if response.Term > core.hardState.Term {
-		core.quorumResponses[response.ResponderID] = struct{}{}
 		core.adoptHigherTerm(response.Term)
 		return nil
 	}
 	if response.Term != core.hardState.Term {
 		return nil
 	}
-	core.quorumResponses[response.ResponderID] = struct{}{}
 	totalLength := uint64(len(transfer.state))
-	if !response.Success {
-		if response.NextOffset > totalLength {
+	if response.Success {
+		if response.Done {
+			if response.NextOffset != totalLength {
+				return nil
+			}
+		} else if response.NextOffset != transfer.activeEnd || response.NextOffset >= totalLength {
 			return nil
 		}
+	} else if (totalLength == 0 && response.NextOffset != 0) ||
+		(totalLength != 0 &&
+			(response.NextOffset >= totalLength || response.NextOffset > transfer.nextOffset)) {
+		return nil
+	}
+
+	core.quorumResponses[response.ResponderID] = struct{}{}
+	if !response.Success {
 		transfer.nextOffset = response.NextOffset
 		progress := core.progress[response.ResponderID]
 		if response.NextOffset > progress.SnapshotNextOffset {
@@ -1029,15 +1039,6 @@ func (core *Core) handleInstallSnapshotResponse(response InstallSnapshotResponse
 		}
 		core.progress[response.ResponderID] = progress
 		return core.issueSnapshotChunk(response.ResponderID)
-	}
-	if response.Done {
-		if response.NextOffset != totalLength {
-			return nil
-		}
-	} else {
-		if response.NextOffset != transfer.activeEnd || response.NextOffset <= transfer.nextOffset {
-			return nil
-		}
 	}
 	transfer.nextOffset = response.NextOffset
 	progress := core.progress[response.ResponderID]

@@ -741,6 +741,186 @@ func TestInstallSnapshotLeaderRewindsRetryOffsetWithoutRegressingLogProgress(t *
 	}
 }
 
+func TestInstallSnapshotInvalidCurrentTermResponseIsAtomicAndCannotSatisfyCheckQuorum(t *testing.T) {
+	tests := []struct {
+		name          string
+		afterProgress bool
+		response      func(InstallSnapshotResponse) InstallSnapshotResponse
+	}{
+		{name: "nonfinal success at stale offset", response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			response.Success = true
+			response.NextOffset = 1
+			return response
+		}},
+		{name: "nonfinal success at total", response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			response.Success = true
+			response.NextOffset = 5
+			return response
+		}},
+		{name: "done success before total", response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			response.Success = true
+			response.Done = true
+			response.NextOffset = 3
+			return response
+		}},
+		{name: "failure at total", response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			response.NextOffset = 5
+			return response
+		}},
+		{name: "failure at bounded future offset", response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			response.NextOffset = 1
+			return response
+		}},
+		{name: "stale nonfinal success after progress", afterProgress: true, response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			response.Success = true
+			response.NextOffset = 3
+			return response
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core, snapshot, transferID := activeSnapshotResponseLeader(t, []byte("abcde"), 3)
+			if test.afterProgress {
+				if err := core.Step(2, InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+					TransferID: transferID, SnapshotID: snapshot.ID, NextOffset: 3, Success: true}); err != nil {
+					t.Fatal(err)
+				}
+				ready, ok := core.Ready()
+				if !ok {
+					t.Fatal("valid progress response emitted no next chunk")
+				}
+				_ = installRequestTo(t, ready, 2)
+				advanceReadyToken(t, core, ready)
+				delete(core.quorumResponses, 2)
+			}
+			beforeProgress, _ := core.Progress(2)
+			transfer := core.outgoingSnapshots[2]
+			beforeNext, beforeEnd := transfer.nextOffset, transfer.activeEnd
+			beforeCore := snapshotReplicationCore(core)
+			response := test.response(InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+				TransferID: transferID, SnapshotID: snapshot.ID})
+
+			if err := core.Step(2, response); err != nil {
+				t.Fatal(err)
+			}
+			if _, counted := core.quorumResponses[2]; counted {
+				t.Fatal("invalid response counted for check-quorum")
+			}
+			assertReplicationCoreSnapshot(t, core, beforeCore)
+			if ready, ok := core.Ready(); ok {
+				t.Fatalf("invalid response emitted Ready: %#v", ready)
+			}
+			afterProgress, _ := core.Progress(2)
+			if afterProgress != beforeProgress || transfer.nextOffset != beforeNext || transfer.activeEnd != beforeEnd {
+				t.Fatalf("invalid response mutated transfer: progress %#v -> %#v offsets %d/%d -> %d/%d",
+					beforeProgress, afterProgress, beforeNext, beforeEnd, transfer.nextOffset, transfer.activeEnd)
+			}
+			if err := core.Tick(10); err != nil {
+				t.Fatal(err)
+			}
+			if role := core.Status().Role; role != RoleFollower {
+				t.Fatalf("invalid response alone preserved role %v, want follower", role)
+			}
+		})
+	}
+}
+
+func TestInstallSnapshotValidCurrentTermResponseSatisfiesCheckQuorum(t *testing.T) {
+	tests := []struct {
+		name     string
+		response func(InstallSnapshotResponse) InstallSnapshotResponse
+		wantNext uint64
+	}{
+		{name: "rejection rewind", response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			return response
+		}, wantNext: 0},
+		{name: "nonfinal success", response: func(response InstallSnapshotResponse) InstallSnapshotResponse {
+			response.Success = true
+			response.NextOffset = 3
+			return response
+		}, wantNext: 3},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core, snapshot, transferID := activeSnapshotResponseLeader(t, []byte("abcde"), 3)
+			response := test.response(InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+				TransferID: transferID, SnapshotID: snapshot.ID})
+			if err := core.Step(2, response); err != nil {
+				t.Fatal(err)
+			}
+			if _, counted := core.quorumResponses[2]; !counted {
+				t.Fatal("valid response did not count for check-quorum")
+			}
+			ready, ok := core.Ready()
+			if !ok {
+				t.Fatal("valid response emitted no next snapshot request")
+			}
+			request := installRequestTo(t, ready, 2)
+			if request.Offset != test.wantNext {
+				t.Fatalf("next request offset = %d, want %d", request.Offset, test.wantNext)
+			}
+			advanceReadyToken(t, core, ready)
+			if err := core.Tick(10); err != nil {
+				t.Fatal(err)
+			}
+			if role := core.Status().Role; role != RoleLeader {
+				t.Fatalf("valid response evidence role = %v, want leader", role)
+			}
+		})
+	}
+}
+
+func TestInstallSnapshotEmptyFailureRetriesCanonicalRequestAndCountsCheckQuorum(t *testing.T) {
+	core, snapshot, transferID := activeSnapshotResponseLeader(t, nil, 3)
+	response := InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+		TransferID: transferID, SnapshotID: snapshot.ID}
+	if err := core.Step(2, response); err != nil {
+		t.Fatal(err)
+	}
+	if _, counted := core.quorumResponses[2]; !counted {
+		t.Fatal("canonical empty rejection did not count for check-quorum")
+	}
+	ready, ok := core.Ready()
+	if !ok {
+		t.Fatal("canonical empty rejection emitted no retry")
+	}
+	retry := installRequestTo(t, ready, 2)
+	if retry.Offset != 0 || retry.TotalLength != 0 || len(retry.Chunk) != 0 || !retry.Done {
+		t.Fatalf("empty retry = %#v", retry)
+	}
+	advanceReadyToken(t, core, ready)
+	if err := core.Tick(10); err != nil {
+		t.Fatal(err)
+	}
+	if role := core.Status().Role; role != RoleLeader {
+		t.Fatalf("empty rejection evidence role = %v, want leader", role)
+	}
+}
+
+func activeSnapshotResponseLeader(t *testing.T, state []byte, chunkLimit uint64) (*Core, Snapshot, TransferID) {
+	t.Helper()
+	identity, _ := testStorageIdentity(t, 1)
+	entries := testEntriesFrom(t, 4, testEntrySpec{term: 3, command: "four"})
+	core, initial := electReplicationLeader(t, 3, 2, HardState{Term: 3, CommitIndex: 3}, entries)
+	rejectInitialAppend(t, core, initial, 2)
+	snapshot, err := NewSnapshot(identity, SnapshotMetadata{LastIncludedIndex: 3, LastIncludedTerm: 2, StateMachineSchemaVersion: 6}, state, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transferID := TransferID{61}
+	if err := core.StartSnapshotTransfer(2, snapshot, transferID, chunkLimit); err != nil {
+		t.Fatal(err)
+	}
+	ready, ok := core.Ready()
+	if !ok {
+		t.Fatal("snapshot transfer emitted no first request")
+	}
+	_ = installRequestTo(t, ready, 2)
+	advanceReadyToken(t, core, ready)
+	delete(core.quorumResponses, 2)
+	return core, snapshot, transferID
+}
+
 func TestInstallSnapshotLeaderCompletesEmptyStateSnapshot(t *testing.T) {
 	identity, _ := testStorageIdentity(t, 1)
 	entries := testEntriesFrom(t, 4, testEntrySpec{term: 3, command: "four"})
@@ -833,6 +1013,13 @@ func installRequestTo(t *testing.T, ready Ready, peerID uint16) InstallSnapshotR
 			continue
 		}
 		if request, ok := message.RPC.(InstallSnapshotRequest); ok {
+			messageType, payload, err := EncodeRPC(request, DefaultCodecLimits())
+			if err != nil {
+				t.Fatalf("outbound InstallSnapshot request is not codec-valid: %v", err)
+			}
+			if _, err := DecodeRPC(messageType, payload, DefaultCodecLimits()); err != nil {
+				t.Fatalf("outbound InstallSnapshot request does not round-trip: %v", err)
+			}
 			return request
 		}
 	}

@@ -733,6 +733,68 @@ func TestNodeShutdownJoinsBlockedSnapshotCaptureWorker(t *testing.T) {
 	}
 }
 
+func TestStateMachineCaptureErrorStopsNodeWithoutWorkerSnapshotMutationOrLeak(t *testing.T) {
+	identity, _ := testStorageIdentity(t, 1)
+	state := RecoveredState{Identity: identity, HardState: HardState{Term: 2, CommitIndex: 2}, AppliedIndex: 2,
+		Entries: []Entry{mustStorageEntry(t, 1, 1, "one"), mustStorageEntry(t, 2, 2, "two")}}
+	options, store, _, manual := task8NodeOptions(t, state)
+	captureFailure := errors.New("capture failed directly")
+	marshalStarted := make(chan struct{})
+	machine := &captureTestMachine{captureErr: captureFailure, started: marshalStarted}
+	options.StateMachine = machine
+	options.SnapshotEntryThreshold = 1
+	options.SnapshotByteThreshold = math.MaxUint64
+	node, err := NewNode(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- node.Run(context.Background()) }()
+	<-node.Ready()
+	manual.Advance(5 * time.Second)
+	if err := <-result; !errors.Is(err, captureFailure) {
+		t.Fatalf("Run capture error = %v, want %v", err, captureFailure)
+	}
+	if machine.captures != 1 {
+		t.Fatalf("Capture calls = %d, want 1", machine.captures)
+	}
+	select {
+	case <-marshalStarted:
+		t.Fatal("direct Capture error launched a Marshal worker")
+	default:
+	}
+	if node.captureInFlight {
+		t.Fatal("direct Capture error left capture in flight")
+	}
+	if state := node.core.LogState(); state.SnapshotIndex != 0 || state.SnapshotTerm != 0 {
+		t.Fatalf("direct Capture error compacted Core: %+v", state)
+	}
+	store.mu.Lock()
+	stored := store.state.Clone()
+	persists := append([]PersistenceBatch(nil), store.persists...)
+	closes := store.closes
+	store.mu.Unlock()
+	if stored.Snapshot != nil || stored.SnapshotBase != (SnapshotMetadata{}) || len(persists) != 0 {
+		t.Fatalf("direct Capture error mutated Store: state=%+v persists=%d", stored, len(persists))
+	}
+	if closes != 1 {
+		t.Fatalf("Store closes = %d, want 1", closes)
+	}
+	if pending := manual.PendingTimers(); pending != 0 {
+		t.Fatalf("pending timers after Capture error = %d", pending)
+	}
+	select {
+	case event := <-node.events:
+		t.Fatalf("direct Capture error emitted snapshot result %#v", event)
+	default:
+	}
+	select {
+	case <-node.done:
+	default:
+		t.Fatal("node cleanup did not close done")
+	}
+}
+
 func TestCaptureBytePressureRequiresNewAppliedProgressAndDoesNotRetriggerAtNewBase(t *testing.T) {
 	node, store, machine := captureTestNode(t, math.MaxUint64)
 	node.options.Store = &capturePressureStore{MemoryStore: store, retained: 2}
