@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"bytes"
+	"fmt"
+)
 
 func (node *Node) validateReady(ready Ready) error {
 	_, _, err := node.validateReadyAndDerive(ready)
@@ -176,6 +179,25 @@ func (node *Node) validateMessageDurability(message PeerMessage, current, prospe
 			if err := requireCoreEntry(rpc.MatchIndex); err != nil {
 				return err
 			}
+		}
+	case InstallSnapshotRequest:
+		if err := requireTerm(rpc.Term); err != nil {
+			return err
+		}
+		metadata := SnapshotMetadata{LastIncludedIndex: rpc.LastIncludedIndex, LastIncludedTerm: rpc.LastIncludedTerm, StateMachineSchemaVersion: rpc.StateMachineSchemaVersion}
+		if prospective.Snapshot == nil || prospective.Snapshot.ID != rpc.SnapshotID ||
+			prospective.Snapshot.Metadata != metadata || prospective.Snapshot.StateChecksum != rpc.Checksum {
+			return fmt.Errorf("%w: outbound InstallSnapshot does not match durable snapshot", ErrInvalidCoreState)
+		}
+		state := prospective.Snapshot.StateBytes()
+		end := rpc.Offset + uint64(len(rpc.Chunk))
+		if rpc.TotalLength != uint64(len(state)) || end > uint64(len(state)) ||
+			!bytes.Equal(rpc.Chunk, state[rpc.Offset:end]) {
+			return fmt.Errorf("%w: outbound InstallSnapshot chunk is not durably identical", ErrInvalidCoreState)
+		}
+	case InstallSnapshotResponse:
+		if err := requireTerm(rpc.Term); err != nil {
+			return err
 		}
 	}
 

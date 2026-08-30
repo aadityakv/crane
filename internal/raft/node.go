@@ -45,6 +45,8 @@ type NodeOptions struct {
 	Clock clock.Clock
 	// Random supplies deterministic election samples.
 	Random interface{ Uint64() uint64 }
+	// TransferIDs supplies deterministic nonzero peer-local snapshot identities.
+	TransferIDs TransferIDSource
 	// ElectionTimeoutMin is the inclusive randomized election lower bound.
 	ElectionTimeoutMin time.Duration
 	// ElectionTimeoutMax is the exclusive randomized election upper bound.
@@ -61,6 +63,14 @@ type NodeOptions struct {
 	SnapshotByteThreshold uint64
 	// MaxSnapshotBytes bounds one encoded application snapshot.
 	MaxSnapshotBytes uint64
+	// MaxSnapshotChunkBytes bounds one outbound InstallSnapshot chunk; zero uses the protocol default.
+	MaxSnapshotChunkBytes uint64
+}
+
+// TransferIDSource is the deterministic owner-provided identity seam for new
+// peer-local snapshot transfer attempts.
+type TransferIDSource interface {
+	NextTransferID(peerID uint16) (TransferID, error)
 }
 
 type inboundRPCEvent struct {
@@ -157,7 +167,7 @@ func NewNode(options NodeOptions) (*Node, error) {
 	if err != nil || expectedIdentity != options.Identity {
 		return nil, fmt.Errorf("%w: node storage identity does not match local voter", ErrInvalidStorageIdentity)
 	}
-	if options.Store == nil || options.StateMachine == nil || options.Transport == nil || options.Clock == nil || options.Random == nil {
+	if options.Store == nil || options.StateMachine == nil || options.Transport == nil || options.Clock == nil || options.Random == nil || options.TransferIDs == nil {
 		return nil, fmt.Errorf("%w: node dependencies must be non-nil", ErrInvalidCoreState)
 	}
 	if options.HeartbeatInterval <= 0 || options.ElectionTimeoutMin <= 0 || options.ElectionTimeoutMax <= options.ElectionTimeoutMin || options.HeartbeatInterval >= options.ElectionTimeoutMin {
@@ -165,6 +175,12 @@ func NewNode(options NodeOptions) (*Node, error) {
 	}
 	if options.SnapshotEntryThreshold == 0 || options.SnapshotByteThreshold == 0 || options.MaxSnapshotBytes == 0 || options.MaxSnapshotBytes > config.MaxRaftSnapshotBytes {
 		return nil, fmt.Errorf("%w: invalid node snapshot bounds", ErrInvalidCoreState)
+	}
+	if options.MaxSnapshotChunkBytes == 0 {
+		options.MaxSnapshotChunkBytes = config.MaxRaftSnapshotChunkBytes
+	}
+	if options.MaxSnapshotChunkBytes > config.MaxRaftSnapshotChunkBytes {
+		return nil, fmt.Errorf("%w: invalid snapshot chunk bound %d", ErrInvalidCoreState, options.MaxSnapshotChunkBytes)
 	}
 	if options.ElectionTimeoutMin/options.HeartbeatInterval < 3 {
 		return nil, fmt.Errorf("%w: election minimum must span at least three heartbeats", ErrInvalidCoreState)
@@ -485,6 +501,9 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 				if captureErr := node.finishSnapshotCapture(event); captureErr != nil {
 					return captureErr
 				}
+				if captureErr := node.drainReady(ctx); captureErr != nil {
+					return captureErr
+				}
 				if publishErr := node.publishStatus(); publishErr != nil {
 					return publishErr
 				}
@@ -617,7 +636,14 @@ func (node *Node) drainReady(ctx context.Context) error {
 			if err := node.core.Err(); err != nil {
 				return err
 			}
-			_, err := node.maybeStartSnapshotCapture()
+			started, err := node.maybeStartSnapshotTransfer()
+			if err != nil {
+				return err
+			}
+			if started {
+				continue
+			}
+			_, err = node.maybeStartSnapshotCapture()
 			return err
 		}
 		batch, prospectiveDurable, err := node.validateReadyAndDerive(ready)
@@ -630,14 +656,18 @@ func (node *Node) drainReady(ctx context.Context) error {
 			}
 			node.durableState = prospectiveDurable
 		}
-		for _, message := range ready.Messages {
-			owned := PeerMessage{To: message.To, RPC: CloneRPC(message.RPC), Requires: message.Requires}
-			result, err := node.options.Transport.Handoff(owned)
+		for _, action := range ready.SnapshotActions {
+			message, err := node.executeSnapshotAction(ready.Token, action)
 			if err != nil {
-				return fmt.Errorf("handoff raft message to voter %d: %w", message.To, err)
+				return err
 			}
-			if result != TransportAccepted && result != TransportUnavailable {
-				return fmt.Errorf("%w: %d", ErrTransportInvariant, result)
+			if err := node.handoffPeerMessage(message); err != nil {
+				return err
+			}
+		}
+		for _, message := range ready.Messages {
+			if err := node.handoffPeerMessage(message); err != nil {
+				return err
 			}
 		}
 		applied := make(map[uint64]ProposalResult, len(ready.CommittedEntries))
@@ -690,6 +720,106 @@ func (node *Node) drainReady(ctx context.Context) error {
 	}
 }
 
+func (node *Node) maybeStartSnapshotTransfer() (bool, error) {
+	if node.core.Status().Role != RoleLeader {
+		return false, nil
+	}
+	for _, voter := range node.options.Voters.Voters() {
+		if voter.ID == node.options.LocalID {
+			continue
+		}
+		progress, ok := node.core.Progress(voter.ID)
+		if !ok || !progress.SnapshotNeeded || !progress.ActiveTransferID.IsZero() {
+			continue
+		}
+		snapshot := node.durableState.Snapshot
+		if snapshot == nil || snapshot.Metadata != node.durableState.SnapshotBase ||
+			snapshot.Metadata.LastIncludedIndex != node.core.log.SnapshotIndex() ||
+			snapshot.Metadata.LastIncludedTerm != node.core.log.SnapshotTerm() {
+			return false, fmt.Errorf("%w: snapshot-needed peer has no exact durable snapshot", ErrSnapshotUnavailable)
+		}
+		if node.options.TransferIDs == nil {
+			return false, fmt.Errorf("%w: snapshot transfer source is nil", ErrTransferIDExhausted)
+		}
+		transferID, err := node.options.TransferIDs.NextTransferID(voter.ID)
+		if err != nil || transferID.IsZero() {
+			return false, fmt.Errorf("%w: peer %d: %v", ErrTransferIDExhausted, voter.ID, err)
+		}
+		chunkLimit := node.options.MaxSnapshotChunkBytes
+		if chunkLimit == 0 {
+			chunkLimit = config.MaxRaftSnapshotChunkBytes
+		}
+		if err := node.core.StartSnapshotTransfer(voter.ID, snapshot.Clone(), transferID, chunkLimit); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+type snapshotStagingStore interface {
+	StageSnapshotChunk(InstallSnapshotRequest) (SnapshotStageResult, error)
+	AbortSnapshotStage() error
+}
+
+func (node *Node) executeSnapshotAction(token ReadyToken, action SnapshotAction) (PeerMessage, error) {
+	store, ok := node.options.Store.(snapshotStagingStore)
+	if !ok {
+		return PeerMessage{}, fmt.Errorf("%w: stable store lacks snapshot staging", ErrInvalidCoreState)
+	}
+	if action.Reset {
+		if err := store.AbortSnapshotStage(); err != nil {
+			return PeerMessage{}, fmt.Errorf("reset raft snapshot stage: %w", err)
+		}
+	}
+	if action.Kind == SnapshotActionAbort {
+		if err := store.AbortSnapshotStage(); err != nil {
+			return PeerMessage{}, fmt.Errorf("abort raft snapshot stage: %w", err)
+		}
+		return node.core.CompleteSnapshotAction(token, SnapshotActionResult{Rejected: true})
+	}
+	if action.Kind != SnapshotActionStage {
+		return PeerMessage{}, fmt.Errorf("%w: unknown snapshot action %d", ErrInvalidCoreState, action.Kind)
+	}
+	staged, err := store.StageSnapshotChunk(action.Request)
+	if err != nil {
+		if errors.Is(err, ErrSnapshotRejected) {
+			return node.core.CompleteSnapshotAction(token, SnapshotActionResult{Rejected: true})
+		}
+		return PeerMessage{}, fmt.Errorf("stage raft snapshot at offset %d: %w", action.Request.Offset, err)
+	}
+	result := SnapshotActionResult{NextOffset: staged.NextOffset, Done: staged.Done}
+	if staged.Done {
+		installed := staged.State.Clone()
+		if installed.Snapshot == nil {
+			return PeerMessage{}, fmt.Errorf("%w: installed snapshot bytes are absent", ErrInvalidCoreState)
+		}
+		if err := node.options.StateMachine.Restore(installed.Snapshot.Metadata.StateMachineSchemaVersion, installed.Snapshot.StateBytes()); err != nil {
+			return PeerMessage{}, fmt.Errorf("restore installed raft snapshot: %w", err)
+		}
+		if err := node.replayRecovered(installed); err != nil {
+			return PeerMessage{}, fmt.Errorf("replay installed raft snapshot suffix: %w", err)
+		}
+		coreState := installed.Clone()
+		coreState.AppliedIndex = coreState.HardState.CommitIndex
+		result.State = coreState
+		node.durableState = installed
+	}
+	return node.core.CompleteSnapshotAction(token, result)
+}
+
+func (node *Node) handoffPeerMessage(message PeerMessage) error {
+	owned := PeerMessage{To: message.To, RPC: CloneRPC(message.RPC), Requires: message.Requires}
+	result, err := node.options.Transport.Handoff(owned)
+	if err != nil {
+		return fmt.Errorf("handoff raft message to voter %d: %w", message.To, err)
+	}
+	if result != TransportAccepted && result != TransportUnavailable {
+		return fmt.Errorf("%w: %d", ErrTransportInvariant, result)
+	}
+	return nil
+}
+
 func persistenceBatchForReady(ready Ready) PersistenceBatch {
 	batch := PersistenceBatch{}
 	if ready.HardState != nil {
@@ -736,6 +866,20 @@ func (node *Node) validateReadyStructure(ready Ready) error {
 			if !found {
 				return fmt.Errorf("%w: message requires absent entry %d", ErrInvalidCoreState, message.Requires.EntriesThrough)
 			}
+		}
+	}
+	if len(ready.SnapshotActions) > 1 {
+		return fmt.Errorf("%w: Ready contains multiple snapshot actions", ErrInvalidCoreState)
+	}
+	for _, action := range ready.SnapshotActions {
+		if action.Kind != SnapshotActionStage && action.Kind != SnapshotActionAbort {
+			return fmt.Errorf("%w: invalid snapshot action %d", ErrInvalidCoreState, action.Kind)
+		}
+		if action.Request.LeaderID == node.options.LocalID || !node.options.Voters.Contains(action.Request.LeaderID) {
+			return fmt.Errorf("%w: invalid snapshot action leader %d", ErrInvalidCoreState, action.Request.LeaderID)
+		}
+		if err := validateSnapshotRequest(action.Request, DefaultCodecLimits()); err != nil {
+			return err
 		}
 	}
 	expected, ok := checkedNextIndex(node.core.Status().AppliedIndex)

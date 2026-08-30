@@ -44,6 +44,34 @@ type FailedProposal struct {
 	Err error
 }
 
+// SnapshotActionKind identifies one owner-executed snapshot storage operation.
+type SnapshotActionKind uint8
+
+const (
+	// SnapshotActionStage durably stages one exact InstallSnapshot chunk.
+	SnapshotActionStage SnapshotActionKind = iota + 1
+	// SnapshotActionAbort removes any partially staged incoming snapshot.
+	SnapshotActionAbort
+)
+
+// SnapshotAction separates protocol validation in Core from snapshot bytes and
+// filesystem ownership in Node and StableStore.
+type SnapshotAction struct {
+	Kind SnapshotActionKind
+	// Request is an owned canonical request identifying the operation.
+	Request InstallSnapshotRequest
+	// Reset requires an older active staging file to be discarded first.
+	Reset bool
+}
+
+// SnapshotActionResult reports the durable result of one exact action.
+type SnapshotActionResult struct {
+	NextOffset uint64
+	Done       bool
+	State      RecoveredState
+	Rejected   bool
+}
+
 // Ready is one immutable-by-convention owned protocol output batch.
 type Ready struct {
 	// Token must be supplied exactly once to Core.Advance.
@@ -60,6 +88,9 @@ type Ready struct {
 	CommittedProposals []CommittedProposal
 	// FailedProposals are exact local proposals invalidated before committed handoff.
 	FailedProposals []FailedProposal
+	// SnapshotActions are owner-executed storage operations. A batch containing
+	// one cannot advance until CompleteSnapshotAction accepts its durable result.
+	SnapshotActions []SnapshotAction
 }
 
 // Clone returns an independently owned copy of the complete batch.
@@ -90,6 +121,16 @@ func (ready Ready) Clone() Ready {
 				To:       message.To,
 				RPC:      CloneRPC(message.RPC),
 				Requires: message.Requires,
+			}
+		}
+	}
+	if ready.SnapshotActions != nil {
+		owned.SnapshotActions = make([]SnapshotAction, len(ready.SnapshotActions))
+		for index, action := range ready.SnapshotActions {
+			owned.SnapshotActions[index] = SnapshotAction{
+				Kind:    action.Kind,
+				Request: CloneRPC(action.Request).(InstallSnapshotRequest),
+				Reset:   action.Reset,
 			}
 		}
 	}

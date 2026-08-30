@@ -41,6 +41,16 @@ type Snapshot struct {
 	envelope []byte
 }
 
+// SnapshotStageResult reports durable byte progress or a completed installed state.
+type SnapshotStageResult struct {
+	// NextOffset is the next exact byte required after durable staging.
+	NextOffset uint64
+	// Done is true only after the complete snapshot and WAL transition are durable.
+	Done bool
+	// State is the installed independently owned durable state when Done is true.
+	State RecoveredState
+}
+
 // Clone returns an independently owned snapshot.
 func (snapshot Snapshot) Clone() Snapshot {
 	snapshot.state = cloneBytes(snapshot.state)
@@ -161,4 +171,58 @@ func validateSnapshotInputs(identity StorageIdentity, metadata SnapshotMetadata,
 		return fmt.Errorf("%w: snapshot state is %d bytes, maximum is %d", ErrInvalidSnapshot, stateLength, maximumStateBytes)
 	}
 	return nil
+}
+
+type snapshotTransferMetadata struct {
+	leaderID    uint16
+	term        uint64
+	transferID  TransferID
+	snapshotID  SnapshotID
+	metadata    SnapshotMetadata
+	totalLength uint64
+	checksum    SnapshotChecksum
+}
+
+func snapshotTransferMetadataFor(request InstallSnapshotRequest) snapshotTransferMetadata {
+	return snapshotTransferMetadata{
+		leaderID: request.LeaderID, term: request.Term, transferID: request.TransferID,
+		snapshotID:  request.SnapshotID,
+		metadata:    SnapshotMetadata{LastIncludedIndex: request.LastIncludedIndex, LastIncludedTerm: request.LastIncludedTerm, StateMachineSchemaVersion: request.StateMachineSchemaVersion},
+		totalLength: request.TotalLength, checksum: request.Checksum,
+	}
+}
+
+func installRecoveredSnapshot(current RecoveredState, snapshot Snapshot, expected StorageIdentity, voters VoterSet) (RecoveredState, error) {
+	metadata := snapshot.Metadata
+	if metadata.LastIncludedIndex <= current.HardState.CommitIndex {
+		return RecoveredState{}, fmt.Errorf("%w: snapshot index %d is not newer than commit %d", ErrSnapshotRejected, metadata.LastIncludedIndex, current.HardState.CommitIndex)
+	}
+	prospective := current.Clone()
+	retained := []Entry(nil)
+	lastIndex := current.SnapshotBase.LastIncludedIndex + uint64(len(current.Entries))
+	if lastIndex < current.SnapshotBase.LastIncludedIndex {
+		return RecoveredState{}, ErrLogOverflow
+	}
+	if metadata.LastIncludedIndex <= lastIndex {
+		term, err := recoveredTermAt(current, metadata.LastIncludedIndex)
+		if err != nil {
+			return RecoveredState{}, err
+		}
+		if term == metadata.LastIncludedTerm {
+			offset := metadata.LastIncludedIndex - current.SnapshotBase.LastIncludedIndex
+			retained = cloneEntries(current.Entries[offset:])
+		}
+	}
+	prospective.SnapshotBase = metadata
+	owned := snapshot.Clone()
+	prospective.Snapshot = &owned
+	prospective.Entries = retained
+	prospective.HardState.CommitIndex = metadata.LastIncludedIndex
+	if prospective.AppliedIndex < metadata.LastIncludedIndex {
+		prospective.AppliedIndex = metadata.LastIncludedIndex
+	}
+	if err := ValidateRecoveredState(prospective, expected, voters); err != nil {
+		return RecoveredState{}, err
+	}
+	return prospective.Clone(), nil
 }

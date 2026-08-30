@@ -665,6 +665,11 @@ func TestHigherTermLeaderContactAtLogicalMaximumAdoptsBeforeDeadlineExhaustion(t
 			if got := core.ElectionDeadline(); got != math.MaxUint64 {
 				t.Fatalf("exhausted election deadline = %d, want MaxUint64", got)
 			}
+			if len(ready.SnapshotActions) != 0 {
+				if _, err := core.CompleteSnapshotAction(ready.Token, SnapshotActionResult{Rejected: true}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := core.Advance(ready.Token); err != nil {
 				t.Fatal(err)
 			}

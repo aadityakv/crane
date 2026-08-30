@@ -173,6 +173,13 @@ type task8ZeroOffsetRandom struct{}
 
 func (task8ZeroOffsetRandom) Uint64() uint64 { return 10_000_000_000 }
 
+type task8TransferIDs struct{ next byte }
+
+func (source *task8TransferIDs) NextTransferID(uint16) (TransferID, error) {
+	source.next++
+	return TransferID{source.next}, nil
+}
+
 type task8ObservableCancelContext struct {
 	done     chan struct{}
 	canceled atomic.Bool
@@ -1478,6 +1485,7 @@ func task8NodeOptions(t *testing.T, state RecoveredState) (NodeOptions, *task8St
 		Store: store, StateMachine: machine,
 		Transport: &task8Transport{result: TransportAccepted},
 		Clock:     manual, Random: task8ZeroOffsetRandom{},
+		TransferIDs:            &task8TransferIDs{},
 		ElectionTimeoutMin:     5 * time.Second,
 		ElectionTimeoutMax:     10 * time.Second,
 		HeartbeatInterval:      1 * time.Second,

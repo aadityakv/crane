@@ -1,10 +1,14 @@
 package raft
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
 	"sync"
+
+	"github.com/aaditya/cs425mp3/internal/config"
 )
 
 // StorageOperation names one fault-injection point shared by deterministic stores.
@@ -19,6 +23,12 @@ const (
 	StorageOperationClose
 	// StorageOperationSnapshotPersist fails the next snapshot compaction before mutation.
 	StorageOperationSnapshotPersist
+	// StorageOperationSnapshotStageWrite fails before newly staged bytes are owned.
+	StorageOperationSnapshotStageWrite
+	// StorageOperationSnapshotStageSync fails before a staged offset becomes acknowledged.
+	StorageOperationSnapshotStageSync
+	// StorageOperationSnapshotInstall fails before the completed snapshot mutates durable state.
+	StorageOperationSnapshotInstall
 )
 
 // MemoryStore is a deterministic, transaction-safe in-memory StableStore.
@@ -29,6 +39,101 @@ type MemoryStore struct {
 	state    RecoveredState
 	closed   bool
 	faults   map[StorageOperation][]error
+	stage    *memorySnapshotStage
+}
+
+type memorySnapshotStage struct {
+	metadata snapshotTransferMetadata
+	bytes    []byte
+}
+
+// StageSnapshotChunk durably advances one exact in-memory transfer chunk.
+func (store *MemoryStore) StageSnapshotChunk(request InstallSnapshotRequest) (SnapshotStageResult, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return SnapshotStageResult{}, ErrStoreClosed
+	}
+	if err := validateSnapshotRequest(request, DefaultCodecLimits()); err != nil {
+		store.stage = nil
+		return SnapshotStageResult{}, fmt.Errorf("%w: %v", ErrSnapshotRejected, err)
+	}
+	metadata := snapshotTransferMetadataFor(request)
+	if store.stage == nil {
+		if request.Offset != 0 {
+			return SnapshotStageResult{}, fmt.Errorf("%w: transfer must begin at offset zero", ErrSnapshotRejected)
+		}
+		store.stage = &memorySnapshotStage{metadata: metadata}
+	} else if store.stage.metadata != metadata {
+		store.stage = nil
+		return SnapshotStageResult{}, fmt.Errorf("%w: transfer metadata changed", ErrSnapshotRejected)
+	}
+
+	nextOffset := uint64(len(store.stage.bytes))
+	end := request.Offset + uint64(len(request.Chunk))
+	switch {
+	case request.Offset == nextOffset:
+		if err := store.takeFault(StorageOperationSnapshotStageWrite); err != nil {
+			store.stage = nil
+			return SnapshotStageResult{}, fmt.Errorf("stage memory raft snapshot bytes: %w", err)
+		}
+		candidate := append(cloneBytes(store.stage.bytes), cloneBytes(request.Chunk)...)
+		if err := store.takeFault(StorageOperationSnapshotStageSync); err != nil {
+			store.stage = nil
+			return SnapshotStageResult{}, fmt.Errorf("sync memory raft snapshot bytes: %w", err)
+		}
+		store.stage.bytes = candidate
+		nextOffset = end
+	case end <= nextOffset:
+		if !bytes.Equal(store.stage.bytes[request.Offset:end], request.Chunk) {
+			store.stage = nil
+			return SnapshotStageResult{}, fmt.Errorf("%w: duplicate bytes changed", ErrSnapshotRejected)
+		}
+	case request.Offset < nextOffset && end > nextOffset:
+		store.stage = nil
+		return SnapshotStageResult{}, fmt.Errorf("%w: chunk partially overlaps durable bytes", ErrSnapshotRejected)
+	default:
+		store.stage = nil
+		return SnapshotStageResult{}, fmt.Errorf("%w: chunk leaves an offset gap", ErrSnapshotRejected)
+	}
+
+	if !request.Done {
+		return SnapshotStageResult{NextOffset: nextOffset}, nil
+	}
+	stateBytes := cloneBytes(store.stage.bytes)
+	checksum := sha256.Sum256(stateBytes)
+	if SnapshotChecksum(checksum) != request.Checksum {
+		store.stage = nil
+		return SnapshotStageResult{}, fmt.Errorf("%w: complete state checksum mismatch", ErrSnapshotRejected)
+	}
+	snapshot, err := NewSnapshot(store.identity, metadata.metadata, stateBytes, config.MaxRaftSnapshotBytes)
+	if err != nil || snapshot.ID != request.SnapshotID {
+		store.stage = nil
+		return SnapshotStageResult{}, fmt.Errorf("%w: complete snapshot identity mismatch: %v", ErrSnapshotRejected, err)
+	}
+	prospective, err := installRecoveredSnapshot(store.state, snapshot, store.identity, store.voters)
+	if err != nil {
+		store.stage = nil
+		return SnapshotStageResult{}, err
+	}
+	if err := store.takeFault(StorageOperationSnapshotInstall); err != nil {
+		store.stage = nil
+		return SnapshotStageResult{}, fmt.Errorf("install memory raft snapshot: %w", err)
+	}
+	store.state = prospective
+	store.stage = nil
+	return SnapshotStageResult{NextOffset: nextOffset, Done: true, State: prospective.Clone()}, nil
+}
+
+// AbortSnapshotStage discards one incomplete in-memory transfer.
+func (store *MemoryStore) AbortSnapshotStage() error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrStoreClosed
+	}
+	store.stage = nil
+	return nil
 }
 
 // PersistSnapshot atomically installs an exact local snapshot and compacts its covered prefix.
@@ -135,6 +240,7 @@ func (store *MemoryStore) Close() error {
 	if err := store.takeFault(StorageOperationClose); err != nil {
 		return fmt.Errorf("close memory raft store: %w", err)
 	}
+	store.stage = nil
 	store.closed = true
 	return nil
 }

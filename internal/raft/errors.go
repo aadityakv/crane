@@ -91,6 +91,10 @@ var (
 	ErrSnapshotUnavailable = errors.New("raft snapshot bytes unavailable")
 	// ErrInvalidSnapshot classifies malformed, corrupt, oversized, or identity-mismatched snapshot bytes.
 	ErrInvalidSnapshot = errors.New("invalid raft snapshot")
+	// ErrSnapshotRejected classifies a peer snapshot chunk that cannot continue the active transfer safely.
+	ErrSnapshotRejected = errors.New("raft snapshot chunk rejected")
+	// ErrTransferIDExhausted classifies inability to allocate a nonzero peer-local snapshot transfer identity.
+	ErrTransferIDExhausted = errors.New("raft snapshot transfer identity exhausted")
 	// ErrTransportInvariant classifies an invalid result from the bounded transport handoff seam.
 	ErrTransportInvariant = errors.New("invalid raft transport handoff result")
 )

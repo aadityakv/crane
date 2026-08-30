@@ -5,6 +5,7 @@ package raft
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -31,7 +32,9 @@ const (
 	// RaftWALFilename contains committed persistence transactions.
 	RaftWALFilename = "wal"
 	// RaftSnapshotFilename reserves the Task 9 snapshot path.
-	RaftSnapshotFilename = "snapshot"
+	RaftSnapshotFilename         = "snapshot"
+	raftSnapshotPreviousFilename = ".snapshot.previous"
+	raftSnapshotStageFilename    = "snapshot-stage"
 
 	identityBytes         = 60
 	identityChecksumBytes = 4
@@ -103,6 +106,13 @@ type FileStore struct {
 	nextTxnID     uint64
 	closed        bool
 	poisoned      bool
+	stage         *fileSnapshotStage
+}
+
+type fileSnapshotStage struct {
+	metadata   snapshotTransferMetadata
+	file       *os.File
+	nextOffset uint64
 }
 
 // OpenFileStore opens or securely initializes <storageDir>/raft and recovers
@@ -222,6 +232,10 @@ func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet,
 	if err != nil {
 		return nil, err
 	}
+	previousSnapshot, err := store.loadSnapshotFile(raftSnapshotPreviousFilename)
+	if err != nil {
+		return nil, err
+	}
 	wal, err := store.openOrCreateWAL()
 	if err != nil {
 		return nil, err
@@ -231,7 +245,7 @@ func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet,
 	if err != nil {
 		return nil, err
 	}
-	state, err = store.reconcileRecoveredSnapshot(state, snapshot)
+	state, err = store.selectRecoveredSnapshot(state, snapshot, previousSnapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +273,10 @@ func (store *FileStore) PersistSnapshot(snapshot Snapshot) error {
 	if err != nil {
 		return err
 	}
+	return store.persistSnapshotStateLocked(snapshot, prospective)
+}
 
+func (store *FileStore) persistSnapshotStateLocked(snapshot Snapshot, prospective RecoveredState) error {
 	snapshotTemporary, err := store.newTemporaryRegularFile(".snapshot.tmp-")
 	if err != nil {
 		return fmt.Errorf("create temporary raft snapshot: %w", err)
@@ -288,6 +305,17 @@ func (store *FileStore) PersistSnapshot(snapshot Snapshot) error {
 		return fmt.Errorf("close temporary raft snapshot: %w", err)
 	}
 	snapshotFile = nil
+	hadPreviousSnapshot := store.state.Snapshot != nil
+	if hadPreviousSnapshot {
+		if err := store.ops.rootRename(store.root, RaftSnapshotFilename, raftSnapshotPreviousFilename); err != nil {
+			store.poisoned = true
+			return fmt.Errorf("preserve previous raft snapshot: %w", err)
+		}
+		if err := store.ops.sync(store.directory); err != nil {
+			store.poisoned = true
+			return fmt.Errorf("sync raft directory after preserving previous snapshot: %w", err)
+		}
+	}
 	if err := store.ops.rootRename(store.root, snapshotName, RaftSnapshotFilename); err != nil {
 		store.poisoned = true
 		return fmt.Errorf("install raft snapshot: %w", err)
@@ -347,8 +375,167 @@ func (store *FileStore) PersistSnapshot(snapshot Snapshot) error {
 		store.poisoned = true
 		return fmt.Errorf("close replaced raft WAL: %w", err)
 	}
+	if hadPreviousSnapshot {
+		if err := store.ops.rootRemove(store.root, raftSnapshotPreviousFilename); err != nil {
+			store.poisoned = true
+			return fmt.Errorf("remove previous raft snapshot: %w", err)
+		}
+		if err := store.ops.sync(store.directory); err != nil {
+			store.poisoned = true
+			return fmt.Errorf("sync raft directory after previous snapshot removal: %w", err)
+		}
+	}
 	store.state = prospective
 	store.nextTxnID = 2
+	return nil
+}
+
+// StageSnapshotChunk writes, syncs, and only then reports one exact follower offset.
+func (store *FileStore) StageSnapshotChunk(request InstallSnapshotRequest) (SnapshotStageResult, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return SnapshotStageResult{}, ErrStoreClosed
+	}
+	if store.poisoned {
+		return SnapshotStageResult{}, fmt.Errorf("%w: persistence outcome requires reopen", ErrStorageCorrupt)
+	}
+	if err := validateSnapshotRequest(request, DefaultCodecLimits()); err != nil {
+		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: %v", ErrSnapshotRejected, err))
+	}
+	metadata := snapshotTransferMetadataFor(request)
+	if store.stage == nil {
+		if request.Offset != 0 {
+			return SnapshotStageResult{}, fmt.Errorf("%w: transfer must begin at offset zero", ErrSnapshotRejected)
+		}
+		file, created, err := store.openAnchoredRegularFile(raftSnapshotStageFilename, os.O_RDWR, true)
+		if err != nil {
+			return SnapshotStageResult{}, fmt.Errorf("create raft snapshot stage: %w", err)
+		}
+		if !created {
+			_ = store.ops.close(file)
+			return SnapshotStageResult{}, fmt.Errorf("%w: unexpected existing snapshot stage", ErrStorageCorrupt)
+		}
+		if err := store.ops.sync(store.directory); err != nil {
+			_ = store.ops.close(file)
+			_ = store.ops.rootRemove(store.root, raftSnapshotStageFilename)
+			return SnapshotStageResult{}, fmt.Errorf("sync raft directory after stage creation: %w", err)
+		}
+		store.stage = &fileSnapshotStage{metadata: metadata, file: file}
+	} else if store.stage.metadata != metadata {
+		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: transfer metadata changed", ErrSnapshotRejected))
+	}
+
+	nextOffset := store.stage.nextOffset
+	end := request.Offset + uint64(len(request.Chunk))
+	switch {
+	case request.Offset == nextOffset:
+		if _, err := store.stage.file.Seek(int64(nextOffset), io.SeekStart); err != nil {
+			store.poisoned = true
+			return SnapshotStageResult{}, fmt.Errorf("seek raft snapshot stage: %w", err)
+		}
+		if err := writeAll(request.Chunk, func(content []byte) (int, error) { return store.ops.write(store.stage.file, content) }); err != nil {
+			store.poisoned = true
+			return SnapshotStageResult{}, fmt.Errorf("write raft snapshot stage at %d: %w", request.Offset, err)
+		}
+		if err := store.ops.sync(store.stage.file); err != nil {
+			store.poisoned = true
+			return SnapshotStageResult{}, fmt.Errorf("sync raft snapshot stage through %d: %w", end, err)
+		}
+		store.stage.nextOffset = end
+		nextOffset = end
+	case end <= nextOffset:
+		if end > uint64(math.MaxInt) {
+			return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: duplicate offset exceeds local integer domain", ErrSnapshotRejected))
+		}
+		staged := make([]byte, len(request.Chunk))
+		if _, err := store.stage.file.ReadAt(staged, int64(request.Offset)); err != nil {
+			store.poisoned = true
+			return SnapshotStageResult{}, fmt.Errorf("read duplicate raft snapshot bytes: %w", err)
+		}
+		if !bytes.Equal(staged, request.Chunk) {
+			return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: duplicate bytes changed", ErrSnapshotRejected))
+		}
+	case request.Offset < nextOffset && end > nextOffset:
+		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: chunk partially overlaps durable bytes", ErrSnapshotRejected))
+	default:
+		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: chunk leaves an offset gap", ErrSnapshotRejected))
+	}
+	if !request.Done {
+		return SnapshotStageResult{NextOffset: nextOffset}, nil
+	}
+	if nextOffset > uint64(math.MaxInt) {
+		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: complete stage exceeds local integer domain", ErrSnapshotRejected))
+	}
+	stateBytes := make([]byte, int(nextOffset))
+	if len(stateBytes) != 0 {
+		if _, err := store.stage.file.ReadAt(stateBytes, 0); err != nil {
+			store.poisoned = true
+			return SnapshotStageResult{}, fmt.Errorf("read complete raft snapshot stage: %w", err)
+		}
+	}
+	checksum := sha256.Sum256(stateBytes)
+	if SnapshotChecksum(checksum) != request.Checksum {
+		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: complete state checksum mismatch", ErrSnapshotRejected))
+	}
+	snapshot, err := NewSnapshot(store.identity, metadata.metadata, stateBytes, config.MaxRaftSnapshotBytes)
+	if err != nil || snapshot.ID != request.SnapshotID {
+		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: complete snapshot identity mismatch: %v", ErrSnapshotRejected, err))
+	}
+	prospective, err := installRecoveredSnapshot(store.state, snapshot, store.identity, store.voters)
+	if err != nil {
+		return SnapshotStageResult{}, store.rejectFileStageLocked(err)
+	}
+	stageFile := store.stage.file
+	store.stage = nil
+	if err := store.ops.close(stageFile); err != nil {
+		store.poisoned = true
+		return SnapshotStageResult{}, fmt.Errorf("close complete raft snapshot stage: %w", err)
+	}
+	if err := store.persistSnapshotStateLocked(snapshot, prospective); err != nil {
+		return SnapshotStageResult{}, err
+	}
+	if err := store.ops.rootRemove(store.root, raftSnapshotStageFilename); err != nil {
+		store.poisoned = true
+		return SnapshotStageResult{}, fmt.Errorf("remove installed raft snapshot stage: %w", err)
+	}
+	if err := store.ops.sync(store.directory); err != nil {
+		store.poisoned = true
+		return SnapshotStageResult{}, fmt.Errorf("sync raft directory after stage removal: %w", err)
+	}
+	return SnapshotStageResult{NextOffset: nextOffset, Done: true, State: prospective.Clone()}, nil
+}
+
+// AbortSnapshotStage discards one incomplete rooted file before a transfer changes.
+func (store *FileStore) AbortSnapshotStage() error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrStoreClosed
+	}
+	return store.abortFileStageLocked()
+}
+
+func (store *FileStore) rejectFileStageLocked(reason error) error {
+	cleanupErr := store.abortFileStageLocked()
+	return errors.Join(reason, cleanupErr)
+}
+
+func (store *FileStore) abortFileStageLocked() error {
+	if store.stage == nil {
+		return nil
+	}
+	stage := store.stage
+	store.stage = nil
+	closeErr := store.ops.close(stage.file)
+	removeErr := store.ops.rootRemove(store.root, raftSnapshotStageFilename)
+	var syncErr error
+	if removeErr == nil {
+		syncErr = store.ops.sync(store.directory)
+	}
+	if closeErr != nil || removeErr != nil || syncErr != nil {
+		return fmt.Errorf("clean raft snapshot stage: %w", errors.Join(closeErr, removeErr, syncErr))
+	}
 	return nil
 }
 
@@ -437,6 +624,11 @@ func (store *FileStore) Close() error {
 
 func (store *FileStore) releaseOpenResources() error {
 	var failures []error
+	if store.stage != nil {
+		if err := store.abortFileStageLocked(); err != nil {
+			failures = append(failures, err)
+		}
+	}
 	if store.wal != nil {
 		if err := store.ops.close(store.wal); err != nil {
 			failures = append(failures, fmt.Errorf("close raft WAL: %w", err))
@@ -495,7 +687,7 @@ func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
 	}
 	removedTemporary := false
 	for name := range names {
-		if !validStoreTemporaryName(name) {
+		if !validStoreTemporaryName(name) && name != raftSnapshotStageFilename {
 			continue
 		}
 		info, err := store.ops.rootLstat(store.root, name)
@@ -517,7 +709,7 @@ func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
 		}
 	}
 	for name := range names {
-		if name != RaftLockFilename && name != RaftIdentityFilename && name != RaftWALFilename && name != RaftSnapshotFilename {
+		if name != RaftLockFilename && name != RaftIdentityFilename && name != RaftWALFilename && name != RaftSnapshotFilename && name != raftSnapshotPreviousFilename {
 			return fmt.Errorf("%w: unexpected raft directory entry %q", ErrStorageCorrupt, name)
 		}
 	}
@@ -656,6 +848,60 @@ func (store *FileStore) reconcileRecoveredSnapshot(state RecoveredState, snapsho
 		return RecoveredState{}, fmt.Errorf("%w: recovered snapshot state: %v", ErrStorageCorrupt, err)
 	}
 	return state.Clone(), nil
+}
+
+func (store *FileStore) selectRecoveredSnapshot(state RecoveredState, current, previous *Snapshot) (RecoveredState, error) {
+	if current != nil {
+		if recovered, err := store.reconcileRecoveredSnapshot(state, current); err == nil {
+			if previous != nil {
+				if err := store.ops.rootRemove(store.root, raftSnapshotPreviousFilename); err != nil {
+					return RecoveredState{}, fmt.Errorf("remove obsolete previous raft snapshot: %w", err)
+				}
+				if err := store.ops.sync(store.directory); err != nil {
+					return RecoveredState{}, fmt.Errorf("sync raft directory after previous snapshot cleanup: %w", err)
+				}
+			}
+			return recovered, nil
+		}
+	}
+	if previous != nil {
+		if recovered, err := store.reconcileRecoveredSnapshot(state, previous); err == nil {
+			if current != nil {
+				if err := store.ops.rootRemove(store.root, RaftSnapshotFilename); err != nil {
+					return RecoveredState{}, fmt.Errorf("remove interrupted raft snapshot: %w", err)
+				}
+			}
+			if err := store.ops.rootRename(store.root, raftSnapshotPreviousFilename, RaftSnapshotFilename); err != nil {
+				return RecoveredState{}, fmt.Errorf("restore previous raft snapshot: %w", err)
+			}
+			if err := store.ops.sync(store.directory); err != nil {
+				return RecoveredState{}, fmt.Errorf("sync raft directory after restoring previous snapshot: %w", err)
+			}
+			return recovered, nil
+		}
+	}
+	if state.SnapshotBase.LastIncludedIndex == 0 {
+		removed := false
+		for _, candidate := range []struct {
+			name     string
+			snapshot *Snapshot
+		}{{RaftSnapshotFilename, current}, {raftSnapshotPreviousFilename, previous}} {
+			if candidate.snapshot == nil {
+				continue
+			}
+			if err := store.ops.rootRemove(store.root, candidate.name); err != nil {
+				return RecoveredState{}, fmt.Errorf("remove interrupted raft snapshot %q: %w", candidate.name, err)
+			}
+			removed = true
+		}
+		if removed {
+			if err := store.ops.sync(store.directory); err != nil {
+				return RecoveredState{}, fmt.Errorf("sync raft directory after interrupted snapshot cleanup: %w", err)
+			}
+		}
+		return state.Clone(), nil
+	}
+	return RecoveredState{}, fmt.Errorf("%w: no snapshot file matches recovered WAL base", ErrStorageCorrupt)
 }
 
 func replacementBatchForState(state RecoveredState) (PersistenceBatch, error) {

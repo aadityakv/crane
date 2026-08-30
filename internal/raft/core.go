@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/aaditya/cs425mp3/internal/config"
 	boundedrandom "github.com/aaditya/cs425mp3/internal/random"
 )
 
@@ -65,11 +66,31 @@ type Core struct {
 	pendingProposals     map[ProposalID]Entry
 	pendingProposalOrder []ProposalID
 	proposalAtIndex      map[uint64]ProposalID
+	incomingSnapshot     *incomingSnapshotProgress
+	outgoingSnapshots    map[uint16]*outgoingSnapshotProgress
+	snapshotActionDone   bool
 
 	pendingReady Ready
 	hasPending   bool
 	nextToken    ReadyToken
 	terminalErr  error
+}
+
+type incomingSnapshotProgress struct {
+	metadata   snapshotTransferMetadata
+	nextOffset uint64
+	request    InstallSnapshotRequest
+}
+
+type outgoingSnapshotProgress struct {
+	term       uint64
+	peerID     uint16
+	transferID TransferID
+	snapshot   Snapshot
+	state      []byte
+	nextOffset uint64
+	chunkLimit uint64
+	activeEnd  uint64
 }
 
 // NewCore validates recovery invariants, owns the recovered log, and samples
@@ -241,11 +262,11 @@ func (core *Core) Step(senderID uint16, rpc RPC) error {
 	case AppendEntriesRequest:
 		return core.handleAppendRequest(message)
 	case InstallSnapshotRequest:
-		return core.handleLeaderContact(message.LeaderID, message.Term)
+		return core.handleInstallSnapshotRequest(message)
 	case AppendEntriesResponse:
 		return core.handleAppendResponse(message)
 	case InstallSnapshotResponse:
-		return nil
+		return core.handleInstallSnapshotResponse(message)
 	case ErrorResponse, Handshake, HandshakeAck:
 		return nil
 	default:
@@ -355,6 +376,9 @@ func (core *Core) Advance(token ReadyToken) error {
 	if !core.hasPending || token == 0 || token != core.pendingReady.Token {
 		return ErrAdvanceToken
 	}
+	if len(core.pendingReady.SnapshotActions) != 0 && !core.snapshotActionDone {
+		return ErrReadyOutstanding
+	}
 	if len(core.pendingReady.CommittedEntries) != 0 {
 		lastApplied := core.pendingReady.CommittedEntries[len(core.pendingReady.CommittedEntries)-1].Index
 		if err := core.log.AdvanceApplied(lastApplied); err != nil {
@@ -363,6 +387,7 @@ func (core *Core) Advance(token ReadyToken) error {
 	}
 	core.pendingReady = Ready{}
 	core.hasPending = false
+	core.snapshotActionDone = false
 	return nil
 }
 
@@ -397,6 +422,7 @@ func (core *Core) CompactSnapshot(metadata SnapshotMetadata) error {
 		return err
 	}
 	if core.role == RoleLeader {
+		core.outgoingSnapshots = nil
 		for peerID, progress := range core.progress {
 			if peerID == core.localID {
 				continue
@@ -405,11 +431,132 @@ func (core *Core) CompactSnapshot(metadata SnapshotMetadata) error {
 				progress.SnapshotNeeded = true
 				progress.ActiveGeneration = 0
 				progress.activeMatchIndex = 0
+				progress.ActiveTransferID = TransferID{}
+				progress.ActiveSnapshotID = SnapshotID{}
+				progress.SnapshotNextOffset = 0
 				core.progress[peerID] = progress
 			}
 		}
 	}
 	return nil
+}
+
+// StartSnapshotTransfer binds one lagging peer to an immutable durable snapshot
+// and emits its first bounded chunk. Transfer identity is supplied by the owner.
+func (core *Core) StartSnapshotTransfer(peerID uint16, snapshot Snapshot, transferID TransferID, chunkLimit uint64) error {
+	if core.terminalErr != nil {
+		return core.terminalErr
+	}
+	if core.hasPending {
+		return ErrReadyOutstanding
+	}
+	if core.role != RoleLeader {
+		return ErrNotLeader
+	}
+	progress, ok := core.progress[peerID]
+	if !ok || peerID == core.localID || !progress.SnapshotNeeded {
+		return fmt.Errorf("%w: peer %d does not need a snapshot", ErrInvalidCoreState, peerID)
+	}
+	if transferID.IsZero() {
+		return fmt.Errorf("%w: zero snapshot transfer identity", ErrInvalidCoreState)
+	}
+	if chunkLimit == 0 || chunkLimit > config.MaxRaftSnapshotChunkBytes {
+		return fmt.Errorf("%w: invalid snapshot chunk limit %d", ErrInvalidCoreState, chunkLimit)
+	}
+	if snapshot.Metadata.LastIncludedIndex != core.log.SnapshotIndex() ||
+		snapshot.Metadata.LastIncludedTerm != core.log.SnapshotTerm() || snapshot.ID == (SnapshotID{}) {
+		return fmt.Errorf("%w: durable snapshot does not match Core base", ErrInvalidCoreState)
+	}
+	if core.outgoingSnapshots == nil {
+		core.outgoingSnapshots = make(map[uint16]*outgoingSnapshotProgress)
+	}
+	if core.outgoingSnapshots[peerID] != nil {
+		return fmt.Errorf("%w: peer %d already has a snapshot transfer", ErrInvalidCoreState, peerID)
+	}
+	transfer := &outgoingSnapshotProgress{
+		term: core.hardState.Term, peerID: peerID, transferID: transferID,
+		snapshot: snapshot.Clone(), state: snapshot.StateBytes(), chunkLimit: chunkLimit,
+	}
+	core.outgoingSnapshots[peerID] = transfer
+	progress.ActiveTransferID = transferID
+	progress.ActiveSnapshotID = snapshot.ID
+	progress.SnapshotNextOffset = 0
+	core.progress[peerID] = progress
+	return core.issueSnapshotChunk(peerID)
+}
+
+// CompleteSnapshotAction correlates one durable owner result with the exact
+// live Ready action. It returns the response that is safe to hand to the peer.
+func (core *Core) CompleteSnapshotAction(token ReadyToken, result SnapshotActionResult) (PeerMessage, error) {
+	if core.terminalErr != nil {
+		return PeerMessage{}, core.terminalErr
+	}
+	if !core.hasPending || token == 0 || token != core.pendingReady.Token ||
+		len(core.pendingReady.SnapshotActions) != 1 || core.snapshotActionDone {
+		return PeerMessage{}, ErrAdvanceToken
+	}
+	action := core.pendingReady.SnapshotActions[0]
+	request := action.Request
+	if action.Kind == SnapshotActionAbort {
+		core.incomingSnapshot = nil
+		core.snapshotActionDone = true
+		return core.snapshotResponse(request, false, false, 0), nil
+	}
+	if action.Kind != SnapshotActionStage || core.incomingSnapshot == nil ||
+		core.incomingSnapshot.metadata != snapshotTransferMetadataFor(request) {
+		return PeerMessage{}, fmt.Errorf("%w: snapshot action no longer matches active transfer", ErrInvalidCoreState)
+	}
+	if result.Rejected {
+		core.incomingSnapshot = nil
+		core.snapshotActionDone = true
+		return core.snapshotResponse(request, false, false, 0), nil
+	}
+
+	end := request.Offset + uint64(len(request.Chunk))
+	wantNext := core.incomingSnapshot.nextOffset
+	if request.Offset == wantNext {
+		wantNext = end
+	} else if end > wantNext {
+		return PeerMessage{}, fmt.Errorf("%w: snapshot action partially overlaps durable offset", ErrInvalidCoreState)
+	}
+	if result.NextOffset != wantNext || result.NextOffset > request.TotalLength {
+		return PeerMessage{}, fmt.Errorf("%w: durable snapshot offset=%d want=%d", ErrInvalidCoreState, result.NextOffset, wantNext)
+	}
+	if !result.Done {
+		if request.Done || result.NextOffset == request.TotalLength {
+			return PeerMessage{}, fmt.Errorf("%w: final snapshot chunk was not installed", ErrInvalidCoreState)
+		}
+		core.incomingSnapshot.nextOffset = result.NextOffset
+		core.snapshotActionDone = true
+		return core.snapshotResponse(request, true, false, result.NextOffset), nil
+	}
+	if !request.Done || result.NextOffset != request.TotalLength {
+		return PeerMessage{}, fmt.Errorf("%w: snapshot installed before exact final offset", ErrInvalidCoreState)
+	}
+	state := result.State.Clone()
+	metadata := snapshotTransferMetadataFor(request)
+	if state.Snapshot == nil || state.Snapshot.ID != request.SnapshotID ||
+		state.Snapshot.Metadata != metadata.metadata || state.Snapshot.StateChecksum != request.Checksum ||
+		state.SnapshotBase != metadata.metadata || state.HardState.Term != core.hardState.Term ||
+		state.HardState.VotedFor != core.hardState.VotedFor ||
+		state.HardState.CommitIndex < request.LastIncludedIndex || state.AppliedIndex < request.LastIncludedIndex {
+		return PeerMessage{}, fmt.Errorf("%w: installed state does not match snapshot action", ErrInvalidCoreState)
+	}
+	log, err := NewLog(
+		state.SnapshotBase.LastIncludedIndex,
+		state.SnapshotBase.LastIncludedTerm,
+		state.HardState.CommitIndex,
+		state.AppliedIndex,
+		state.Entries,
+	)
+	if err != nil {
+		return PeerMessage{}, fmt.Errorf("%w: installed snapshot log: %v", ErrInvalidCoreState, err)
+	}
+	core.log = log
+	core.hardState = state.HardState
+	core.incomingSnapshot = nil
+	core.snapshotActionDone = true
+	return core.snapshotResponse(request, true, true, result.NextOffset), nil
 }
 
 // ElectionDeadline returns the current absolute logical election deadline.
@@ -511,6 +658,7 @@ func (core *Core) startElection(finalPreVoter uint16) error {
 	}
 
 	core.preVotes[finalPreVoter] = struct{}{}
+	core.cancelIncomingSnapshot()
 	core.hardState.Term = term
 	core.hardState.VotedFor = core.localID
 	core.role = RoleCandidate
@@ -623,6 +771,12 @@ func (core *Core) becomeLeader(finalVoter uint16) error {
 			continue
 		}
 		core.progress[voter.ID] = Progress{NextIndex: newIndex}
+		if core.outgoingSnapshots[voter.ID] != nil {
+			if err := core.issueSnapshotChunk(voter.ID); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := core.issueAppend(voter.ID); err != nil {
 			return err
 		}
@@ -661,6 +815,12 @@ func (core *Core) tickLeader(now uint64) error {
 		if voter.ID == core.localID {
 			continue
 		}
+		if core.outgoingSnapshots[voter.ID] != nil {
+			if err := core.issueSnapshotChunk(voter.ID); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := core.issueAppend(voter.ID); err != nil {
 			return err
 		}
@@ -684,6 +844,7 @@ func (core *Core) stepDownWithoutTermChange(now uint64) error {
 	core.leaderID = 0
 	core.recentLeader = false
 	core.progress = nil
+	core.outgoingSnapshots = nil
 	core.quorumResponses = nil
 	core.electionDeadline = deadline
 	core.failPendingProposals(ErrProposalFailed)
@@ -703,6 +864,10 @@ func (core *Core) handleLeaderContact(leaderID uint16, term uint64) error {
 		deadline = math.MaxUint64
 		deadlineExhausted = true
 	}
+	if core.incomingSnapshot != nil &&
+		(core.incomingSnapshot.metadata.term != term || core.incomingSnapshot.metadata.leaderID != leaderID) {
+		core.cancelIncomingSnapshot()
+	}
 	if term > core.hardState.Term {
 		core.adoptHigherTerm(term)
 	} else if core.role == RoleLeader && leaderID != core.localID {
@@ -714,10 +879,200 @@ func (core *Core) handleLeaderContact(leaderID uint16, term uint64) error {
 	core.preVotes = nil
 	core.votes = nil
 	core.progress = nil
+	core.outgoingSnapshots = nil
 	core.quorumResponses = nil
 	core.electionDeadline = deadline
 	core.deadlineExhausted = deadlineExhausted
 	return nil
+}
+
+func (core *Core) handleInstallSnapshotRequest(request InstallSnapshotRequest) error {
+	if request.Term < core.hardState.Term {
+		core.queueMessage(request.LeaderID, InstallSnapshotResponse{
+			ResponderID: core.localID, LeaderID: request.LeaderID,
+			Term: core.hardState.Term, RequestTerm: request.Term,
+			TransferID: request.TransferID, SnapshotID: request.SnapshotID,
+		}, DurabilityPrerequisite{})
+		return nil
+	}
+	hardStateChanged := request.Term > core.hardState.Term
+	authorityChanged := core.incomingSnapshot != nil &&
+		(core.incomingSnapshot.metadata.term != request.Term || core.incomingSnapshot.metadata.leaderID != request.LeaderID)
+	if err := core.handleLeaderContact(request.LeaderID, request.Term); err != nil {
+		return err
+	}
+	if authorityChanged {
+		return nil
+	}
+	if request.LastIncludedIndex <= core.log.CommitIndex() {
+		core.cancelIncomingSnapshot()
+		core.queueMessage(request.LeaderID, InstallSnapshotResponse{
+			ResponderID: core.localID, LeaderID: request.LeaderID,
+			Term: core.hardState.Term, RequestTerm: request.Term,
+			TransferID: request.TransferID, SnapshotID: request.SnapshotID,
+			NextOffset: request.TotalLength, Success: true, Done: true,
+		}, DurabilityPrerequisite{HardState: hardStateChanged})
+		return nil
+	}
+
+	metadata := snapshotTransferMetadataFor(request)
+	reset := false
+	if core.incomingSnapshot == nil {
+		if request.Offset != 0 {
+			core.queueSnapshotAction(SnapshotAction{Kind: SnapshotActionAbort, Request: request})
+			return nil
+		}
+		core.incomingSnapshot = &incomingSnapshotProgress{metadata: metadata, request: CloneRPC(request).(InstallSnapshotRequest)}
+	} else if core.incomingSnapshot.metadata != metadata {
+		if request.Offset != 0 {
+			core.queueSnapshotAction(SnapshotAction{Kind: SnapshotActionAbort, Request: request})
+			return nil
+		}
+		reset = true
+		core.incomingSnapshot = &incomingSnapshotProgress{metadata: metadata, request: CloneRPC(request).(InstallSnapshotRequest)}
+	}
+
+	nextOffset := core.incomingSnapshot.nextOffset
+	end := request.Offset + uint64(len(request.Chunk))
+	if request.Offset > nextOffset || (request.Offset < nextOffset && end > nextOffset) {
+		core.queueSnapshotAction(SnapshotAction{Kind: SnapshotActionAbort, Request: request})
+		return nil
+	}
+	core.incomingSnapshot.request = CloneRPC(request).(InstallSnapshotRequest)
+	core.queueSnapshotAction(SnapshotAction{Kind: SnapshotActionStage, Request: request, Reset: reset})
+	return nil
+}
+
+func (core *Core) cancelIncomingSnapshot() {
+	if core.incomingSnapshot == nil {
+		return
+	}
+	request := core.incomingSnapshot.request
+	core.incomingSnapshot = nil
+	core.queueSnapshotAction(SnapshotAction{Kind: SnapshotActionAbort, Request: request})
+}
+
+func (core *Core) queueSnapshotAction(action SnapshotAction) {
+	core.pendingReady.SnapshotActions = append(core.pendingReady.SnapshotActions, SnapshotAction{
+		Kind: action.Kind, Request: CloneRPC(action.Request).(InstallSnapshotRequest), Reset: action.Reset,
+	})
+	core.hasPending = true
+}
+
+func (core *Core) snapshotResponse(request InstallSnapshotRequest, success, done bool, nextOffset uint64) PeerMessage {
+	return PeerMessage{
+		To: request.LeaderID,
+		RPC: InstallSnapshotResponse{
+			ResponderID: core.localID, LeaderID: request.LeaderID,
+			Term: core.hardState.Term, RequestTerm: request.Term,
+			TransferID: request.TransferID, SnapshotID: request.SnapshotID,
+			NextOffset: nextOffset, Success: success, Done: done,
+		},
+	}
+}
+
+func (core *Core) issueSnapshotChunk(peerID uint16) error {
+	transfer := core.outgoingSnapshots[peerID]
+	if transfer == nil || core.role != RoleLeader || transfer.term != core.hardState.Term {
+		return nil
+	}
+	totalLength := uint64(len(transfer.state))
+	if transfer.nextOffset > totalLength {
+		return fmt.Errorf("%w: outgoing snapshot offset exceeds state", ErrInvalidCoreState)
+	}
+	end := transfer.nextOffset + transfer.chunkLimit
+	if end < transfer.nextOffset || end > totalLength {
+		end = totalLength
+	}
+	request := InstallSnapshotRequest{
+		LeaderID: core.localID, Term: transfer.term,
+		TransferID: transfer.transferID, SnapshotID: transfer.snapshot.ID,
+		LastIncludedIndex:         transfer.snapshot.Metadata.LastIncludedIndex,
+		LastIncludedTerm:          transfer.snapshot.Metadata.LastIncludedTerm,
+		StateMachineSchemaVersion: transfer.snapshot.Metadata.StateMachineSchemaVersion,
+		TotalLength:               totalLength, Checksum: transfer.snapshot.StateChecksum,
+		Offset: transfer.nextOffset, Chunk: cloneBytes(transfer.state[transfer.nextOffset:end]),
+		Done: end == totalLength,
+	}
+	transfer.activeEnd = end
+	core.queueMessage(peerID, request, DurabilityPrerequisite{})
+	return nil
+}
+
+func (core *Core) handleInstallSnapshotResponse(response InstallSnapshotResponse) error {
+	if core.role != RoleLeader || response.LeaderID != core.localID {
+		return nil
+	}
+	transfer := core.outgoingSnapshots[response.ResponderID]
+	if transfer == nil || response.RequestTerm != transfer.term ||
+		response.TransferID != transfer.transferID || response.SnapshotID != transfer.snapshot.ID {
+		return nil
+	}
+	if response.Term > core.hardState.Term {
+		if response.NextOffset != transfer.nextOffset {
+			return nil
+		}
+		core.quorumResponses[response.ResponderID] = struct{}{}
+		core.adoptHigherTerm(response.Term)
+		return nil
+	}
+	if response.Term != core.hardState.Term {
+		return nil
+	}
+	if !response.Success {
+		if response.NextOffset != transfer.nextOffset {
+			return nil
+		}
+		core.quorumResponses[response.ResponderID] = struct{}{}
+		core.clearOutgoingSnapshot(response.ResponderID)
+		return nil
+	}
+	totalLength := uint64(len(transfer.state))
+	if response.NextOffset != transfer.activeEnd ||
+		(response.NextOffset <= transfer.nextOffset && !(totalLength == 0 && response.Done)) {
+		return nil
+	}
+	if response.Done != (response.NextOffset == totalLength) {
+		return nil
+	}
+	core.quorumResponses[response.ResponderID] = struct{}{}
+	transfer.nextOffset = response.NextOffset
+	progress := core.progress[response.ResponderID]
+	progress.SnapshotNextOffset = response.NextOffset
+	core.progress[response.ResponderID] = progress
+	if !response.Done {
+		return core.issueSnapshotChunk(response.ResponderID)
+	}
+
+	includedIndex := transfer.snapshot.Metadata.LastIncludedIndex
+	core.clearOutgoingSnapshot(response.ResponderID)
+	progress = core.progress[response.ResponderID]
+	if includedIndex > progress.MatchIndex {
+		progress.MatchIndex = includedIndex
+	}
+	nextIndex, ok := checkedNextIndex(progress.MatchIndex)
+	if !ok {
+		return ErrLogOverflow
+	}
+	progress.NextIndex = nextIndex
+	progress.SnapshotNeeded = false
+	core.progress[response.ResponderID] = progress
+	if err := core.advanceLeaderCommit(); err != nil {
+		return err
+	}
+	return core.issueAppend(response.ResponderID)
+}
+
+func (core *Core) clearOutgoingSnapshot(peerID uint16) {
+	delete(core.outgoingSnapshots, peerID)
+	progress, ok := core.progress[peerID]
+	if !ok {
+		return
+	}
+	progress.ActiveTransferID = TransferID{}
+	progress.ActiveSnapshotID = SnapshotID{}
+	progress.SnapshotNextOffset = 0
+	core.progress[peerID] = progress
 }
 
 func (core *Core) handleAppendRequest(request AppendEntriesRequest) error {
@@ -1124,6 +1479,7 @@ func saturatingTickAdd(now, interval uint64) uint64 {
 
 func (core *Core) adoptHigherTerm(term uint64) {
 	core.failPendingProposals(ErrProposalFailed)
+	core.cancelIncomingSnapshot()
 	core.hardState.Term = term
 	core.hardState.VotedFor = 0
 	core.role = RoleFollower
@@ -1132,6 +1488,7 @@ func (core *Core) adoptHigherTerm(term uint64) {
 	core.preVotes = nil
 	core.votes = nil
 	core.progress = nil
+	core.outgoingSnapshots = nil
 	core.quorumResponses = nil
 	if core.now > math.MaxUint64-core.electionTimeoutMin {
 		core.electionDeadline = math.MaxUint64

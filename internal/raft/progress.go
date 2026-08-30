@@ -12,6 +12,12 @@ type Progress struct {
 	ActiveGeneration RequestGeneration
 	// SnapshotNeeded reports that log replication cannot cross the compacted base.
 	SnapshotNeeded bool
+	// ActiveTransferID is the live peer-local snapshot transfer, or zero.
+	ActiveTransferID TransferID
+	// ActiveSnapshotID is the immutable snapshot bound to ActiveTransferID.
+	ActiveSnapshotID SnapshotID
+	// SnapshotNextOffset is the next unacknowledged byte in the active transfer.
+	SnapshotNextOffset uint64
 
 	activeMatchIndex uint64
 }
