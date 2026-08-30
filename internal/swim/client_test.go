@@ -423,9 +423,21 @@ type lostJoinAcceptedServerResult struct {
 
 func startLostJoinAcceptedServer(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, now time.Time) (config.Endpoint, <-chan lostJoinAcceptedServerResult) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	var listener net.Listener
+	for attempts := 0; attempts < 100; attempts++ {
+		candidate, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := candidate.Addr().(*net.TCPAddr).Port
+		if port > 2 && port <= 65529 {
+			listener = candidate
+			break
+		}
+		_ = candidate.Close()
+	}
+	if listener == nil {
+		t.Fatal("could not reserve a join server port with room for all service offsets")
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	address := listener.Addr().(*net.TCPAddr)
