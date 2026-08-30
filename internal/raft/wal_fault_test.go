@@ -5,11 +5,180 @@ package raft
 import (
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/aaditya/cs425mp3/internal/config"
 )
+
+func TestStorageStoresShareExactCanonicalBatchBounds(t *testing.T) {
+	identity, voters := testStorageIdentity(t, 1)
+	factories := []struct {
+		name string
+		open func(t *testing.T) StableStore
+	}{
+		{
+			name: "memory",
+			open: func(t *testing.T) StableStore {
+				store, err := NewMemoryStore(identity, voters)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return store
+			},
+		},
+		{
+			name: "file",
+			open: func(t *testing.T) StableStore {
+				store, err := OpenFileStore(t.TempDir(), identity, voters)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return store
+			},
+		},
+	}
+	cases := []struct {
+		name    string
+		batch   func() PersistenceBatch
+		wantErr bool
+	}{
+		{name: "command_exact", batch: func() PersistenceBatch { return commandBoundaryBatch(config.MaxRaftCommandBytes) }},
+		{name: "command_one_over", batch: func() PersistenceBatch { return commandBoundaryBatch(config.MaxRaftCommandBytes + 1) }, wantErr: true},
+		{name: "entry_count_exact", batch: func() PersistenceBatch { return entryCountBoundaryBatch(math.MaxUint16) }},
+		{name: "entry_count_one_over", batch: func() PersistenceBatch { return entryCountBoundaryBatch(math.MaxUint16 + 1) }, wantErr: true},
+		{name: "transaction_exact", batch: func() PersistenceBatch { return transactionBoundaryBatch(t, 0) }},
+		{name: "transaction_one_over", batch: func() PersistenceBatch { return transactionBoundaryBatch(t, 1) }, wantErr: true},
+	}
+	for _, factory := range factories {
+		for _, test := range cases {
+			t.Run(factory.name+"_"+test.name, func(t *testing.T) {
+				store := factory.open(t)
+				defer store.Close()
+				err := store.Persist(test.batch())
+				if test.wantErr {
+					if !errors.Is(err, ErrInvalidStorageState) {
+						t.Fatalf("Persist error = %v, want ErrInvalidStorageState", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("Persist exact boundary: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestStorageStoresRejectHostileBatchesWithoutLargeOwnershipClone(t *testing.T) {
+	identity, voters := testStorageIdentity(t, 1)
+	oversized := []struct {
+		name  string
+		batch PersistenceBatch
+	}{
+		{name: "command", batch: commandBoundaryBatch(config.MaxRaftCommandBytes + 1)},
+		{name: "entry_count", batch: entryCountBoundaryBatch(math.MaxUint16 + 1)},
+		{name: "transaction", batch: transactionBoundaryBatch(t, 1)},
+	}
+	factories := []struct {
+		name string
+		open func(t *testing.T) StableStore
+	}{
+		{name: "memory", open: func(t *testing.T) StableStore {
+			store, err := NewMemoryStore(identity, voters)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return store
+		}},
+		{name: "file", open: func(t *testing.T) StableStore {
+			store, err := OpenFileStore(t.TempDir(), identity, voters)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return store
+		}},
+	}
+	for _, factory := range factories {
+		for _, test := range oversized {
+			t.Run(factory.name+"_"+test.name, func(t *testing.T) {
+				store := factory.open(t)
+				defer store.Close()
+				if err := store.Persist(test.batch); !errors.Is(err, ErrInvalidStorageState) {
+					t.Fatalf("Persist error = %v, want ErrInvalidStorageState", err)
+				}
+				result := testing.Benchmark(func(benchmark *testing.B) {
+					for iteration := 0; iteration < benchmark.N; iteration++ {
+						_ = store.Persist(test.batch)
+					}
+				})
+				if got := result.AllocedBytesPerOp(); got > 64<<10 {
+					t.Fatalf("rejected batch allocated %d bytes/op, want <= 65536 before ownership clone", got)
+				}
+			})
+		}
+	}
+}
+
+func commandBoundaryBatch(commandBytes uint64) PersistenceBatch {
+	return PersistenceBatch{
+		HardState:   hardStatePointer(HardState{Term: 1}),
+		ReplaceFrom: 1,
+		Entries: []Entry{{
+			Index:   1,
+			Term:    1,
+			Kind:    EntryCommand,
+			command: make([]byte, int(commandBytes)),
+		}},
+	}
+}
+
+func entryCountBoundaryBatch(count int) PersistenceBatch {
+	entries := make([]Entry, count)
+	for index := range entries {
+		entries[index] = Entry{Index: uint64(index + 1), Term: 1, Kind: EntryNoOp}
+	}
+	return PersistenceBatch{
+		HardState:   hardStatePointer(HardState{Term: 1}),
+		ReplaceFrom: 1,
+		Entries:     entries,
+	}
+}
+
+func transactionBoundaryBatch(t *testing.T, extraBytes uint64) PersistenceBatch {
+	t.Helper()
+	// Independently derived v1 framing with every optional effect present:
+	// begin/commit=64, snapshot=48, truncate=36, applied=36,
+	// hard-state=46, entries fixed=30, and each of eight entries
+	// contributes 21 metadata bytes.
+	const entries = 8
+	fixedBytes := uint64(64 + 48 + 36 + 36 + 46 + 30 + 21*entries)
+	commandBytes := MaxWALTransactionBytes - fixedBytes + extraBytes
+	result := make([]Entry, entries)
+	for index := range result {
+		length := commandBytes
+		if length > config.MaxRaftCommandBytes {
+			length = config.MaxRaftCommandBytes
+		}
+		result[index] = Entry{Index: uint64(index + 1), Term: 1, Kind: EntryCommand, command: make([]byte, int(length))}
+		commandBytes -= length
+	}
+	if commandBytes != 0 {
+		t.Fatalf("independent transaction fixture left %d command bytes undistributed", commandBytes)
+	}
+	applied := uint64(0)
+	snapshot := SnapshotMetadata{}
+	return PersistenceBatch{
+		HardState:    hardStatePointer(HardState{Term: 1}),
+		ReplaceFrom:  1,
+		Entries:      result,
+		SnapshotBase: &snapshot,
+		AppliedIndex: &applied,
+	}
+}
 
 func TestWALWriteAllHandlesRepeatedShortWritesAndRejectsZeroProgress(t *testing.T) {
 	content := []byte("abcdef")
@@ -275,7 +444,7 @@ func TestIdentityRenameAndDirectorySyncFailuresAreFatalAndRecoverable(t *testing
 		{
 			name: "rename",
 			alter: func(operations *fileStoreOperations, _ string, injected error) {
-				operations.rename = func(string, string) error { return injected }
+				operations.rootRename = func(*os.Root, string, string) error { return injected }
 			},
 		},
 		{

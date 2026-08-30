@@ -3,6 +3,8 @@ package raft
 import (
 	"fmt"
 	"math"
+
+	"github.com/aaditya/cs425mp3/internal/config"
 )
 
 // StableStore durably owns all safety-critical Raft state for one voter.
@@ -121,14 +123,78 @@ func ValidateRecoveredState(state RecoveredState, expected StorageIdentity, vote
 	return nil
 }
 
-func applyPersistenceBatch(current RecoveredState, batch PersistenceBatch, expected StorageIdentity, voters VoterSet) (RecoveredState, error) {
-	batch = batch.Clone()
+func validatePersistenceBatchBounds(batch PersistenceBatch) error {
 	if batch.HardState == nil && batch.ReplaceFrom == 0 && len(batch.Entries) == 0 && batch.SnapshotBase == nil && batch.AppliedIndex == nil {
-		return RecoveredState{}, fmt.Errorf("%w: empty persistence batch", ErrInvalidStorageState)
+		return fmt.Errorf("%w: empty persistence batch", ErrInvalidStorageState)
 	}
 	if batch.ReplaceFrom == 0 && len(batch.Entries) != 0 {
-		return RecoveredState{}, fmt.Errorf("%w: replacement entries require ReplaceFrom", ErrInvalidStorageState)
+		return fmt.Errorf("%w: replacement entries require ReplaceFrom", ErrInvalidStorageState)
 	}
+	entryCount := uint64(len(batch.Entries))
+	if entryCount > math.MaxUint16 {
+		return fmt.Errorf("%w: WAL entry count %d exceeds %d", ErrInvalidStorageState, entryCount, uint64(math.MaxUint16))
+	}
+
+	var entriesPayload uint64
+	if entryCount != 0 {
+		entriesPayload = 10
+		for _, entry := range batch.Entries {
+			commandLength := uint64(len(entry.command))
+			if commandLength > config.MaxRaftCommandBytes {
+				return fmt.Errorf("%w: command length %d exceeds %d", ErrInvalidStorageState, commandLength, config.MaxRaftCommandBytes)
+			}
+			addition := uint64(minimumWALEntryBytes) + commandLength
+			var ok bool
+			entriesPayload, ok = checkedBoundedAdd(entriesPayload, addition, MaxWALRecordPayloadBytes)
+			if !ok {
+				return fmt.Errorf("%w: entries record exceeds %d bytes", ErrInvalidStorageState, MaxWALRecordPayloadBytes)
+			}
+		}
+	}
+
+	// Every transaction has begin and commit records. Each record contributes
+	// the exact 16-byte header and 4-byte checksum around its canonical payload.
+	total := uint64(2 * (walRecordHeaderBytes + boundaryPayloadBytes + walRecordChecksumBytes))
+	addRecord := func(payloadBytes uint64) bool {
+		addition := uint64(walRecordHeaderBytes+walRecordChecksumBytes) + payloadBytes
+		var ok bool
+		total, ok = checkedBoundedAdd(total, addition, MaxWALTransactionBytes)
+		return ok
+	}
+	if batch.SnapshotBase != nil && !addRecord(snapshotPayloadBytes) {
+		return fmt.Errorf("%w: WAL transaction exceeds %d bytes", ErrInvalidStorageState, MaxWALTransactionBytes)
+	}
+	if batch.ReplaceFrom != 0 && !addRecord(truncatePayloadBytes) {
+		return fmt.Errorf("%w: WAL transaction exceeds %d bytes", ErrInvalidStorageState, MaxWALTransactionBytes)
+	}
+	if entryCount != 0 && !addRecord(entriesPayload) {
+		return fmt.Errorf("%w: WAL transaction exceeds %d bytes", ErrInvalidStorageState, MaxWALTransactionBytes)
+	}
+	if batch.AppliedIndex != nil && !addRecord(appliedPayloadBytes) {
+		return fmt.Errorf("%w: WAL transaction exceeds %d bytes", ErrInvalidStorageState, MaxWALTransactionBytes)
+	}
+	if batch.HardState != nil && !addRecord(hardStatePayloadBytes) {
+		return fmt.Errorf("%w: WAL transaction exceeds %d bytes", ErrInvalidStorageState, MaxWALTransactionBytes)
+	}
+	return nil
+}
+
+func checkedBoundedAdd(current, addition, maximum uint64) (uint64, bool) {
+	if current > maximum || addition > maximum-current {
+		return 0, false
+	}
+	return current + addition, true
+}
+
+func applyPersistenceBatch(current RecoveredState, batch PersistenceBatch, expected StorageIdentity, voters VoterSet) (RecoveredState, error) {
+	if err := validatePersistenceBatchBounds(batch); err != nil {
+		return RecoveredState{}, err
+	}
+	return applyValidatedPersistenceBatch(current, batch, expected, voters)
+}
+
+func applyValidatedPersistenceBatch(current RecoveredState, batch PersistenceBatch, expected StorageIdentity, voters VoterSet) (RecoveredState, error) {
+	batch = batch.Clone()
 	prospective := current.Clone()
 	if batch.SnapshotBase != nil {
 		base := *batch.SnapshotBase

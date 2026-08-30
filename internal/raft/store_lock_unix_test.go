@@ -32,6 +32,106 @@ func TestStorageFileStoreInitializesExactOwnerOnlyLayout(t *testing.T) {
 	}
 }
 
+func TestStorageDirectoryReplacementAtOpenNeverTouchesUnlockedReplacement(t *testing.T) {
+	directory := t.TempDir()
+	identity, voters := testStorageIdentity(t, 1)
+	raftDirectory := filepath.Join(directory, RaftStorageDirectoryName)
+	movedDirectory := filepath.Join(directory, RaftStorageDirectoryName+"-moved")
+	operations := defaultFileStoreOperations()
+	originalOpenFile := operations.openFile
+	swapped := false
+	operations.openFile = func(path string, flags int, mode os.FileMode) (*os.File, error) {
+		file, err := originalOpenFile(path, flags, mode)
+		if err != nil || swapped || path != raftDirectory || flags&syscall.O_DIRECTORY == 0 {
+			return file, err
+		}
+		if err := os.Rename(raftDirectory, movedDirectory); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		if err := os.Mkdir(raftDirectory, 0o700); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		swapped = true
+		return file, nil
+	}
+	store, _ := openFileStore(directory, identity, voters, operations)
+	if store != nil {
+		defer store.Close()
+	}
+	if !swapped {
+		t.Fatal("directory replacement seam did not run")
+	}
+	entries, err := os.ReadDir(raftDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("unlocked replacement directory was touched: %v", names)
+	}
+}
+
+func TestStorageDirectoryReplacementAfterLockStaysOnAnchoredInode(t *testing.T) {
+	directory := t.TempDir()
+	identity, voters := testStorageIdentity(t, 1)
+	raftDirectory := filepath.Join(directory, RaftStorageDirectoryName)
+	movedDirectory := filepath.Join(directory, RaftStorageDirectoryName+"-moved")
+	operations := defaultFileStoreOperations()
+	originalFlock := operations.flock
+	swapped := false
+	operations.flock = func(fd int, operation int) error {
+		if err := originalFlock(fd, operation); err != nil {
+			return err
+		}
+		if swapped || operation&syscall.LOCK_EX == 0 {
+			return nil
+		}
+		if err := os.Rename(raftDirectory, movedDirectory); err != nil {
+			return err
+		}
+		if err := os.Mkdir(raftDirectory, 0o700); err != nil {
+			return err
+		}
+		swapped = true
+		return nil
+	}
+	store, err := openFileStore(directory, identity, voters, operations)
+	if err != nil {
+		t.Fatalf("open anchored store after path replacement: %v", err)
+	}
+	defer store.Close()
+	if !swapped {
+		t.Fatal("post-lock directory replacement seam did not run")
+	}
+	if err := store.Persist(PersistenceBatch{HardState: hardStatePointer(HardState{Term: 1})}); err != nil {
+		t.Fatalf("persist through anchored WAL: %v", err)
+	}
+	replacementEntries, err := os.ReadDir(raftDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replacementEntries) != 0 {
+		t.Fatalf("unlocked replacement directory was touched after lock: %v", replacementEntries)
+	}
+	for _, name := range []string{RaftLockFilename, RaftIdentityFilename, RaftWALFilename} {
+		if _, err := os.Lstat(filepath.Join(movedDirectory, name)); err != nil {
+			t.Fatalf("anchored directory missing %s: %v", name, err)
+		}
+	}
+	walInfo, err := os.Stat(filepath.Join(movedDirectory, RaftWALFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walInfo.Size() == 0 {
+		t.Fatal("persist did not append to anchored WAL")
+	}
+}
+
 func TestLockRejectsLifetimeDoubleOpenAndAllowsReopenAfterClose(t *testing.T) {
 	directory := t.TempDir()
 	identity, voters := testStorageIdentity(t, 1)

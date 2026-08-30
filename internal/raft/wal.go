@@ -86,6 +86,9 @@ func encodeWALTransaction(transactionID uint64, batch PersistenceBatch) ([]byte,
 	if transactionID == 0 {
 		return nil, fmt.Errorf("%w: zero WAL transaction ID", ErrInvalidStorageState)
 	}
+	if err := validatePersistenceBatchBounds(batch); err != nil {
+		return nil, err
+	}
 	batch = batch.Clone()
 	flags := flagsForBatch(batch)
 	count := uint8(bits.OnesCount8(uint8(flags)))

@@ -4,7 +4,9 @@ package raft
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -35,25 +37,41 @@ const (
 var identityMagic = [4]byte{'R', 'I', 'D', '1'}
 
 type fileStoreOperations struct {
-	mkdir      func(string, os.FileMode) error
-	readDir    func(string) ([]os.DirEntry, error)
-	openFile   func(string, int, os.FileMode) (*os.File, error)
-	createTemp func(string, string) (*os.File, error)
-	rename     func(string, string) error
-	write      func(*os.File, []byte) (int, error)
-	sync       func(*os.File) error
-	truncate   func(*os.File, int64) error
-	close      func(*os.File) error
-	flock      func(int, int) error
+	mkdir        func(string, os.FileMode) error
+	lstat        func(string) (os.FileInfo, error)
+	openFile     func(string, int, os.FileMode) (*os.File, error)
+	openRoot     func(string) (*os.Root, error)
+	rootLstat    func(*os.Root, string) (os.FileInfo, error)
+	rootOpenFile func(*os.Root, string, int, os.FileMode) (*os.File, error)
+	rootRename   func(*os.Root, string, string) error
+	rootRemove   func(*os.Root, string) error
+	closeRoot    func(*os.Root) error
+	random       func([]byte) (int, error)
+	write        func(*os.File, []byte) (int, error)
+	sync         func(*os.File) error
+	truncate     func(*os.File, int64) error
+	close        func(*os.File) error
+	flock        func(int, int) error
 }
 
 func defaultFileStoreOperations() fileStoreOperations {
 	return fileStoreOperations{
-		mkdir:      os.Mkdir,
-		readDir:    os.ReadDir,
-		openFile:   os.OpenFile,
-		createTemp: os.CreateTemp,
-		rename:     os.Rename,
+		mkdir:    os.Mkdir,
+		lstat:    os.Lstat,
+		openFile: os.OpenFile,
+		openRoot: os.OpenRoot,
+		rootLstat: func(root *os.Root, name string) (os.FileInfo, error) {
+			return root.Lstat(name)
+		},
+		rootOpenFile: func(root *os.Root, name string, flags int, mode os.FileMode) (*os.File, error) {
+			return root.OpenFile(name, flags, mode)
+		},
+		rootRename: func(root *os.Root, oldName, newName string) error {
+			return root.Rename(oldName, newName)
+		},
+		rootRemove: func(root *os.Root, name string) error { return root.Remove(name) },
+		closeRoot:  func(root *os.Root) error { return root.Close() },
+		random:     rand.Read,
 		write: func(file *os.File, content []byte) (int, error) {
 			return file.Write(content)
 		},
@@ -73,6 +91,7 @@ type FileStore struct {
 	voters        VoterSet
 	directoryPath string
 	directory     *os.File
+	root          *os.Root
 	lock          *os.File
 	lockHeld      bool
 	wal           *os.File
@@ -141,16 +160,50 @@ func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet,
 	if err := validateOpenedDirectory(directory, directoryPath); err != nil {
 		return nil, err
 	}
+	directoryInfo, err := directory.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat anchored raft directory %q: %w", directoryPath, err)
+	}
+	pathInfo, err := operations.lstat(directoryPath)
+	if err != nil {
+		return nil, fmt.Errorf("lstat raft directory %q after open: %w", directoryPath, err)
+	}
+	if err := validateDirectoryInfo(pathInfo, directoryPath); err != nil {
+		return nil, err
+	}
+	if !os.SameFile(directoryInfo, pathInfo) {
+		return nil, fmt.Errorf("%w: raft directory %q changed while opening", ErrStorageCorrupt, directoryPath)
+	}
+	root, err := operations.openRoot(directoryPath)
+	if err != nil {
+		return nil, fmt.Errorf("anchor raft directory %q: %w", directoryPath, err)
+	}
+	store.root = root
+	rootDirectory, err := operations.rootOpenFile(root, ".", os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open anchored raft directory %q: %w", directoryPath, err)
+	}
+	rootDirectoryInfo, statErr := rootDirectory.Stat()
+	closeErr := operations.close(rootDirectory)
+	if statErr != nil {
+		return nil, fmt.Errorf("stat anchored raft root %q: %w", directoryPath, statErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close anchored raft root %q: %w", directoryPath, closeErr)
+	}
+	if err := validateDirectoryInfo(rootDirectoryInfo, directoryPath); err != nil {
+		return nil, err
+	}
+	if !os.SameFile(directoryInfo, rootDirectoryInfo) {
+		return nil, fmt.Errorf("%w: raft directory %q changed before anchoring", ErrStorageCorrupt, directoryPath)
+	}
 
 	lockPath := filepath.Join(directoryPath, RaftLockFilename)
-	lock, err := operations.openFile(lockPath, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	lock, _, err := store.openAnchoredRegularFile(RaftLockFilename, os.O_RDWR, true)
 	if err != nil {
 		return nil, fmt.Errorf("open raft lock %q: %w", lockPath, err)
 	}
 	store.lock = lock
-	if err := validateOpenedRegularFile(lock, lockPath); err != nil {
-		return nil, err
-	}
 	if err := operations.flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return nil, fmt.Errorf("%w: %q", ErrStorageLocked, directoryPath)
@@ -200,10 +253,13 @@ func (store *FileStore) Persist(batch PersistenceBatch) error {
 	if store.poisoned {
 		return fmt.Errorf("%w: persistence outcome requires reopen", ErrStorageCorrupt)
 	}
+	if err := validatePersistenceBatchBounds(batch); err != nil {
+		return err
+	}
 	if store.nextTxnID == 0 {
 		return fmt.Errorf("%w: WAL transaction ID exhausted", ErrInvalidStorageState)
 	}
-	prospective, err := applyPersistenceBatch(store.state, batch, store.identity, store.voters)
+	prospective, err := applyValidatedPersistenceBatch(store.state, batch, store.identity, store.voters)
 	if err != nil {
 		return err
 	}
@@ -263,6 +319,12 @@ func (store *FileStore) releaseOpenResources() error {
 		}
 		store.lock = nil
 	}
+	if store.root != nil {
+		if err := store.ops.closeRoot(store.root); err != nil {
+			failures = append(failures, fmt.Errorf("close anchored raft root: %w", err))
+		}
+		store.root = nil
+	}
 	if store.directory != nil {
 		if err := store.ops.close(store.directory); err != nil {
 			failures = append(failures, fmt.Errorf("close raft directory: %w", err))
@@ -273,20 +335,27 @@ func (store *FileStore) releaseOpenResources() error {
 }
 
 func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
-	entries, err := store.ops.readDir(store.directoryPath)
+	directory, err := store.ops.rootOpenFile(store.root, ".", os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return fmt.Errorf("list raft directory %q: %w", store.directoryPath, err)
+		return fmt.Errorf("open anchored raft directory for enumeration: %w", err)
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := store.ops.close(directory)
+	if readErr != nil {
+		return fmt.Errorf("list raft directory %q: %w", store.directoryPath, readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close raft directory enumeration %q: %w", store.directoryPath, closeErr)
 	}
 	names := make(map[string]bool, len(entries))
 	for _, entry := range entries {
 		names[entry.Name()] = true
 	}
-	identityPath := filepath.Join(store.directoryPath, RaftIdentityFilename)
 	if !names[RaftIdentityFilename] {
 		if len(names) != 1 || !names[RaftLockFilename] {
 			return fmt.Errorf("%w: missing identity in nonempty raft directory", ErrStorageCorrupt)
 		}
-		return store.createIdentity(identityPath)
+		return store.createIdentity()
 	}
 	for name := range names {
 		if name != RaftLockFilename && name != RaftIdentityFilename && name != RaftWALFilename && name != RaftSnapshotFilename {
@@ -296,7 +365,8 @@ func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
 	if names[RaftSnapshotFilename] {
 		return fmt.Errorf("%w: snapshot bytes are unsupported before Task 9", ErrStorageCorrupt)
 	}
-	file, err := store.ops.openFile(identityPath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	identityPath := filepath.Join(store.directoryPath, RaftIdentityFilename)
+	file, _, err := store.openAnchoredRegularFile(RaftIdentityFilename, os.O_RDONLY, false)
 	if err != nil {
 		return fmt.Errorf("open raft identity %q: %w", identityPath, err)
 	}
@@ -305,9 +375,6 @@ func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
 			resultErr = errors.Join(resultErr, store.ops.close(file))
 		}
 	}()
-	if err := validateOpenedRegularFile(file, identityPath); err != nil {
-		return err
-	}
 	info, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("stat raft identity %q: %w", identityPath, err)
@@ -334,22 +401,29 @@ func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
 	return nil
 }
 
-func (store *FileStore) createIdentity(identityPath string) (resultErr error) {
-	temporary, err := store.ops.createTemp(store.directoryPath, ".identity.tmp-")
+func (store *FileStore) createIdentity() (resultErr error) {
+	var suffix [16]byte
+	if read, err := store.ops.random(suffix[:]); err != nil || read != len(suffix) {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return fmt.Errorf("generate temporary raft identity name: %w", err)
+	}
+	temporaryName := ".identity.tmp-" + hex.EncodeToString(suffix[:])
+	temporary, err := store.ops.rootOpenFile(store.root, temporaryName, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return fmt.Errorf("create temporary raft identity: %w", err)
 	}
-	temporaryPath := temporary.Name()
 	removeTemporary := true
 	defer func() {
 		if temporary != nil {
 			resultErr = errors.Join(resultErr, store.ops.close(temporary))
 		}
 		if removeTemporary {
-			_ = os.Remove(temporaryPath)
+			_ = store.ops.rootRemove(store.root, temporaryName)
 		}
 	}()
-	if err := validateOpenedRegularFile(temporary, temporaryPath); err != nil {
+	if err := validateOpenedRegularFile(temporary, temporaryName); err != nil {
 		return err
 	}
 	if err := writeAll(encodeStorageIdentity(store.identity), func(content []byte) (int, error) { return store.ops.write(temporary, content) }); err != nil {
@@ -363,7 +437,7 @@ func (store *FileStore) createIdentity(identityPath string) (resultErr error) {
 		return fmt.Errorf("close temporary raft identity: %w", err)
 	}
 	temporary = nil
-	if err := store.ops.rename(temporaryPath, identityPath); err != nil {
+	if err := store.ops.rootRename(store.root, temporaryName, RaftIdentityFilename); err != nil {
 		return fmt.Errorf("install raft identity: %w", err)
 	}
 	removeTemporary = false
@@ -375,16 +449,9 @@ func (store *FileStore) createIdentity(identityPath string) (resultErr error) {
 
 func (store *FileStore) openOrCreateWAL() (*os.File, error) {
 	walPath := filepath.Join(store.directoryPath, RaftWALFilename)
-	file, err := store.ops.openFile(walPath, os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if errors.Is(err, os.ErrNotExist) {
-		file, err = store.ops.openFile(walPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
-	}
+	file, _, err := store.openAnchoredRegularFile(RaftWALFilename, os.O_RDWR, true)
 	if err != nil {
 		return nil, fmt.Errorf("open raft WAL %q: %w", walPath, err)
-	}
-	if err := validateOpenedRegularFile(file, walPath); err != nil {
-		_ = store.ops.close(file)
-		return nil, err
 	}
 	// Repeat both creation barriers on every open. A prior attempt can observe
 	// the created path after either sync failed, so existence alone is not proof
@@ -398,6 +465,36 @@ func (store *FileStore) openOrCreateWAL() (*os.File, error) {
 		return nil, fmt.Errorf("sync raft directory before WAL recovery: %w", err)
 	}
 	return file, nil
+}
+
+func (store *FileStore) openAnchoredRegularFile(name string, flags int, allowCreate bool) (*os.File, bool, error) {
+	path := filepath.Join(store.directoryPath, name)
+	before, err := store.ops.rootLstat(store.root, name)
+	created := false
+	if err != nil {
+		if !allowCreate || !errors.Is(err, os.ErrNotExist) {
+			return nil, false, err
+		}
+		created = true
+		flags |= os.O_CREATE | os.O_EXCL
+	} else if err := validateRegularFileInfo(before, path); err != nil {
+		return nil, false, err
+	}
+	file, err := store.ops.rootOpenFile(store.root, name, flags|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return nil, false, err
+	}
+	opened, err := file.Stat()
+	if err == nil {
+		err = validateRegularFileInfo(opened, path)
+	}
+	if err == nil && !created && !os.SameFile(before, opened) {
+		err = fmt.Errorf("%w: raft path %q changed while opening", ErrStorageCorrupt, path)
+	}
+	if err != nil {
+		return nil, false, errors.Join(err, store.ops.close(file))
+	}
+	return file, created, nil
 }
 
 func (store *FileStore) recoverWAL() (RecoveredState, uint64, error) {
@@ -643,6 +740,10 @@ func validateOpenedDirectory(file *os.File, path string) error {
 	if err != nil {
 		return fmt.Errorf("stat opened raft directory %q: %w", path, err)
 	}
+	return validateDirectoryInfo(info, path)
+}
+
+func validateDirectoryInfo(info os.FileInfo, path string) error {
 	if !info.IsDir() || info.Mode().Perm() != 0o700 {
 		return fmt.Errorf("%w: raft directory %q must be a real 0700 directory", ErrStorageCorrupt, path)
 	}
@@ -654,6 +755,10 @@ func validateOpenedRegularFile(file *os.File, path string) error {
 	if err != nil {
 		return fmt.Errorf("stat opened raft path %q: %w", path, err)
 	}
+	return validateRegularFileInfo(info, path)
+}
+
+func validateRegularFileInfo(info os.FileInfo, path string) error {
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 		return fmt.Errorf("%w: raft path %q must be a real 0600 regular file", ErrStorageCorrupt, path)
 	}

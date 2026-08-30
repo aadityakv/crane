@@ -72,10 +72,13 @@ func (store *MemoryStore) Persist(batch PersistenceBatch) error {
 	if store.closed {
 		return ErrStoreClosed
 	}
+	if err := validatePersistenceBatchBounds(batch); err != nil {
+		return err
+	}
 	if err := store.takeFault(StorageOperationPersist); err != nil {
 		return fmt.Errorf("persist memory raft store: %w", err)
 	}
-	prospective, err := applyPersistenceBatch(store.state, batch, store.identity, store.voters)
+	prospective, err := applyValidatedPersistenceBatch(store.state, batch, store.identity, store.voters)
 	if err != nil {
 		return err
 	}
