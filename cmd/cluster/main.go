@@ -187,6 +187,8 @@ func runClusterProcesses(ctx context.Context, nodeBinary string, configPaths []s
 				} else {
 					beginShutdown(syscall.SIGTERM, fmt.Errorf("node %d exited: %w", result.nodeID, result.err))
 				}
+			} else if result.err != nil {
+				cause = errors.Join(cause, fmt.Errorf("node %d shutdown: %w", result.nodeID, result.err))
 			}
 		case sig, ok := <-signalStream:
 			if !ok {
@@ -269,9 +271,21 @@ func waitForSeedReadiness(ctx context.Context, seed *clusterChild, children []*c
 }
 
 func waitClusterChild(child *clusterChild, results chan<- clusterChildResult) {
-	err := child.cmd.Wait()
-	err = errors.Join(err, child.stdout.Flush(), child.stderr.Flush())
+	waitError := child.cmd.Wait()
+	if childExitedBySignal(waitError) {
+		waitError = nil
+	}
+	err := errors.Join(waitError, child.stdout.Flush(), child.stderr.Flush())
 	results <- clusterChildResult{nodeID: child.nodeID, err: err}
+}
+
+func childExitedBySignal(err error) bool {
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) {
+		return false
+	}
+	status, ok := exitError.ProcessState.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled()
 }
 
 func drainChildren(children []*clusterChild, results <-chan clusterChildResult) error {

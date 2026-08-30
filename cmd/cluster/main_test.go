@@ -334,6 +334,43 @@ func TestRunClusterProcessesSecondSignalEscalatesGracefulShutdown(t *testing.T) 
 	}
 }
 
+func TestRunClusterProcessesPreservesChildFailureDuringRequestedShutdown(t *testing.T) {
+	nodeBinary := writeClusterHelperWrapper(t)
+	configDirectory := t.TempDir()
+	configPaths := make([]string, 3)
+	for index := range configPaths {
+		configPaths[index] = filepath.Join(configDirectory, fmt.Sprintf("node-%d.json", index+1))
+		if err := os.WriteFile(configPaths[index], []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(configPaths[2]+".stay-alive", []byte("stay\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPaths[1]+".fail-on-stop", []byte("fail\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	signals := make(chan os.Signal, 1)
+	result := make(chan error, 1)
+	go func() {
+		result <- runClusterProcesses(ctx, nodeBinary, configPaths, signals, os.Stderr, os.Stderr)
+	}()
+	for _, configPath := range configPaths {
+		waitForFile(t, ctx, configPath+".started")
+	}
+	signals <- syscall.SIGTERM
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "node 2 shutdown") {
+			t.Fatalf("runClusterProcesses error = %v, want node 2 shutdown failure", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for requested cluster shutdown")
+	}
+}
+
 func TestDrainChildrenReapsChildAfterGraceExpires(t *testing.T) {
 	nodeBinary := writeClusterHelperWrapper(t)
 	configPath := filepath.Join(t.TempDir(), "node-1.json")
@@ -433,6 +470,9 @@ func TestClusterChildHelper(t *testing.T) {
 	case <-signals:
 		if err := os.WriteFile(configPath+".term-received", []byte("term\n"), 0o600); err != nil {
 			os.Exit(94)
+		}
+		if fileExists(configPath + ".fail-on-stop") {
+			os.Exit(24)
 		}
 		if fileExists(configPath + ".delay-stop") {
 			released, _ := waitForHelperFile(configPath+".release-stop", 5*time.Second, signals)
