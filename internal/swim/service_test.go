@@ -478,7 +478,7 @@ func TestServiceInvalidDatagramsCannotPoisonReplayCapacity(t *testing.T) {
 	}
 }
 
-func TestServiceRejectsZeroIncarnationBeforeReplayAcceptance(t *testing.T) {
+func TestServiceRejectsZeroIncarnationWithoutConsumingAcceptedReplayCapacity(t *testing.T) {
 	now := time.Unix(2070, 0)
 	service, peer, source, authenticator := newDatagramDecoderService(t, now, 1)
 	clusterID := decodedTestClusterID(t, testClusterID)
@@ -491,9 +491,9 @@ func TestServiceRejectsZeroIncarnationBeforeReplayAcceptance(t *testing.T) {
 
 	valid := poisoned
 	valid.Incarnation = 1
-	validFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, requestByte, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: valid, ReporterID: peer.NodeID}}}))
+	validFrame := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, requestByte+1, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: valid, ReporterID: peer.NodeID}}}))
 	if _, ok := service.decodeDatagram(transport.Packet{From: source, Data: validFrame}); !ok {
-		t.Fatal("zero-incarnation update consumed the legitimate frame's replay ID")
+		t.Fatal("zero-incarnation update consumed accepted replay capacity")
 	}
 }
 
@@ -808,7 +808,7 @@ func TestServiceStateDependentACKsCannotPoisonReplayCapacity(t *testing.T) {
 				t.Fatalf("uncorrelated %s canceled the valid probe", test.name)
 			}
 
-			validFrame := encodeSimulationDatagram(t, authenticator, now, sender.NodeID, 100, test.messageType, test.message(validSequence, target))
+			validFrame := encodeSimulationDatagram(t, authenticator, now, sender.NodeID, 10_000, test.messageType, test.message(validSequence, target))
 			validEvent, ok := service.decodeDatagram(transport.Packet{From: source, Data: validFrame})
 			if !ok {
 				t.Fatalf("valid correlated %s was poisoned out of replay capacity", test.name)
@@ -821,17 +821,85 @@ func TestServiceStateDependentACKsCannotPoisonReplayCapacity(t *testing.T) {
 			}
 
 			test.install(engine, sender, target, validSequence)
-			duplicateEvent, ok := service.decodeDatagram(transport.Packet{From: source, Data: validFrame})
-			if !ok {
-				t.Fatalf("duplicate %s did not reach owner replay validation", test.name)
-			}
-			if err := loop.handleDatagram(duplicateEvent); err != nil {
-				t.Fatal(err)
+			if _, ok := service.decodeDatagram(transport.Packet{From: source, Data: validFrame}); ok {
+				t.Fatalf("duplicate %s passed reader replay preflight", test.name)
 			}
 			if _, exists := engine.activeProbes[validSequence]; !exists {
 				t.Fatalf("duplicate valid %s mutated probe state", test.name)
 			}
 		})
+	}
+}
+
+func TestServiceReplayPreflightSkipsGobForStaleAndRepeatedInvalidDatagrams(t *testing.T) {
+	now := time.Unix(2275, 0)
+	service, peer, source, authenticator := newDatagramDecoderService(t, now, 1)
+	decodeCalls := 0
+	decoder := func(payload []byte, destination any) error {
+		decodeCalls++
+		return wire.DecodeGob(payload, destination)
+	}
+
+	staleAt := now.Add(-time.Duration(service.options.Config.Timing.ReplayWindow))
+	stale := encodeSimulationDatagram(t, authenticator, staleAt, peer.NodeID, 500, wire.MessageSWIMGossip, GossipMessage{})
+	if _, accepted := service.decodeDatagramContextWithDecoder(context.Background(), transport.Packet{From: source, Data: stale}, decoder); accepted {
+		t.Fatal("stale datagram passed replay preflight")
+	}
+	if decodeCalls != 0 {
+		t.Fatalf("stale datagram gob decodes = %d, want 0", decodeCalls)
+	}
+
+	freshInvalid := encodeSimulationDatagram(t, authenticator, now, peer.NodeID, 501, wire.MessageSWIMGossip, GossipMessage{})
+	rejectingDecoder := func([]byte, any) error {
+		decodeCalls++
+		return errors.New("injected semantic failure")
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, accepted := service.decodeDatagramContextWithDecoder(context.Background(), transport.Packet{From: source, Data: freshInvalid}, rejectingDecoder); accepted {
+			t.Fatalf("invalid datagram attempt %d was accepted", attempt+1)
+		}
+	}
+	if decodeCalls != 1 {
+		t.Fatalf("repeated invalid datagram gob decodes = %d, want 1", decodeCalls)
+	}
+
+	freshValid := encodeSimulationDatagram(t, authenticator, now, peer.NodeID, 502, wire.MessageSWIMGossip, GossipMessage{})
+	if _, accepted := service.decodeDatagramContextWithDecoder(context.Background(), transport.Packet{From: source, Data: freshValid}, decoder); !accepted {
+		t.Fatal("separately cached invalid ID consumed valid replay capacity")
+	}
+}
+
+func TestTCPReplayPreflightPrecedesGobAndCachesInvalidIDs(t *testing.T) {
+	now := time.Unix(2280, 0)
+	service, _, _, _ := newDatagramDecoderService(t, now, 2)
+	request := func(requestID wire.RequestID, timestamp time.Time) ProtocolErrorMessage {
+		frame := tcpServiceTestFrameWithPayload(service.clusterID, 2, requestID, timestamp, wire.MessageSWIMJoinRequest, []byte("not-gob"))
+		serverConnection, clientConnection := net.Pipe()
+		serverStream := wire.NewTCPFrameStream(serverConnection, service.options.Authenticator, service.limits, time.Second)
+		clientStream := wire.NewTCPFrameStream(clientConnection, service.options.Authenticator, service.limits, time.Second)
+		defer serverStream.Close()
+		defer clientStream.Close()
+		handled := make(chan struct{})
+		go func() {
+			service.handleTCPJoin(context.Background(), serverStream, frame)
+			close(handled)
+		}()
+		response := decodeServiceProtocolError(t, mustReadServiceFrame(t, clientStream))
+		<-handled
+		return response
+	}
+
+	stale := request(wire.RequestID{61}, now.Add(-time.Duration(service.options.Config.Timing.ReplayWindow)))
+	if stale.Code != protocolErrorReplay {
+		t.Fatalf("stale malformed request error = %#v, want replay preflight", stale)
+	}
+	first := request(wire.RequestID{62}, now)
+	if first.Code != protocolErrorInvalidPayload {
+		t.Fatalf("first malformed request error = %#v, want invalid payload", first)
+	}
+	second := request(wire.RequestID{62}, now)
+	if second.Code != protocolErrorReplay {
+		t.Fatalf("repeated malformed request error = %#v, want cached replay", second)
 	}
 }
 
@@ -1763,7 +1831,7 @@ func TestServiceDigestTriggersAuthenticatedSnapshotResync(t *testing.T) {
 	zero := missing
 	zero.Incarnation = 0
 	zeroFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 60, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: zero, ReporterID: 1}}}))
-	updateFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 60, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: missing, ReporterID: 1}}}))
+	updateFrame := encodeServiceTestFrame(t, authenticator, clusterID, 1, 62, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: []Update{{Member: missing, ReporterID: 1}}}))
 	seedDatagram := seed.service.options.Datagram.(transport.SourceDatagram)
 	if err := seedDatagram.SendFrom(context.Background(), seedPing, seedPing, zeroFrame); err != nil {
 		t.Fatal(err)

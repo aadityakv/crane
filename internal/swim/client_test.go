@@ -67,6 +67,65 @@ func TestSnapshotClientInvalidResponseCannotPoisonReplayCapacity(t *testing.T) {
 	}
 }
 
+func TestSnapshotClientReplayPreflightPrecedesPayloadDecode(t *testing.T) {
+	now := time.Unix(4462, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	endpoint := startScriptedTCPServer(t, authenticator, clusterID, []func(wire.Frame) wire.Frame{
+		func(request wire.Frame) wire.Frame {
+			staleAt := now.Add(-time.Duration(configuration.Timing.ReplayWindow))
+			return tcpServiceTestFrameWithPayload(clusterID, 2, request.Header.RequestID, staleAt, wire.MessageSWIMSnapshotResponse, []byte("not-gob"))
+		},
+	})
+	client, err := newProtocolClient(configuration, authenticator, clock.NewManual(now), random.NewLockedSource(199), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.snapshot(testContext(t), endpoint); !errors.Is(err, wire.ErrTimestamp) {
+		t.Fatalf("stale malformed response error = %v, want timestamp preflight", err)
+	}
+}
+
+func TestSnapshotClientRequiresResponderAsNonterminalSnapshotMember(t *testing.T) {
+	now := time.Unix(4463, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	other := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
+	terminalResponder := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Dead}
+	aliveResponder := terminalResponder
+	aliveResponder.Status = Alive
+	responses := []SnapshotResponse{
+		{Members: []Member{other}},
+		{Members: []Member{terminalResponder, other}},
+		{Members: []Member{aliveResponder, other}},
+	}
+	scripts := make([]func(wire.Frame) wire.Frame, len(responses))
+	for index := range responses {
+		response := responses[index]
+		scripts[index] = func(request wire.Frame) wire.Frame {
+			return tcpServiceTestFrameWithPayload(clusterID, 2, request.Header.RequestID, now, wire.MessageSWIMSnapshotResponse, mustEncodeGob(t, response))
+		}
+	}
+	endpoint := startScriptedTCPServer(t, authenticator, clusterID, scripts)
+	client, err := newProtocolClient(configuration, authenticator, clock.NewManual(now), random.NewLockedSource(200), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.replay = wire.NewReplayGuard(client.clock, time.Duration(configuration.Timing.ReplayWindow), serviceFutureSkew, 1)
+
+	for _, name := range []string{"missing", "terminal"} {
+		if snapshot, err := client.snapshot(testContext(t), endpoint); !errors.Is(err, ErrSnapshotProtocol) || snapshot != nil {
+			t.Fatalf("%s responder snapshot = %#v, error = %v, want protocol rejection", name, snapshot, err)
+		}
+	}
+	if snapshot, err := client.snapshot(testContext(t), endpoint); err != nil || len(snapshot) != 2 || snapshot[0] != aliveResponder {
+		t.Fatalf("valid responder after invalid snapshots = %#v, error = %v", snapshot, err)
+	}
+}
+
 func TestValidateSnapshotStateAcceptsOnlyUniqueTerminalFloors(t *testing.T) {
 	member := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 5, Status: Alive}
 	floor := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 7, Status: Dead}
@@ -95,7 +154,7 @@ func TestInternalSnapshotResyncRejectsUnexpectedFirstResponderBeforeReplayAccept
 	configuration := serviceTestConfig(t, 1)
 	authenticator := wire.NewHMACAuthenticator(testServiceKey())
 	clusterID := decodedTestClusterID(t, testClusterID)
-	validMember := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
+	validMember := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
 	validPayload := mustEncodeGob(t, SnapshotResponse{Members: []Member{validMember}})
 	errorPayload := mustEncodeGob(t, encodeProtocolError(ErrServiceNotAdmitted))
 

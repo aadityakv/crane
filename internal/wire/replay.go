@@ -30,6 +30,8 @@ type ReplayGuard struct {
 	maxEntries    int
 	seen          map[replayKey]time.Time
 	expirations   replayExpiryHeap
+	invalid       map[replayKey]time.Time
+	invalidExpiry replayExpiryHeap
 }
 
 type replayKey struct {
@@ -69,11 +71,43 @@ func NewReplayGuard(source clock.Clock, window, maxFutureSkew time.Duration, max
 		maxFutureSkew: maxFutureSkew,
 		maxEntries:    maxEntries,
 		seen:          make(map[replayKey]time.Time),
+		invalid:       make(map[replayKey]time.Time),
 	}
 }
 
-// Accept records a fresh sender/request pair or returns a classified rejection.
-func (g *ReplayGuard) Accept(senderID uint16, requestID RequestID, timestamp time.Time) error {
+// Preflight rejects invalid timestamps and request IDs already observed as
+// either valid or semantically invalid, without consuming accepted capacity.
+func (g *ReplayGuard) Preflight(senderID uint16, requestID RequestID, timestamp time.Time) error {
+	if g == nil || g.clock == nil {
+		return ErrReplayConfiguration
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.preflightLocked(senderID, requestID, timestamp, g.clock.Now())
+}
+
+func (g *ReplayGuard) preflightLocked(senderID uint16, requestID RequestID, timestamp, now time.Time) error {
+	if timestamp.After(now.Add(g.maxFutureSkew)) || !timestamp.Add(g.window).After(now) {
+		return fmt.Errorf("%w: message %s, local %s", ErrTimestamp, timestamp, now)
+	}
+
+	g.purgeExpired(now)
+	g.purgeInvalidExpired(now)
+	key := replayKey{senderID: senderID, requestID: requestID}
+	if _, exists := g.seen[key]; exists {
+		return ErrReplay
+	}
+	if _, exists := g.invalid[key]; exists {
+		return ErrReplay
+	}
+	if len(g.seen) >= g.maxEntries {
+		return ErrReplayCacheFull
+	}
+	return nil
+}
+
+// Commit records a preflighted, semantically valid sender/request pair.
+func (g *ReplayGuard) Commit(senderID uint16, requestID RequestID, timestamp time.Time) error {
 	if g == nil || g.clock == nil {
 		return ErrReplayConfiguration
 	}
@@ -81,22 +115,72 @@ func (g *ReplayGuard) Accept(senderID uint16, requestID RequestID, timestamp tim
 	defer g.mu.Unlock()
 
 	now := g.clock.Now()
-	if timestamp.After(now.Add(g.maxFutureSkew)) || !timestamp.Add(g.window).After(now) {
-		return fmt.Errorf("%w: message %s, local %s", ErrTimestamp, timestamp, now)
+	if err := g.preflightLocked(senderID, requestID, timestamp, now); err != nil {
+		return err
 	}
 
-	g.purgeExpired(now)
 	key := replayKey{senderID: senderID, requestID: requestID}
-	if _, exists := g.seen[key]; exists {
-		return ErrReplay
-	}
-	if len(g.seen) >= g.maxEntries {
-		return ErrReplayCacheFull
-	}
-
 	expiresAt := timestamp.Add(g.window)
 	g.seen[key] = expiresAt
 	heap.Push(&g.expirations, replayExpiry{key: key, expiresAt: expiresAt})
+	return nil
+}
+
+// Accept records a fresh sender/request pair or returns a classified rejection.
+// It is the compatibility shorthand for Commit when no semantic validation is
+// required between the timestamp/duplicate check and recording.
+func (g *ReplayGuard) Accept(senderID uint16, requestID RequestID, timestamp time.Time) error {
+	return g.Commit(senderID, requestID, timestamp)
+}
+
+// RecordInvalid remembers a preflighted request ID that failed semantic
+// validation. Invalid IDs use a separate bounded cache and never consume
+// capacity reserved for accepted messages.
+func (g *ReplayGuard) RecordInvalid(senderID uint16, requestID RequestID, timestamp time.Time) {
+	if g == nil || g.clock == nil || g.maxEntries <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := g.clock.Now()
+	if timestamp.After(now.Add(g.maxFutureSkew)) || !timestamp.Add(g.window).After(now) {
+		return
+	}
+	g.purgeExpired(now)
+	g.purgeInvalidExpired(now)
+	key := replayKey{senderID: senderID, requestID: requestID}
+	if _, accepted := g.seen[key]; accepted {
+		return
+	}
+	if _, exists := g.invalid[key]; exists {
+		return
+	}
+	for len(g.invalid) >= g.maxEntries && g.invalidExpiry.Len() > 0 {
+		evicted := heap.Pop(&g.invalidExpiry).(replayExpiry)
+		if current, exists := g.invalid[evicted.key]; exists && current.Equal(evicted.expiresAt) {
+			delete(g.invalid, evicted.key)
+		}
+	}
+	if len(g.invalid) >= g.maxEntries {
+		return
+	}
+	expiresAt := timestamp.Add(g.window)
+	g.invalid[key] = expiresAt
+	heap.Push(&g.invalidExpiry, replayExpiry{key: key, expiresAt: expiresAt})
+}
+
+// ValidateTimestamp checks only the replay-window and future-skew boundary.
+func (g *ReplayGuard) ValidateTimestamp(timestamp time.Time) error {
+	if g == nil || g.clock == nil {
+		return ErrReplayConfiguration
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := g.clock.Now()
+	if timestamp.After(now.Add(g.maxFutureSkew)) || !timestamp.Add(g.window).After(now) {
+		return fmt.Errorf("%w: message %s, local %s", ErrTimestamp, timestamp, now)
+	}
 	return nil
 }
 
@@ -105,6 +189,15 @@ func (g *ReplayGuard) purgeExpired(now time.Time) {
 		expired := heap.Pop(&g.expirations).(replayExpiry)
 		if current, exists := g.seen[expired.key]; exists && current.Equal(expired.expiresAt) {
 			delete(g.seen, expired.key)
+		}
+	}
+}
+
+func (g *ReplayGuard) purgeInvalidExpired(now time.Time) {
+	for g.invalidExpiry.Len() > 0 && !g.invalidExpiry[0].expiresAt.After(now) {
+		expired := heap.Pop(&g.invalidExpiry).(replayExpiry)
+		if current, exists := g.invalid[expired.key]; exists && current.Equal(expired.expiresAt) {
+			delete(g.invalid, expired.key)
 		}
 	}
 }

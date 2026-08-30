@@ -174,9 +174,15 @@ func (c *protocolClient) beginSnapshot(ctx context.Context, endpoint config.Endp
 	}
 	var response SnapshotResponse
 	if err := wire.DecodeGob(frame.Payload, &response); err != nil {
+		c.recordInvalidResponse(frame)
 		return nil, fmt.Errorf("%w: decode snapshot response: %v", ErrSnapshotProtocol, err)
 	}
 	if err := validateSnapshotState(response.Members, response.Floors); err != nil {
+		c.recordInvalidResponse(frame)
+		return nil, err
+	}
+	if err := validateSnapshotResponder(frame.Header.SenderID, response.Members); err != nil {
+		c.recordInvalidResponse(frame)
 		return nil, err
 	}
 	if err := c.acceptResponse(frame); err != nil {
@@ -227,12 +233,15 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 	}
 	var snapshot JoinSnapshot
 	if err := wire.DecodeGob(frame.Payload, &snapshot); err != nil {
+		c.recordInvalidResponse(frame)
 		return joinClientResult{}, fmt.Errorf("%w: decode join snapshot: %v", ErrSnapshotProtocol, err)
 	}
 	if err := validateSnapshotState(snapshot.Members, snapshot.Floors); err != nil {
+		c.recordInvalidResponse(frame)
 		return joinClientResult{}, err
 	}
 	if err := validateJoinResponder(ctx, c.addresses, remoteEndpoint, c.senderID, frame.Header.SenderID, snapshot.Members); err != nil {
+		c.recordInvalidResponse(frame)
 		return joinClientResult{}, err
 	}
 	if err := c.acceptResponse(frame); err != nil {
@@ -252,13 +261,16 @@ func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, sto
 		return joinClientResult{}, err
 	}
 	if acceptedFrame.Header.SenderID != frame.Header.SenderID {
+		c.recordInvalidResponse(acceptedFrame)
 		return joinClientResult{}, fmt.Errorf("%w: join responder changed from %d to %d", ErrSnapshotProtocol, frame.Header.SenderID, acceptedFrame.Header.SenderID)
 	}
 	var accepted JoinAccepted
 	if err := wire.DecodeGob(acceptedFrame.Payload, &accepted); err != nil {
+		c.recordInvalidResponse(acceptedFrame)
 		return joinClientResult{}, fmt.Errorf("%w: decode join acceptance: %v", ErrSnapshotProtocol, err)
 	}
 	if accepted.Member != prepared {
+		c.recordInvalidResponse(acceptedFrame)
 		return joinClientResult{}, fmt.Errorf("%w: accepted member %#v does not match announced %#v", ErrSnapshotProtocol, accepted.Member, prepared)
 	}
 	if err := c.acceptResponse(acceptedFrame); err != nil {
@@ -276,16 +288,9 @@ func validateJoinResponder(ctx context.Context, addresses *addressMatcher, endpo
 	if senderID == localSenderID {
 		return fmt.Errorf("%w: first responder uses local node ID %d", ErrSnapshotProtocol, senderID)
 	}
-	var responder Member
-	found := false
-	for _, member := range members {
-		if member.NodeID == senderID {
-			responder, found = member, true
-			break
-		}
-	}
-	if !found || (responder.Status != Alive && responder.Status != Suspect) {
-		return fmt.Errorf("%w: first responder %d is not a nonterminal snapshot member", ErrSnapshotProtocol, senderID)
+	responder, err := snapshotResponder(senderID, members)
+	if err != nil {
+		return err
 	}
 	advertised, err := (config.NodeConfig{AdvertiseHost: responder.Host, BasePort: responder.BasePort}).AdvertiseEndpoint(config.ServiceSWIMSnapshot)
 	if err != nil {
@@ -346,15 +351,24 @@ func (c *protocolClient) readResponse(ctx context.Context, stream *wire.TCPFrame
 	if err != nil {
 		return wire.Frame{}, fmt.Errorf("read SWIM TCP response: %w", err)
 	}
-	if frame.Header.SenderID == 0 || frame.Header.RequestID != requestID {
+	if frame.Header.SenderID == 0 {
+		return wire.Frame{}, fmt.Errorf("%w: uncorrelated response", ErrSnapshotProtocol)
+	}
+	if err := c.preflightResponse(frame); err != nil {
+		return wire.Frame{}, err
+	}
+	if frame.Header.RequestID != requestID {
+		c.recordInvalidResponse(frame)
 		return wire.Frame{}, fmt.Errorf("%w: uncorrelated response", ErrSnapshotProtocol)
 	}
 	if expectedSenderID != 0 && frame.Header.SenderID != expectedSenderID {
+		c.recordInvalidResponse(frame)
 		return wire.Frame{}, fmt.Errorf("%w: responder changed from %d to %d", ErrSnapshotProtocol, expectedSenderID, frame.Header.SenderID)
 	}
 	if frame.Header.Message == wire.MessageSWIMError {
 		var response ProtocolErrorMessage
 		if err := wire.DecodeGob(frame.Payload, &response); err != nil {
+			c.recordInvalidResponse(frame)
 			return wire.Frame{}, fmt.Errorf("%w: decode protocol error: %v", ErrSnapshotProtocol, err)
 		}
 		if err := c.acceptResponse(frame); err != nil {
@@ -363,16 +377,28 @@ func (c *protocolClient) readResponse(ctx context.Context, stream *wire.TCPFrame
 		return wire.Frame{}, decodeProtocolError(response)
 	}
 	if frame.Header.Message != expected {
+		c.recordInvalidResponse(frame)
 		return wire.Frame{}, fmt.Errorf("%w: got message %d, want %d", ErrSnapshotProtocol, frame.Header.Message, expected)
 	}
 	return frame, nil
 }
 
 func (c *protocolClient) acceptResponse(frame wire.Frame) error {
-	if err := c.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
-		return fmt.Errorf("%w: response replay validation: %v", ErrSnapshotProtocol, err)
+	if err := c.replay.Commit(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
+		return fmt.Errorf("%w: response replay commit: %w", ErrSnapshotProtocol, err)
 	}
 	return nil
+}
+
+func (c *protocolClient) preflightResponse(frame wire.Frame) error {
+	if err := c.replay.Preflight(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
+		return fmt.Errorf("%w: response replay preflight: %w", ErrSnapshotProtocol, err)
+	}
+	return nil
+}
+
+func (c *protocolClient) recordInvalidResponse(frame wire.Frame) {
+	c.replay.RecordInvalid(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
 }
 
 func (c *protocolClient) nextRequestID() wire.RequestID {
@@ -406,6 +432,20 @@ func validateSnapshot(members []Member) error {
 		}
 	}
 	return nil
+}
+
+func validateSnapshotResponder(senderID uint16, members []Member) error {
+	_, err := snapshotResponder(senderID, members)
+	return err
+}
+
+func snapshotResponder(senderID uint16, members []Member) (Member, error) {
+	for _, member := range members {
+		if member.NodeID == senderID && (member.Status == Alive || member.Status == Suspect) {
+			return member, nil
+		}
+	}
+	return Member{}, fmt.Errorf("%w: responder %d is not a nonterminal snapshot member", ErrSnapshotProtocol, senderID)
 }
 
 func validateSnapshotState(members, floors []Member) error {

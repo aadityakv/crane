@@ -871,13 +871,23 @@ func (s *Service) handleTCPConnection(ctx context.Context, connection net.Conn) 
 	case wire.MessageSWIMSnapshotRequest:
 		s.handleTCPSnapshot(ctx, stream, frame)
 	default:
+		if err := s.preflightTCPReplay(frame); err != nil {
+			_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
+			return
+		}
+		s.recordInvalidTCPReplay(frame)
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, fmt.Errorf("%w: first message %d", ErrSnapshotProtocol, frame.Header.Message))
 	}
 }
 
 func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream, requestFrame wire.Frame) {
+	if err := s.preflightTCPReplay(requestFrame); err != nil {
+		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, err)
+		return
+	}
 	var request JoinRequest
 	if err := wire.DecodeGob(requestFrame.Payload, &request); err != nil || request.NodeID == 0 || request.NodeID != requestFrame.Header.SenderID {
+		s.recordInvalidTCPReplay(requestFrame)
 		_ = s.writeTCPError(ctx, stream, requestFrame.Header.RequestID, fmt.Errorf("%w: invalid join request", ErrInvalidJoinAnnouncement))
 		return
 	}
@@ -898,12 +908,18 @@ func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream
 	if err != nil {
 		return
 	}
+	if err := s.preflightTCPReplay(announceFrame); err != nil {
+		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, err)
+		return
+	}
 	if announceFrame.Header.SenderID == 0 || announceFrame.Header.SenderID != requestFrame.Header.SenderID || announceFrame.Header.Message != wire.MessageSWIMJoinAnnounce {
+		s.recordInvalidTCPReplay(announceFrame)
 		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, fmt.Errorf("%w: join announcement must follow snapshot", ErrSnapshotProtocol))
 		return
 	}
 	var announce JoinAnnounce
 	if err := wire.DecodeGob(announceFrame.Payload, &announce); err != nil || announce.Member.NodeID != announceFrame.Header.SenderID || announce.Member.Incarnation == 0 || announce.Member.Status != Alive || validateAdvertisedEndpoint(announce.Member) != nil {
+		s.recordInvalidTCPReplay(announceFrame)
 		_ = s.writeTCPError(ctx, stream, announceFrame.Header.RequestID, fmt.Errorf("%w: invalid join announcement payload", ErrInvalidJoinAnnouncement))
 		return
 	}
@@ -920,14 +936,20 @@ func (s *Service) handleTCPJoin(ctx context.Context, stream *wire.TCPFrameStream
 }
 
 func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameStream, frame wire.Frame) {
+	if err := s.preflightTCPReplay(frame); err != nil {
+		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, err)
+		return
+	}
 	active := s.active.Load().(map[uint16]Member)
 	requester, exists := active[frame.Header.SenderID]
 	if !exists {
+		s.recordInvalidTCPReplay(frame)
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, ErrServiceNotAdmitted)
 		return
 	}
 	var request SnapshotRequest
 	if err := wire.DecodeGob(frame.Payload, &request); err != nil {
+		s.recordInvalidTCPReplay(frame)
 		_ = s.writeTCPError(ctx, stream, frame.Header.RequestID, fmt.Errorf("%w: invalid snapshot request", ErrInvalidSnapshotPayload))
 		return
 	}
@@ -947,6 +969,9 @@ func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameSt
 	if err != nil {
 		return
 	}
+	if s.replay.ValidateTimestamp(time.UnixMilli(appliedFrame.Header.TimestampMillis)) != nil {
+		return
+	}
 	if appliedFrame.Header.SenderID != requester.NodeID || appliedFrame.Header.RequestID != frame.Header.RequestID || appliedFrame.Header.Message != wire.MessageSWIMSnapshotApplied {
 		return
 	}
@@ -958,10 +983,18 @@ func (s *Service) handleTCPSnapshot(ctx context.Context, stream *wire.TCPFrameSt
 }
 
 func (s *Service) acceptTCPReplay(frame wire.Frame) error {
-	if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
+	if err := s.replay.Commit(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis)); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *Service) preflightTCPReplay(frame wire.Frame) error {
+	return s.replay.Preflight(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+}
+
+func (s *Service) recordInvalidTCPReplay(frame wire.Frame) {
+	s.replay.RecordInvalid(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
 }
 
 func (s *Service) requestTCPSnapshot(ctx context.Context) ([]Member, error) {
@@ -1039,6 +1072,13 @@ func (s *Service) decodeDatagram(packet transport.Packet) (datagramServiceEvent,
 }
 
 func (s *Service) decodeDatagramContext(ctx context.Context, packet transport.Packet) (datagramServiceEvent, bool) {
+	return s.decodeDatagramContextWithDecoder(ctx, packet, wire.DecodeGob)
+}
+
+func (s *Service) decodeDatagramContextWithDecoder(ctx context.Context, packet transport.Packet, decodeGob func([]byte, any) error) (_ datagramServiceEvent, accepted bool) {
+	if decodeGob == nil {
+		return datagramServiceEvent{}, false
+	}
 	if len(packet.Data) > s.limits.MaxSWIMDatagramSize {
 		return datagramServiceEvent{}, false
 	}
@@ -1051,49 +1091,61 @@ func (s *Service) decodeDatagramContext(ctx context.Context, packet transport.Pa
 	}
 	active := s.active.Load().(map[uint16]Member)
 	sender, exists := active[frame.Header.SenderID]
-	if !exists || !s.matchesDatagramSource(ctx, packet.From, sender, frame.Header.Message) {
+	if !exists {
 		return datagramServiceEvent{}, false
 	}
+	timestamp := time.UnixMilli(frame.Header.TimestampMillis)
+	if err := s.replay.Preflight(frame.Header.SenderID, frame.Header.RequestID, timestamp); err != nil {
+		return datagramServiceEvent{}, false
+	}
+	if !s.matchesDatagramSource(ctx, packet.From, sender, frame.Header.Message) {
+		return datagramServiceEvent{}, false
+	}
+	defer func() {
+		if !accepted {
+			s.replay.RecordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+		}
+	}()
 	event := datagramServiceEvent{
 		sender:    sender,
 		senderID:  frame.Header.SenderID,
 		requestID: frame.Header.RequestID,
-		timestamp: time.UnixMilli(frame.Header.TimestampMillis),
+		timestamp: timestamp,
 	}
 	switch frame.Header.Message {
 	case wire.MessageSWIMPing:
 		var message PingMessage
-		if wire.DecodeGob(frame.Payload, &message) != nil {
+		if decodeGob(frame.Payload, &message) != nil {
 			return datagramServiceEvent{}, false
 		}
 		event.message, event.updates = message, message.Updates
 	case wire.MessageSWIMAck:
 		var message AckMessage
-		if wire.DecodeGob(frame.Payload, &message) != nil {
+		if decodeGob(frame.Payload, &message) != nil {
 			return datagramServiceEvent{}, false
 		}
 		event.message, event.updates = message, message.Updates
 	case wire.MessageSWIMPingReq:
 		var message PingReqMessage
-		if wire.DecodeGob(frame.Payload, &message) != nil {
+		if decodeGob(frame.Payload, &message) != nil {
 			return datagramServiceEvent{}, false
 		}
 		event.message, event.updates = message, message.Updates
 	case wire.MessageSWIMIndirectAck:
 		var message IndirectAckMessage
-		if wire.DecodeGob(frame.Payload, &message) != nil {
+		if decodeGob(frame.Payload, &message) != nil {
 			return datagramServiceEvent{}, false
 		}
 		event.message, event.updates = message, message.Updates
 	case wire.MessageSWIMGossip:
 		var message GossipMessage
-		if wire.DecodeGob(frame.Payload, &message) != nil {
+		if decodeGob(frame.Payload, &message) != nil {
 			return datagramServiceEvent{}, false
 		}
 		event.message, event.updates = message, message.Updates
 	case wire.MessageSWIMDigest:
 		var message DigestMessage
-		if wire.DecodeGob(frame.Payload, &message) != nil {
+		if decodeGob(frame.Payload, &message) != nil {
 			return datagramServiceEvent{}, false
 		}
 		event.message, event.updates = message, message.Updates
@@ -1116,7 +1168,7 @@ func (s *Service) decodeDatagramContext(ctx context.Context, packet transport.Pa
 		// Exact probe/relay correlation is owner-confined and runs immediately
 		// before replay acceptance and any state mutation.
 	default:
-		if err := s.replay.Accept(frame.Header.SenderID, frame.Header.RequestID, event.timestamp); err != nil {
+		if err := s.replay.Commit(frame.Header.SenderID, frame.Header.RequestID, event.timestamp); err != nil {
 			return datagramServiceEvent{}, false
 		}
 	}
@@ -1145,16 +1197,18 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 	switch message := event.message.(type) {
 	case AckMessage:
 		if !l.engine.acceptsAck(sender, message.Ack) {
+			l.service.replay.RecordInvalid(event.senderID, event.requestID, event.timestamp)
 			return nil
 		}
-		if err := l.service.replay.Accept(event.senderID, event.requestID, event.timestamp); err != nil {
+		if err := l.service.replay.Commit(event.senderID, event.requestID, event.timestamp); err != nil {
 			return nil
 		}
 	case IndirectAckMessage:
 		if !l.engine.acceptsIndirectAck(sender, message.IndirectAck) {
+			l.service.replay.RecordInvalid(event.senderID, event.requestID, event.timestamp)
 			return nil
 		}
-		if err := l.service.replay.Accept(event.senderID, event.requestID, event.timestamp); err != nil {
+		if err := l.service.replay.Commit(event.senderID, event.requestID, event.timestamp); err != nil {
 			return nil
 		}
 	}
