@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -163,6 +164,62 @@ func TestAppendCommittedButUnappliedConflictIsFatalWithoutPeerRejection(t *testi
 	}
 	if _, ok := core.Ready(); ok {
 		t.Fatal("fatal committed conflict emitted an ordinary peer rejection")
+	}
+}
+
+func TestAppendCommittedConflictLeavesCompleteCoreStateUnchanged(t *testing.T) {
+	tests := []struct {
+		name        string
+		requestTerm uint64
+	}{
+		{name: "same term", requestTerm: 3},
+		{name: "higher term", requestTerm: 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core := committedConflictLeader(t)
+			before := snapshotReplicationCore(core)
+			request := AppendEntriesRequest{
+				LeaderID: 2, Term: test.requestTerm, Generation: 13,
+				PrevLogIndex: 1, PrevLogTerm: 1,
+				Entries: testEntriesFrom(t, 2, testEntrySpec{term: test.requestTerm, command: "illegal"}),
+			}
+
+			if err := core.Step(2, request); !errors.Is(err, ErrCommittedConflict) {
+				t.Fatalf("protected append error = %v, want ErrCommittedConflict", err)
+			}
+			assertReplicationCoreSnapshot(t, core, before)
+		})
+	}
+}
+
+func TestAppendHigherTermOrdinaryMismatchStillRecordsLeaderContact(t *testing.T) {
+	entries := testEntries(t, testEntrySpec{term: 1, command: "one"})
+	core := newReplicationCore(t, 3, 1, HardState{Term: 2, VotedFor: 1}, 0, entries, []uint64{4, 6})
+	request := AppendEntriesRequest{
+		LeaderID: 2, Term: 3, Generation: 14,
+		PrevLogIndex: 2, PrevLogTerm: 1,
+	}
+
+	if err := core.Step(2, request); err != nil {
+		t.Fatal(err)
+	}
+	ready := requireReady(t, core)
+	response := appendResponseFromReady(t, ready)
+	if response.Success || response.Term != 3 || response.ConflictIndex != 2 {
+		t.Fatalf("higher-term mismatch response = %#v, want term-3 rejection at index 2", response)
+	}
+	if got, want := core.Status(), (Status{Role: RoleFollower, Term: 3, LeaderID: 2, LastIndex: 1}); got != want {
+		t.Fatalf("higher-term mismatch status = %#v, want %#v", got, want)
+	}
+	if got, want := core.ElectionDeadline(), uint64(6); got != want {
+		t.Fatalf("higher-term mismatch deadline = %d, want %d", got, want)
+	}
+	if ready.HardState == nil || *ready.HardState != (HardState{Term: 3}) {
+		t.Fatalf("higher-term mismatch hard state = %#v, want durable term 3", ready.HardState)
+	}
+	if got, want := ready.Messages[0].Requires, (DurabilityPrerequisite{HardState: true}); got != want {
+		t.Fatalf("higher-term mismatch prerequisite = %#v, want %#v", got, want)
 	}
 }
 
@@ -346,6 +403,71 @@ func TestReplicationGenerationIsPeerLocalAndWrongPeerResponseIsAtomic(t *testing
 	}
 }
 
+func TestReplicationGenerationOverflowOnExactRetryIsAtomic(t *testing.T) {
+	tests := []struct {
+		name     string
+		response func(AppendEntriesRequest) AppendEntriesResponse
+		prepare  func(*testing.T, *Core)
+	}{
+		{
+			name: "rejection retry",
+			response: func(request AppendEntriesRequest) AppendEntriesResponse {
+				return AppendEntriesResponse{
+					ResponderID: 2, LeaderID: request.LeaderID,
+					Term: request.Term, RequestTerm: request.Term, Generation: request.Generation,
+					Success: false, ConflictIndex: 1,
+				}
+			},
+		},
+		{
+			name: "success while follower remains behind",
+			response: func(request AppendEntriesRequest) AppendEntriesResponse {
+				return appendSuccess(request, 2)
+			},
+			prepare: func(t *testing.T, core *Core) {
+				entry := testEntriesFrom(t, 2, testEntrySpec{term: 1, command: "still-behind"})[0]
+				if _, err := core.log.Append(1, 1, []Entry{entry}); err != nil {
+					t.Fatal(err)
+				}
+				core.progress[core.localID] = Progress{MatchIndex: 2, NextIndex: 3}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core, request := leaderWithNoOpRequest(t, 2)
+			if test.prepare != nil {
+				test.prepare(t, core)
+			}
+			progress := core.progress[2]
+			progress.Generation = RequestGeneration(math.MaxUint64)
+			core.progress[2] = progress
+			before := snapshotReplicationCore(core)
+
+			if err := core.Step(2, test.response(request)); !errors.Is(err, ErrReplicationGenerationOverflow) {
+				t.Fatalf("exact retry error = %v, want ErrReplicationGenerationOverflow", err)
+			}
+			assertReplicationCoreSnapshot(t, core, before)
+		})
+	}
+}
+
+func TestReplicationGenerationOverflowOnMultiPeerHeartbeatTickIsAtomic(t *testing.T) {
+	core, _ := leaderWithNoOpRequest(t, 2)
+	peer2 := core.progress[2]
+	peer2.Generation = RequestGeneration(math.MaxUint64 - 1)
+	core.progress[2] = peer2
+	peer3 := core.progress[3]
+	peer3.Generation = RequestGeneration(math.MaxUint64)
+	core.progress[3] = peer3
+	before := snapshotReplicationCore(core)
+
+	if err := core.Tick(6); !errors.Is(err, ErrReplicationGenerationOverflow) {
+		t.Fatalf("multi-peer heartbeat error = %v, want ErrReplicationGenerationOverflow", err)
+	}
+	assertReplicationCoreSnapshot(t, core, before)
+}
+
 func TestProgressMarksSnapshotNeededWhenHintReachesCompactedBase(t *testing.T) {
 	entries := testEntriesFrom(t, 4, testEntrySpec{term: 3, command: "four"})
 	core, initial := electReplicationLeader(t, 3, 2, HardState{Term: 3, CommitIndex: 3}, entries)
@@ -362,6 +484,12 @@ func TestProgressMarksSnapshotNeededWhenHintReachesCompactedBase(t *testing.T) {
 	}
 	if _, ok := core.Ready(); ok {
 		t.Fatal("snapshot-needed progress emitted Task 9 transfer work")
+	}
+	if err := core.Tick(10); err != nil {
+		t.Fatal(err)
+	}
+	if got := core.Status().Role; got != RoleLeader {
+		t.Fatalf("role after exact compacted rejection = %v, want response counted for check-quorum", got)
 	}
 }
 
@@ -662,4 +790,135 @@ func appendResponseFromReady(t *testing.T, ready Ready) AppendEntriesResponse {
 		t.Fatalf("Ready RPC = %T, want AppendEntriesResponse", ready.Messages[0].RPC)
 	}
 	return response
+}
+
+type replicationCoreSnapshot struct {
+	status               Status
+	hardState            HardState
+	log                  LogState
+	now                  uint64
+	electionDeadline     uint64
+	deadlineExhausted    bool
+	recentLeader         bool
+	heartbeatDeadline    uint64
+	quorumDeadline       uint64
+	preVotes             map[uint16]struct{}
+	votes                map[uint16]struct{}
+	progress             map[uint16]Progress
+	quorumResponses      map[uint16]struct{}
+	nextProposalID       ProposalID
+	pendingProposals     map[ProposalID]Entry
+	pendingProposalOrder []ProposalID
+	proposalAtIndex      map[uint64]ProposalID
+	pendingReady         Ready
+	hasPending           bool
+	nextToken            ReadyToken
+	randomIndex          int
+}
+
+func snapshotReplicationCore(core *Core) replicationCoreSnapshot {
+	return replicationCoreSnapshot{
+		status:               core.Status(),
+		hardState:            core.HardState(),
+		log:                  core.LogState(),
+		now:                  core.now,
+		electionDeadline:     core.electionDeadline,
+		deadlineExhausted:    core.deadlineExhausted,
+		recentLeader:         core.recentLeader,
+		heartbeatDeadline:    core.heartbeatDeadline,
+		quorumDeadline:       core.quorumDeadline,
+		preVotes:             cloneVoterEvidence(core.preVotes),
+		votes:                cloneVoterEvidence(core.votes),
+		progress:             cloneProgress(core.progress),
+		quorumResponses:      cloneVoterEvidence(core.quorumResponses),
+		nextProposalID:       core.nextProposalID,
+		pendingProposals:     clonePendingProposals(core.pendingProposals),
+		pendingProposalOrder: append([]ProposalID(nil), core.pendingProposalOrder...),
+		proposalAtIndex:      cloneProposalIndices(core.proposalAtIndex),
+		pendingReady:         core.pendingReady.Clone(),
+		hasPending:           core.hasPending,
+		nextToken:            core.nextToken,
+		randomIndex:          core.random.(*coreScriptedRandom).index,
+	}
+}
+
+func assertReplicationCoreSnapshot(t *testing.T, core *Core, want replicationCoreSnapshot) {
+	t.Helper()
+	got := snapshotReplicationCore(core)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("complete core state changed:\n got=%#v\nwant=%#v", got, want)
+	}
+}
+
+func cloneVoterEvidence(source map[uint16]struct{}) map[uint16]struct{} {
+	if source == nil {
+		return nil
+	}
+	owned := make(map[uint16]struct{}, len(source))
+	for voterID := range source {
+		owned[voterID] = struct{}{}
+	}
+	return owned
+}
+
+func cloneProgress(source map[uint16]Progress) map[uint16]Progress {
+	if source == nil {
+		return nil
+	}
+	owned := make(map[uint16]Progress, len(source))
+	for voterID, progress := range source {
+		owned[voterID] = progress
+	}
+	return owned
+}
+
+func clonePendingProposals(source map[ProposalID]Entry) map[ProposalID]Entry {
+	if source == nil {
+		return nil
+	}
+	owned := make(map[ProposalID]Entry, len(source))
+	for proposalID, entry := range source {
+		owned[proposalID] = entry.Clone()
+	}
+	return owned
+}
+
+func cloneProposalIndices(source map[uint64]ProposalID) map[uint64]ProposalID {
+	if source == nil {
+		return nil
+	}
+	owned := make(map[uint64]ProposalID, len(source))
+	for index, proposalID := range source {
+		owned[index] = proposalID
+	}
+	return owned
+}
+
+func committedConflictLeader(t *testing.T) *Core {
+	t.Helper()
+	entries := testEntries(t,
+		testEntrySpec{term: 1, command: "applied"},
+		testEntrySpec{term: 1, command: "committed-not-applied"},
+		testEntrySpec{term: 3, command: "pending"},
+	)
+	core := newReplicationCore(t, 3, 1, HardState{Term: 3, CommitIndex: 2}, 1, entries, []uint64{4, 6, 8})
+	core.role = RoleLeader
+	core.leaderID = core.localID
+	core.now = 3
+	core.electionDeadline = math.MaxUint64
+	core.deadlineExhausted = true
+	core.heartbeatDeadline = 4
+	core.quorumDeadline = 8
+	core.progress = map[uint16]Progress{
+		1: {MatchIndex: 3, NextIndex: 4},
+		2: {MatchIndex: 1, NextIndex: 2, Generation: 7, ActiveGeneration: 7, activeMatchIndex: 2},
+		3: {NextIndex: 2, Generation: 9, ActiveGeneration: 9, activeMatchIndex: 2},
+	}
+	core.quorumResponses = map[uint16]struct{}{2: {}}
+	entry := entries[2].Clone()
+	core.nextProposalID = 1
+	core.pendingProposals = map[ProposalID]Entry{1: entry}
+	core.pendingProposalOrder = []ProposalID{1}
+	core.proposalAtIndex = map[uint64]ProposalID{3: 1}
+	return core
 }

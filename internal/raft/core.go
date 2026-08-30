@@ -580,11 +580,26 @@ func (core *Core) becomeLeader(finalVoter uint16) error {
 }
 
 func (core *Core) tickLeader(now uint64) error {
-	core.now = now
 	if now >= core.quorumDeadline {
 		if 1+len(core.quorumResponses) < core.voters.Majority() {
+			core.now = now
 			return core.stepDownWithoutTermChange(now)
 		}
+	}
+	if now >= core.heartbeatDeadline {
+		for _, voter := range core.voters.Voters() {
+			if voter.ID == core.localID {
+				continue
+			}
+			progress := core.progress[voter.ID]
+			if !progress.SnapshotNeeded && progress.Generation == RequestGeneration(math.MaxUint64) {
+				return ErrReplicationGenerationOverflow
+			}
+		}
+	}
+
+	core.now = now
+	if now >= core.quorumDeadline {
 		core.quorumResponses = make(map[uint16]struct{}, len(core.voters.Voters())-1)
 		core.quorumDeadline = saturatingTickAdd(now, core.electionTimeoutMin)
 	}
@@ -664,20 +679,35 @@ func (core *Core) handleAppendRequest(request AppendEntriesRequest) error {
 		return nil
 	}
 
+	before := core.log.State()
+	trialLog, err := NewLog(
+		before.SnapshotIndex,
+		before.SnapshotTerm,
+		before.CommitIndex,
+		before.AppliedIndex,
+		before.Entries,
+	)
+	if err != nil {
+		return err
+	}
+	hint, appendErr := trialLog.Append(request.PrevLogIndex, request.PrevLogTerm, request.Entries)
+	if appendErr != nil &&
+		!errors.Is(appendErr, ErrLogUnavailable) &&
+		!errors.Is(appendErr, ErrLogCompacted) &&
+		!errors.Is(appendErr, ErrLogMismatch) {
+		return appendErr
+	}
+
 	hardStateChanged := request.Term > core.hardState.Term
 	if err := core.handleLeaderContact(request.LeaderID, request.Term); err != nil {
 		return err
 	}
-	before := core.log.State()
-	hint, err := core.log.Append(request.PrevLogIndex, request.PrevLogTerm, request.Entries)
-	if err != nil {
-		if errors.Is(err, ErrLogUnavailable) || errors.Is(err, ErrLogCompacted) || errors.Is(err, ErrLogMismatch) {
-			requires := DurabilityPrerequisite{HardState: hardStateChanged}
-			core.queueAppendResponse(request, false, 0, hint, requires)
-			return nil
-		}
-		return err
+	if appendErr != nil {
+		requires := DurabilityPrerequisite{HardState: hardStateChanged}
+		core.queueAppendResponse(request, false, 0, hint, requires)
+		return nil
 	}
+	core.log = trialLog
 
 	lastVerified := request.PrevLogIndex
 	if len(request.Entries) != 0 {
@@ -762,15 +792,17 @@ func (core *Core) handleAppendResponse(response AppendEntriesResponse) error {
 	if response.Success && response.MatchIndex != progress.activeMatchIndex {
 		return nil
 	}
-	progress.ActiveGeneration = 0
-	progress.activeMatchIndex = 0
-	core.progress[response.ResponderID] = progress
-	core.quorumResponses[response.ResponderID] = struct{}{}
 	if response.Term > core.hardState.Term {
+		progress.ActiveGeneration = 0
+		progress.activeMatchIndex = 0
+		core.progress[response.ResponderID] = progress
+		core.quorumResponses[response.ResponderID] = struct{}{}
 		core.adoptHigherTerm(response.Term)
 		return nil
 	}
 	if response.Success {
+		progress.ActiveGeneration = 0
+		progress.activeMatchIndex = 0
 		if response.MatchIndex > progress.MatchIndex {
 			progress.MatchIndex = response.MatchIndex
 		}
@@ -782,7 +814,11 @@ func (core *Core) handleAppendResponse(response AppendEntriesResponse) error {
 			progress.NextIndex = nextIndex
 		}
 		progress.SnapshotNeeded = false
+		if progress.NextIndex <= core.log.LastIndex() && progress.Generation == RequestGeneration(math.MaxUint64) {
+			return ErrReplicationGenerationOverflow
+		}
 		core.progress[response.ResponderID] = progress
+		core.quorumResponses[response.ResponderID] = struct{}{}
 		if err := core.advanceLeaderCommit(); err != nil {
 			return err
 		}
@@ -792,6 +828,8 @@ func (core *Core) handleAppendResponse(response AppendEntriesResponse) error {
 		return nil
 	}
 
+	progress.ActiveGeneration = 0
+	progress.activeMatchIndex = 0
 	nextIndex := response.ConflictIndex
 	if response.ConflictTerm != 0 {
 		if lastIndex, ok := core.log.LastIndexOfTerm(response.ConflictTerm); ok {
@@ -820,10 +858,15 @@ func (core *Core) handleAppendResponse(response AppendEntriesResponse) error {
 	if nextIndex <= core.log.SnapshotIndex() {
 		progress.SnapshotNeeded = true
 		core.progress[response.ResponderID] = progress
+		core.quorumResponses[response.ResponderID] = struct{}{}
 		return nil
 	}
 	progress.SnapshotNeeded = false
+	if progress.Generation == RequestGeneration(math.MaxUint64) {
+		return ErrReplicationGenerationOverflow
+	}
 	core.progress[response.ResponderID] = progress
+	core.quorumResponses[response.ResponderID] = struct{}{}
 	return core.issueAppend(response.ResponderID)
 }
 
