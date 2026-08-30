@@ -85,6 +85,16 @@ func TestValidateRaftRejectsZeroThresholdsAndOversizedSnapshots(t *testing.T) {
 	}
 }
 
+func TestValidateRaftAcceptsElectionMinimumOfExactlyThreeHeartbeats(t *testing.T) {
+	raft := DefaultRaftConfig()
+	raft.HeartbeatInterval = Duration(150 * time.Millisecond)
+	raft.ElectionTimeoutMin = Duration(450 * time.Millisecond)
+	raft.RPCTimeout = Duration(300 * time.Millisecond)
+	if err := validateRaft(raft); err != nil {
+		t.Fatalf("validateRaft rejected an election minimum of exactly three heartbeats: %v", err)
+	}
+}
+
 func TestNodeConfigRaftVoterByIDReturnsOwnedValue(t *testing.T) {
 	configuration := validConfig(createSecret(t, 0o600))
 	voter, ok := configuration.RaftVoterByID(2)
@@ -97,5 +107,21 @@ func TestNodeConfigRaftVoterByIDReturnsOwnedValue(t *testing.T) {
 	}
 	if voter, ok := configuration.RaftVoterByID(4); ok || voter != (RaftVoter{}) {
 		t.Fatalf("RaftVoterByID(4) = %#v, %t, want no voter", voter, ok)
+	}
+}
+
+func TestNodeConfigRaftVoterByIDWorksForNonVoterNode(t *testing.T) {
+	configuration := validConfig(createSecret(t, 0o600))
+	configuration.NodeID = 4
+	configuration.BasePort = 8300
+	if err := configuration.Validate(); err != nil {
+		t.Fatalf("Validate non-voter configuration: %v", err)
+	}
+	voter, ok := configuration.RaftVoterByID(2)
+	if !ok || voter != (RaftVoter{NodeID: 2, Endpoint: "127.0.0.1:8108"}) {
+		t.Fatalf("RaftVoterByID(2) on non-voter = %#v, %t", voter, ok)
+	}
+	if voter, ok := configuration.RaftVoterByID(configuration.NodeID); ok || voter != (RaftVoter{}) {
+		t.Fatalf("RaftVoterByID(local non-voter ID) = %#v, %t, want no voter", voter, ok)
 	}
 }
