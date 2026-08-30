@@ -295,7 +295,7 @@ func validateTiming(timing TimingConfig) error {
 	if timing.IndirectChecks == 0 {
 		return fmt.Errorf("indirect checks must be nonzero")
 	}
-	if time.Duration(timing.DirectProbeTimeout)+time.Duration(timing.IndirectProbeTimeout) > time.Duration(timing.ProbeInterval) {
+	if time.Duration(timing.DirectProbeTimeout) > time.Duration(timing.ProbeInterval)-time.Duration(timing.IndirectProbeTimeout) {
 		return fmt.Errorf("direct and indirect probe timeouts exceed probe interval")
 	}
 	return nil

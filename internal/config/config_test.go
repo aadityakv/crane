@@ -3,10 +3,22 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestValidateTimingRejectsOverflowingTimeoutSum(t *testing.T) {
+	timing := DefaultTimingConfig()
+	timing.ProbeInterval = Duration(math.MaxInt64)
+	timing.DirectProbeTimeout = Duration(math.MaxInt64)
+	timing.IndirectProbeTimeout = 1
+
+	if err := validateTiming(timing); err == nil {
+		t.Fatal("validateTiming accepted direct+indirect duration overflow")
+	}
+}
 
 func createSecret(t *testing.T, mode os.FileMode) string {
 	t.Helper()
