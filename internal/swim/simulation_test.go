@@ -24,10 +24,11 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 	running := startRunningService(t, configuration, newServiceStore(1), clock.NewManual(now), network, 30)
 	subscriptionContext, cancelSubscription := context.WithCancel(context.Background())
 	defer cancelSubscription()
-	events, err := running.service.Subscribe(subscriptionContext, 1)
+	subscription, err := running.service.Subscribe(subscriptionContext, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := subscription.Events()
 	destination, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMPing)
 	sender := running.service.options.Datagram.(transport.SourceDatagram)
 	authenticator := wire.NewHMACAuthenticator(testServiceKey())
@@ -51,7 +52,7 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for slow-subscriber resync marker")
 	}
-	snapshot, err := running.service.Snapshot(testContext(t))
+	snapshot, err := subscription.Snapshot(testContext(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +73,103 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("snapshot did not resume slow-subscriber delta delivery")
+	}
+	running.stop(t)
+}
+
+func TestSimulationSubscriptionSnapshotResumesOnlyItsCaller(t *testing.T) {
+	now := time.Unix(5050, 0)
+	network := transport.NewMemoryNetwork()
+	configuration := serviceTestConfig(t, 1)
+	running := startRunningService(t, configuration, newServiceStore(1), clock.NewManual(now), network, 301)
+	firstContext, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	secondContext, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	first, err := running.service.Subscribe(firstContext, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := running.service.Subscribe(secondContext, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destination, _ := configuration.AdvertiseEndpoint(config.ServiceSWIMPing)
+	sender := running.service.options.Datagram.(transport.SourceDatagram)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	inject := func(request byte, members ...Member) {
+		t.Helper()
+		updates := make([]Update, 0, len(members))
+		for _, member := range members {
+			updates = append(updates, Update{Member: member, ReporterID: 1})
+		}
+		frame := encodeServiceTestFrame(t, authenticator, clusterID, 1, request, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{Updates: updates}))
+		if err := sender.SendFrom(context.Background(), destination, destination, frame); err != nil {
+			t.Fatal(err)
+		}
+		network.Advance()
+	}
+	secondMember := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	thirdMember := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
+	inject(90, secondMember, thirdMember)
+	waitForSnapshot(t, running.service, func(members []Member) bool { return len(members) == 3 })
+	for name, events := range map[string]<-chan MembershipEvent{"first": first.Events(), "second": second.Events()} {
+		select {
+		case event := <-events:
+			if event.Cause != EventResyncRequired {
+				t.Fatalf("%s overflow event = %#v, want resync marker", name, event)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for %s resync marker", name)
+		}
+	}
+
+	if _, err := first.Snapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	fourthMember := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
+	inject(91, fourthMember)
+	waitForSnapshot(t, running.service, func(members []Member) bool { return len(members) == 4 })
+	select {
+	case event := <-first.Events():
+		if event.Current != fourthMember {
+			t.Fatalf("resynchronized first event = %#v, want %#v", event, fourthMember)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first subscription did not resume after its snapshot")
+	}
+	select {
+	case event := <-second.Events():
+		t.Fatalf("first subscription snapshot resumed second subscription: %#v", event)
+	default:
+	}
+
+	if _, err := running.service.Snapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	fifthMember := Member{NodeID: 5, Host: "127.0.0.5", BasePort: 15000, Incarnation: 1, Status: Alive}
+	inject(92, fifthMember)
+	waitForSnapshot(t, running.service, func(members []Member) bool { return len(members) == 5 })
+	select {
+	case event := <-second.Events():
+		t.Fatalf("unscoped service snapshot resumed second subscription: %#v", event)
+	default:
+	}
+	if _, err := second.Snapshot(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	sixthMember := Member{NodeID: 6, Host: "127.0.0.6", BasePort: 16000, Incarnation: 1, Status: Alive}
+	inject(93, sixthMember)
+	waitForSnapshot(t, running.service, func(members []Member) bool { return len(members) == 6 })
+	select {
+	case event := <-second.Events():
+		if event.Current != sixthMember {
+			t.Fatalf("resynchronized second event = %#v, want %#v", event, sixthMember)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second subscription did not resume after its snapshot")
 	}
 	running.stop(t)
 }
@@ -294,10 +392,11 @@ func TestSimulationSuspicionRefutationStaleAndDuplicateUpdates(t *testing.T) {
 
 	eventsContext, cancelEvents := context.WithCancel(context.Background())
 	defer cancelEvents()
-	events, err := cluster.nodes[1].running.service.Subscribe(eventsContext, 4)
+	subscription, err := cluster.nodes[1].running.service.Subscribe(eventsContext, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := subscription.Events()
 	newMember := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
 	cluster.network.Duplicate(cluster.endpoint(1, config.ServiceSWIMPing), cluster.endpoint(1, config.ServiceSWIMPing))
 	cluster.inject(t, 1, 1, 82, GossipMessage{Updates: []Update{{Member: newMember, ReporterID: 1}}})

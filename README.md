@@ -127,7 +127,7 @@ The introducer admits a joining node and supplies its snapshot; after admission 
 
 ## SWIM behavior and current scope
 
-The SWIM event loop owns membership state. It runs direct probes, then indirect `PING-REQ` probes on timeout; lack of a matching authenticated ACK creates `Suspect`, and the suspicion timer eventually produces `Dead`. A node refutes suspicion by publishing a higher-incarnation `Alive`; `Dead` and `Left` are retained as tombstones to prevent stale resurrection. Membership events and snapshots are copied, bounded views: slow subscribers receive a resynchronization marker instead of blocking SWIM.
+The SWIM event loop owns membership state. It runs direct probes, then indirect `PING-REQ` probes on timeout; lack of a matching authenticated ACK creates `Suspect`, and the suspicion timer eventually produces `Dead`. A node refutes suspicion by publishing a higher-incarnation `Alive`; `Dead` and `Left` are retained as tombstones to prevent stale resurrection. Membership events and snapshots are copied, bounded views: slow subscribers receive a resynchronization marker instead of blocking SWIM. Recovery is scoped to the returned subscription handle: call `Subscription.Snapshot` after its marker; a general `Service.Snapshot` does not resume any subscriber.
 
 Membership failure does not terminate a process, delete data, alter the configured Raft voter set, or reassign Crane work. Authenticating, replay-checking, and schema validation happen before SWIM state mutation. The real-process integration test covers local admission, failure detection, restart with a higher incarnation, and continued operation after seed loss.
 

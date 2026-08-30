@@ -141,7 +141,13 @@ func (s *Service) Ready() <-chan struct{} {
 }
 
 // Snapshot returns a copied, sorted membership view from the owner goroutine.
+// It does not acknowledge recovery for any subscription; callers recovering
+// from EventResyncRequired must use that Subscription's Snapshot method.
 func (s *Service) Snapshot(ctx context.Context) ([]Member, error) {
+	return s.snapshot(ctx, 0)
+}
+
+func (s *Service) snapshot(ctx context.Context, subscriptionID uint64) ([]Member, error) {
 	if ctx == nil {
 		return nil, errors.New("swim snapshot: nil context")
 	}
@@ -165,8 +171,11 @@ func (s *Service) Snapshot(ctx context.Context) ([]Member, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if subscriptionID == 0 {
+			return result.members, nil
+		}
 		select {
-		case s.events <- snapshotDeliveredServiceEvent{revision: result.revision}:
+		case s.events <- snapshotDeliveredServiceEvent{subscriptionID: subscriptionID, revision: result.revision}:
 			return result.members, nil
 		case <-s.done:
 			return nil, ErrServiceNotRunning
@@ -180,9 +189,39 @@ func (s *Service) Snapshot(ctx context.Context) ([]Member, error) {
 	}
 }
 
+// Subscription is one bounded membership event stream and its scoped
+// snapshot-recovery capability.
+type Subscription struct {
+	service *Service
+	id      uint64
+	events  <-chan MembershipEvent
+}
+
+// Events returns the subscription's bounded event channel. It closes when the
+// subscription context is canceled or the service stops.
+func (s *Subscription) Events() <-chan MembershipEvent {
+	if s == nil || s.events == nil {
+		events := make(chan MembershipEvent)
+		close(events)
+		return events
+	}
+	return s.events
+}
+
+// Snapshot returns a current copied membership view and resumes delta
+// delivery only for this subscription if the captured revision is still
+// current when the owner receives the acknowledgment.
+func (s *Subscription) Snapshot(ctx context.Context) ([]Member, error) {
+	if s == nil || s.service == nil || s.id == 0 {
+		return nil, ErrServiceNotRunning
+	}
+	return s.service.snapshot(ctx, s.id)
+}
+
 // Subscribe registers a bounded event stream owned by the service loop. The
+// returned handle scopes snapshot recovery to this subscriber; its event
 // channel closes on subscription cancellation or service shutdown.
-func (s *Service) Subscribe(ctx context.Context, capacity int) (<-chan MembershipEvent, error) {
+func (s *Service) Subscribe(ctx context.Context, capacity int) (*Subscription, error) {
 	if ctx == nil {
 		return nil, errors.New("swim subscribe: nil context")
 	}
@@ -230,7 +269,7 @@ func (s *Service) Subscribe(ctx context.Context, capacity int) (<-chan Membershi
 		case <-s.done:
 		}
 	}(result.id)
-	return result.events, nil
+	return &Subscription{service: s, id: result.id, events: result.events}, nil
 }
 
 func (s *Service) enqueueUnsubscribe(id uint64) {
@@ -422,7 +461,10 @@ type snapshotServiceEvent struct{ response chan<- snapshotResult }
 
 func (snapshotServiceEvent) serviceEvent() {}
 
-type snapshotDeliveredServiceEvent struct{ revision uint64 }
+type snapshotDeliveredServiceEvent struct {
+	subscriptionID uint64
+	revision       uint64
+}
 
 func (snapshotDeliveredServiceEvent) serviceEvent() {}
 
@@ -573,7 +615,7 @@ func (l *serviceLoop) run(parent context.Context) error {
 				event.response <- snapshotResult{members: l.engine.Snapshot(), revision: l.membershipRevision}
 			case snapshotDeliveredServiceEvent:
 				if event.revision == l.membershipRevision {
-					l.subscriptions.markAllResynchronized()
+					l.subscriptions.MarkResynchronized(event.subscriptionID)
 				}
 			case subscribeServiceEvent:
 				if event.state == nil || !event.state.state.CompareAndSwap(subscribeRequestPending, subscribeRequestAccepted) {

@@ -847,10 +847,11 @@ func TestServicePersistsSelfRefutationBeforePublishingOrSending(t *testing.T) {
 	harness := startPersistenceService(t, store)
 	ctx, cancelSubscription := context.WithCancel(context.Background())
 	defer cancelSubscription()
-	events, err := harness.service.Subscribe(ctx, 4)
+	subscription, err := harness.service.Subscribe(ctx, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := subscription.Events()
 	baselineSends := harness.datagram.sendCount.Load()
 	harness.datagram.armed.Store(true)
 	harness.sendSelfSuspicion(t, 2)
@@ -892,10 +893,11 @@ func TestServicePersistenceFailureAbortsEffectsAndFailsRun(t *testing.T) {
 	store := newBarrierServiceStore(1, 3, persistError)
 	close(store.release)
 	harness := startPersistenceService(t, store)
-	events, err := harness.service.Subscribe(context.Background(), 4)
+	subscription, err := harness.service.Subscribe(context.Background(), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := subscription.Events()
 	baselineSends := harness.datagram.sendCount.Load()
 	harness.datagram.armed.Store(true)
 	harness.sendSelfSuspicion(t, 2)
@@ -917,10 +919,11 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 	harness := startPersistenceService(t, store)
 	subscriptionContext, cancelSubscription := context.WithCancel(context.Background())
 	defer cancelSubscription()
-	events, err := harness.service.Subscribe(subscriptionContext, 1)
+	subscription, err := harness.service.Subscribe(subscriptionContext, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := subscription.Events()
 
 	third := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
 	fourth := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
@@ -948,7 +951,7 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 	snapshotContext, cancelSnapshot := context.WithCancel(context.Background())
 	snapshotResult := make(chan error, 1)
 	go func() {
-		_, err := harness.service.Snapshot(snapshotContext)
+		_, err := subscription.Snapshot(snapshotContext)
 		snapshotResult <- err
 	}()
 	waitServiceEventQueue(t, harness.service, 1)
@@ -972,7 +975,7 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 	default:
 	}
 
-	if _, err := harness.service.Snapshot(testContext(t)); err != nil {
+	if _, err := subscription.Snapshot(testContext(t)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
@@ -999,10 +1002,11 @@ func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testi
 	harness := startPersistenceService(t, store)
 	subscriptionContext, cancelSubscription := context.WithCancel(context.Background())
 	defer cancelSubscription()
-	events, err := harness.service.Subscribe(subscriptionContext, 1)
+	subscription, err := harness.service.Subscribe(subscriptionContext, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
+	events := subscription.Events()
 
 	third := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}
 	fourth := Member{NodeID: 4, Host: "127.0.0.4", BasePort: 14000, Incarnation: 1, Status: Alive}
@@ -1027,7 +1031,7 @@ func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testi
 	}
 	fifth := Member{NodeID: 5, Host: "127.0.0.5", BasePort: 15000, Incarnation: 1, Status: Alive}
 	harness.enqueuePeerGossip([]Update{{Member: fifth, ReporterID: 2}})
-	harness.service.events <- snapshotDeliveredServiceEvent{revision: captured.revision}
+	harness.service.events <- snapshotDeliveredServiceEvent{subscriptionID: subscription.id, revision: captured.revision}
 	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -1043,7 +1047,7 @@ func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testi
 	default:
 	}
 
-	if _, err := harness.service.Snapshot(testContext(t)); err != nil {
+	if _, err := subscription.Snapshot(testContext(t)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
