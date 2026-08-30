@@ -1,6 +1,10 @@
 package swim
 
-import "time"
+import (
+	"time"
+
+	"github.com/aaditya/cs425mp3/internal/wire"
+)
 
 // PingMessage is the concrete authenticated payload for a direct probe.
 type PingMessage struct {
@@ -56,17 +60,35 @@ type ProtocolErrorMessage struct {
 	Message string
 }
 
+// ProbeID is the complete origin-scoped correlation identity. Sequence keeps
+// deterministic ordering while RequestID prevents a colliding sequence from
+// matching a different probe generation.
+type ProbeID struct {
+	Sequence  uint64
+	RequestID wire.RequestID
+}
+
 // Ping asks one member to acknowledge one origin-scoped probe sequence.
 type Ping struct {
 	OriginID uint16
 	Sequence uint64
+	// RequestID is the probe UUID and must match the authenticated frame.
+	RequestID wire.RequestID
 }
+
+// ID returns the complete probe correlation identity.
+func (p Ping) ID() ProbeID { return ProbeID{Sequence: p.Sequence, RequestID: p.RequestID} }
 
 // Ack confirms receipt of a Ping for its origin-scoped sequence.
 type Ack struct {
 	OriginID uint16
 	Sequence uint64
+	// RequestID echoes the Ping probe UUID.
+	RequestID wire.RequestID
 }
+
+// ID returns the complete probe correlation identity.
+func (a Ack) ID() ProbeID { return ProbeID{Sequence: a.Sequence, RequestID: a.RequestID} }
 
 // PingReq asks a relay to probe Target on behalf of OriginID while preserving
 // the origin's sequence generation.
@@ -74,13 +96,25 @@ type PingReq struct {
 	OriginID uint16
 	Target   Member
 	Sequence uint64
+	// RequestID preserves the origin's probe UUID through the relay.
+	RequestID wire.RequestID
 }
+
+// ID returns the complete probe correlation identity.
+func (p PingReq) ID() ProbeID { return ProbeID{Sequence: p.Sequence, RequestID: p.RequestID} }
 
 // IndirectAck tells an origin that one authorized relay reached Target.
 type IndirectAck struct {
 	OriginID uint16
 	Target   Member
 	Sequence uint64
+	// RequestID echoes the origin's probe UUID through the relay.
+	RequestID wire.RequestID
+}
+
+// ID returns the complete probe correlation identity.
+func (a IndirectAck) ID() ProbeID {
+	return ProbeID{Sequence: a.Sequence, RequestID: a.RequestID}
 }
 
 // Outbound is one protocol message addressed to a membership endpoint.
@@ -110,6 +144,8 @@ type TimerRequest struct {
 	OriginID uint16
 	NodeID   uint16
 	Sequence uint64
+	// RequestID makes relay cleanup exact when sequences collide.
+	RequestID wire.RequestID
 	// Incarnation makes membership timers generation-specific.
 	Incarnation uint64
 	Status      Status

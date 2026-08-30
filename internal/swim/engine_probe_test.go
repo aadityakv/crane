@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/random"
+	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
 func TestNewEngineRejectsInvalidOwnerDependenciesAndTiming(t *testing.T) {
@@ -66,10 +67,11 @@ func TestEngineBeginProbeSelectsAlivePeerAndSchedulesDirectTimeout(t *testing.T)
 	now := time.Date(2026, 8, 29, 14, 0, 0, 0, time.UTC)
 
 	effects := engine.BeginProbe(now)
+	requestID := effects.Outbound[0].Message.(Ping).RequestID
 
 	wantOutbound := []Outbound{{
 		To:      peer3,
-		Message: Ping{OriginID: self.NodeID, Sequence: 41},
+		Message: Ping{OriginID: self.NodeID, Sequence: 41, RequestID: requestID},
 	}}
 	if !reflect.DeepEqual(effects.Outbound, wantOutbound) {
 		t.Fatalf("outbound = %#v, want %#v", effects.Outbound, wantOutbound)
@@ -159,7 +161,7 @@ func TestEngineProbeDirectTimeoutSelectsDistinctRelaysAndIgnoresDuplicate(t *tes
 		if outbound.To != wantRelays[index] {
 			t.Fatalf("relay %d = %#v, want %#v", index, outbound.To, wantRelays[index])
 		}
-		if request != (PingReq{OriginID: self.NodeID, Target: peers[0], Sequence: ping.Sequence}) {
+		if request != (PingReq{OriginID: self.NodeID, Target: peers[0], Sequence: ping.Sequence, RequestID: ping.RequestID}) {
 			t.Fatalf("request %d = %#v", index, request)
 		}
 	}
@@ -196,6 +198,42 @@ func TestEngineProbeDirectAckCancelsProbeAndMakesLateMessagesHarmless(t *testing
 	}
 	if got := engine.HandleIndirectTimeout(sequence, now.Add(time.Second)); !reflect.DeepEqual(got, Effects{}) {
 		t.Fatalf("late indirect timeout effects = %#v, want zero", got)
+	}
+}
+
+func TestEngineProbeSequenceCollisionRequiresMatchingRequestUUID(t *testing.T) {
+	self := Member{NodeID: 1, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Incarnation: 4, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+	now := time.Date(2026, 8, 29, 14, 21, 0, 0, time.UTC)
+	ping := engine.BeginProbe(now).Outbound[0].Message.(Ping)
+	if ping.RequestID == (wire.RequestID{}) {
+		t.Fatal("BeginProbe generated a zero request UUID")
+	}
+	collision := ping.RequestID
+	collision[0] ^= 0xff
+
+	engine.HandleAck(target, Ack{OriginID: self.NodeID, Sequence: ping.Sequence, RequestID: collision}, now.Add(10*time.Millisecond))
+	if len(engine.activeProbes) != 1 {
+		t.Fatal("same sequence with a different request UUID canceled the probe")
+	}
+	engine.HandleAck(target, Ack{OriginID: self.NodeID, Sequence: ping.Sequence, RequestID: ping.RequestID}, now.Add(20*time.Millisecond))
+	if len(engine.activeProbes) != 0 {
+		t.Fatal("matching sequence and request UUID did not cancel the probe")
+	}
+}
+
+func TestEngineProbeRequestUUIDsStayUniqueWhenRandomSourceRepeats(t *testing.T) {
+	self := Member{NodeID: 1, Status: Alive}
+	target := Member{NodeID: 2, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+
+	first := engine.BeginProbe(time.Time{}).Outbound[0].Message.(Ping)
+	second := engine.BeginProbe(time.Time{}.Add(time.Second)).Outbound[0].Message.(Ping)
+	if first.RequestID == second.RequestID {
+		t.Fatalf("successive probe UUIDs collided at %x", first.RequestID)
 	}
 }
 
@@ -400,16 +438,17 @@ func TestIndirectProbeRelaysAckToOriginalProbeAndCancelsBothTimeouts(t *testing.
 	relayEffects := relayEngine.HandlePingReq(origin, request, now.Add(310*time.Millisecond))
 	wantRelayOutbound := []Outbound{{
 		To:      target,
-		Message: Ping{OriginID: origin.NodeID, Sequence: sequence},
+		Message: Ping{OriginID: origin.NodeID, Sequence: sequence, RequestID: request.RequestID},
 	}}
 	if !reflect.DeepEqual(relayEffects.Outbound, wantRelayOutbound) {
 		t.Fatalf("relay outbound = %#v, want %#v", relayEffects.Outbound, wantRelayOutbound)
 	}
 	wantRelayTimers := []TimerRequest{{
-		Kind:     TimerRelayProbe,
-		OriginID: origin.NodeID,
-		Sequence: sequence,
-		Deadline: now.Add(1010 * time.Millisecond),
+		Kind:      TimerRelayProbe,
+		OriginID:  origin.NodeID,
+		Sequence:  sequence,
+		RequestID: request.RequestID,
+		Deadline:  now.Add(1010 * time.Millisecond),
 	}}
 	if !reflect.DeepEqual(relayEffects.Timers, wantRelayTimers) {
 		t.Fatalf("relay timers = %#v, want %#v", relayEffects.Timers, wantRelayTimers)
@@ -418,7 +457,7 @@ func TestIndirectProbeRelaysAckToOriginalProbeAndCancelsBothTimeouts(t *testing.
 	targetEffects := targetEngine.HandlePing(relay, relayEffects.Outbound[0].Message.(Ping), now.Add(320*time.Millisecond))
 	wantTargetOutbound := []Outbound{{
 		To:      relay,
-		Message: Ack{OriginID: origin.NodeID, Sequence: sequence},
+		Message: Ack{OriginID: origin.NodeID, Sequence: sequence, RequestID: request.RequestID},
 	}}
 	if !reflect.DeepEqual(targetEffects.Outbound, wantTargetOutbound) {
 		t.Fatalf("target outbound = %#v, want %#v", targetEffects.Outbound, wantTargetOutbound)
@@ -428,9 +467,10 @@ func TestIndirectProbeRelaysAckToOriginalProbeAndCancelsBothTimeouts(t *testing.
 	wantAckOutbound := []Outbound{{
 		To: origin,
 		Message: IndirectAck{
-			OriginID: origin.NodeID,
-			Target:   target,
-			Sequence: sequence,
+			OriginID:  origin.NodeID,
+			Target:    target,
+			Sequence:  sequence,
+			RequestID: request.RequestID,
 		},
 	}}
 	if !reflect.DeepEqual(ackEffects.Outbound, wantAckOutbound) {
@@ -556,6 +596,37 @@ func TestIndirectRelayRejectsInvalidAndDuplicatePingReq(t *testing.T) {
 	}
 	if len(engine.relayProbes) != 1 {
 		t.Fatalf("relay probes after duplicate = %d, want one", len(engine.relayProbes))
+	}
+}
+
+func TestIndirectRelayKeepsSequenceCollisionsSeparateByRequestUUID(t *testing.T) {
+	origin := Member{NodeID: 1, Host: "node1", BasePort: 8001, Incarnation: 7, Status: Alive}
+	target := Member{NodeID: 2, Host: "node2", BasePort: 8002, Incarnation: 4, Status: Alive}
+	relay := Member{NodeID: 3, Host: "node3", BasePort: 8003, Incarnation: 5, Status: Alive}
+	engine := newTestEngineWithSelf(relay)
+	for _, member := range []Member{origin, target} {
+		mustMerge(t, engine.table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	firstID := wire.RequestID{1}
+	secondID := wire.RequestID{2}
+	first := PingReq{OriginID: origin.NodeID, Target: target, Sequence: 91, RequestID: firstID}
+	second := PingReq{OriginID: origin.NodeID, Target: target, Sequence: 91, RequestID: secondID}
+	engine.HandlePingReq(origin, first, time.Time{})
+	engine.HandlePingReq(origin, second, time.Time{})
+	if len(engine.relayProbes) != 2 {
+		t.Fatalf("relay generations = %d, want two UUID-distinct collisions", len(engine.relayProbes))
+	}
+
+	effects := engine.HandleAck(target, Ack{OriginID: origin.NodeID, Sequence: 91, RequestID: secondID}, time.Time{}.Add(time.Millisecond))
+	if len(effects.Outbound) != 1 || effects.Outbound[0].Message.(IndirectAck).RequestID != secondID {
+		t.Fatalf("relayed ACK effects = %#v, want second UUID", effects)
+	}
+	if len(engine.relayProbes) != 1 {
+		t.Fatalf("relay generations after second ACK = %d, want first collision retained", len(engine.relayProbes))
+	}
+	engine.HandleRelayTimeoutRequest(origin.NodeID, 91, firstID, time.Time{}.Add(2*time.Millisecond))
+	if len(engine.relayProbes) != 0 {
+		t.Fatalf("relay generations after exact cleanup = %d, want zero", len(engine.relayProbes))
 	}
 }
 

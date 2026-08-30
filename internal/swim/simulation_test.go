@@ -581,6 +581,7 @@ func encodeSimulationDatagram(t *testing.T, authenticator wire.Authenticator, no
 	t.Helper()
 	var requestID wire.RequestID
 	binary.BigEndian.PutUint64(requestID[8:], requestNumber)
+	message = withTestProbeRequestID(message, requestID)
 	payload := mustEncodeGob(t, message)
 	encoded, err := wire.Encode(wire.Header{
 		Version:         wire.Version1,

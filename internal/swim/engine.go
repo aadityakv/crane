@@ -1,11 +1,13 @@
 package swim
 
 import (
+	"encoding/binary"
 	"errors"
 	"math"
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/random"
+	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
 var (
@@ -37,6 +39,8 @@ type Engine struct {
 	source        random.Source
 	selector      probeSelector
 	nextSequence  uint64
+	probePrefix   uint64
+	probeCount    uint64
 	activeProbes  map[uint64]*activeProbe
 	relayProbes   map[relayProbeKey]relayProbe
 	suspicions    map[uint16]*suspicionState
@@ -54,11 +58,12 @@ type activeProbe struct {
 	target Member
 	phase  probePhase
 	relays map[uint16]Member
+	id     ProbeID
 }
 
 type relayProbeKey struct {
 	originID uint16
-	sequence uint64
+	probe    ProbeID
 }
 
 type relayProbe struct {
@@ -83,7 +88,8 @@ func NewEngine(config EngineConfig, table *Table, dissemination *Disseminator, s
 	if source == nil {
 		return nil, ErrNilEngineRandomSource
 	}
-	sequence := source.Uint64() & uint64(math.MaxInt64)
+	randomSeed := source.Uint64()
+	sequence := randomSeed & uint64(math.MaxInt64)
 	if sequence == 0 {
 		sequence = 1
 	}
@@ -94,6 +100,8 @@ func NewEngine(config EngineConfig, table *Table, dissemination *Disseminator, s
 		source:        source,
 		selector:      probeSelector{source: source},
 		nextSequence:  sequence,
+		probePrefix:   randomSeed ^ uint64(config.SelfID)<<48,
+		probeCount:    sequence,
 		activeProbes:  make(map[uint64]*activeProbe),
 		relayProbes:   make(map[relayProbeKey]relayProbe),
 		suspicions:    make(map[uint16]*suspicionState),
@@ -109,11 +117,12 @@ func (e *Engine) BeginProbe(now time.Time) Effects {
 		return Effects{}
 	}
 	sequence := e.takeSequence()
-	e.activeProbes[sequence] = &activeProbe{target: target, phase: probeDirect}
+	requestID := e.takeProbeRequestID()
+	e.activeProbes[sequence] = &activeProbe{target: target, phase: probeDirect, id: ProbeID{Sequence: sequence, RequestID: requestID}}
 	return Effects{
 		Outbound: []Outbound{{
 			To:      target,
-			Message: Ping{OriginID: e.config.SelfID, Sequence: sequence},
+			Message: Ping{OriginID: e.config.SelfID, Sequence: sequence, RequestID: requestID},
 		}},
 		Timers: []TimerRequest{{
 			Kind:     TimerDirectProbe,
@@ -146,9 +155,10 @@ func (e *Engine) HandleDirectTimeout(sequence uint64, now time.Time) Effects {
 		outbound = append(outbound, Outbound{
 			To: relay,
 			Message: PingReq{
-				OriginID: e.config.SelfID,
-				Target:   probe.target,
-				Sequence: sequence,
+				OriginID:  e.config.SelfID,
+				Target:    probe.target,
+				Sequence:  sequence,
+				RequestID: probe.id.RequestID,
 			},
 		})
 	}
@@ -174,7 +184,7 @@ func (e *Engine) HandlePing(from Member, message Ping, _ time.Time) Effects {
 	}
 	return Effects{Outbound: []Outbound{{
 		To:      from,
-		Message: Ack{OriginID: originID, Sequence: message.Sequence},
+		Message: Ack{OriginID: originID, Sequence: message.Sequence, RequestID: message.RequestID},
 	}}}
 }
 
@@ -195,7 +205,7 @@ func (e *Engine) HandlePingReq(from Member, message PingReq, now time.Time) Effe
 	if !exists || target.Status != Alive || !sameProbeIdentity(target, message.Target) {
 		return Effects{}
 	}
-	key := relayProbeKey{originID: originID, sequence: message.Sequence}
+	key := relayProbeKey{originID: originID, probe: message.ID()}
 	if _, exists := e.relayProbes[key]; exists {
 		return Effects{}
 	}
@@ -203,13 +213,14 @@ func (e *Engine) HandlePingReq(from Member, message PingReq, now time.Time) Effe
 	return Effects{
 		Outbound: []Outbound{{
 			To:      target,
-			Message: Ping{OriginID: originID, Sequence: message.Sequence},
+			Message: Ping{OriginID: originID, Sequence: message.Sequence, RequestID: message.RequestID},
 		}},
 		Timers: []TimerRequest{{
-			Kind:     TimerRelayProbe,
-			OriginID: originID,
-			Sequence: message.Sequence,
-			Deadline: now.Add(e.config.IndirectProbeTimeout),
+			Kind:      TimerRelayProbe,
+			OriginID:  originID,
+			Sequence:  message.Sequence,
+			RequestID: message.RequestID,
+			Deadline:  now.Add(e.config.IndirectProbeTimeout),
 		}},
 	}
 }
@@ -222,15 +233,16 @@ func (e *Engine) HandleAck(from Member, message Ack, _ time.Time) Effects {
 		delete(e.activeProbes, message.Sequence)
 		return Effects{}
 	case ackRelayProbe:
-		key := relayProbeKey{originID: message.OriginID, sequence: message.Sequence}
+		key := relayProbeKey{originID: message.OriginID, probe: message.ID()}
 		probe := e.relayProbes[key]
 		delete(e.relayProbes, key)
 		return Effects{Outbound: []Outbound{{
 			To: probe.origin,
 			Message: IndirectAck{
-				OriginID: message.OriginID,
-				Target:   probe.target,
-				Sequence: message.Sequence,
+				OriginID:  message.OriginID,
+				Target:    probe.target,
+				Sequence:  message.Sequence,
+				RequestID: message.RequestID,
 			},
 		}}}
 	default:
@@ -254,11 +266,11 @@ func (e *Engine) ackDisposition(from Member, message Ack) ackDisposition {
 	originID := message.OriginID
 	if originID == 0 || originID == e.config.SelfID {
 		probe, exists := e.activeProbes[message.Sequence]
-		if exists && sameProbeIdentity(from, probe.target) {
+		if exists && probeRequestIDMatches(probe.id.RequestID, message.RequestID) && sameProbeIdentity(from, probe.target) {
 			return ackLocalProbe
 		}
 	}
-	probe, exists := e.relayProbes[relayProbeKey{originID: originID, sequence: message.Sequence}]
+	probe, exists := e.relayProbes[relayProbeKey{originID: originID, probe: message.ID()}]
 	if exists && sameProbeIdentity(from, probe.target) {
 		return ackRelayProbe
 	}
@@ -277,7 +289,7 @@ func (e *Engine) HandleIndirectAck(from Member, message IndirectAck, _ time.Time
 
 func (e *Engine) acceptsIndirectAck(from Member, message IndirectAck) bool {
 	probe, exists := e.activeProbes[message.Sequence]
-	if !exists || probe.phase != probeIndirect || (message.OriginID != 0 && message.OriginID != e.config.SelfID) || !sameProbeIdentity(message.Target, probe.target) {
+	if !exists || probe.phase != probeIndirect || !probeRequestIDMatches(probe.id.RequestID, message.RequestID) || (message.OriginID != 0 && message.OriginID != e.config.SelfID) || !sameProbeIdentity(message.Target, probe.target) {
 		return false
 	}
 	relay, allowed := probe.relays[from.NodeID]
@@ -286,7 +298,18 @@ func (e *Engine) acceptsIndirectAck(from Member, message IndirectAck) bool {
 
 // HandleRelayTimeout discards only the named origin/sequence generation.
 func (e *Engine) HandleRelayTimeout(originID uint16, sequence uint64, _ time.Time) Effects {
-	delete(e.relayProbes, relayProbeKey{originID: originID, sequence: sequence})
+	for key := range e.relayProbes {
+		if key.originID == originID && key.probe.Sequence == sequence {
+			delete(e.relayProbes, key)
+		}
+	}
+	return Effects{}
+}
+
+// HandleRelayTimeoutRequest discards only the complete origin/sequence/UUID
+// relay generation carried by a production timer.
+func (e *Engine) HandleRelayTimeoutRequest(originID uint16, sequence uint64, requestID wire.RequestID, _ time.Time) Effects {
+	delete(e.relayProbes, relayProbeKey{originID: originID, probe: ProbeID{Sequence: sequence, RequestID: requestID}})
 	return Effects{}
 }
 
@@ -340,6 +363,26 @@ func (e *Engine) takeSequence() uint64 {
 		e.nextSequence = 1
 	}
 	return sequence
+}
+
+func (e *Engine) takeProbeRequestID() wire.RequestID {
+	e.probeCount++
+	if e.probeCount == 0 {
+		e.probeCount++
+	}
+	var requestID wire.RequestID
+	binary.BigEndian.PutUint64(requestID[:8], e.probePrefix)
+	binary.BigEndian.PutUint64(requestID[8:], e.probeCount)
+	if requestID == (wire.RequestID{}) {
+		requestID[len(requestID)-1] = 1
+	}
+	return requestID
+}
+
+func probeRequestIDMatches(expected, actual wire.RequestID) bool {
+	// Zero exists only for direct engine compatibility tests and never crosses
+	// the service boundary; production probes always have a nonzero UUID.
+	return expected == (wire.RequestID{}) || actual == (wire.RequestID{}) || expected == actual
 }
 
 func (e *Engine) selectRelays(target Member) []Member {

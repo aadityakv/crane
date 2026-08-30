@@ -410,6 +410,84 @@ func TestServiceRejectsZeroIncarnationBeforeReplayAcceptance(t *testing.T) {
 	}
 }
 
+func TestServiceRejectsProbePayloadRequestUUIDMismatch(t *testing.T) {
+	now := time.Unix(2080, 0)
+	service, peer, source, authenticator := newDatagramDecoderService(t, now, 4)
+	clusterID := decodedTestClusterID(t, testClusterID)
+	headerID := wire.RequestID{31}
+	payloadID := wire.RequestID{32}
+	payload := mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 5, RequestID: payloadID}})
+	frame := encodeServiceTestFrameWithRequestID(t, authenticator, clusterID, peer.NodeID, headerID, now, wire.MessageSWIMPing, payload)
+
+	if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: frame}); ok {
+		t.Fatalf("mismatched probe UUID reached owner as %#v", event)
+	}
+
+	zeroPayload := mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 6}})
+	zeroFrame, err := wire.Encode(wire.Header{
+		Version:         wire.Version1,
+		Message:         wire.MessageSWIMPing,
+		ClusterID:       clusterID,
+		SenderID:        peer.NodeID,
+		RequestID:       headerID,
+		TimestampMillis: now.UnixMilli(),
+		Codec:           wire.CodecGob,
+	}, zeroPayload, authenticator, wire.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: zeroFrame}); ok {
+		t.Fatalf("missing probe UUID reached owner as %#v", event)
+	}
+}
+
+func TestServiceProbeFrameRequestUUIDMatchesPayload(t *testing.T) {
+	now := time.Unix(2090, 0)
+	configuration := serviceTestConfig(t, 1)
+	network := transport.NewMemoryNetwork()
+	base := serviceMemoryDatagram(t, network, configuration)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	recording := newRecordingDatagram(base, authenticator, serviceWireLimits(t))
+	self := Member{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 2, Status: Alive}
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 3, Status: Alive}
+	dissemination := NewDisseminator(8, serviceRetransmitFactor)
+	table := NewTable()
+	mustMerge(t, table, Update{Member: self, ReporterID: self.NodeID})
+	mustMerge(t, table, Update{Member: peer, ReporterID: peer.NodeID})
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       3,
+		SuspicionMultiplier:  5,
+	}, table, dissemination, random.NewLockedSource(311))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{
+		options:   ServiceOptions{Config: configuration, Authenticator: authenticator, Clock: clock.NewManual(now)},
+		clusterID: decodedTestClusterID(t, testClusterID),
+		limits:    serviceWireLimits(t),
+	}
+	loop := &serviceLoop{service: service, engine: engine, dissemination: dissemination, datagram: recording, requestPrefix: 9}
+	requestID := wire.RequestID{9, 8, 7, 6}
+	if delivered, err := loop.sendMessage(context.Background(), peer, Ping{OriginID: self.NodeID, Sequence: 44, RequestID: requestID}); err != nil || !delivered {
+		t.Fatalf("sendMessage delivered=%v error=%v", delivered, err)
+	}
+	frames := recording.frames()
+	if len(frames) != 1 {
+		t.Fatalf("recorded frames = %d, want one", len(frames))
+	}
+	var payload PingMessage
+	if err := wire.DecodeGob(frames[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if frames[0].Header.RequestID != requestID || payload.Ping.RequestID != requestID {
+		t.Fatalf("frame request ID=%x payload request ID=%x want=%x", frames[0].Header.RequestID, payload.Ping.RequestID, requestID)
+	}
+}
+
 func TestServiceFreshFramesCannotRegossipAliveBelowExpiredFloor(t *testing.T) {
 	now := time.Unix(2100, 0)
 	service, reporter, source, authenticator := newDatagramDecoderService(t, now, 16)
@@ -1999,7 +2077,12 @@ func mustEncodeGob(t *testing.T, value any) []byte {
 
 func encodeServiceTestFrame(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, senderID uint16, requestByte byte, now time.Time, message wire.MessageType, payload []byte) []byte {
 	t.Helper()
-	requestID := wire.RequestID{requestByte}
+	return encodeServiceTestFrameWithRequestID(t, authenticator, clusterID, senderID, wire.RequestID{requestByte}, now, message, payload)
+}
+
+func encodeServiceTestFrameWithRequestID(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, senderID uint16, requestID wire.RequestID, now time.Time, message wire.MessageType, payload []byte) []byte {
+	t.Helper()
+	payload = alignTestProbePayload(t, message, payload, requestID)
 	encoded, err := wire.Encode(wire.Header{
 		Version:         wire.Version1,
 		Message:         message,
@@ -2013,6 +2096,75 @@ func encodeServiceTestFrame(t *testing.T, authenticator wire.Authenticator, clus
 		t.Fatal(err)
 	}
 	return encoded
+}
+
+func alignTestProbePayload(t *testing.T, messageType wire.MessageType, payload []byte, requestID wire.RequestID) []byte {
+	t.Helper()
+	var message any
+	switch messageType {
+	case wire.MessageSWIMPing:
+		message = new(PingMessage)
+	case wire.MessageSWIMAck:
+		message = new(AckMessage)
+	case wire.MessageSWIMPingReq:
+		message = new(PingReqMessage)
+	case wire.MessageSWIMIndirectAck:
+		message = new(IndirectAckMessage)
+	default:
+		return payload
+	}
+	if wire.DecodeGob(payload, message) != nil {
+		return payload
+	}
+	value := withTestProbeRequestID(message, requestID)
+	return mustEncodeGob(t, value)
+}
+
+func withTestProbeRequestID(message any, requestID wire.RequestID) any {
+	switch message := message.(type) {
+	case PingMessage:
+		if message.Ping.RequestID == (wire.RequestID{}) {
+			message.Ping.RequestID = requestID
+		}
+		return message
+	case *PingMessage:
+		if message.Ping.RequestID == (wire.RequestID{}) {
+			message.Ping.RequestID = requestID
+		}
+		return message
+	case AckMessage:
+		if message.Ack.RequestID == (wire.RequestID{}) {
+			message.Ack.RequestID = requestID
+		}
+		return message
+	case *AckMessage:
+		if message.Ack.RequestID == (wire.RequestID{}) {
+			message.Ack.RequestID = requestID
+		}
+		return message
+	case PingReqMessage:
+		if message.PingReq.RequestID == (wire.RequestID{}) {
+			message.PingReq.RequestID = requestID
+		}
+		return message
+	case *PingReqMessage:
+		if message.PingReq.RequestID == (wire.RequestID{}) {
+			message.PingReq.RequestID = requestID
+		}
+		return message
+	case IndirectAckMessage:
+		if message.IndirectAck.RequestID == (wire.RequestID{}) {
+			message.IndirectAck.RequestID = requestID
+		}
+		return message
+	case *IndirectAckMessage:
+		if message.IndirectAck.RequestID == (wire.RequestID{}) {
+			message.IndirectAck.RequestID = requestID
+		}
+		return message
+	default:
+		return message
+	}
 }
 
 func waitServiceReady(t *testing.T, service *Service) {

@@ -981,6 +981,11 @@ func (s *Service) decodeDatagramContext(ctx context.Context, packet transport.Pa
 		}
 		event.message, event.updates = message, message.Updates
 	}
+	var bound bool
+	event.message, bound = bindDatagramProbeRequestID(event.message, frame.Header.RequestID)
+	if !bound {
+		return datagramServiceEvent{}, false
+	}
 	for _, update := range event.updates {
 		if !validUpdate(update) || validateAdvertisedEndpoint(update.Member) != nil {
 			return datagramServiceEvent{}, false
@@ -1222,7 +1227,7 @@ func (l *serviceLoop) handleTimer(event timerServiceEvent) error {
 	case TimerIndirectProbe:
 		effects = l.engine.HandleIndirectTimeout(request.Sequence, now)
 	case TimerRelayProbe:
-		effects = l.engine.HandleRelayTimeout(request.OriginID, request.Sequence, now)
+		effects = l.engine.HandleRelayTimeoutRequest(request.OriginID, request.Sequence, request.RequestID, now)
 	case TimerSuspicion:
 		effects = l.engine.HandleSuspicionTimeout(request.NodeID, request.Incarnation, now)
 	case TimerTombstone:
@@ -1302,6 +1307,14 @@ func (l *serviceLoop) sendDigestRound(ctx context.Context) error {
 }
 
 func (l *serviceLoop) sendMessage(ctx context.Context, member Member, message any) (bool, error) {
+	requestID := l.nextRequestID()
+	if probeRequestID, isProbe := outboundProbeRequestID(message); isProbe {
+		if probeRequestID == (wire.RequestID{}) {
+			message = withOutboundProbeRequestID(message, requestID)
+		} else {
+			requestID = probeRequestID
+		}
+	}
 	messageType, endpointService, payloadForUpdates, err := datagramMessageDescriptor(message)
 	if err != nil {
 		return false, err
@@ -1316,7 +1329,7 @@ func (l *serviceLoop) sendMessage(ctx context.Context, member Member, message an
 		Message:         messageType,
 		ClusterID:       l.service.clusterID,
 		SenderID:        l.service.options.Config.NodeID,
-		RequestID:       l.nextRequestID(),
+		RequestID:       requestID,
 		TimestampMillis: l.service.options.Clock.Now().UnixMilli(),
 		Codec:           wire.CodecGob,
 	}
@@ -1475,19 +1488,82 @@ func validDatagramMessage(message any, sender Member, active map[uint16]Member, 
 
 	switch message := message.(type) {
 	case PingMessage:
-		return message.Ping.Sequence != 0 && validOrigin(message.Ping.OriginID)
+		return message.Ping.Sequence != 0 && message.Ping.RequestID != (wire.RequestID{}) && validOrigin(message.Ping.OriginID)
 	case AckMessage:
-		return message.Ack.Sequence != 0 && validOrigin(message.Ack.OriginID)
+		return message.Ack.Sequence != 0 && message.Ack.RequestID != (wire.RequestID{}) && validOrigin(message.Ack.OriginID)
 	case PingReqMessage:
 		request := message.PingReq
-		return request.Sequence != 0 && request.OriginID == sender.NodeID && request.Target.NodeID != sender.NodeID && request.Target.NodeID != selfID && activeIdentity(request.Target, true)
+		return request.Sequence != 0 && request.RequestID != (wire.RequestID{}) && request.OriginID == sender.NodeID && request.Target.NodeID != sender.NodeID && request.Target.NodeID != selfID && activeIdentity(request.Target, true)
 	case IndirectAckMessage:
 		ack := message.IndirectAck
-		return ack.Sequence != 0 && ack.OriginID == selfID && activeIdentity(ack.Target, false)
+		return ack.Sequence != 0 && ack.RequestID != (wire.RequestID{}) && ack.OriginID == selfID && activeIdentity(ack.Target, false)
 	case GossipMessage, DigestMessage:
 		return true
 	default:
 		return false
+	}
+}
+
+func bindDatagramProbeRequestID(message any, headerID wire.RequestID) (any, bool) {
+	if headerID == (wire.RequestID{}) {
+		return nil, false
+	}
+	bind := func(payloadID wire.RequestID) (wire.RequestID, bool) {
+		return payloadID, payloadID != (wire.RequestID{}) && payloadID == headerID
+	}
+	switch message := message.(type) {
+	case PingMessage:
+		var ok bool
+		message.Ping.RequestID, ok = bind(message.Ping.RequestID)
+		return message, ok
+	case AckMessage:
+		var ok bool
+		message.Ack.RequestID, ok = bind(message.Ack.RequestID)
+		return message, ok
+	case PingReqMessage:
+		var ok bool
+		message.PingReq.RequestID, ok = bind(message.PingReq.RequestID)
+		return message, ok
+	case IndirectAckMessage:
+		var ok bool
+		message.IndirectAck.RequestID, ok = bind(message.IndirectAck.RequestID)
+		return message, ok
+	default:
+		return message, true
+	}
+}
+
+func outboundProbeRequestID(message any) (wire.RequestID, bool) {
+	switch message := message.(type) {
+	case Ping:
+		return message.RequestID, true
+	case Ack:
+		return message.RequestID, true
+	case PingReq:
+		return message.RequestID, true
+	case IndirectAck:
+		return message.RequestID, true
+	default:
+		return wire.RequestID{}, false
+	}
+}
+
+func withOutboundProbeRequestID(message any, requestID wire.RequestID) any {
+	switch message := message.(type) {
+	case Ping:
+		message.RequestID = requestID
+		return message
+	case Ack:
+		message.RequestID = requestID
+		return message
+	case PingReq:
+		message.RequestID = requestID
+		return message
+	case IndirectAck:
+		message.RequestID = requestID
+		return message
+	default:
+		return message
 	}
 }
 
