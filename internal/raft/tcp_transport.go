@@ -1,0 +1,524 @@
+package raft
+
+import (
+	"context"
+	cryptorand "crypto/rand"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/aaditya/cs425mp3/internal/clock"
+	"github.com/aaditya/cs425mp3/internal/wire"
+)
+
+const (
+	// TransportReplayEntries bounds accepted request identities across every peer reconnect.
+	TransportReplayEntries = 8192
+	// TransportFutureSkew is the accepted authenticated wire-clock lead.
+	TransportFutureSkew = 30 * time.Second
+	// TransportMaxInboundConnections bounds concurrent authenticated and unauthenticated handlers.
+	TransportMaxInboundConnections = 64
+	transportBackoffMinimum        = 50 * time.Millisecond
+	transportBackoffMaximum        = time.Second
+)
+
+const (
+	tcpTransportNew uint32 = iota
+	tcpTransportRunning
+	tcpTransportStopped
+)
+
+// TCPDialContext opens one context-bounded connection to an exact configured voter endpoint.
+type TCPDialContext func(context.Context, string, string) (net.Conn, error)
+
+// BackoffFunc waits for one bounded reconnect delay or returns on cancellation.
+type BackoffFunc func(context.Context, time.Duration) error
+
+// RequestIDSource supplies fresh nonzero wire request identities.
+type RequestIDSource interface {
+	NextRequestID() (wire.RequestID, error)
+}
+
+// RPCIngress is the bounded authenticated delivery seam into the serialized Node.
+type RPCIngress interface {
+	SubmitRPC(context.Context, uint16, RPC) error
+}
+
+// TCPTransportOptions fixes authentication, voters, timing, allocation limits, and deterministic seams.
+type TCPTransportOptions struct {
+	// LocalID is the configured local voter used in every outbound header and payload.
+	LocalID uint16
+	// Voters is the immutable endpoint and trust boundary.
+	Voters VoterSet
+	// ClusterID is the exact authenticated wire cluster identity.
+	ClusterID [16]byte
+	// Authenticator verifies and signs canonical frames.
+	Authenticator wire.Authenticator
+	// Clock timestamps frames and drives service-global replay validation.
+	Clock clock.Clock
+	// ReplayWindow bounds accepted request age and replay retention.
+	ReplayWindow time.Duration
+	// RPCTimeout bounds dial, handshake, read, and write attempts.
+	RPCTimeout time.Duration
+	// CodecLimits applies the configured append and snapshot allocation bounds.
+	CodecLimits CodecLimits
+	// RequestIDs supplies unique wire identities; nil uses cryptographic randomness.
+	RequestIDs RequestIDSource
+	// DialContext optionally replaces the production TCP dialer.
+	DialContext TCPDialContext
+	// Backoff optionally replaces cancellation-aware exponential reconnect waiting.
+	Backoff BackoffFunc
+}
+
+// TCPTransport owns one bounded outbound worker per remote voter and bounded inbound handlers.
+type TCPTransport struct {
+	localID       uint16
+	voters        VoterSet
+	clusterID     [16]byte
+	authenticator wire.Authenticator
+	clock         clock.Clock
+	replayWindow  time.Duration
+	rpcTimeout    time.Duration
+	codecLimits   CodecLimits
+	limits        wire.Limits
+	replay        *wire.ReplayGuard
+	requestIDs    RequestIDSource
+	dialContext   TCPDialContext
+	backoff       BackoffFunc
+
+	state  atomic.Uint32
+	ready  chan struct{}
+	done   chan struct{}
+	queues map[uint16]*peerIntentQueue
+
+	requestMu sync.Mutex
+	issued    map[wire.RequestID]struct{}
+
+	connections sync.Map
+}
+
+// NewTCPTransport validates and owns options without opening sockets or starting goroutines.
+func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
+	if err := options.Voters.ValidateLocalID(options.LocalID); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrTransportInvariant, err)
+	}
+	if options.ClusterID == ([16]byte{}) || options.Authenticator == nil || options.Clock == nil || options.ReplayWindow <= 0 || options.RPCTimeout <= 0 {
+		return nil, fmt.Errorf("%w: invalid TCP transport options", ErrTransportInvariant)
+	}
+	resolvedCodec, err := resolveCodecLimits(options.CodecLimits)
+	if err != nil {
+		return nil, err
+	}
+	requestIDs := options.RequestIDs
+	if requestIDs == nil {
+		requestIDs = cryptoRequestIDSource{}
+	}
+	dialContext := options.DialContext
+	if dialContext == nil {
+		dialer := &net.Dialer{}
+		dialContext = dialer.DialContext
+	}
+	backoff := options.Backoff
+	if backoff == nil {
+		backoff = waitTransportBackoff
+	}
+	limits := wire.DefaultLimits()
+	clusterID := options.ClusterID
+	limits.ExpectedClusterID = &clusterID
+	queues := make(map[uint16]*peerIntentQueue, len(options.Voters.voters)-1)
+	for _, voter := range options.Voters.Voters() {
+		if voter.ID != options.LocalID {
+			queues[voter.ID] = newPeerIntentQueue(PeerQueueCapacity)
+		}
+	}
+	transport := &TCPTransport{
+		localID: options.LocalID, voters: options.Voters, clusterID: clusterID,
+		authenticator: options.Authenticator, clock: options.Clock, replayWindow: options.ReplayWindow,
+		rpcTimeout: options.RPCTimeout, codecLimits: resolvedCodec, limits: limits,
+		replay:     wire.NewReplayGuard(options.Clock, options.ReplayWindow, TransportFutureSkew, TransportReplayEntries),
+		requestIDs: requestIDs, dialContext: dialContext, backoff: backoff,
+		ready: make(chan struct{}), done: make(chan struct{}), queues: queues,
+		issued: make(map[wire.RequestID]struct{}),
+	}
+	return transport, nil
+}
+
+// Ready closes after the accept owner and every peer worker have started.
+func (transport *TCPTransport) Ready() <-chan struct{} {
+	if transport == nil {
+		return nil
+	}
+	return transport.ready
+}
+
+// Done closes after listener, streams, handlers, and peer workers have joined.
+func (transport *TCPTransport) Done() <-chan struct{} {
+	if transport == nil {
+		return nil
+	}
+	return transport.done
+}
+
+// Handoff transfers an owned RPC copy to one peer queue without blocking.
+func (transport *TCPTransport) Handoff(message PeerMessage) (TransportHandoff, error) {
+	if transport == nil || transport.state.Load() != tcpTransportRunning {
+		return TransportUnavailable, nil
+	}
+	queue := transport.queues[message.To]
+	if queue == nil || message.RPC == nil {
+		return TransportUnavailable, fmt.Errorf("%w: invalid remote voter %d", ErrTransportInvariant, message.To)
+	}
+	if err := ValidateRPCSender(message.RPC, transport.localID, transport.voters); err != nil {
+		return TransportUnavailable, fmt.Errorf("%w: outbound sender binding: %v", ErrTransportInvariant, err)
+	}
+	return queue.offer(message), nil
+}
+
+// Run owns one listener, all outbound streams, and joined bounded handlers until cancellation or fatal accept failure.
+func (transport *TCPTransport) Run(ctx context.Context, listener net.Listener, ingress RPCIngress) (runErr error) {
+	if transport == nil || ctx == nil || listener == nil || ingress == nil {
+		return fmt.Errorf("%w: nil TCP transport Run dependency", ErrTransportInvariant)
+	}
+	if !transport.state.CompareAndSwap(tcpTransportNew, tcpTransportRunning) {
+		return ErrTransportStopped
+	}
+	workerContext, cancelWorkers := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	fatal := make(chan error, 1)
+	for peerID, queue := range transport.queues {
+		voter, _ := transport.voters.Voter(peerID)
+		workers.Add(1)
+		go transport.runPeerWorker(workerContext, voter, queue, fatal, &workers)
+	}
+	workers.Add(1)
+	go transport.acceptConnections(workerContext, listener, ingress, fatal, &workers)
+	close(transport.ready)
+
+	select {
+	case <-ctx.Done():
+	case runErr = <-fatal:
+	}
+	cancelWorkers()
+	_ = listener.Close()
+	transport.closeConnections()
+	for _, queue := range transport.queues {
+		queue.close()
+	}
+	workers.Wait()
+	transport.state.Store(tcpTransportStopped)
+	close(transport.done)
+	return runErr
+}
+
+func (transport *TCPTransport) runPeerWorker(ctx context.Context, voter Voter, queue *peerIntentQueue, fatal chan<- error, workers *sync.WaitGroup) {
+	defer workers.Done()
+	var stream *wire.TCPFrameStream
+	var connection net.Conn
+	defer func() {
+		if stream != nil {
+			_ = stream.Close()
+			transport.connections.Delete(connection)
+		}
+	}()
+	for {
+		message, ok := queue.take(ctx)
+		if !ok {
+			return
+		}
+		messageType, payload, err := EncodeRPC(message.RPC, transport.codecLimits)
+		if err != nil {
+			transport.reportFatal(ctx, fatal, fmt.Errorf("encode outbound Raft RPC for voter %d: %w", voter.ID, err))
+			return
+		}
+		attempt := uint(0)
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			if stream == nil {
+				stream, connection, err = transport.dialPeer(ctx, voter)
+				if err != nil && errors.Is(err, ErrRequestIDExhausted) {
+					transport.reportFatal(ctx, fatal, err)
+					return
+				}
+			}
+			if err == nil {
+				var requestID wire.RequestID
+				requestID, err = transport.nextRequestID()
+				if err == nil {
+					frame := wire.Frame{Header: transport.outboundHeader(messageType, requestID), Payload: payload}
+					err = stream.WriteFrame(ctx, frame)
+				}
+				if errors.Is(err, ErrRequestIDExhausted) {
+					transport.reportFatal(ctx, fatal, err)
+					return
+				}
+			}
+			if err == nil {
+				break
+			}
+			if stream != nil {
+				_ = stream.Close()
+				transport.connections.Delete(connection)
+				stream = nil
+				connection = nil
+			}
+			if waitErr := transport.backoff(ctx, reconnectDelay(attempt)); waitErr != nil {
+				return
+			}
+			if attempt < 63 {
+				attempt++
+			}
+			err = nil
+		}
+	}
+}
+
+func (transport *TCPTransport) dialPeer(ctx context.Context, voter Voter) (*wire.TCPFrameStream, net.Conn, error) {
+	dialContext, cancelDial := context.WithTimeout(ctx, transport.rpcTimeout)
+	defer cancelDial()
+	connection, err := transport.dialContext(dialContext, "tcp", voter.Endpoint.String())
+	if err != nil {
+		return nil, nil, err
+	}
+	transport.connections.Store(connection, struct{}{})
+	stream := wire.NewTCPFrameStream(connection, transport.authenticator, transport.limits, transport.rpcTimeout)
+	requestID, err := transport.nextRequestID()
+	if err != nil {
+		transport.connections.Delete(connection)
+		_ = stream.Close()
+		return nil, nil, err
+	}
+	messageType, payload, err := EncodeRPC(Handshake{SenderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint()}, transport.codecLimits)
+	if err == nil {
+		err = stream.WriteFrame(ctx, wire.Frame{Header: transport.outboundHeader(messageType, requestID), Payload: payload})
+	}
+	var response wire.Frame
+	if err == nil {
+		response, err = stream.ReadFrame(ctx)
+	}
+	if err == nil {
+		err = transport.acceptHandshakeAck(response, voter.ID, requestID)
+	}
+	if err != nil {
+		transport.connections.Delete(connection)
+		_ = stream.Close()
+		return nil, nil, err
+	}
+	return stream, connection, nil
+}
+
+func (transport *TCPTransport) acceptHandshakeAck(frame wire.Frame, peerID uint16, requestID wire.RequestID) error {
+	preflighted, err := transport.preflightFrame(frame)
+	if err != nil {
+		return err
+	}
+	invalid := func(err error) error {
+		if preflighted {
+			transport.recordInvalidFrame(frame)
+		}
+		return err
+	}
+	if frame.Header.RequestID != requestID || frame.Header.SenderID != peerID || frame.Header.Message != wire.MessageRaftHandshakeAck || frame.Header.Codec != wire.CodecBinary {
+		return invalid(fmt.Errorf("%w: invalid handshake acknowledgement header", ErrTransportProtocol))
+	}
+	rpc, err := DecodeRPC(frame.Header.Message, frame.Payload, transport.codecLimits)
+	if err != nil {
+		return invalid(err)
+	}
+	if err := ValidateRPCSender(rpc, peerID, transport.voters); err != nil {
+		return invalid(err)
+	}
+	if err := transport.commitFrame(frame); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (transport *TCPTransport) outboundHeader(message wire.MessageType, requestID wire.RequestID) wire.Header {
+	return wire.Header{
+		Version: wire.Version1, Message: message, ClusterID: transport.clusterID,
+		SenderID: transport.localID, RequestID: requestID,
+		TimestampMillis: transport.clock.Now().UnixMilli(), Codec: wire.CodecBinary,
+	}
+}
+
+func (transport *TCPTransport) acceptConnections(ctx context.Context, listener net.Listener, ingress RPCIngress, fatal chan<- error, workers *sync.WaitGroup) {
+	defer workers.Done()
+	capacity := make(chan struct{}, TransportMaxInboundConnections)
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() == nil {
+				transport.reportFatal(ctx, fatal, fmt.Errorf("accept Raft TCP: %w", err))
+			}
+			return
+		}
+		select {
+		case capacity <- struct{}{}:
+			transport.connections.Store(connection, struct{}{})
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				defer func() { <-capacity }()
+				defer transport.connections.Delete(connection)
+				transport.handleInboundConnection(ctx, connection, ingress)
+			}()
+		default:
+			_ = connection.Close()
+		}
+	}
+}
+
+func (transport *TCPTransport) handleInboundConnection(ctx context.Context, connection net.Conn, ingress RPCIngress) {
+	stream := wire.NewTCPFrameStream(connection, transport.authenticator, transport.limits, transport.rpcTimeout)
+	defer stream.Close()
+	frame, err := stream.ReadFrame(ctx)
+	if err != nil {
+		return
+	}
+	rpc, ok := transport.validateInboundFrame(frame, 0, wire.MessageRaftHandshake)
+	if !ok {
+		return
+	}
+	handshake := rpc.(Handshake)
+	boundID := handshake.SenderID
+	messageType, payload, err := EncodeRPC(HandshakeAck{ResponderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint()}, transport.codecLimits)
+	if err != nil {
+		return
+	}
+	ack := wire.Frame{Header: transport.outboundHeader(messageType, frame.Header.RequestID), Payload: payload}
+	if err := stream.WriteFrame(ctx, ack); err != nil {
+		return
+	}
+	for {
+		frame, err = stream.ReadFrame(ctx)
+		if err != nil {
+			return
+		}
+		rpc, ok = transport.validateInboundFrame(frame, boundID, 0)
+		if !ok {
+			return
+		}
+		deliveryContext, cancelDelivery := context.WithTimeout(ctx, transport.rpcTimeout)
+		err = ingress.SubmitRPC(deliveryContext, boundID, rpc)
+		cancelDelivery()
+		if err != nil && ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+func (transport *TCPTransport) validateInboundFrame(frame wire.Frame, boundID uint16, required wire.MessageType) (RPC, bool) {
+	preflighted, err := transport.preflightFrame(frame)
+	if err != nil {
+		return nil, false
+	}
+	reject := func() (RPC, bool) {
+		if preflighted {
+			transport.recordInvalidFrame(frame)
+		}
+		return nil, false
+	}
+	if frame.Header.RequestID == (wire.RequestID{}) || frame.Header.Codec != wire.CodecBinary || frame.Header.SenderID == transport.localID || !transport.voters.Contains(frame.Header.SenderID) {
+		return reject()
+	}
+	if required != 0 && frame.Header.Message != required {
+		return reject()
+	}
+	if boundID != 0 {
+		if frame.Header.SenderID != boundID || !isNodeRPCMessage(frame.Header.Message) {
+			return reject()
+		}
+	}
+	rpc, err := DecodeRPC(frame.Header.Message, frame.Payload, transport.codecLimits)
+	if err != nil {
+		return reject()
+	}
+	if err := ValidateRPCSender(rpc, frame.Header.SenderID, transport.voters); err != nil {
+		return reject()
+	}
+	if err := transport.commitFrame(frame); err != nil {
+		return nil, false
+	}
+	return rpc, true
+}
+
+func isNodeRPCMessage(message wire.MessageType) bool {
+	return message >= wire.MessageRaftPreVoteRequest && message <= wire.MessageRaftInstallSnapshotResponse
+}
+
+func (transport *TCPTransport) preflightFrame(frame wire.Frame) (bool, error) {
+	err := transport.replay.Preflight(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+	return err == nil, err
+}
+
+func (transport *TCPTransport) commitFrame(frame wire.Frame) error {
+	return transport.replay.Commit(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+}
+
+func (transport *TCPTransport) recordInvalidFrame(frame wire.Frame) {
+	transport.replay.RecordInvalid(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
+}
+
+func (transport *TCPTransport) nextRequestID() (wire.RequestID, error) {
+	transport.requestMu.Lock()
+	defer transport.requestMu.Unlock()
+	id, err := transport.requestIDs.NextRequestID()
+	if err != nil || id == (wire.RequestID{}) {
+		return wire.RequestID{}, fmt.Errorf("%w: %v", ErrRequestIDExhausted, err)
+	}
+	if _, reused := transport.issued[id]; reused {
+		return wire.RequestID{}, ErrRequestIDExhausted
+	}
+	transport.issued[id] = struct{}{}
+	return id, nil
+}
+
+func (transport *TCPTransport) closeConnections() {
+	transport.connections.Range(func(connection, _ any) bool {
+		_ = connection.(net.Conn).Close()
+		return true
+	})
+}
+
+func (transport *TCPTransport) reportFatal(ctx context.Context, fatal chan<- error, err error) {
+	select {
+	case fatal <- err:
+	case <-ctx.Done():
+	default:
+	}
+}
+
+func reconnectDelay(attempt uint) time.Duration {
+	if attempt >= 5 {
+		return transportBackoffMaximum
+	}
+	delay := transportBackoffMinimum << attempt
+	if delay > transportBackoffMaximum {
+		return transportBackoffMaximum
+	}
+	return delay
+}
+
+func waitTransportBackoff(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type cryptoRequestIDSource struct{}
+
+func (cryptoRequestIDSource) NextRequestID() (wire.RequestID, error) {
+	var id wire.RequestID
+	_, err := cryptorand.Read(id[:])
+	return id, err
+}

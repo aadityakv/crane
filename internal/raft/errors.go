@@ -97,6 +97,12 @@ var (
 	ErrTransferIDExhausted = errors.New("raft snapshot transfer identity exhausted")
 	// ErrTransportInvariant classifies an invalid result from the bounded transport handoff seam.
 	ErrTransportInvariant = errors.New("invalid raft transport handoff result")
+	// ErrTransportStopped classifies a repeated transport run or terminal transport use.
+	ErrTransportStopped = errors.New("raft transport is stopped")
+	// ErrTransportProtocol classifies a rejected authenticated peer stream.
+	ErrTransportProtocol = errors.New("invalid raft transport protocol")
+	// ErrRequestIDExhausted classifies zero, reused, or unavailable wire request identity.
+	ErrRequestIDExhausted = errors.New("raft wire request identity exhausted")
 )
 
 // NotLeaderError carries a best-effort, non-authoritative leader hint.
