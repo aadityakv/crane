@@ -159,7 +159,7 @@ func applyPersistenceBatch(current RecoveredState, batch PersistenceBatch, expec
 			return RecoveredState{}, fmt.Errorf("%w: replacement begins at protected index %d", ErrInvalidStorageState, batch.ReplaceFrom)
 		}
 		lastIndex := baseIndex + uint64(len(prospective.Entries))
-		if lastIndex < baseIndex || batch.ReplaceFrom > lastIndex+1 || (lastIndex == math.MaxUint64 && batch.ReplaceFrom > lastIndex) {
+		if lastIndex < baseIndex || (batch.ReplaceFrom > lastIndex && (lastIndex == math.MaxUint64 || batch.ReplaceFrom != lastIndex+1)) {
 			return RecoveredState{}, fmt.Errorf("%w: replacement index %d is not contiguous after %d", ErrInvalidStorageState, batch.ReplaceFrom, lastIndex)
 		}
 		offset64 := batch.ReplaceFrom - baseIndex - 1

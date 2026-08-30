@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -223,6 +224,27 @@ func TestMemoryStoreCloseExactlyOnce(t *testing.T) {
 	}
 	if _, err := store.Recover(); !errors.Is(err, ErrStoreClosed) {
 		t.Fatalf("Recover after close error = %v, want ErrStoreClosed", err)
+	}
+}
+
+func TestStorageSuffixReplacementAtMaximumIndexUsesCheckedArithmetic(t *testing.T) {
+	identity, voters := testStorageIdentity(t, 1)
+	current := RecoveredState{
+		Identity:     identity,
+		HardState:    HardState{Term: 2, CommitIndex: math.MaxUint64 - 1},
+		SnapshotBase: SnapshotMetadata{LastIncludedIndex: math.MaxUint64 - 1, LastIncludedTerm: 1},
+		AppliedIndex: math.MaxUint64 - 1,
+		Entries:      []Entry{mustStorageEntry(t, math.MaxUint64, 2, "old")},
+	}
+	got, err := applyPersistenceBatch(current, PersistenceBatch{
+		ReplaceFrom: math.MaxUint64,
+		Entries:     []Entry{mustStorageEntry(t, math.MaxUint64, 2, "new")},
+	}, identity, voters)
+	if err != nil {
+		t.Fatalf("replace maximum index: %v", err)
+	}
+	if len(got.Entries) != 1 || string(got.Entries[0].CommandBytes()) != "new" {
+		t.Fatalf("maximum replacement = %+v, want new entry", got.Entries)
 	}
 }
 
