@@ -69,6 +69,7 @@ type Core struct {
 	pendingReady Ready
 	hasPending   bool
 	nextToken    ReadyToken
+	terminalErr  error
 }
 
 // NewCore validates recovery invariants, owns the recovered log, and samples
@@ -183,6 +184,9 @@ func NewCore(options CoreOptions) (*Core, error) {
 // Tick advances the explicit monotonic logical clock and begins a pre-vote at
 // an expired follower, pre-candidate, or candidate deadline.
 func (core *Core) Tick(now uint64) error {
+	if core.terminalErr != nil {
+		return core.terminalErr
+	}
 	if core.hasPending {
 		return ErrReadyOutstanding
 	}
@@ -205,6 +209,9 @@ func (core *Core) Tick(now uint64) error {
 
 // Step applies one validated peer RPC from a configured authenticated sender.
 func (core *Core) Step(senderID uint16, rpc RPC) error {
+	if core.terminalErr != nil {
+		return core.terminalErr
+	}
 	if core.hasPending {
 		return ErrReadyOutstanding
 	}
@@ -249,44 +256,53 @@ func (core *Core) Step(senderID uint16, rpc RPC) error {
 // ProposeEntry rejects non-leaders and fences leaders until a current-term
 // entry is committed. Task 6 owns proposal append and completion mechanics.
 func (core *Core) ProposeEntry(command []byte) (Entry, error) {
+	_, entry, err := core.proposeTracked(EntryCommand, command)
+	return entry, err
+}
+
+// proposeTracked appends one command or barrier and returns its exact waiter identity.
+func (core *Core) proposeTracked(kind EntryKind, command []byte) (ProposalID, Entry, error) {
+	if core.terminalErr != nil {
+		return 0, Entry{}, core.terminalErr
+	}
 	if core.hasPending {
-		return Entry{}, ErrReadyOutstanding
+		return 0, Entry{}, ErrReadyOutstanding
 	}
 	if core.role != RoleLeader {
-		return Entry{}, ErrNotLeader
+		return 0, Entry{}, ErrNotLeader
 	}
 	if !core.hasCommittedCurrentTerm() {
-		return Entry{}, ErrLeadershipNotAuthorized
+		return 0, Entry{}, ErrLeadershipNotAuthorized
 	}
 	if uint64(len(command)) > core.appendLimits.MaxCommandBytes {
-		return Entry{}, fmt.Errorf("%w: proposal command is %d bytes, maximum is %d", ErrRPCTooLarge, len(command), core.appendLimits.MaxCommandBytes)
+		return 0, Entry{}, fmt.Errorf("%w: proposal command is %d bytes, maximum is %d", ErrRPCTooLarge, len(command), core.appendLimits.MaxCommandBytes)
 	}
 	if core.nextProposalID == ProposalID(math.MaxUint64) {
-		return Entry{}, ErrProposalIdentityOverflow
+		return 0, Entry{}, ErrProposalIdentityOverflow
 	}
 	for _, voter := range core.voters.Voters() {
 		if voter.ID == core.localID {
 			continue
 		}
 		if progress := core.progress[voter.ID]; progress.Generation == RequestGeneration(math.MaxUint64) {
-			return Entry{}, ErrReplicationGenerationOverflow
+			return 0, Entry{}, ErrReplicationGenerationOverflow
 		}
 	}
 	previousIndex := core.log.LastIndex()
 	newIndex, ok := checkedNextIndex(previousIndex)
 	if !ok {
-		return Entry{}, ErrLogOverflow
+		return 0, Entry{}, ErrLogOverflow
 	}
 	selfNext, ok := checkedNextIndex(newIndex)
 	if !ok {
-		return Entry{}, ErrLogOverflow
+		return 0, Entry{}, ErrLogOverflow
 	}
-	entry, err := NewEntry(newIndex, core.hardState.Term, EntryCommand, command)
+	entry, err := NewEntry(newIndex, core.hardState.Term, kind, command)
 	if err != nil {
-		return Entry{}, err
+		return 0, Entry{}, err
 	}
 	if _, err := core.log.Append(previousIndex, core.log.LastTerm(), []Entry{entry}); err != nil {
-		return Entry{}, err
+		return 0, Entry{}, err
 	}
 	proposalID := core.nextProposalID + 1
 	core.nextProposalID = proposalID
@@ -304,10 +320,10 @@ func (core *Core) ProposeEntry(command []byte) (Entry, error) {
 			continue
 		}
 		if err := core.issueAppend(voter.ID); err != nil {
-			return Entry{}, err
+			return 0, Entry{}, err
 		}
 	}
-	return entry.Clone(), nil
+	return proposalID, entry.Clone(), nil
 }
 
 // Ready returns an independently owned copy of the one live protocol batch.
@@ -317,18 +333,25 @@ func (core *Core) Ready() (Ready, bool) {
 		return Ready{}, false
 	}
 	if core.pendingReady.Token == 0 {
-		core.nextToken++
-		if core.nextToken == 0 {
-			core.nextToken++
+		if core.nextToken == ReadyToken(math.MaxUint64) {
+			core.terminalErr = ErrReadyTokenExhausted
+			return Ready{}, false
 		}
+		core.nextToken++
 		core.pendingReady.Token = core.nextToken
 	}
 	return core.pendingReady.Clone(), true
 }
 
+// Err returns the stable terminal core error, if one has occurred.
+func (core *Core) Err() error { return core.terminalErr }
+
 // Advance consumes the exact live Ready batch after owner-ordered persistence,
 // bounded handoff, and any later application work have succeeded.
 func (core *Core) Advance(token ReadyToken) error {
+	if core.terminalErr != nil {
+		return core.terminalErr
+	}
 	if !core.hasPending || token == 0 || token != core.pendingReady.Token {
 		return ErrAdvanceToken
 	}

@@ -55,6 +55,8 @@ var (
 	ErrReadyOutstanding = errors.New("raft Ready batch is outstanding")
 	// ErrAdvanceToken classifies a missing, stale, or mismatched Ready token.
 	ErrAdvanceToken = errors.New("invalid raft Ready advance token")
+	// ErrReadyTokenExhausted classifies terminal exhaustion of unique Ready tokens.
+	ErrReadyTokenExhausted = errors.New("raft Ready token space exhausted")
 	// ErrDeadlineOverflow classifies election deadline arithmetic outside uint64.
 	ErrDeadlineOverflow = errors.New("raft election deadline overflow")
 	// ErrTickRegression classifies a logical tick earlier than the last accepted tick.
@@ -73,4 +75,37 @@ var (
 	ErrProposalIdentityOverflow = errors.New("raft proposal identity overflow")
 	// ErrUnsupportedCoreRPC classifies a validated payload outside the current core task boundary.
 	ErrUnsupportedCoreRPC = errors.New("unsupported raft core RPC")
+	// ErrNotRunning classifies a local API call made before Run becomes ready.
+	ErrNotRunning = errors.New("raft node is not running")
+	// ErrStopped classifies a local API call made after terminal node shutdown.
+	ErrStopped = errors.New("raft node is stopped")
+	// ErrOverloaded classifies a bounded local or inbound queue at capacity.
+	ErrOverloaded = errors.New("raft node is overloaded")
+	// ErrLeadershipResyncRequired classifies a leadership stream that overflowed.
+	ErrLeadershipResyncRequired = errors.New("raft leadership resynchronization required")
+	// ErrInvalidLeadershipCapacity classifies a subscription capacity outside its bounded domain.
+	ErrInvalidLeadershipCapacity = errors.New("invalid raft leadership subscription capacity")
+	// ErrLeadershipSequenceOverflow classifies terminal exhaustion of leadership event sequencing.
+	ErrLeadershipSequenceOverflow = errors.New("raft leadership sequence exhausted")
+	// ErrSnapshotUnavailable classifies recovered snapshot metadata without Task 9 snapshot bytes.
+	ErrSnapshotUnavailable = errors.New("raft snapshot bytes unavailable")
+	// ErrTransportInvariant classifies an invalid result from the bounded transport handoff seam.
+	ErrTransportInvariant = errors.New("invalid raft transport handoff result")
 )
+
+// NotLeaderError carries a best-effort, non-authoritative leader hint.
+type NotLeaderError struct {
+	// LeaderID is the last leader identity observed by the local voter, or zero.
+	LeaderID uint16
+}
+
+// Error returns a command-free diagnostic string.
+func (err *NotLeaderError) Error() string {
+	if err == nil || err.LeaderID == 0 {
+		return ErrNotLeader.Error()
+	}
+	return ErrNotLeader.Error() + "; best-effort leader hint is available"
+}
+
+// Unwrap preserves errors.Is classification as ErrNotLeader.
+func (*NotLeaderError) Unwrap() error { return ErrNotLeader }

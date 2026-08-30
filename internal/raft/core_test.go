@@ -155,6 +155,32 @@ func TestReadyAdvanceRequiresExactLiveTokenAtomically(t *testing.T) {
 	}
 }
 
+func TestReadyTokenExhaustionFailsClosedWithoutReusingAncientToken(t *testing.T) {
+	core := newElectionCore(t, 3, 1, HardState{}, nil, 5, 15, []uint64{10, 10})
+	core.nextToken = ReadyToken(math.MaxUint64)
+	if err := core.Tick(5); err != nil {
+		t.Fatal(err)
+	}
+	if ready, ok := core.Ready(); ok {
+		t.Fatalf("Ready at exhausted token = %#v, want no reusable token", ready)
+	}
+	if !errors.Is(core.Err(), ErrReadyTokenExhausted) {
+		t.Fatalf("Core.Err() = %v, want ErrReadyTokenExhausted", core.Err())
+	}
+	if err := core.Advance(ReadyToken(1)); !errors.Is(err, ErrReadyTokenExhausted) {
+		t.Fatalf("Advance(ancient token 1) error = %v, want exhaustion failure", err)
+	}
+	if err := core.Tick(6); !errors.Is(err, ErrReadyTokenExhausted) {
+		t.Fatalf("Tick after exhaustion error = %v, want stable exhaustion failure", err)
+	}
+	if err := core.Step(2, PreVoteRequest{CandidateID: 2, CurrentTerm: 0, ProspectiveTerm: 1}); !errors.Is(err, ErrReadyTokenExhausted) {
+		t.Fatalf("Step after exhaustion error = %v, want stable exhaustion failure", err)
+	}
+	if _, err := core.ProposeEntry([]byte("after-exhaustion")); !errors.Is(err, ErrReadyTokenExhausted) {
+		t.Fatalf("ProposeEntry after exhaustion error = %v, want stable exhaustion failure", err)
+	}
+}
+
 func TestReadyGrantedVoteRequiresHardStateDurability(t *testing.T) {
 	core := newElectionCore(t, 3, 1, HardState{}, nil, 5, 15, []uint64{10})
 	request := RequestVoteRequest{CandidateID: 2, Term: 1}

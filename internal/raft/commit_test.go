@@ -162,6 +162,29 @@ func TestProposalDuplicateCommandsReceiveDistinctExactCommittedIdentities(t *tes
 	}
 }
 
+func TestBarrierProposalTracksAnExactNoOpIdentity(t *testing.T) {
+	core, _ := authorizedLeader(t)
+	proposalID, entry, err := core.proposeTracked(EntryNoOp, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proposalID == 0 || entry.Index != 2 || entry.Term != 1 || entry.Kind != EntryNoOp || len(entry.CommandBytes()) != 0 {
+		t.Fatalf("tracked barrier = id %d entry %#v, want exact term-1 no-op at index 2", proposalID, entry)
+	}
+	persistReady := advanceReady(t, core)
+	request := appendRequestTo(t, persistReady, 2)
+	if err := core.Step(2, appendSuccess(request, 2)); err != nil {
+		t.Fatal(err)
+	}
+	commitReady := requireReady(t, core)
+	if len(commitReady.CommittedProposals) != 1 || commitReady.CommittedProposals[0].ID != proposalID || !sameEntry(commitReady.CommittedProposals[0].Entry, entry) {
+		t.Fatalf("committed barriers = %#v, want exact identity %d", commitReady.CommittedProposals, proposalID)
+	}
+	if len(commitReady.CommittedEntries) != 1 || commitReady.CommittedEntries[0].Kind != EntryNoOp {
+		t.Fatalf("committed entries = %#v, want barrier no-op", commitReady.CommittedEntries)
+	}
+}
+
 func TestProposalOverwriteFailsExactIdentityAndCannotCrossComplete(t *testing.T) {
 	core, _ := authorizedLeader(t)
 	proposed, err := core.ProposeEntry([]byte("original"))
