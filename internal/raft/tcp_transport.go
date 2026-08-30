@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/clock"
+	"github.com/aaditya/cs425mp3/internal/config"
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
@@ -19,12 +20,11 @@ const (
 	// TransportReplayEntries bounds accepted request identities per remote voter across reconnects.
 	TransportReplayEntries = 8192
 	// TransportFutureSkew is the accepted authenticated wire-clock lead.
-	TransportFutureSkew = 30 * time.Second
+	TransportFutureSkew = config.ReplayFutureSkewAllowance
 	// TransportMaxInboundConnections bounds concurrent authenticated and unauthenticated handlers.
 	TransportMaxInboundConnections = 64
 	transportBackoffMinimum        = 50 * time.Millisecond
 	transportBackoffMaximum        = time.Second
-	transportMaxReplayWindow       = time.Duration(1<<63-1) - TransportFutureSkew
 )
 
 const (
@@ -117,7 +117,7 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 	if err := options.Voters.ValidateLocalID(options.LocalID); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTransportInvariant, err)
 	}
-	if options.ClusterID == ([16]byte{}) || options.Authenticator == nil || options.Clock == nil || options.ReplayWindow <= 0 || options.ReplayWindow > transportMaxReplayWindow || options.RPCTimeout <= 0 {
+	if options.ClusterID == ([16]byte{}) || options.Authenticator == nil || options.Clock == nil || options.ReplayWindow <= 0 || options.ReplayWindow > config.MaxReplayWindow || options.RPCTimeout <= 0 {
 		return nil, fmt.Errorf("%w: invalid TCP transport options", ErrTransportInvariant)
 	}
 	replayRetention := options.ReplayWindow + TransportFutureSkew

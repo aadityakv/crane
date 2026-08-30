@@ -62,8 +62,14 @@ type TimingConfig struct {
 	ReplayWindow Duration `json:"replay_window"`
 }
 
-// MinClusterSecretBytes is the minimum raw HMAC-SHA256 key length accepted for a cluster secret.
-const MinClusterSecretBytes = 32
+const (
+	// MinClusterSecretBytes is the minimum raw HMAC-SHA256 key length accepted for a cluster secret.
+	MinClusterSecretBytes = 32
+	// ReplayFutureSkewAllowance is the modeled authenticated wire-clock lead reserved in replay retention arithmetic.
+	ReplayFutureSkewAllowance = 30 * time.Second
+	// MaxReplayWindow is the largest replay window whose retained lifetime remains representable as a time.Duration.
+	MaxReplayWindow = time.Duration(1<<63-1) - ReplayFutureSkewAllowance
+)
 
 // DefaultTimingConfig returns the deterministic timing configuration used when a JSON config omits timing fields.
 func DefaultTimingConfig() TimingConfig {
@@ -303,6 +309,9 @@ func LoadClusterSecret(path string) ([]byte, error) {
 func validateTiming(timing TimingConfig) error {
 	if timing.ProbeInterval <= 0 || timing.DirectProbeTimeout <= 0 || timing.IndirectProbeTimeout <= 0 || timing.ReplayWindow <= 0 {
 		return fmt.Errorf("all timing durations must be greater than zero")
+	}
+	if time.Duration(timing.ReplayWindow) > MaxReplayWindow {
+		return fmt.Errorf("replay window exceeds maximum safe retained lifetime")
 	}
 	if timing.SuspicionMultiplier == 0 {
 		return fmt.Errorf("suspicion multiplier must be nonzero")

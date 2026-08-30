@@ -56,6 +56,71 @@ func TestServiceConstructorIsSideEffectFreeAndRequiresLocalVoter(t *testing.T) {
 	}
 }
 
+func TestServiceConstructorValidatesReplayRetentionBeforeEffects(t *testing.T) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	const modeledFutureSkew = 30 * time.Second
+	maxReplayWindow := maxDuration - modeledFutureSkew
+
+	for _, test := range []struct {
+		name         string
+		replayWindow time.Duration
+		wantErr      bool
+	}{
+		{name: "exact max-safe remains pure", replayWindow: maxReplayWindow},
+		{name: "one nanosecond over rejected", replayWindow: maxReplayWindow + time.Nanosecond, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configuration, secret := task10ServiceConfig(t, 1, 33050)
+			storage := filepath.Join(t.TempDir(), "absent-raft-storage")
+			configuration.StorageDir = storage
+			configuration.Timing.ReplayWindow = config.Duration(test.replayWindow)
+
+			service, err := NewService(ServiceOptions{
+				Config: configuration, Secret: secret, Clock: &task10PanicClock{},
+				Random: task10ConstructorPanicRandom{}, StateMachine: task10ConstructorPanicStateMachine{},
+			})
+			if test.wantErr {
+				if !errors.Is(err, ErrInvalidCoreState) {
+					t.Fatalf("NewService error = %v, want ErrInvalidCoreState", err)
+				}
+				if service != nil {
+					t.Fatal("NewService returned a service for overflowing replay retention")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("NewService rejected exact max-safe replay window: %v", err)
+				}
+				select {
+				case <-service.Ready():
+					t.Fatal("pure constructor closed Ready")
+				default:
+				}
+			}
+			if _, statErr := os.Stat(storage); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("NewService touched storage path: %v", statErr)
+			}
+		})
+	}
+}
+
+type task10ConstructorPanicRandom struct{}
+
+func (task10ConstructorPanicRandom) Uint64() uint64 { panic("constructor read random source") }
+
+type task10ConstructorPanicStateMachine struct{}
+
+func (task10ConstructorPanicStateMachine) Apply(uint64, uint64, []byte) ([]byte, error) {
+	panic("constructor applied state machine command")
+}
+
+func (task10ConstructorPanicStateMachine) Capture(uint64, uint64) (SnapshotCapture, error) {
+	panic("constructor captured state machine snapshot")
+}
+
+func (task10ConstructorPanicStateMachine) Restore(uint32, []byte) error {
+	panic("constructor restored state machine snapshot")
+}
+
 func TestServiceRunOrdersRecoveryBindWorkersOwnerAndIsolatedReady(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33100)
 	events := &task8EventLog{}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -18,6 +19,62 @@ func TestValidateTimingRejectsOverflowingTimeoutSum(t *testing.T) {
 
 	if err := validateTiming(timing); err == nil {
 		t.Fatal("validateTiming accepted direct+indirect duration overflow")
+	}
+}
+
+func TestReplayWindowRetentionBoundaryValidation(t *testing.T) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	const modeledFutureSkew = 30 * time.Second
+	maxReplayWindow := maxDuration - modeledFutureSkew
+	secret := createSecret(t, 0o600)
+
+	configuration := validConfig(secret)
+	configuration.Timing.ReplayWindow = Duration(maxReplayWindow)
+	if err := configuration.Validate(); err != nil {
+		t.Fatalf("Validate rejected exact max-safe replay window: %v", err)
+	}
+
+	configuration.Timing.ReplayWindow = Duration(maxReplayWindow + time.Nanosecond)
+	if err := configuration.Validate(); err == nil {
+		t.Fatal("Validate accepted replay window whose modeled retention overflows")
+	}
+}
+
+func TestDecodeReplayWindowRetentionBoundary(t *testing.T) {
+	const maxDuration = time.Duration(1<<63 - 1)
+	const modeledFutureSkew = 30 * time.Second
+	maxReplayWindow := maxDuration - modeledFutureSkew
+	secret := createSecret(t, 0o600)
+
+	for _, test := range []struct {
+		name         string
+		replayWindow time.Duration
+		wantErr      bool
+	}{
+		{name: "exact max-safe", replayWindow: maxReplayWindow},
+		{name: "one nanosecond over", replayWindow: maxReplayWindow + time.Nanosecond, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configuration := validConfig(secret)
+			configuration.Timing.ReplayWindow = Duration(test.replayWindow)
+			encoded, err := json.Marshal(configuration)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			decoded, err := Decode(bytes.NewReader(encoded))
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("Decode accepted replay window whose modeled retention overflows")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Decode rejected exact max-safe replay window: %v", err)
+			}
+			if got := time.Duration(decoded.Timing.ReplayWindow); got != test.replayWindow {
+				t.Fatalf("decoded replay window = %s, want %s", got, test.replayWindow)
+			}
+		})
 	}
 }
 
