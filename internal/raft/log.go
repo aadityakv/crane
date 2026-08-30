@@ -137,6 +137,20 @@ func (l *Log) Entry(index uint64) (Entry, error) {
 	return l.entries[offset].Clone(), nil
 }
 
+// LastIndexOfTerm returns the greatest available index in term.
+func (l *Log) LastIndexOfTerm(term uint64) (uint64, bool) {
+	for index := len(l.entries); index > 0; index-- {
+		entry := l.entries[index-1]
+		if entry.Term == term {
+			return entry.Index, true
+		}
+	}
+	if l.snapshotIndex != 0 && l.snapshotTerm == term {
+		return l.snapshotIndex, true
+	}
+	return 0, false
+}
+
 // Append proves a previous position before repairing the retained suffix.
 func (l *Log) Append(prevIndex, prevTerm uint64, entries []Entry) (ConflictHint, error) {
 	localTerm, err := l.Term(prevIndex)

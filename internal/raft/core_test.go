@@ -420,7 +420,7 @@ func startPreVote(t *testing.T, core *Core, tick uint64) Ready {
 
 func electedCandidate(t *testing.T, voterCount int, localID uint16) *Core {
 	t.Helper()
-	core := newElectionCore(t, voterCount, localID, HardState{}, nil, 5, 15, []uint64{10, 10, 10, 10})
+	core := newElectionCore(t, voterCount, localID, HardState{}, nil, 5, 15, []uint64{10, 10, 10, 10, 10, 10, 10, 10})
 	startPreVote(t, core, 5)
 	responder := uint16(1)
 	if responder == localID {

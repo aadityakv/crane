@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -24,6 +25,12 @@ type CoreOptions struct {
 	ElectionTimeoutMin uint64
 	// ElectionTimeoutMax is the exclusive timeout bound in logical ticks.
 	ElectionTimeoutMax uint64
+	// HeartbeatInterval is the positive logical-tick replication cadence; zero defaults to one.
+	HeartbeatInterval uint64
+	// MaxAppendEntries bounds entries carried by one generated AppendEntries request.
+	MaxAppendEntries uint16
+	// MaxAppendBytes bounds the actual canonical encoded AppendEntries payload.
+	MaxAppendBytes uint64
 	// Random supplies deterministic uint64 samples; the core applies unbiased bounding.
 	Random interface{ Uint64() uint64 }
 }
@@ -45,12 +52,19 @@ type Core struct {
 	electionTimeoutMax uint64
 	random             interface{ Uint64() uint64 }
 	recentLeader       bool
+	heartbeatInterval  uint64
+	heartbeatDeadline  uint64
+	quorumDeadline     uint64
+	quorumResponses    map[uint16]struct{}
+	appendLimits       CodecLimits
 
-	preVotes map[uint16]struct{}
-	votes    map[uint16]struct{}
-	// activeAppendGenerations contains only Task 5's initial no-op request per peer.
-	// Task 6 replaces this narrow correlation seam with full progress tracking.
-	activeAppendGenerations map[uint16]RequestGeneration
+	preVotes             map[uint16]struct{}
+	votes                map[uint16]struct{}
+	progress             map[uint16]Progress
+	nextProposalID       ProposalID
+	pendingProposals     map[ProposalID]Entry
+	pendingProposalOrder []ProposalID
+	proposalAtIndex      map[uint64]ProposalID
 
 	pendingReady Ready
 	hasPending   bool
@@ -76,6 +90,30 @@ func NewCore(options CoreOptions) (*Core, error) {
 			options.ElectionTimeoutMin,
 			options.ElectionTimeoutMax,
 		)
+	}
+	heartbeatInterval := options.HeartbeatInterval
+	if heartbeatInterval == 0 {
+		heartbeatInterval = 1
+	}
+	if heartbeatInterval >= options.ElectionTimeoutMin {
+		return nil, fmt.Errorf(
+			"%w: heartbeat interval %d must be below election minimum %d",
+			ErrInvalidCoreState,
+			heartbeatInterval,
+			options.ElectionTimeoutMin,
+		)
+	}
+	appendLimits := DefaultCodecLimits()
+	if options.MaxAppendEntries != 0 {
+		appendLimits.MaxAppendEntries = options.MaxAppendEntries
+	}
+	if options.MaxAppendBytes != 0 {
+		appendLimits.MaxEncodedBytes = options.MaxAppendBytes
+	}
+	if _, _, err := EncodeRPC(AppendEntriesRequest{
+		LeaderID: options.LocalID, Term: 1, Generation: 1,
+	}, appendLimits); err != nil {
+		return nil, fmt.Errorf("%w: append limits: %v", ErrInvalidCoreState, err)
 	}
 	state := options.Log.State()
 	if state.CommitIndex != options.HardState.CommitIndex {
@@ -131,6 +169,8 @@ func NewCore(options CoreOptions) (*Core, error) {
 		electionTimeoutMin: options.ElectionTimeoutMin,
 		electionTimeoutMax: options.ElectionTimeoutMax,
 		random:             options.Random,
+		heartbeatInterval:  heartbeatInterval,
+		appendLimits:       appendLimits,
 	}
 	deadline, err := core.sampleDeadline(0)
 	if err != nil {
@@ -149,11 +189,14 @@ func (core *Core) Tick(now uint64) error {
 	if now < core.now {
 		return fmt.Errorf("%w: now=%d previous=%d", ErrTickRegression, now, core.now)
 	}
+	if core.role == RoleLeader {
+		return core.tickLeader(now)
+	}
 	if core.deadlineExhausted {
 		core.now = now
 		return nil
 	}
-	if core.role == RoleLeader || now < core.electionDeadline {
+	if now < core.electionDeadline {
 		core.now = now
 		return nil
 	}
@@ -169,8 +212,14 @@ func (core *Core) Step(senderID uint16, rpc RPC) error {
 	if err := ValidateRPCSender(rpc, senderID, core.voters); err != nil {
 		return err
 	}
-	if err := validateRPC(rpc, DefaultCodecLimits()); err != nil {
-		return err
+	if request, ok := rpc.(AppendEntriesRequest); ok {
+		if _, _, err := EncodeRPC(request, core.appendLimits); err != nil {
+			return err
+		}
+	} else {
+		if err := validateRPC(rpc, DefaultCodecLimits()); err != nil {
+			return err
+		}
 	}
 
 	switch message := rpc.(type) {
@@ -183,7 +232,7 @@ func (core *Core) Step(senderID uint16, rpc RPC) error {
 	case RequestVoteResponse:
 		return core.handleVoteResponse(message)
 	case AppendEntriesRequest:
-		return core.handleLeaderContact(message.LeaderID, message.Term)
+		return core.handleAppendRequest(message)
 	case InstallSnapshotRequest:
 		return core.handleLeaderContact(message.LeaderID, message.Term)
 	case AppendEntriesResponse:
@@ -199,7 +248,7 @@ func (core *Core) Step(senderID uint16, rpc RPC) error {
 
 // ProposeEntry rejects non-leaders and fences leaders until a current-term
 // entry is committed. Task 6 owns proposal append and completion mechanics.
-func (core *Core) ProposeEntry(_ []byte) (Entry, error) {
+func (core *Core) ProposeEntry(command []byte) (Entry, error) {
 	if core.hasPending {
 		return Entry{}, ErrReadyOutstanding
 	}
@@ -209,7 +258,56 @@ func (core *Core) ProposeEntry(_ []byte) (Entry, error) {
 	if !core.hasCommittedCurrentTerm() {
 		return Entry{}, ErrLeadershipNotAuthorized
 	}
-	return Entry{}, ErrLeadershipNotAuthorized
+	if uint64(len(command)) > core.appendLimits.MaxCommandBytes {
+		return Entry{}, fmt.Errorf("%w: proposal command is %d bytes, maximum is %d", ErrRPCTooLarge, len(command), core.appendLimits.MaxCommandBytes)
+	}
+	if core.nextProposalID == ProposalID(math.MaxUint64) {
+		return Entry{}, ErrProposalIdentityOverflow
+	}
+	for _, voter := range core.voters.Voters() {
+		if voter.ID == core.localID {
+			continue
+		}
+		if progress := core.progress[voter.ID]; progress.Generation == RequestGeneration(math.MaxUint64) {
+			return Entry{}, ErrReplicationGenerationOverflow
+		}
+	}
+	previousIndex := core.log.LastIndex()
+	newIndex, ok := checkedNextIndex(previousIndex)
+	if !ok {
+		return Entry{}, ErrLogOverflow
+	}
+	selfNext, ok := checkedNextIndex(newIndex)
+	if !ok {
+		return Entry{}, ErrLogOverflow
+	}
+	entry, err := NewEntry(newIndex, core.hardState.Term, EntryCommand, command)
+	if err != nil {
+		return Entry{}, err
+	}
+	if _, err := core.log.Append(previousIndex, core.log.LastTerm(), []Entry{entry}); err != nil {
+		return Entry{}, err
+	}
+	proposalID := core.nextProposalID + 1
+	core.nextProposalID = proposalID
+	if core.pendingProposals == nil {
+		core.pendingProposals = make(map[ProposalID]Entry)
+		core.proposalAtIndex = make(map[uint64]ProposalID)
+	}
+	core.pendingProposals[proposalID] = entry.Clone()
+	core.pendingProposalOrder = append(core.pendingProposalOrder, proposalID)
+	core.proposalAtIndex[entry.Index] = proposalID
+	core.progress[core.localID] = Progress{MatchIndex: newIndex, NextIndex: selfNext}
+	core.queueEntries([]Entry{entry})
+	for _, voter := range core.voters.Voters() {
+		if voter.ID == core.localID {
+			continue
+		}
+		if err := core.issueAppend(voter.ID); err != nil {
+			return Entry{}, err
+		}
+	}
+	return entry.Clone(), nil
 }
 
 // Ready returns an independently owned copy of the one live protocol batch.
@@ -233,6 +331,12 @@ func (core *Core) Ready() (Ready, bool) {
 func (core *Core) Advance(token ReadyToken) error {
 	if !core.hasPending || token == 0 || token != core.pendingReady.Token {
 		return ErrAdvanceToken
+	}
+	if len(core.pendingReady.CommittedEntries) != 0 {
+		lastApplied := core.pendingReady.CommittedEntries[len(core.pendingReady.CommittedEntries)-1].Index
+		if err := core.log.AdvanceApplied(lastApplied); err != nil {
+			return err
+		}
 	}
 	core.pendingReady = Ready{}
 	core.hasPending = false
@@ -262,6 +366,12 @@ func (core *Core) ElectionDeadline() uint64 { return core.electionDeadline }
 
 // Voters returns the immutable fixed voter set used by the core.
 func (core *Core) Voters() VoterSet { return core.voters }
+
+// Progress returns an owned view of one voter's leader replication state.
+func (core *Core) Progress(voterID uint16) (Progress, bool) {
+	progress, ok := core.progress[voterID]
+	return progress, ok
+}
 
 func (core *Core) startPreVote(now uint64) error {
 	if core.hardState.Term == math.MaxUint64 {
@@ -433,6 +543,10 @@ func (core *Core) becomeLeader(finalVoter uint16) error {
 	if !ok {
 		return ErrLogOverflow
 	}
+	selfNext, ok := checkedNextIndex(newIndex)
+	if !ok {
+		return ErrLogOverflow
+	}
 	entry, err := NewEntry(newIndex, core.hardState.Term, EntryNoOp, nil)
 	if err != nil {
 		return err
@@ -447,25 +561,66 @@ func (core *Core) becomeLeader(finalVoter uint16) error {
 	core.leaderID = core.localID
 	core.preVotes = nil
 	core.recentLeader = false
-	core.activeAppendGenerations = make(map[uint16]RequestGeneration, len(core.voters.Voters())-1)
+	core.progress = make(map[uint16]Progress, len(core.voters.Voters()))
+	core.progress[core.localID] = Progress{MatchIndex: newIndex, NextIndex: selfNext}
+	core.quorumResponses = make(map[uint16]struct{}, len(core.voters.Voters())-1)
+	core.heartbeatDeadline = saturatingTickAdd(core.now, core.heartbeatInterval)
+	core.quorumDeadline = saturatingTickAdd(core.now, core.electionTimeoutMin)
 	core.queueEntries([]Entry{entry})
 	for _, voter := range core.voters.Voters() {
 		if voter.ID == core.localID {
 			continue
 		}
-		generation := RequestGeneration(1)
-		request := AppendEntriesRequest{
-			LeaderID:     core.localID,
-			Term:         core.hardState.Term,
-			Generation:   generation,
-			PrevLogIndex: previousIndex,
-			PrevLogTerm:  previousTerm,
-			LeaderCommit: core.log.CommitIndex(),
-			Entries:      []Entry{entry},
+		core.progress[voter.ID] = Progress{NextIndex: newIndex}
+		if err := core.issueAppend(voter.ID); err != nil {
+			return err
 		}
-		core.activeAppendGenerations[voter.ID] = generation
-		core.queueMessage(voter.ID, request, DurabilityPrerequisite{EntriesThrough: newIndex})
 	}
+	return nil
+}
+
+func (core *Core) tickLeader(now uint64) error {
+	core.now = now
+	if now >= core.quorumDeadline {
+		if 1+len(core.quorumResponses) < core.voters.Majority() {
+			return core.stepDownWithoutTermChange(now)
+		}
+		core.quorumResponses = make(map[uint16]struct{}, len(core.voters.Voters())-1)
+		core.quorumDeadline = saturatingTickAdd(now, core.electionTimeoutMin)
+	}
+	if now < core.heartbeatDeadline {
+		return nil
+	}
+	for _, voter := range core.voters.Voters() {
+		if voter.ID == core.localID {
+			continue
+		}
+		if err := core.issueAppend(voter.ID); err != nil {
+			return err
+		}
+	}
+	core.heartbeatDeadline = saturatingTickAdd(now, core.heartbeatInterval)
+	return nil
+}
+
+func (core *Core) stepDownWithoutTermChange(now uint64) error {
+	deadline, err := core.sampleDeadline(now)
+	if err != nil {
+		if !errors.Is(err, ErrDeadlineOverflow) {
+			return err
+		}
+		deadline = math.MaxUint64
+		core.deadlineExhausted = true
+	} else {
+		core.deadlineExhausted = false
+	}
+	core.role = RoleFollower
+	core.leaderID = 0
+	core.recentLeader = false
+	core.progress = nil
+	core.quorumResponses = nil
+	core.electionDeadline = deadline
+	core.failPendingProposals(ErrProposalFailed)
 	return nil
 }
 
@@ -484,15 +639,114 @@ func (core *Core) handleLeaderContact(leaderID uint16, term uint64) error {
 	}
 	if term > core.hardState.Term {
 		core.adoptHigherTerm(term)
+	} else if core.role == RoleLeader && leaderID != core.localID {
+		core.failPendingProposals(ErrProposalFailed)
 	}
 	core.role = RoleFollower
 	core.leaderID = leaderID
 	core.recentLeader = true
 	core.preVotes = nil
 	core.votes = nil
+	core.progress = nil
+	core.quorumResponses = nil
 	core.electionDeadline = deadline
 	core.deadlineExhausted = deadlineExhausted
 	return nil
+}
+
+func (core *Core) handleAppendRequest(request AppendEntriesRequest) error {
+	if request.Term < core.hardState.Term {
+		conflictIndex, ok := checkedNextIndex(core.log.LastIndex())
+		if !ok {
+			conflictIndex = core.log.LastIndex()
+		}
+		core.queueAppendResponse(request, false, 0, ConflictHint{Index: conflictIndex}, DurabilityPrerequisite{})
+		return nil
+	}
+
+	hardStateChanged := request.Term > core.hardState.Term
+	if err := core.handleLeaderContact(request.LeaderID, request.Term); err != nil {
+		return err
+	}
+	before := core.log.State()
+	hint, err := core.log.Append(request.PrevLogIndex, request.PrevLogTerm, request.Entries)
+	if err != nil {
+		if errors.Is(err, ErrLogUnavailable) || errors.Is(err, ErrLogCompacted) || errors.Is(err, ErrLogMismatch) {
+			requires := DurabilityPrerequisite{HardState: hardStateChanged}
+			core.queueAppendResponse(request, false, 0, hint, requires)
+			return nil
+		}
+		return err
+	}
+
+	lastVerified := request.PrevLogIndex
+	if len(request.Entries) != 0 {
+		lastVerified = request.Entries[len(request.Entries)-1].Index
+	}
+	previousCommit := core.log.CommitIndex()
+	commitIndex := request.LeaderCommit
+	if commitIndex > lastVerified {
+		commitIndex = lastVerified
+	}
+	if commitIndex > core.log.CommitIndex() {
+		if err := core.log.AdvanceCommit(commitIndex); err != nil {
+			return err
+		}
+		core.hardState.CommitIndex = commitIndex
+		core.recordHardState()
+		if err := core.queueCommittedEntries(previousCommit, commitIndex); err != nil {
+			return err
+		}
+		hardStateChanged = true
+	}
+
+	changed := changedLogEntries(before.Entries, core.log.State().Entries)
+	requires := DurabilityPrerequisite{HardState: hardStateChanged}
+	if len(changed) != 0 {
+		core.queueEntries(changed)
+		requires.EntriesThrough = changed[len(changed)-1].Index
+	}
+	core.queueAppendResponse(request, true, lastVerified, ConflictHint{}, requires)
+	return nil
+}
+
+func (core *Core) queueAppendResponse(request AppendEntriesRequest, success bool, matchIndex uint64, hint ConflictHint, requires DurabilityPrerequisite) {
+	core.queueMessage(request.LeaderID, AppendEntriesResponse{
+		ResponderID:   core.localID,
+		LeaderID:      request.LeaderID,
+		Term:          core.hardState.Term,
+		RequestTerm:   request.Term,
+		Generation:    request.Generation,
+		Success:       success,
+		MatchIndex:    matchIndex,
+		ConflictTerm:  hint.Term,
+		ConflictIndex: hint.Index,
+	}, requires)
+}
+
+func changedLogEntries(before, after []Entry) []Entry {
+	shared := len(before)
+	if len(after) < shared {
+		shared = len(after)
+	}
+	firstChanged := shared
+	for index := 0; index < shared; index++ {
+		if !sameEntry(before[index], after[index]) {
+			firstChanged = index
+			break
+		}
+	}
+	if firstChanged == shared && len(after) == len(before) {
+		return nil
+	}
+	return cloneEntries(after[firstChanged:])
+}
+
+func sameEntry(left, right Entry) bool {
+	return left.Index == right.Index &&
+		left.Term == right.Term &&
+		left.Kind == right.Kind &&
+		bytes.Equal(left.command, right.command)
 }
 
 func (core *Core) handleAppendResponse(response AppendEntriesResponse) error {
@@ -501,18 +755,278 @@ func (core *Core) handleAppendResponse(response AppendEntriesResponse) error {
 		response.RequestTerm != core.hardState.Term {
 		return nil
 	}
-	generation, active := core.activeAppendGenerations[response.ResponderID]
-	if !active || response.Generation != generation {
+	progress, active := core.progress[response.ResponderID]
+	if !active || response.Generation != progress.ActiveGeneration {
 		return nil
 	}
-	delete(core.activeAppendGenerations, response.ResponderID)
+	if response.Success && response.MatchIndex != progress.activeMatchIndex {
+		return nil
+	}
+	progress.ActiveGeneration = 0
+	progress.activeMatchIndex = 0
+	core.progress[response.ResponderID] = progress
+	core.quorumResponses[response.ResponderID] = struct{}{}
 	if response.Term > core.hardState.Term {
 		core.adoptHigherTerm(response.Term)
+		return nil
+	}
+	if response.Success {
+		if response.MatchIndex > progress.MatchIndex {
+			progress.MatchIndex = response.MatchIndex
+		}
+		nextIndex, ok := checkedNextIndex(progress.MatchIndex)
+		if !ok {
+			return ErrLogOverflow
+		}
+		if progress.NextIndex < nextIndex {
+			progress.NextIndex = nextIndex
+		}
+		progress.SnapshotNeeded = false
+		core.progress[response.ResponderID] = progress
+		if err := core.advanceLeaderCommit(); err != nil {
+			return err
+		}
+		if progress.NextIndex <= core.log.LastIndex() {
+			return core.issueAppend(response.ResponderID)
+		}
+		return nil
+	}
+
+	nextIndex := response.ConflictIndex
+	if response.ConflictTerm != 0 {
+		if lastIndex, ok := core.log.LastIndexOfTerm(response.ConflictTerm); ok {
+			var nextOK bool
+			nextIndex, nextOK = checkedNextIndex(lastIndex)
+			if !nextOK {
+				return ErrLogOverflow
+			}
+		}
+	}
+	maximumNext, ok := checkedNextIndex(core.log.LastIndex())
+	if !ok {
+		return ErrLogOverflow
+	}
+	if nextIndex > maximumNext {
+		nextIndex = maximumNext
+	}
+	minimumNext, ok := checkedNextIndex(progress.MatchIndex)
+	if !ok {
+		return ErrLogOverflow
+	}
+	if nextIndex < minimumNext {
+		nextIndex = minimumNext
+	}
+	progress.NextIndex = nextIndex
+	if nextIndex <= core.log.SnapshotIndex() {
+		progress.SnapshotNeeded = true
+		core.progress[response.ResponderID] = progress
+		return nil
+	}
+	progress.SnapshotNeeded = false
+	core.progress[response.ResponderID] = progress
+	return core.issueAppend(response.ResponderID)
+}
+
+func (core *Core) issueAppend(peerID uint16) error {
+	progress, ok := core.progress[peerID]
+	if !ok || peerID == core.localID || progress.SnapshotNeeded {
+		return nil
+	}
+	if progress.Generation == RequestGeneration(math.MaxUint64) {
+		return ErrReplicationGenerationOverflow
+	}
+	minimumNext, ok := checkedNextIndex(progress.MatchIndex)
+	if !ok {
+		return ErrLogOverflow
+	}
+	if progress.NextIndex < minimumNext {
+		progress.NextIndex = minimumNext
+	}
+	maximumNext, ok := checkedNextIndex(core.log.LastIndex())
+	if !ok {
+		return ErrLogOverflow
+	}
+	if progress.NextIndex > maximumNext {
+		progress.NextIndex = maximumNext
+	}
+	if progress.NextIndex <= core.log.SnapshotIndex() {
+		progress.SnapshotNeeded = true
+		progress.ActiveGeneration = 0
+		core.progress[peerID] = progress
+		return nil
+	}
+
+	prevIndex := progress.NextIndex - 1
+	prevTerm, err := core.log.Term(prevIndex)
+	if err != nil {
+		return err
+	}
+	generation := progress.Generation + 1
+	request := AppendEntriesRequest{
+		LeaderID: core.localID, Term: core.hardState.Term, Generation: generation,
+		PrevLogIndex: prevIndex, PrevLogTerm: prevTerm,
+		LeaderCommit: core.log.CommitIndex(),
+	}
+	for index := progress.NextIndex; index <= core.log.LastIndex(); index++ {
+		if len(request.Entries) == int(core.appendLimits.MaxAppendEntries) {
+			break
+		}
+		entry, err := core.log.Entry(index)
+		if err != nil {
+			return err
+		}
+		candidate := request
+		candidate.Entries = append(cloneEntries(request.Entries), entry)
+		if _, _, err := EncodeRPC(candidate, core.appendLimits); err != nil {
+			if errors.Is(err, ErrRPCTooLarge) {
+				break
+			}
+			return err
+		}
+		request.Entries = candidate.Entries
+		if index == math.MaxUint64 {
+			break
+		}
+	}
+	matchIndex := prevIndex
+	if len(request.Entries) != 0 {
+		matchIndex = request.Entries[len(request.Entries)-1].Index
+	}
+	requires := DurabilityPrerequisite{}
+	if len(request.Entries) != 0 && readyContainsEntry(core.pendingReady.Entries, request.Entries[len(request.Entries)-1].Index) {
+		requires.EntriesThrough = request.Entries[len(request.Entries)-1].Index
+	}
+	progress.Generation = generation
+	progress.ActiveGeneration = generation
+	progress.activeMatchIndex = matchIndex
+	core.progress[peerID] = progress
+	core.queueMessage(peerID, request, requires)
+	return nil
+}
+
+func (core *Core) advanceLeaderCommit() error {
+	currentCommit := core.log.CommitIndex()
+	for candidate := core.log.LastIndex(); candidate > currentCommit; candidate-- {
+		term, err := core.log.Term(candidate)
+		if err != nil {
+			return err
+		}
+		if term != core.hardState.Term {
+			continue
+		}
+		replicas := 0
+		for _, voter := range core.voters.Voters() {
+			progress := core.progress[voter.ID]
+			if progress.MatchIndex >= candidate {
+				replicas++
+			}
+		}
+		if replicas < core.voters.Majority() {
+			continue
+		}
+		if err := core.log.AdvanceCommit(candidate); err != nil {
+			return err
+		}
+		core.hardState.CommitIndex = candidate
+		core.recordHardState()
+		if err := core.queueCommittedEntries(currentCommit, candidate); err != nil {
+			return err
+		}
+		return nil
 	}
 	return nil
 }
 
+func readyContainsEntry(entries []Entry, index uint64) bool {
+	for _, entry := range entries {
+		if entry.Index == index {
+			return true
+		}
+	}
+	return false
+}
+
+func (core *Core) queueCommittedEntries(previousCommit, commitIndex uint64) error {
+	index, ok := checkedNextIndex(previousCommit)
+	if !ok {
+		return ErrLogOverflow
+	}
+	for index <= commitIndex {
+		entry, err := core.log.Entry(index)
+		if err != nil {
+			return err
+		}
+		core.pendingReady.CommittedEntries = append(core.pendingReady.CommittedEntries, entry)
+		core.resolveCommittedProposal(entry)
+		core.hasPending = true
+		if index == math.MaxUint64 {
+			break
+		}
+		index++
+	}
+	return nil
+}
+
+func (core *Core) resolveCommittedProposal(entry Entry) {
+	proposalID, ok := core.proposalAtIndex[entry.Index]
+	if !ok {
+		return
+	}
+	proposal, ok := core.pendingProposals[proposalID]
+	if !ok {
+		delete(core.proposalAtIndex, entry.Index)
+		return
+	}
+	if sameEntry(proposal, entry) {
+		core.pendingReady.CommittedProposals = append(core.pendingReady.CommittedProposals, CommittedProposal{
+			ID: proposalID, Entry: proposal.Clone(),
+		})
+	} else {
+		core.pendingReady.FailedProposals = append(core.pendingReady.FailedProposals, FailedProposal{
+			ID: proposalID, Entry: proposal.Clone(), Err: ErrProposalFailed,
+		})
+	}
+	delete(core.pendingProposals, proposalID)
+	delete(core.proposalAtIndex, entry.Index)
+	core.removePendingProposalOrder(proposalID)
+}
+
+func (core *Core) removePendingProposalOrder(proposalID ProposalID) {
+	for index, pendingID := range core.pendingProposalOrder {
+		if pendingID != proposalID {
+			continue
+		}
+		copy(core.pendingProposalOrder[index:], core.pendingProposalOrder[index+1:])
+		core.pendingProposalOrder = core.pendingProposalOrder[:len(core.pendingProposalOrder)-1]
+		return
+	}
+}
+
+func (core *Core) failPendingProposals(reason error) {
+	for _, proposalID := range core.pendingProposalOrder {
+		proposal, ok := core.pendingProposals[proposalID]
+		if !ok {
+			continue
+		}
+		core.pendingReady.FailedProposals = append(core.pendingReady.FailedProposals, FailedProposal{
+			ID: proposalID, Entry: proposal.Clone(), Err: reason,
+		})
+		delete(core.proposalAtIndex, proposal.Index)
+		delete(core.pendingProposals, proposalID)
+		core.hasPending = true
+	}
+	core.pendingProposalOrder = nil
+}
+
+func saturatingTickAdd(now, interval uint64) uint64 {
+	if now > math.MaxUint64-interval {
+		return math.MaxUint64
+	}
+	return now + interval
+}
+
 func (core *Core) adoptHigherTerm(term uint64) {
+	core.failPendingProposals(ErrProposalFailed)
 	core.hardState.Term = term
 	core.hardState.VotedFor = 0
 	core.role = RoleFollower
@@ -520,7 +1034,8 @@ func (core *Core) adoptHigherTerm(term uint64) {
 	core.recentLeader = false
 	core.preVotes = nil
 	core.votes = nil
-	core.activeAppendGenerations = nil
+	core.progress = nil
+	core.quorumResponses = nil
 	if core.now > math.MaxUint64-core.electionTimeoutMin {
 		core.electionDeadline = math.MaxUint64
 		core.deadlineExhausted = true

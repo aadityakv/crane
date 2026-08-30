@@ -23,6 +23,27 @@ type PeerMessage struct {
 	Requires DurabilityPrerequisite
 }
 
+// ProposalID identifies one leader-local proposal independently of command bytes.
+type ProposalID uint64
+
+// CommittedProposal hands off one exact committed local proposal for later application completion.
+type CommittedProposal struct {
+	// ID is the unique leader-local proposal identity.
+	ID ProposalID
+	// Entry is the exact term, index, kind, and content identity that committed.
+	Entry Entry
+}
+
+// FailedProposal reports one exact local proposal that can no longer commit as submitted.
+type FailedProposal struct {
+	// ID is the unique leader-local proposal identity.
+	ID ProposalID
+	// Entry is the exact entry originally bound to the proposal.
+	Entry Entry
+	// Err classifies why the pending proposal can no longer complete.
+	Err error
+}
+
 // Ready is one immutable-by-convention owned protocol output batch.
 type Ready struct {
 	// Token must be supplied exactly once to Core.Advance.
@@ -33,6 +54,12 @@ type Ready struct {
 	Entries []Entry
 	// Messages are owned outbound peer RPCs with explicit durability gates.
 	Messages []PeerMessage
+	// CommittedEntries are newly committed owned entries to process in ascending order.
+	CommittedEntries []Entry
+	// CommittedProposals are exact local proposal identities handed to the later apply owner.
+	CommittedProposals []CommittedProposal
+	// FailedProposals are exact local proposals invalidated before committed handoff.
+	FailedProposals []FailedProposal
 }
 
 // Clone returns an independently owned copy of the complete batch.
@@ -43,6 +70,19 @@ func (ready Ready) Clone() Ready {
 		owned.HardState = &hardState
 	}
 	owned.Entries = cloneEntries(ready.Entries)
+	owned.CommittedEntries = cloneEntries(ready.CommittedEntries)
+	if ready.CommittedProposals != nil {
+		owned.CommittedProposals = make([]CommittedProposal, len(ready.CommittedProposals))
+		for index, proposal := range ready.CommittedProposals {
+			owned.CommittedProposals[index] = CommittedProposal{ID: proposal.ID, Entry: proposal.Entry.Clone()}
+		}
+	}
+	if ready.FailedProposals != nil {
+		owned.FailedProposals = make([]FailedProposal, len(ready.FailedProposals))
+		for index, proposal := range ready.FailedProposals {
+			owned.FailedProposals[index] = FailedProposal{ID: proposal.ID, Entry: proposal.Entry.Clone(), Err: proposal.Err}
+		}
+	}
 	if ready.Messages != nil {
 		owned.Messages = make([]PeerMessage, len(ready.Messages))
 		for index, message := range ready.Messages {

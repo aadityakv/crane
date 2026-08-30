@@ -51,10 +51,16 @@ var (
 	ErrTickRegression = errors.New("raft logical tick regressed")
 	// ErrTermOverflow classifies an election that cannot increment MaxUint64.
 	ErrTermOverflow = errors.New("raft term overflow")
+	// ErrReplicationGenerationOverflow classifies a peer request generation that cannot advance.
+	ErrReplicationGenerationOverflow = errors.New("raft replication generation overflow")
 	// ErrNotLeader classifies a proposal submitted while the local voter is not leader.
 	ErrNotLeader = errors.New("raft voter is not leader")
 	// ErrLeadershipNotAuthorized classifies a leader fenced until a current-term commit.
 	ErrLeadershipNotAuthorized = errors.New("raft leadership is not authorized by a current-term commit")
+	// ErrProposalFailed classifies an exact pending proposal lost before committed handoff.
+	ErrProposalFailed = errors.New("raft proposal failed before exact committed handoff")
+	// ErrProposalIdentityOverflow classifies a leader-local proposal identity that cannot advance.
+	ErrProposalIdentityOverflow = errors.New("raft proposal identity overflow")
 	// ErrUnsupportedCoreRPC classifies a validated payload outside the current core task boundary.
 	ErrUnsupportedCoreRPC = errors.New("unsupported raft core RPC")
 )

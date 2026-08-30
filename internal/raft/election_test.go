@@ -75,6 +75,7 @@ func TestPreVoteRecentLeaderContactIsRejectedAndResetsDeadline(t *testing.T) {
 	if got := core.Status().LeaderID; got != 2 {
 		t.Fatalf("leader after contact = %d, want 2", got)
 	}
+	advanceReady(t, core)
 
 	request := PreVoteRequest{CandidateID: 3, CurrentTerm: 2, ProspectiveTerm: 3}
 	if err := core.Step(3, request); err != nil {
@@ -456,9 +457,11 @@ func TestDuplicateAppendGenerationCannotStepDown(t *testing.T) {
 	if err := core.Step(2, accepted); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := core.Ready(); ok {
-		t.Fatal("Task 5 append acknowledgement emitted replication output")
+	commitReady := requireReady(t, core)
+	if commitReady.HardState == nil || commitReady.HardState.CommitIndex != 1 {
+		t.Fatalf("append acknowledgement commit Ready = %#v, want durable no-op commit", commitReady)
 	}
+	advanceReadyToken(t, core, commitReady)
 	beforeDuplicate := snapshotCore(t, core)
 	duplicate := higherTermAppendRejection(issued, 2, 2)
 	if err := core.Step(2, duplicate); err != nil {
@@ -648,9 +651,7 @@ func TestHigherTermLeaderContactAtLogicalMaximumAdoptsBeforeDeadlineExhaustion(t
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			core, _ := leaderWithNoOpRequest(t, 2)
-			if err := core.Tick(math.MaxUint64); err != nil {
-				t.Fatal(err)
-			}
+			core.now = math.MaxUint64
 			if err := core.Step(2, test.rpc); err != nil {
 				t.Fatalf("higher-term contact at logical maximum error = %v", err)
 			}
@@ -704,9 +705,7 @@ func TestHigherTermRequestVoteAtLogicalMaximumPersistsVoteAndExhaustsDeadline(t 
 
 func TestHigherTermIssuedResponseAtLogicalMaximumAdoptsAndExhaustsDeadline(t *testing.T) {
 	core, issued := leaderWithNoOpRequest(t, 2)
-	if err := core.Tick(math.MaxUint64); err != nil {
-		t.Fatal(err)
-	}
+	core.now = math.MaxUint64
 	response := higherTermAppendRejection(issued, 2, 2)
 	if err := core.Step(2, response); err != nil {
 		t.Fatal(err)
