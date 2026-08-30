@@ -518,9 +518,17 @@ func TestServiceInvalidDatagramsCannotPoisonReplayCapacity(t *testing.T) {
 		t.Fatalf("zero-sequence Ping accepted as %#v", event)
 	}
 
-	legitimate := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 10, now, wire.MessageSWIMPing, mustEncodeGob(t, PingMessage{Ping: Ping{OriginID: peer.NodeID, Sequence: 1}}))
-	if _, ok := service.decodeDatagram(transport.Packet{From: source, Data: legitimate}); !ok {
+	legitimate := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 10, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{}))
+	legitimateEvent, ok := service.decodeDatagram(transport.Packet{From: source, Data: legitimate})
+	if !ok {
 		t.Fatal("invalid traffic exhausted replay capacity before legitimate frame")
+	}
+	self := service.active.Load().(map[uint16]Member)[service.options.Config.NodeID]
+	table := NewTable()
+	mustMerge(t, table, Update{Member: self, ReporterID: self.NodeID})
+	mustMerge(t, table, Update{Member: peer, ReporterID: peer.NodeID})
+	if err := (&serviceLoop{service: service, engine: &Engine{table: table}, admitted: true}).handleDatagram(legitimateEvent); err != nil {
+		t.Fatal(err)
 	}
 	if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: legitimate}); ok {
 		t.Fatalf("duplicate legitimate frame accepted as %#v", event)
@@ -2209,6 +2217,7 @@ type persistenceHarness struct {
 	now           time.Time
 	cancel        context.CancelFunc
 	result        chan error
+	requestID     atomic.Uint64
 }
 
 func startPersistenceService(t *testing.T, store *barrierServiceStore) *persistenceHarness {
@@ -2283,11 +2292,15 @@ func (h *persistenceHarness) sendSelfSuspicion(t *testing.T, peerID uint16) {
 
 func (h *persistenceHarness) enqueuePeerGossip(updates []Update) {
 	sender := h.service.active.Load().(map[uint16]Member)[2]
+	var requestID wire.RequestID
+	binary.LittleEndian.PutUint64(requestID[:8], h.requestID.Add(1))
 	h.service.events <- datagramServiceEvent{
-		sender:   sender,
-		senderID: 2,
-		message:  GossipMessage{Updates: append([]Update(nil), updates...)},
-		updates:  append([]Update(nil), updates...),
+		sender:    sender,
+		senderID:  2,
+		requestID: requestID,
+		timestamp: h.now,
+		message:   GossipMessage{Updates: append([]Update(nil), updates...)},
+		updates:   append([]Update(nil), updates...),
 	}
 }
 
