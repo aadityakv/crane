@@ -9,6 +9,16 @@ var (
 	ErrNotVoter = errors.New("raft node is not a configured voter")
 	// ErrInvalidStorageIdentity classifies incomplete or inconsistent persisted identity fields.
 	ErrInvalidStorageIdentity = errors.New("invalid raft storage identity")
+	// ErrInvalidStorageState classifies a recovered or prospective state that violates durable Raft invariants.
+	ErrInvalidStorageState = errors.New("invalid raft storage state")
+	// ErrStorageIdentityMismatch classifies durable state belonging to another format, cluster, voter, or voter set.
+	ErrStorageIdentityMismatch = errors.New("raft storage identity mismatch")
+	// ErrStoreClosed classifies use of a stable store after its one successful close.
+	ErrStoreClosed = errors.New("raft stable store is closed")
+	// ErrStorageCorrupt classifies complete durable bytes that cannot safely be interpreted.
+	ErrStorageCorrupt = errors.New("raft storage is corrupt")
+	// ErrStorageLocked classifies a storage directory already owned by another live store.
+	ErrStorageLocked = errors.New("raft storage is locked")
 	// ErrInvalidEntry classifies an entry outside the canonical Raft log domain.
 	ErrInvalidEntry = errors.New("invalid raft entry")
 	// ErrMalformedRPC classifies a payload whose binary layout is incomplete or non-canonical.
