@@ -265,22 +265,69 @@ func TestElectionSplitVoteRetriesOnlyAtNewSampledDeadline(t *testing.T) {
 	}
 }
 
-func TestPreVoteStaleResponseDoesNotStartElection(t *testing.T) {
-	core := newElectionCore(t, 3, 1, HardState{Term: 1}, nil, 5, 15, []uint64{10, 10, 10})
-	startPreVote(t, core, 5)
-	before := snapshotCore(t, core)
-	stale := PreVoteResponse{
-		ResponderID:        2,
-		CandidateID:        1,
-		Term:               0,
-		RequestCurrentTerm: 1,
-		ProspectiveTerm:    2,
-		Granted:            true,
+func TestPreVoteLowerTermGrantRoundTripsWithoutResponderDurableMutation(t *testing.T) {
+	candidate := newElectionCore(t, 3, 1, HardState{Term: 7, VotedFor: 1}, nil, 5, 15, []uint64{10, 10, 10})
+	preVoteReady := startPreVote(t, candidate, 5)
+	request := outboundPreVoteRequestTo(t, preVoteReady, 2)
+	if got, want := candidate.HardState(), (HardState{Term: 7, VotedFor: 1}); got != want {
+		t.Fatalf("starting pre-vote changed candidate hard state to %#v, want %#v", got, want)
 	}
-	if err := core.Step(2, stale); err != nil {
+
+	voter := newElectionCore(t, 3, 2, HardState{Term: 5, VotedFor: 3}, nil, 5, 15, []uint64{10})
+	voterBefore := voter.HardState()
+	if err := voter.Step(1, request); err != nil {
 		t.Fatal(err)
 	}
-	assertCoreSnapshot(t, core, before)
+	voterReady := requireReady(t, voter)
+	if voterReady.HardState != nil {
+		t.Fatalf("pre-vote responder emitted hard state %#v", *voterReady.HardState)
+	}
+	response, ok := voterReady.Messages[0].RPC.(PreVoteResponse)
+	if !ok || !response.Granted || response.Term != 5 || response.RequestCurrentTerm != 7 || response.ProspectiveTerm != 8 {
+		t.Fatalf("lower-term pre-vote response = %#v, want correlated term-5 grant", voterReady.Messages[0].RPC)
+	}
+	if got := voter.HardState(); got != voterBefore {
+		t.Fatalf("pre-vote request changed responder hard state from %#v to %#v", voterBefore, got)
+	}
+
+	if err := candidate.Step(2, response); err != nil {
+		t.Fatal(err)
+	}
+	electionReady := requireReady(t, candidate)
+	if got, want := candidate.Status().Role, RoleCandidate; got != want {
+		t.Fatalf("role after lower-term grant = %v, want %v", got, want)
+	}
+	if electionReady.HardState == nil || *electionReady.HardState != (HardState{Term: 8, VotedFor: 1}) {
+		t.Fatalf("real election hard state = %#v, want term 8 self vote", electionReady.HardState)
+	}
+}
+
+func TestPreVoteProspectiveTermResponderDeniesAndForgedGrantCannotCount(t *testing.T) {
+	candidate := newElectionCore(t, 3, 1, HardState{Term: 7}, nil, 5, 15, []uint64{10, 10, 10})
+	preVoteReady := startPreVote(t, candidate, 5)
+	request := outboundPreVoteRequestTo(t, preVoteReady, 2)
+
+	prospectiveVoter := newElectionCore(t, 3, 2, HardState{Term: 8, VotedFor: 2}, nil, 5, 15, []uint64{10})
+	voterBefore := prospectiveVoter.HardState()
+	if err := prospectiveVoter.Step(1, request); err != nil {
+		t.Fatal(err)
+	}
+	denialReady := requireReady(t, prospectiveVoter)
+	denial := denialReady.Messages[0].RPC.(PreVoteResponse)
+	if denial.Granted || denial.Term != 8 {
+		t.Fatalf("prospective-term responder = %#v, want term-8 denial", denial)
+	}
+	if denialReady.HardState != nil || prospectiveVoter.HardState() != voterBefore {
+		t.Fatalf("prospective-term pre-vote changed durable state: ready=%#v state=%#v", denialReady, prospectiveVoter.HardState())
+	}
+
+	before := snapshotCore(t, candidate)
+	forged := denial
+	forged.Granted = true
+	if err := candidate.Step(2, forged); err != nil {
+		t.Fatal(err)
+	}
+	assertCoreSnapshot(t, candidate, before)
 }
 
 func TestElectionDuplicateAndMisaddressedVotesDoNotFormQuorum(t *testing.T) {
@@ -364,6 +411,75 @@ func TestHigherTermReplicationResponseRequiresActiveLeaderCorrelation(t *testing
 		ConflictIndex: 1,
 	}
 	if err := core.Step(2, futureRequest); err != nil {
+		t.Fatal(err)
+	}
+	assertCoreSnapshot(t, core, before)
+}
+
+func TestHigherTermAppendResponseWithUnissuedGenerationCannotStepDown(t *testing.T) {
+	core, issued := leaderWithNoOpRequest(t, 2)
+	before := snapshotCore(t, core)
+	forged := higherTermAppendRejection(issued, 2, 2)
+	forged.Generation++
+	if err := core.Step(2, forged); err != nil {
+		t.Fatal(err)
+	}
+	assertCoreSnapshot(t, core, before)
+}
+
+func TestHigherTermIssuedAppendResponseStepsDown(t *testing.T) {
+	core, issued := leaderWithNoOpRequest(t, 2)
+	response := higherTermAppendRejection(issued, 2, 2)
+	if err := core.Step(2, response); err != nil {
+		t.Fatal(err)
+	}
+	ready := requireReady(t, core)
+	if got := core.Status(); got.Role != RoleFollower || got.Term != 2 || got.LeaderID != 0 {
+		t.Fatalf("status after issued higher response = %#v, want follower term 2", got)
+	}
+	if ready.HardState == nil || *ready.HardState != (HardState{Term: 2}) {
+		t.Fatalf("issued higher response hard state = %#v, want term 2 cleared vote", ready.HardState)
+	}
+}
+
+func TestDuplicateAppendGenerationCannotStepDown(t *testing.T) {
+	core, issued := leaderWithNoOpRequest(t, 2)
+	accepted := AppendEntriesResponse{
+		ResponderID: 2,
+		LeaderID:    issued.LeaderID,
+		Term:        issued.Term,
+		RequestTerm: issued.Term,
+		Generation:  issued.Generation,
+		Success:     true,
+		MatchIndex:  issued.Entries[0].Index,
+	}
+	if err := core.Step(2, accepted); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := core.Ready(); ok {
+		t.Fatal("Task 5 append acknowledgement emitted replication output")
+	}
+	beforeDuplicate := snapshotCore(t, core)
+	duplicate := higherTermAppendRejection(issued, 2, 2)
+	if err := core.Step(2, duplicate); err != nil {
+		t.Fatal(err)
+	}
+	assertCoreSnapshot(t, core, beforeDuplicate)
+}
+
+func TestHigherTermUnissuedSnapshotResponseCannotStepDown(t *testing.T) {
+	core, _ := leaderWithNoOpRequest(t, 2)
+	before := snapshotCore(t, core)
+	response := InstallSnapshotResponse{
+		ResponderID: 2,
+		LeaderID:    1,
+		Term:        2,
+		RequestTerm: 1,
+		TransferID:  TransferID{1},
+		SnapshotID:  SnapshotID{1},
+		Success:     false,
+	}
+	if err := core.Step(2, response); err != nil {
 		t.Fatal(err)
 	}
 	assertCoreSnapshot(t, core, before)
@@ -465,8 +581,6 @@ func TestHigherTermLeaderRequestsPersistTermAndResetContact(t *testing.T) {
 }
 
 func TestHigherTermActiveResponsesPersistTermAndStepDown(t *testing.T) {
-	transferID := TransferID{1}
-	snapshotID := SnapshotID{1}
 	tests := []struct {
 		name      string
 		candidate bool
@@ -487,15 +601,6 @@ func TestHigherTermActiveResponsesPersistTermAndStepDown(t *testing.T) {
 			Generation:    1,
 			Success:       false,
 			ConflictIndex: 1,
-		}},
-		{name: "install snapshot", rpc: InstallSnapshotResponse{
-			ResponderID: 2,
-			LeaderID:    1,
-			Term:        2,
-			RequestTerm: 1,
-			TransferID:  transferID,
-			SnapshotID:  snapshotID,
-			Success:     false,
 		}},
 	}
 	for _, test := range tests {
@@ -519,6 +624,111 @@ func TestHigherTermActiveResponsesPersistTermAndStepDown(t *testing.T) {
 				t.Fatalf("higher response hard state = %#v, want term 2 cleared vote", ready.HardState)
 			}
 		})
+	}
+}
+
+func TestHigherTermLeaderContactAtLogicalMaximumAdoptsBeforeDeadlineExhaustion(t *testing.T) {
+	tests := []struct {
+		name string
+		rpc  RPC
+	}{
+		{name: "append entries", rpc: AppendEntriesRequest{LeaderID: 2, Term: 2, Generation: 1}},
+		{name: "install snapshot", rpc: InstallSnapshotRequest{
+			LeaderID:                  2,
+			Term:                      2,
+			TransferID:                TransferID{1},
+			SnapshotID:                SnapshotID{1},
+			LastIncludedIndex:         1,
+			LastIncludedTerm:          1,
+			StateMachineSchemaVersion: 1,
+			Checksum:                  SnapshotChecksum{1},
+			Done:                      true,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core, _ := leaderWithNoOpRequest(t, 2)
+			if err := core.Tick(math.MaxUint64); err != nil {
+				t.Fatal(err)
+			}
+			if err := core.Step(2, test.rpc); err != nil {
+				t.Fatalf("higher-term contact at logical maximum error = %v", err)
+			}
+			ready := requireReady(t, core)
+			if got := core.Status(); got.Role != RoleFollower || got.Term != 2 || got.LeaderID != 2 {
+				t.Fatalf("status after exhausted contact = %#v, want follower term 2 leader 2", got)
+			}
+			if ready.HardState == nil || *ready.HardState != (HardState{Term: 2}) {
+				t.Fatalf("exhausted contact hard state = %#v, want durable term 2 cleared vote", ready.HardState)
+			}
+			if got := core.ElectionDeadline(); got != math.MaxUint64 {
+				t.Fatalf("exhausted election deadline = %d, want MaxUint64", got)
+			}
+			if err := core.Advance(ready.Token); err != nil {
+				t.Fatal(err)
+			}
+			if err := core.Tick(math.MaxUint64); err != nil {
+				t.Fatalf("exhausted follower Tick error = %v", err)
+			}
+			if _, ok := core.Ready(); ok {
+				t.Fatal("deadline-exhausted follower campaigned")
+			}
+		})
+	}
+}
+
+func TestHigherTermRequestVoteAtLogicalMaximumPersistsVoteAndExhaustsDeadline(t *testing.T) {
+	core, _ := leaderWithNoOpRequest(t, 2)
+	if err := core.Tick(math.MaxUint64); err != nil {
+		t.Fatal(err)
+	}
+	request := RequestVoteRequest{CandidateID: 2, Term: 2, LastLogIndex: 1, LastLogTerm: 1}
+	if err := core.Step(2, request); err != nil {
+		t.Fatal(err)
+	}
+	ready := requireReady(t, core)
+	if got := core.Status(); got.Role != RoleFollower || got.Term != 2 || got.LeaderID != 0 {
+		t.Fatalf("status after exhausted vote request = %#v, want follower term 2", got)
+	}
+	if ready.HardState == nil || *ready.HardState != (HardState{Term: 2, VotedFor: 2}) {
+		t.Fatalf("exhausted vote hard state = %#v, want durable term 2 vote 2", ready.HardState)
+	}
+	response := ready.Messages[0].RPC.(RequestVoteResponse)
+	if !response.Granted || ready.Messages[0].Requires != (DurabilityPrerequisite{HardState: true}) {
+		t.Fatalf("exhausted vote response/dependency = %#v / %#v", response, ready.Messages[0].Requires)
+	}
+	if got := core.ElectionDeadline(); got != math.MaxUint64 {
+		t.Fatalf("exhausted vote deadline = %d, want MaxUint64", got)
+	}
+}
+
+func TestHigherTermIssuedResponseAtLogicalMaximumAdoptsAndExhaustsDeadline(t *testing.T) {
+	core, issued := leaderWithNoOpRequest(t, 2)
+	if err := core.Tick(math.MaxUint64); err != nil {
+		t.Fatal(err)
+	}
+	response := higherTermAppendRejection(issued, 2, 2)
+	if err := core.Step(2, response); err != nil {
+		t.Fatal(err)
+	}
+	ready := requireReady(t, core)
+	if got := core.Status(); got.Role != RoleFollower || got.Term != 2 || got.LeaderID != 0 {
+		t.Fatalf("status after exhausted issued response = %#v, want follower term 2", got)
+	}
+	if ready.HardState == nil || *ready.HardState != (HardState{Term: 2}) {
+		t.Fatalf("exhausted response hard state = %#v, want durable term 2", ready.HardState)
+	}
+	if got := core.ElectionDeadline(); got != math.MaxUint64 {
+		t.Fatalf("exhausted response deadline = %d, want MaxUint64", got)
+	}
+	if err := core.Advance(ready.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.Tick(math.MaxUint64); err != nil {
+		t.Fatalf("exhausted response follower Tick error = %v", err)
+	}
+	if _, ok := core.Ready(); ok {
+		t.Fatal("deadline-exhausted response follower campaigned")
 	}
 }
 
@@ -762,5 +972,53 @@ func assertCanonicalOutbound(t *testing.T, core *Core, ready Ready, senderID uin
 		if _, _, err := EncodeRPC(outbound.RPC, DefaultCodecLimits()); err != nil {
 			t.Fatalf("outbound %T canonical encoding: %v", outbound.RPC, err)
 		}
+	}
+}
+
+func outboundPreVoteRequestTo(t *testing.T, ready Ready, peerID uint16) PreVoteRequest {
+	t.Helper()
+	for _, outbound := range ready.Messages {
+		if outbound.To == peerID {
+			request, ok := outbound.RPC.(PreVoteRequest)
+			if !ok {
+				t.Fatalf("outbound to %d = %T, want PreVoteRequest", peerID, outbound.RPC)
+			}
+			return request
+		}
+	}
+	t.Fatalf("no pre-vote request to peer %d in %#v", peerID, ready.Messages)
+	return PreVoteRequest{}
+}
+
+func leaderWithNoOpRequest(t *testing.T, peerID uint16) (*Core, AppendEntriesRequest) {
+	t.Helper()
+	core := electedCandidate(t, 3, 1)
+	grant := RequestVoteResponse{ResponderID: 2, CandidateID: 1, Term: 1, RequestTerm: 1, Granted: true}
+	if err := core.Step(2, grant); err != nil {
+		t.Fatal(err)
+	}
+	ready := advanceReady(t, core)
+	for _, outbound := range ready.Messages {
+		if outbound.To == peerID {
+			request, ok := outbound.RPC.(AppendEntriesRequest)
+			if !ok {
+				t.Fatalf("outbound to %d = %T, want AppendEntriesRequest", peerID, outbound.RPC)
+			}
+			return core, request
+		}
+	}
+	t.Fatalf("no append request to peer %d in %#v", peerID, ready.Messages)
+	return nil, AppendEntriesRequest{}
+}
+
+func higherTermAppendRejection(request AppendEntriesRequest, responderID uint16, term uint64) AppendEntriesResponse {
+	return AppendEntriesResponse{
+		ResponderID:   responderID,
+		LeaderID:      request.LeaderID,
+		Term:          term,
+		RequestTerm:   request.Term,
+		Generation:    request.Generation,
+		Success:       false,
+		ConflictIndex: 1,
 	}
 }

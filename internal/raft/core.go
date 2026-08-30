@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"math"
 
@@ -39,6 +40,7 @@ type Core struct {
 
 	now                uint64
 	electionDeadline   uint64
+	deadlineExhausted  bool
 	electionTimeoutMin uint64
 	electionTimeoutMax uint64
 	random             interface{ Uint64() uint64 }
@@ -46,6 +48,9 @@ type Core struct {
 
 	preVotes map[uint16]struct{}
 	votes    map[uint16]struct{}
+	// activeAppendGenerations contains only Task 5's initial no-op request per peer.
+	// Task 6 replaces this narrow correlation seam with full progress tracking.
+	activeAppendGenerations map[uint16]RequestGeneration
 
 	pendingReady Ready
 	hasPending   bool
@@ -144,6 +149,10 @@ func (core *Core) Tick(now uint64) error {
 	if now < core.now {
 		return fmt.Errorf("%w: now=%d previous=%d", ErrTickRegression, now, core.now)
 	}
+	if core.deadlineExhausted {
+		core.now = now
+		return nil
+	}
 	if core.role == RoleLeader || now < core.electionDeadline {
 		core.now = now
 		return nil
@@ -178,9 +187,9 @@ func (core *Core) Step(senderID uint16, rpc RPC) error {
 	case InstallSnapshotRequest:
 		return core.handleLeaderContact(message.LeaderID, message.Term)
 	case AppendEntriesResponse:
-		return core.handleHigherTermResponse(message.LeaderID, message.Term, message.RequestTerm)
+		return core.handleAppendResponse(message)
 	case InstallSnapshotResponse:
-		return core.handleHigherTermResponse(message.LeaderID, message.Term, message.RequestTerm)
+		return nil
 	case ErrorResponse, Handshake, HandshakeAck:
 		return nil
 	default:
@@ -273,6 +282,7 @@ func (core *Core) startPreVote(now uint64) error {
 
 	core.now = now
 	core.electionDeadline = deadline
+	core.deadlineExhausted = false
 	core.role = RolePreCandidate
 	core.leaderID = 0
 	core.recentLeader = false
@@ -309,7 +319,7 @@ func (core *Core) handlePreVoteResponse(response PreVoteResponse) error {
 		response.RequestCurrentTerm != core.hardState.Term ||
 		core.hardState.Term == math.MaxUint64 ||
 		response.ProspectiveTerm != core.hardState.Term+1 ||
-		response.Term < core.hardState.Term ||
+		response.Term > core.hardState.Term ||
 		!response.Granted {
 		return nil
 	}
@@ -346,6 +356,7 @@ func (core *Core) startElection(finalPreVoter uint16) error {
 	core.leaderID = 0
 	core.recentLeader = false
 	core.electionDeadline = deadline
+	core.deadlineExhausted = false
 	core.preVotes = nil
 	core.votes = map[uint16]struct{}{core.localID: {}}
 	core.recordHardState()
@@ -436,20 +447,23 @@ func (core *Core) becomeLeader(finalVoter uint16) error {
 	core.leaderID = core.localID
 	core.preVotes = nil
 	core.recentLeader = false
+	core.activeAppendGenerations = make(map[uint16]RequestGeneration, len(core.voters.Voters())-1)
 	core.queueEntries([]Entry{entry})
 	for _, voter := range core.voters.Voters() {
 		if voter.ID == core.localID {
 			continue
 		}
+		generation := RequestGeneration(1)
 		request := AppendEntriesRequest{
 			LeaderID:     core.localID,
 			Term:         core.hardState.Term,
-			Generation:   1,
+			Generation:   generation,
 			PrevLogIndex: previousIndex,
 			PrevLogTerm:  previousTerm,
 			LeaderCommit: core.log.CommitIndex(),
 			Entries:      []Entry{entry},
 		}
+		core.activeAppendGenerations[voter.ID] = generation
 		core.queueMessage(voter.ID, request, DurabilityPrerequisite{EntriesThrough: newIndex})
 	}
 	return nil
@@ -460,8 +474,13 @@ func (core *Core) handleLeaderContact(leaderID uint16, term uint64) error {
 		return nil
 	}
 	deadline, err := core.sampleDeadline(core.now)
+	deadlineExhausted := false
 	if err != nil {
-		return err
+		if !errors.Is(err, ErrDeadlineOverflow) {
+			return err
+		}
+		deadline = math.MaxUint64
+		deadlineExhausted = true
 	}
 	if term > core.hardState.Term {
 		core.adoptHigherTerm(term)
@@ -472,17 +491,24 @@ func (core *Core) handleLeaderContact(leaderID uint16, term uint64) error {
 	core.preVotes = nil
 	core.votes = nil
 	core.electionDeadline = deadline
+	core.deadlineExhausted = deadlineExhausted
 	return nil
 }
 
-func (core *Core) handleHigherTermResponse(recipientID uint16, term, requestTerm uint64) error {
+func (core *Core) handleAppendResponse(response AppendEntriesResponse) error {
 	if core.role != RoleLeader ||
-		recipientID != core.localID ||
-		requestTerm != core.hardState.Term ||
-		term <= core.hardState.Term {
+		response.LeaderID != core.localID ||
+		response.RequestTerm != core.hardState.Term {
 		return nil
 	}
-	core.adoptHigherTerm(term)
+	generation, active := core.activeAppendGenerations[response.ResponderID]
+	if !active || response.Generation != generation {
+		return nil
+	}
+	delete(core.activeAppendGenerations, response.ResponderID)
+	if response.Term > core.hardState.Term {
+		core.adoptHigherTerm(response.Term)
+	}
 	return nil
 }
 
@@ -494,6 +520,11 @@ func (core *Core) adoptHigherTerm(term uint64) {
 	core.recentLeader = false
 	core.preVotes = nil
 	core.votes = nil
+	core.activeAppendGenerations = nil
+	if core.now > math.MaxUint64-core.electionTimeoutMin {
+		core.electionDeadline = math.MaxUint64
+		core.deadlineExhausted = true
+	}
 	core.recordHardState()
 }
 
