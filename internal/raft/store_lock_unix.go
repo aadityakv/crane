@@ -14,8 +14,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/aaditya/cs425mp3/internal/config"
 )
 
 const (
@@ -215,12 +218,20 @@ func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet,
 	if err := store.loadOrCreateIdentity(); err != nil {
 		return nil, err
 	}
+	snapshot, err := store.loadSnapshotFile(RaftSnapshotFilename)
+	if err != nil {
+		return nil, err
+	}
 	wal, err := store.openOrCreateWAL()
 	if err != nil {
 		return nil, err
 	}
 	store.wal = wal
 	state, lastTransaction, err := store.recoverWAL()
+	if err != nil {
+		return nil, err
+	}
+	state, err = store.reconcileRecoveredSnapshot(state, snapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -233,6 +244,114 @@ func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet,
 	return store, nil
 }
 
+// PersistSnapshot writes and syncs the canonical snapshot before atomically
+// replacing the WAL with the exact compacted base and retained suffix.
+func (store *FileStore) PersistSnapshot(snapshot Snapshot) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrStoreClosed
+	}
+	if store.poisoned {
+		return fmt.Errorf("%w: persistence outcome requires reopen", ErrStorageCorrupt)
+	}
+	prospective, err := compactRecoveredState(store.state, snapshot, store.identity, store.voters)
+	if err != nil {
+		return err
+	}
+
+	snapshotTemporary, err := store.newTemporaryRegularFile(".snapshot.tmp-")
+	if err != nil {
+		return fmt.Errorf("create temporary raft snapshot: %w", err)
+	}
+	snapshotName, snapshotFile := snapshotTemporary.name, snapshotTemporary.file
+	removeSnapshotTemporary := true
+	defer func() {
+		if snapshotFile != nil {
+			_ = store.ops.close(snapshotFile)
+		}
+		if removeSnapshotTemporary {
+			_ = store.ops.rootRemove(store.root, snapshotName)
+		}
+	}()
+	if err := writeAll(snapshot.EnvelopeBytes(), func(content []byte) (int, error) { return store.ops.write(snapshotFile, content) }); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("write temporary raft snapshot: %w", err)
+	}
+	if err := store.ops.sync(snapshotFile); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("sync temporary raft snapshot: %w", err)
+	}
+	if err := store.ops.close(snapshotFile); err != nil {
+		snapshotFile = nil
+		store.poisoned = true
+		return fmt.Errorf("close temporary raft snapshot: %w", err)
+	}
+	snapshotFile = nil
+	if err := store.ops.rootRename(store.root, snapshotName, RaftSnapshotFilename); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("install raft snapshot: %w", err)
+	}
+	removeSnapshotTemporary = false
+	if err := store.ops.sync(store.directory); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("sync raft directory after snapshot install: %w", err)
+	}
+
+	replacementBatch, err := replacementBatchForState(prospective)
+	if err != nil {
+		store.poisoned = true
+		return err
+	}
+	replacement, err := encodeWALTransaction(1, replacementBatch)
+	if err != nil {
+		store.poisoned = true
+		return err
+	}
+	walTemporary, err := store.newTemporaryRegularFile(".wal.tmp-")
+	if err != nil {
+		store.poisoned = true
+		return fmt.Errorf("create replacement raft WAL: %w", err)
+	}
+	walName, newWAL := walTemporary.name, walTemporary.file
+	removeWALTemporary := true
+	defer func() {
+		if newWAL != nil {
+			_ = store.ops.close(newWAL)
+		}
+		if removeWALTemporary {
+			_ = store.ops.rootRemove(store.root, walName)
+		}
+	}()
+	if err := writeAll(replacement, func(content []byte) (int, error) { return store.ops.write(newWAL, content) }); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("write replacement raft WAL: %w", err)
+	}
+	if err := store.ops.sync(newWAL); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("sync replacement raft WAL: %w", err)
+	}
+	if err := store.ops.rootRename(store.root, walName, RaftWALFilename); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("install replacement raft WAL: %w", err)
+	}
+	removeWALTemporary = false
+	if err := store.ops.sync(store.directory); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("sync raft directory after WAL replacement: %w", err)
+	}
+	oldWAL := store.wal
+	store.wal = newWAL
+	newWAL = nil
+	if err := store.ops.close(oldWAL); err != nil {
+		store.poisoned = true
+		return fmt.Errorf("close replaced raft WAL: %w", err)
+	}
+	store.state = prospective
+	store.nextTxnID = 2
+	return nil
+}
+
 // Recover returns an independently owned copy of the checked durable state.
 func (store *FileStore) Recover() (RecoveredState, error) {
 	store.mu.Lock()
@@ -241,6 +360,23 @@ func (store *FileStore) Recover() (RecoveredState, error) {
 		return RecoveredState{}, ErrStoreClosed
 	}
 	return store.state.Clone(), nil
+}
+
+// RetainedWALBytes returns the current replacement/append WAL size.
+func (store *FileStore) RetainedWALBytes() (uint64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return 0, ErrStoreClosed
+	}
+	info, err := store.wal.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if info.Size() < 0 {
+		return 0, fmt.Errorf("%w: negative WAL size", ErrStorageCorrupt)
+	}
+	return uint64(info.Size()), nil
 }
 
 // Persist appends, syncs, and only then acknowledges one complete transaction.
@@ -357,13 +493,33 @@ func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
 		}
 		return store.createIdentity()
 	}
+	removedTemporary := false
+	for name := range names {
+		if !validStoreTemporaryName(name) {
+			continue
+		}
+		info, err := store.ops.rootLstat(store.root, name)
+		if err != nil {
+			return fmt.Errorf("lstat stale raft temporary %q: %w", name, err)
+		}
+		if err := validateRegularFileInfo(info, filepath.Join(store.directoryPath, name)); err != nil {
+			return err
+		}
+		if err := store.ops.rootRemove(store.root, name); err != nil {
+			return fmt.Errorf("remove stale raft temporary %q: %w", name, err)
+		}
+		delete(names, name)
+		removedTemporary = true
+	}
+	if removedTemporary {
+		if err := store.ops.sync(store.directory); err != nil {
+			return fmt.Errorf("sync raft directory after temporary cleanup: %w", err)
+		}
+	}
 	for name := range names {
 		if name != RaftLockFilename && name != RaftIdentityFilename && name != RaftWALFilename && name != RaftSnapshotFilename {
 			return fmt.Errorf("%w: unexpected raft directory entry %q", ErrStorageCorrupt, name)
 		}
-	}
-	if names[RaftSnapshotFilename] {
-		return fmt.Errorf("%w: snapshot bytes are unsupported before Task 9", ErrStorageCorrupt)
 	}
 	identityPath := filepath.Join(store.directoryPath, RaftIdentityFilename)
 	file, _, err := store.openAnchoredRegularFile(RaftIdentityFilename, os.O_RDONLY, false)
@@ -399,6 +555,127 @@ func (store *FileStore) loadOrCreateIdentity() (resultErr error) {
 		return fmt.Errorf("%w: persisted format=%d cluster=%x local=%d voters=%x", ErrStorageIdentityMismatch, persisted.FormatVersion, persisted.ClusterID, persisted.LocalVoterID, persisted.VoterFingerprint)
 	}
 	return nil
+}
+
+func validStoreTemporaryName(name string) bool {
+	for _, prefix := range []string{".snapshot.tmp-", ".wal.tmp-"} {
+		if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+32 {
+			continue
+		}
+		_, err := hex.DecodeString(name[len(prefix):])
+		return err == nil
+	}
+	return false
+}
+
+type temporaryRegularFile struct {
+	name string
+	file *os.File
+}
+
+func (store *FileStore) newTemporaryRegularFile(prefix string) (temporaryRegularFile, error) {
+	var suffix [16]byte
+	if read, err := store.ops.random(suffix[:]); err != nil || read != len(suffix) {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return temporaryRegularFile{}, err
+	}
+	name := prefix + hex.EncodeToString(suffix[:])
+	file, err := store.ops.rootOpenFile(store.root, name, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return temporaryRegularFile{}, err
+	}
+	if err := validateOpenedRegularFile(file, name); err != nil {
+		return temporaryRegularFile{}, errors.Join(err, store.ops.close(file))
+	}
+	return temporaryRegularFile{name: name, file: file}, nil
+}
+
+func (store *FileStore) loadSnapshotFile(name string) (*Snapshot, error) {
+	info, err := store.ops.rootLstat(store.root, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lstat raft snapshot: %w", err)
+	}
+	if err := validateRegularFileInfo(info, filepath.Join(store.directoryPath, name)); err != nil {
+		return nil, err
+	}
+	maximumEnvelopeBytes := uint64(snapshotEnvelopeHeaderBytes) + config.MaxRaftSnapshotBytes
+	if info.Size() < 0 || uint64(info.Size()) > maximumEnvelopeBytes {
+		return nil, fmt.Errorf("%w: snapshot file size %d exceeds maximum", ErrStorageCorrupt, info.Size())
+	}
+	file, _, err := store.openAnchoredRegularFile(name, os.O_RDONLY, false)
+	if err != nil {
+		return nil, fmt.Errorf("open raft snapshot: %w", err)
+	}
+	content, readErr := io.ReadAll(io.LimitReader(file, int64(maximumEnvelopeBytes)+1))
+	closeErr := store.ops.close(file)
+	if readErr != nil {
+		return nil, fmt.Errorf("read raft snapshot: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close raft snapshot: %w", closeErr)
+	}
+	snapshot, err := DecodeSnapshotEnvelope(content, store.identity, config.MaxRaftSnapshotBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrStorageCorrupt, err)
+	}
+	return &snapshot, nil
+}
+
+func (store *FileStore) reconcileRecoveredSnapshot(state RecoveredState, snapshot *Snapshot) (RecoveredState, error) {
+	if snapshot == nil {
+		if state.SnapshotBase.LastIncludedIndex != 0 {
+			return RecoveredState{}, fmt.Errorf("%w: WAL snapshot base has no snapshot bytes", ErrStorageCorrupt)
+		}
+		return state.Clone(), nil
+	}
+	if snapshot.Metadata.LastIncludedIndex < state.SnapshotBase.LastIncludedIndex {
+		return RecoveredState{}, fmt.Errorf("%w: snapshot bytes are older than WAL base", ErrStorageCorrupt)
+	}
+	if snapshot.Metadata.LastIncludedIndex == state.SnapshotBase.LastIncludedIndex {
+		if snapshot.Metadata != state.SnapshotBase {
+			return RecoveredState{}, fmt.Errorf("%w: snapshot metadata differs from WAL base", ErrStorageCorrupt)
+		}
+		owned := snapshot.Clone()
+		state.Snapshot = &owned
+		if state.AppliedIndex < snapshot.Metadata.LastIncludedIndex {
+			state.AppliedIndex = snapshot.Metadata.LastIncludedIndex
+		}
+	} else {
+		var err error
+		state, err = compactRecoveredState(state, snapshot.Clone(), store.identity, store.voters)
+		if err != nil {
+			return RecoveredState{}, fmt.Errorf("%w: reconcile snapshot with fuller WAL: %v", ErrStorageCorrupt, err)
+		}
+	}
+	if err := ValidateRecoveredState(state, store.identity, store.voters); err != nil {
+		return RecoveredState{}, fmt.Errorf("%w: recovered snapshot state: %v", ErrStorageCorrupt, err)
+	}
+	return state.Clone(), nil
+}
+
+func replacementBatchForState(state RecoveredState) (PersistenceBatch, error) {
+	if state.Snapshot == nil || state.Snapshot.Metadata != state.SnapshotBase {
+		return PersistenceBatch{}, fmt.Errorf("%w: replacement WAL requires exact snapshot payload", ErrInvalidStorageState)
+	}
+	hardState := state.HardState
+	base := state.SnapshotBase
+	applied := state.AppliedIndex
+	snapshot := state.Snapshot.Clone()
+	batch := PersistenceBatch{HardState: &hardState, SnapshotBase: &base, Snapshot: &snapshot, AppliedIndex: &applied}
+	if len(state.Entries) != 0 {
+		next, ok := checkedNextIndex(base.LastIncludedIndex)
+		if !ok {
+			return PersistenceBatch{}, ErrLogOverflow
+		}
+		batch.ReplaceFrom = next
+		batch.Entries = cloneEntries(state.Entries)
+	}
+	return batch, nil
 }
 
 func (store *FileStore) createIdentity() (resultErr error) {

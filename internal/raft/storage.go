@@ -25,6 +25,8 @@ type RecoveredState struct {
 	HardState HardState
 	// SnapshotBase is the compacted log position, or zero before the first snapshot.
 	SnapshotBase SnapshotMetadata
+	// Snapshot is the exact validated portable payload for SnapshotBase, when present.
+	Snapshot *Snapshot
 	// AppliedIndex is the durable recovery seam at or after SnapshotBase.
 	AppliedIndex uint64
 	// Entries is the retained contiguous suffix immediately after SnapshotBase.
@@ -33,6 +35,10 @@ type RecoveredState struct {
 
 // Clone returns an independently owned copy of the complete recovered state.
 func (state RecoveredState) Clone() RecoveredState {
+	if state.Snapshot != nil {
+		snapshot := state.Snapshot.Clone()
+		state.Snapshot = &snapshot
+	}
 	state.Entries = cloneEntries(state.Entries)
 	return state
 }
@@ -49,6 +55,9 @@ type PersistenceBatch struct {
 	Entries []Entry
 	// SnapshotBase replaces the compacted base when non-nil (reserved for Task 9).
 	SnapshotBase *SnapshotMetadata
+	// Snapshot is the owned validated payload corresponding exactly to SnapshotBase.
+	// It is used by replacement-WAL recovery and is not encoded inside the WAL.
+	Snapshot *Snapshot
 	// AppliedIndex replaces the durable recovery seam when non-nil.
 	AppliedIndex *uint64
 }
@@ -63,6 +72,10 @@ func (batch PersistenceBatch) Clone() PersistenceBatch {
 	if batch.SnapshotBase != nil {
 		base := *batch.SnapshotBase
 		owned.SnapshotBase = &base
+	}
+	if batch.Snapshot != nil {
+		snapshot := batch.Snapshot.Clone()
+		owned.Snapshot = &snapshot
 	}
 	if batch.AppliedIndex != nil {
 		index := *batch.AppliedIndex
@@ -98,6 +111,15 @@ func ValidateRecoveredState(state RecoveredState, expected StorageIdentity, vote
 	if base.LastIncludedIndex > state.AppliedIndex || state.AppliedIndex > state.HardState.CommitIndex {
 		return fmt.Errorf("%w: snapshot=%d applied=%d commit=%d", ErrInvalidStorageState, base.LastIncludedIndex, state.AppliedIndex, state.HardState.CommitIndex)
 	}
+	if state.Snapshot != nil {
+		if base.LastIncludedIndex == 0 || state.Snapshot.Metadata != base {
+			return fmt.Errorf("%w: snapshot payload does not match snapshot base", ErrInvalidStorageState)
+		}
+		decoded, err := DecodeSnapshotEnvelope(state.Snapshot.EnvelopeBytes(), expected, config.MaxRaftSnapshotBytes)
+		if err != nil || decoded.ID != state.Snapshot.ID || decoded.StateChecksum != state.Snapshot.StateChecksum {
+			return fmt.Errorf("%w: snapshot payload validation failed: %v", ErrInvalidStorageState, err)
+		}
+	}
 
 	lastIndex := base.LastIncludedIndex
 	previousTerm := base.LastIncludedTerm
@@ -124,11 +146,14 @@ func ValidateRecoveredState(state RecoveredState, expected StorageIdentity, vote
 }
 
 func validatePersistenceBatchBounds(batch PersistenceBatch) error {
-	if batch.HardState == nil && batch.ReplaceFrom == 0 && len(batch.Entries) == 0 && batch.SnapshotBase == nil && batch.AppliedIndex == nil {
+	if batch.HardState == nil && batch.ReplaceFrom == 0 && len(batch.Entries) == 0 && batch.SnapshotBase == nil && batch.Snapshot == nil && batch.AppliedIndex == nil {
 		return fmt.Errorf("%w: empty persistence batch", ErrInvalidStorageState)
 	}
 	if batch.ReplaceFrom == 0 && len(batch.Entries) != 0 {
 		return fmt.Errorf("%w: replacement entries require ReplaceFrom", ErrInvalidStorageState)
+	}
+	if batch.Snapshot != nil && (batch.SnapshotBase == nil || batch.Snapshot.Metadata != *batch.SnapshotBase) {
+		return fmt.Errorf("%w: snapshot payload and base must agree", ErrInvalidStorageState)
 	}
 	entryCount := uint64(len(batch.Entries))
 	if entryCount > math.MaxUint16 {
@@ -196,6 +221,19 @@ func applyPersistenceBatch(current RecoveredState, batch PersistenceBatch, expec
 func applyValidatedPersistenceBatch(current RecoveredState, batch PersistenceBatch, expected StorageIdentity, voters VoterSet) (RecoveredState, error) {
 	batch = batch.Clone()
 	prospective := current.Clone()
+	original := current.Clone()
+	var nextHardState *HardState
+	if batch.HardState != nil {
+		next := *batch.HardState
+		if next.Term < prospective.HardState.Term || next.CommitIndex < prospective.HardState.CommitIndex {
+			return RecoveredState{}, fmt.Errorf("%w: hard-state term or commit regressed", ErrInvalidStorageState)
+		}
+		if next.Term == prospective.HardState.Term && prospective.HardState.VotedFor != 0 && next.VotedFor != prospective.HardState.VotedFor {
+			return RecoveredState{}, fmt.Errorf("%w: vote changed within term %d", ErrInvalidStorageState, next.Term)
+		}
+		nextHardState = &next
+	}
+	snapshotAdvanced := false
 	if batch.SnapshotBase != nil {
 		base := *batch.SnapshotBase
 		if base.LastIncludedIndex < prospective.SnapshotBase.LastIncludedIndex {
@@ -204,24 +242,45 @@ func applyValidatedPersistenceBatch(current RecoveredState, batch PersistenceBat
 		if base.LastIncludedIndex == prospective.SnapshotBase.LastIncludedIndex && base != prospective.SnapshotBase {
 			return RecoveredState{}, fmt.Errorf("%w: snapshot metadata changed at the same index", ErrInvalidStorageState)
 		}
-		if base.LastIncludedIndex > prospective.HardState.CommitIndex {
+		effectiveCommit := prospective.HardState.CommitIndex
+		if nextHardState != nil && nextHardState.CommitIndex > effectiveCommit {
+			effectiveCommit = nextHardState.CommitIndex
+		}
+		if base.LastIncludedIndex > effectiveCommit {
 			return RecoveredState{}, fmt.Errorf("%w: snapshot is not committed", ErrInvalidStorageState)
 		}
 		if base.LastIncludedIndex > prospective.SnapshotBase.LastIncludedIndex {
+			snapshotAdvanced = true
 			offset := base.LastIncludedIndex - prospective.SnapshotBase.LastIncludedIndex
-			if offset > uint64(len(prospective.Entries)) {
-				return RecoveredState{}, fmt.Errorf("%w: snapshot index unavailable", ErrInvalidStorageState)
+			if offset <= uint64(len(prospective.Entries)) {
+				if offset != 0 && prospective.Entries[offset-1].Term != base.LastIncludedTerm {
+					if base.LastIncludedIndex <= original.HardState.CommitIndex {
+						return RecoveredState{}, fmt.Errorf("%w: snapshot term does not match retained committed log", ErrInvalidStorageState)
+					}
+					prospective.Entries = nil
+				} else {
+					prospective.Entries = cloneEntries(prospective.Entries[offset:])
+				}
+			} else {
+				if original.HardState.CommitIndex != 0 {
+					return RecoveredState{}, fmt.Errorf("%w: snapshot index unavailable", ErrInvalidStorageState)
+				}
+				prospective.Entries = nil
 			}
-			if offset != 0 && prospective.Entries[offset-1].Term != base.LastIncludedTerm {
-				return RecoveredState{}, fmt.Errorf("%w: snapshot term does not match retained log", ErrInvalidStorageState)
-			}
-			prospective.Entries = cloneEntries(prospective.Entries[offset:])
 		}
 		prospective.SnapshotBase = base
+		if batch.Snapshot != nil {
+			snapshot := batch.Snapshot.Clone()
+			prospective.Snapshot = &snapshot
+		} else if current.SnapshotBase != base {
+			prospective.Snapshot = nil
+		}
 	}
 	if batch.ReplaceFrom != 0 {
 		baseIndex := prospective.SnapshotBase.LastIncludedIndex
-		if batch.ReplaceFrom <= baseIndex || batch.ReplaceFrom <= prospective.HardState.CommitIndex {
+		nextAfterBase, hasNext := checkedNextIndex(baseIndex)
+		replacesSnapshotSuffix := snapshotAdvanced && hasNext && batch.ReplaceFrom == nextAfterBase
+		if batch.ReplaceFrom <= baseIndex || (batch.ReplaceFrom <= prospective.HardState.CommitIndex && !replacesSnapshotSuffix) {
 			return RecoveredState{}, fmt.Errorf("%w: replacement begins at protected index %d", ErrInvalidStorageState, batch.ReplaceFrom)
 		}
 		lastIndex := baseIndex + uint64(len(prospective.Entries))
@@ -239,21 +298,51 @@ func applyValidatedPersistenceBatch(current RecoveredState, batch PersistenceBat
 		entries = append(entries, cloneEntries(batch.Entries)...)
 		prospective.Entries = entries
 	}
-	if batch.HardState != nil {
-		next := *batch.HardState
-		if next.Term < prospective.HardState.Term || next.CommitIndex < prospective.HardState.CommitIndex {
-			return RecoveredState{}, fmt.Errorf("%w: hard-state term or commit regressed", ErrInvalidStorageState)
-		}
-		if next.Term == prospective.HardState.Term && prospective.HardState.VotedFor != 0 && next.VotedFor != prospective.HardState.VotedFor {
-			return RecoveredState{}, fmt.Errorf("%w: vote changed within term %d", ErrInvalidStorageState, next.Term)
-		}
-		prospective.HardState = next
+	if nextHardState != nil {
+		prospective.HardState = *nextHardState
 	}
 	if batch.AppliedIndex != nil {
 		if *batch.AppliedIndex < prospective.AppliedIndex {
 			return RecoveredState{}, fmt.Errorf("%w: applied index regressed", ErrInvalidStorageState)
 		}
 		prospective.AppliedIndex = *batch.AppliedIndex
+	}
+	if err := ValidateRecoveredState(prospective, expected, voters); err != nil {
+		return RecoveredState{}, err
+	}
+	return prospective.Clone(), nil
+}
+
+func compactRecoveredState(current RecoveredState, snapshot Snapshot, expected StorageIdentity, voters VoterSet) (RecoveredState, error) {
+	decoded, err := DecodeSnapshotEnvelope(snapshot.EnvelopeBytes(), expected, config.MaxRaftSnapshotBytes)
+	if err != nil || decoded.ID != snapshot.ID || decoded.Metadata != snapshot.Metadata || decoded.StateChecksum != snapshot.StateChecksum {
+		return RecoveredState{}, fmt.Errorf("%w: invalid local snapshot payload: %v", ErrInvalidStorageState, err)
+	}
+	metadata := snapshot.Metadata
+	if metadata.LastIncludedIndex <= current.SnapshotBase.LastIncludedIndex {
+		if metadata == current.SnapshotBase && current.Snapshot != nil && current.Snapshot.ID == snapshot.ID {
+			return current.Clone(), nil
+		}
+		return RecoveredState{}, fmt.Errorf("%w: snapshot index did not advance", ErrInvalidStorageState)
+	}
+	if metadata.LastIncludedIndex > current.HardState.CommitIndex {
+		return RecoveredState{}, fmt.Errorf("%w: snapshot index %d exceeds commit %d", ErrInvalidStorageState, metadata.LastIncludedIndex, current.HardState.CommitIndex)
+	}
+	term, err := recoveredTermAt(current, metadata.LastIncludedIndex)
+	if err != nil || term != metadata.LastIncludedTerm {
+		return RecoveredState{}, fmt.Errorf("%w: snapshot term does not match committed local entry", ErrInvalidStorageState)
+	}
+	offset := metadata.LastIncludedIndex - current.SnapshotBase.LastIncludedIndex
+	if offset > uint64(len(current.Entries)) {
+		return RecoveredState{}, fmt.Errorf("%w: snapshot offset is unavailable", ErrInvalidStorageState)
+	}
+	prospective := current.Clone()
+	prospective.SnapshotBase = metadata
+	owned := decoded.Clone()
+	prospective.Snapshot = &owned
+	prospective.Entries = cloneEntries(current.Entries[offset:])
+	if prospective.AppliedIndex < metadata.LastIncludedIndex {
+		prospective.AppliedIndex = metadata.LastIncludedIndex
 	}
 	if err := ValidateRecoveredState(prospective, expected, voters); err != nil {
 		return RecoveredState{}, err

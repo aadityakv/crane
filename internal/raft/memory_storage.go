@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 )
 
@@ -16,6 +17,8 @@ const (
 	StorageOperationPersist
 	// StorageOperationClose fails the next close request before resources are released.
 	StorageOperationClose
+	// StorageOperationSnapshotPersist fails the next snapshot compaction before mutation.
+	StorageOperationSnapshotPersist
 )
 
 // MemoryStore is a deterministic, transaction-safe in-memory StableStore.
@@ -26,6 +29,42 @@ type MemoryStore struct {
 	state    RecoveredState
 	closed   bool
 	faults   map[StorageOperation][]error
+}
+
+// PersistSnapshot atomically installs an exact local snapshot and compacts its covered prefix.
+func (store *MemoryStore) PersistSnapshot(snapshot Snapshot) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrStoreClosed
+	}
+	if err := store.takeFault(StorageOperationSnapshotPersist); err != nil {
+		return fmt.Errorf("persist memory raft snapshot: %w", err)
+	}
+	prospective, err := compactRecoveredState(store.state, snapshot, store.identity, store.voters)
+	if err != nil {
+		return err
+	}
+	store.state = prospective
+	return nil
+}
+
+// RetainedWALBytes reports deterministic canonical retained entry bytes.
+func (store *MemoryStore) RetainedWALBytes() (uint64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return 0, ErrStoreClosed
+	}
+	var total uint64
+	for _, entry := range store.state.Entries {
+		addition := uint64(minimumWALEntryBytes + len(entry.command))
+		if total > math.MaxUint64-addition {
+			return 0, ErrLogOverflow
+		}
+		total += addition
+	}
+	return total, nil
 }
 
 // NewMemoryStore returns an empty store bound to identity and voters.

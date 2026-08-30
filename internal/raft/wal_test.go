@@ -359,7 +359,11 @@ func TestWALRestartAfterEveryEffectRecordKind(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := SnapshotMetadata{LastIncludedIndex: 2, LastIncludedTerm: 2, StateMachineSchemaVersion: 1}
-	if err := store.Persist(PersistenceBatch{SnapshotBase: &base}); err != nil {
+	snapshot, err := NewSnapshot(identity, base, []byte("state-at-two"), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistSnapshot(snapshot); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Persist(PersistenceBatch{ReplaceFrom: 3}); err != nil {

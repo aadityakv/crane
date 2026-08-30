@@ -89,6 +89,8 @@ var (
 	ErrLeadershipSequenceOverflow = errors.New("raft leadership sequence exhausted")
 	// ErrSnapshotUnavailable classifies recovered snapshot metadata without Task 9 snapshot bytes.
 	ErrSnapshotUnavailable = errors.New("raft snapshot bytes unavailable")
+	// ErrInvalidSnapshot classifies malformed, corrupt, oversized, or identity-mismatched snapshot bytes.
+	ErrInvalidSnapshot = errors.New("invalid raft snapshot")
 	// ErrTransportInvariant classifies an invalid result from the bounded transport handoff seam.
 	ErrTransportInvariant = errors.New("invalid raft transport handoff result")
 )

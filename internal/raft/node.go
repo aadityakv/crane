@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/clock"
+	"github.com/aaditya/cs425mp3/internal/config"
 )
 
 const (
@@ -54,6 +55,12 @@ type NodeOptions struct {
 	MaxAppendEntries uint16
 	// MaxAppendBytes optionally narrows the default append encoded-byte bound.
 	MaxAppendBytes uint64
+	// SnapshotEntryThreshold triggers capture only after this many applied entries beyond the durable base.
+	SnapshotEntryThreshold uint64
+	// SnapshotByteThreshold triggers capture only after retained WAL bytes exceed this bound.
+	SnapshotByteThreshold uint64
+	// MaxSnapshotBytes bounds one encoded application snapshot.
+	MaxSnapshotBytes uint64
 }
 
 type inboundRPCEvent struct {
@@ -130,6 +137,7 @@ type Node struct {
 	nextSubscriberID uint64
 	leadership       LeadershipEvent
 	hasLeadership    bool
+	captureInFlight  bool
 
 	// afterAdvance is a same-package observation seam; it never influences behavior.
 	afterAdvance func(ReadyToken)
@@ -154,6 +162,9 @@ func NewNode(options NodeOptions) (*Node, error) {
 	}
 	if options.HeartbeatInterval <= 0 || options.ElectionTimeoutMin <= 0 || options.ElectionTimeoutMax <= options.ElectionTimeoutMin || options.HeartbeatInterval >= options.ElectionTimeoutMin {
 		return nil, fmt.Errorf("%w: invalid node timing", ErrInvalidCoreState)
+	}
+	if options.SnapshotEntryThreshold == 0 || options.SnapshotByteThreshold == 0 || options.MaxSnapshotBytes == 0 || options.MaxSnapshotBytes > config.MaxRaftSnapshotBytes {
+		return nil, fmt.Errorf("%w: invalid node snapshot bounds", ErrInvalidCoreState)
 	}
 	if options.ElectionTimeoutMin/options.HeartbeatInterval < 3 {
 		return nil, fmt.Errorf("%w: election minimum must span at least three heartbeats", ErrInvalidCoreState)
@@ -288,14 +299,22 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 	if err := ValidateRecoveredState(recovered, node.options.Identity, node.options.Voters); err != nil {
 		return err
 	}
-	if recovered.SnapshotBase.LastIncludedIndex != 0 || recovered.SnapshotBase.LastIncludedTerm != 0 || recovered.SnapshotBase.StateMachineSchemaVersion != 0 {
+	if recovered.SnapshotBase.LastIncludedIndex != 0 && recovered.Snapshot == nil {
 		return fmt.Errorf("%w: recovered snapshot index=%d schema=%d", ErrSnapshotUnavailable, recovered.SnapshotBase.LastIncludedIndex, recovered.SnapshotBase.StateMachineSchemaVersion)
 	}
+	if recovered.Snapshot != nil {
+		decoded, snapshotErr := DecodeSnapshotEnvelope(recovered.Snapshot.EnvelopeBytes(), node.options.Identity, config.MaxRaftSnapshotBytes)
+		if snapshotErr != nil || decoded.Metadata != recovered.SnapshotBase || decoded.ID != recovered.Snapshot.ID {
+			return fmt.Errorf("%w: recovered snapshot validation failed: %v", ErrSnapshotUnavailable, snapshotErr)
+		}
+		recovered.Snapshot = &decoded
+	}
+	recoveryApplied := recovered.SnapshotBase.LastIncludedIndex
 	log, err := NewLog(
 		recovered.SnapshotBase.LastIncludedIndex,
 		recovered.SnapshotBase.LastIncludedTerm,
 		recovered.HardState.CommitIndex,
-		recovered.HardState.CommitIndex,
+		recoveryApplied,
 		recovered.Entries,
 	)
 	if err != nil {
@@ -303,7 +322,7 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 	}
 	node.core, err = node.newCore(CoreOptions{
 		LocalID: node.options.LocalID, Voters: node.options.Voters,
-		HardState: recovered.HardState, Log: log, AppliedIndex: recovered.HardState.CommitIndex,
+		HardState: recovered.HardState, Log: log, AppliedIndex: recoveryApplied,
 		ElectionTimeoutMin: uint64(node.options.ElectionTimeoutMin),
 		ElectionTimeoutMax: uint64(node.options.ElectionTimeoutMax),
 		HeartbeatInterval:  uint64(node.options.HeartbeatInterval),
@@ -315,11 +334,20 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	node.durableState = recovered.Clone()
-	if err := node.options.StateMachine.Restore(0, cloneBytes(nil)); err != nil {
-		return fmt.Errorf("restore empty raft application base: %w", err)
+	restoreSchema := uint32(0)
+	var restoreBytes []byte
+	if recovered.Snapshot != nil {
+		restoreSchema = recovered.Snapshot.Metadata.StateMachineSchemaVersion
+		restoreBytes = recovered.Snapshot.StateBytes()
+	}
+	if err := node.options.StateMachine.Restore(restoreSchema, restoreBytes); err != nil {
+		return fmt.Errorf("restore raft application snapshot: %w", err)
 	}
 	if err := node.replayRecovered(recovered); err != nil {
 		return err
+	}
+	if err := node.core.log.AdvanceApplied(recovered.HardState.CommitIndex); err != nil {
+		return fmt.Errorf("establish recovered application seam: %w", err)
 	}
 	node.pendingLocal = make(map[ProposalID]pendingLocalRequest)
 	node.subscribers = make(map[uint64]*leadershipSubscriber)
@@ -450,6 +478,16 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 				if subscriber := node.subscribers[event.id]; subscriber != nil {
 					node.terminateLeadershipSubscriber(subscriber, event.err)
 				}
+			case snapshotCaptureResult:
+				if ctx.Err() != nil {
+					return nil
+				}
+				if captureErr := node.finishSnapshotCapture(event); captureErr != nil {
+					return captureErr
+				}
+				if publishErr := node.publishStatus(); publishErr != nil {
+					return publishErr
+				}
 			}
 		}
 	}
@@ -471,11 +509,116 @@ func (node *Node) replayRecovered(recovered RecoveredState) error {
 	return nil
 }
 
+type snapshotCaptureResult struct {
+	snapshot Snapshot
+	err      error
+}
+
+type retainedWALByteReporter interface {
+	RetainedWALBytes() (uint64, error)
+}
+
+func (node *Node) maybeStartSnapshotCapture() (bool, error) {
+	if node.captureInFlight {
+		return false, nil
+	}
+	state := node.core.LogState()
+	if state.AppliedIndex < state.SnapshotIndex {
+		return false, fmt.Errorf("%w: applied index is below snapshot base", ErrLogInvariant)
+	}
+	entryTriggered := state.AppliedIndex-state.SnapshotIndex > node.options.SnapshotEntryThreshold
+	byteTriggered := false
+	if reporter, ok := node.options.Store.(retainedWALByteReporter); ok {
+		retained, err := reporter.RetainedWALBytes()
+		if err != nil {
+			return false, fmt.Errorf("measure retained raft WAL: %w", err)
+		}
+		byteTriggered = retained > node.options.SnapshotByteThreshold
+	}
+	if !entryTriggered && !byteTriggered {
+		return false, nil
+	}
+	if state.AppliedIndex == 0 {
+		return false, nil
+	}
+	term, err := node.core.log.Term(state.AppliedIndex)
+	if err != nil {
+		return false, err
+	}
+	capture, err := node.options.StateMachine.Capture(state.AppliedIndex, term)
+	if err != nil {
+		return false, fmt.Errorf("capture raft application at %d: %w", state.AppliedIndex, err)
+	}
+	if capture == nil {
+		return false, fmt.Errorf("%w: application returned a nil snapshot capture", ErrInvalidSnapshot)
+	}
+	schema := capture.SchemaVersion()
+	if schema == 0 {
+		return false, fmt.Errorf("%w: application returned zero snapshot schema", ErrInvalidSnapshot)
+	}
+	metadata := SnapshotMetadata{LastIncludedIndex: state.AppliedIndex, LastIncludedTerm: term, StateMachineSchemaVersion: schema}
+	node.captureInFlight = true
+	node.watchers.Add(1)
+	go func() {
+		defer node.watchers.Done()
+		stateBytes, marshalErr := capture.MarshalBinary()
+		if marshalErr == nil && capture.SchemaVersion() != schema {
+			marshalErr = fmt.Errorf("%w: snapshot schema changed during encoding", ErrInvalidSnapshot)
+		}
+		var snapshot Snapshot
+		if marshalErr == nil {
+			snapshot, marshalErr = NewSnapshot(node.options.Identity, metadata, stateBytes, node.options.MaxSnapshotBytes)
+		}
+		result := snapshotCaptureResult{snapshot: snapshot, err: marshalErr}
+		select {
+		case node.events <- result:
+		case <-node.done:
+		}
+	}()
+	return true, nil
+}
+
+func (node *Node) finishSnapshotCapture(result snapshotCaptureResult) error {
+	if !node.captureInFlight {
+		return fmt.Errorf("%w: no snapshot capture is active", ErrInvalidCoreState)
+	}
+	node.captureInFlight = false
+	if result.err != nil {
+		return fmt.Errorf("encode raft application snapshot: %w", result.err)
+	}
+	if result.snapshot.Metadata.LastIncludedIndex <= node.core.log.SnapshotIndex() {
+		return nil
+	}
+	if result.snapshot.Metadata.LastIncludedIndex > node.core.log.AppliedIndex() {
+		return fmt.Errorf("%w: completed snapshot is ahead of applied state", ErrInvalidCoreState)
+	}
+	prospective, err := compactRecoveredState(node.durableState, result.snapshot, node.options.Identity, node.options.Voters)
+	if err != nil {
+		return fmt.Errorf("validate completed raft snapshot: %w", err)
+	}
+	store, ok := node.options.Store.(interface{ PersistSnapshot(Snapshot) error })
+	if !ok {
+		return fmt.Errorf("%w: stable store lacks snapshot persistence", ErrInvalidCoreState)
+	}
+	if err := store.PersistSnapshot(result.snapshot.Clone()); err != nil {
+		return fmt.Errorf("persist raft snapshot at %d: %w", result.snapshot.Metadata.LastIncludedIndex, err)
+	}
+	if err := node.core.CompactSnapshot(result.snapshot.Metadata); err != nil {
+		return err
+	}
+	node.durableState = prospective
+	return nil
+}
+
 func (node *Node) drainReady(ctx context.Context) error {
 	for {
 		ready, ok := node.core.Ready()
 		if !ok {
-			return node.core.Err()
+			if err := node.core.Err(); err != nil {
+				return err
+			}
+			_, err := node.maybeStartSnapshotCapture()
+			return err
 		}
 		batch, prospectiveDurable, err := node.validateReadyAndDerive(ready)
 		if err != nil {

@@ -1478,9 +1478,12 @@ func task8NodeOptions(t *testing.T, state RecoveredState) (NodeOptions, *task8St
 		Store: store, StateMachine: machine,
 		Transport: &task8Transport{result: TransportAccepted},
 		Clock:     manual, Random: task8ZeroOffsetRandom{},
-		ElectionTimeoutMin: 5 * time.Second,
-		ElectionTimeoutMax: 10 * time.Second,
-		HeartbeatInterval:  1 * time.Second,
+		ElectionTimeoutMin:     5 * time.Second,
+		ElectionTimeoutMax:     10 * time.Second,
+		HeartbeatInterval:      1 * time.Second,
+		SnapshotEntryThreshold: 4096,
+		SnapshotByteThreshold:  64 << 20,
+		MaxSnapshotBytes:       16 << 20,
 	}, store, machine, manual
 }
 

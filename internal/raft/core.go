@@ -384,6 +384,34 @@ func (core *Core) HardState() HardState { return core.hardState }
 // LogState returns an independently owned copy of the checked log.
 func (core *Core) LogState() LogState { return core.log.State() }
 
+// CompactSnapshot releases a durably snapshotted prefix. The caller must make
+// the exact snapshot durable before invoking this transition.
+func (core *Core) CompactSnapshot(metadata SnapshotMetadata) error {
+	if core.terminalErr != nil {
+		return core.terminalErr
+	}
+	if core.hasPending {
+		return ErrReadyOutstanding
+	}
+	if err := core.log.Compact(metadata.LastIncludedIndex, metadata.LastIncludedTerm); err != nil {
+		return err
+	}
+	if core.role == RoleLeader {
+		for peerID, progress := range core.progress {
+			if peerID == core.localID {
+				continue
+			}
+			if progress.NextIndex <= core.log.SnapshotIndex() {
+				progress.SnapshotNeeded = true
+				progress.ActiveGeneration = 0
+				progress.activeMatchIndex = 0
+				core.progress[peerID] = progress
+			}
+		}
+	}
+	return nil
+}
+
 // ElectionDeadline returns the current absolute logical election deadline.
 func (core *Core) ElectionDeadline() uint64 { return core.electionDeadline }
 
