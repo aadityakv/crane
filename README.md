@@ -13,13 +13,14 @@ go env GOMOD
 
 The second command must point to this repository's `go.mod`. The module's Go version floor remains 1.26. A newer Go release may build and test the project, but the pinned Staticcheck v0.7.0 analyzer is verified only with Go 1.26.x; use that toolchain for `make verify`.
 
-Run the full local gate before changing or operating the runtime:
+Run the full local gate, including a build from a clean copied tree, before
+changing or operating the runtime:
 
 ```sh
-make verify
+make clean-build verify
 ```
 
-The gate checks formatting, unit tests, race safety, `go vet`, Staticcheck, and the real-process integration test. `make build` produces `bin/cs425-node` and `bin/cs425-cluster`; the other individual targets are `test`, `race`, `integration`, `vet`, `staticcheck`, and `fmt-check`. CI runs the supported checks on current macOS and Linux runners.
+The gate checks clean-tree build isolation, formatting, unit tests, race safety, `go vet`, Staticcheck, and the real-process integration test. `make build` produces `bin/cs425-node` and `bin/cs425-cluster`; the other individual targets are `clean-build`, `test`, `race`, `integration`, `vet`, `staticcheck`, and `fmt-check`. CI runs the supported checks on current macOS and Linux runners.
 
 ## Cluster secret
 
@@ -85,7 +86,7 @@ The secret-creation command in the preceding section must also have created `./l
 
 `-config` is required. For generated local clusters only, the node command accepts `-node-id`, `-bind-host`, `-advertise-host`, `-base-port`, and `-storage-dir` overrides. Cluster identity, seed, voters, timing, and secret location remain file-controlled so a command-line typo cannot create another security or consensus domain.
 
-Startup creates the storage directory with owner-only permissions, loads the last persisted incarnation, binds SWIM's UDP and snapshot TCP listeners, and prints its readiness signal only after the service is ready. The supervisor cancels all services if a required listener or startup invariant fails. Send `SIGINT` or `SIGTERM` for graceful shutdown: the node persists a newer incarnation, announces `Left` for a bounded dissemination interval, then closes listeners and waits for its goroutines. Configuration, authentication-key, storage, listener, and invariant failures exit nonzero; requested graceful shutdown exits zero.
+Startup creates a missing storage directory as `0700`. If the final path already exists, it must be a real directory owned by the current user with exactly `0700` permissions; startup rejects an unsafe path without silently applying `chmod`. The incarnation path must be a non-symlink regular file owned by the current user, grant no group or other permissions, and fit the bounded decimal-state representation; FIFOs, directories, links, oversized files, and permissive files are rejected before reading. After loading identity, the node binds SWIM's UDP and snapshot TCP listeners and prints its readiness signal only after the service is ready. The supervisor cancels all services if a required listener or startup invariant fails. Send `SIGINT` or `SIGTERM` for graceful shutdown: the node persists a newer incarnation, announces `Left` for a bounded dissemination interval, then closes listeners and waits for its goroutines. Configuration, authentication-key, storage, listener, and invariant failures exit nonzero; requested graceful shutdown exits zero.
 
 ## Local three-node cluster
 
@@ -94,6 +95,7 @@ The launcher generates strict `0600` configuration files under its data root, cr
 ```sh
 make build
 umask 077
+test ! -e local.secret || { echo "refusing to overwrite local.secret" >&2; exit 1; }
 head -c 32 /dev/urandom > local.secret
 chmod 600 local.secret
 ./bin/cs425-cluster \
@@ -104,7 +106,7 @@ chmod 600 local.secret
   -node-binary ./bin/cs425-node
 ```
 
-`cmd/cluster` starts the seed first, waits for its readiness signal, then launches the remaining nodes with node-ID-prefixed logs. It forwards the first `SIGINT`/`SIGTERM` to the children for graceful leave and waits for them; a second signal escalates shutdown. Five or more local nodes use a five-voter static map; three or four nodes use a three-voter map.
+`cmd/cluster` starts the seed first, waits for its readiness signal, then launches the remaining nodes with node-ID-prefixed logs. Missing per-node and configuration directories are created as `0700`; unsafe existing final directories are rejected without permission repair. It forwards the first `SIGINT`/`SIGTERM` to the children for graceful leave and waits for them; a second signal escalates shutdown. A child operational failure remains a launcher error even after the user requested shutdown. Five or more local nodes use a five-voter static map; three or four nodes use a three-voter map.
 
 ## Remote hosts
 
@@ -127,8 +129,8 @@ The introducer admits a joining node and supplies its snapshot; after admission 
 
 ## SWIM behavior and current scope
 
-The SWIM event loop owns membership state. It runs direct probes, then indirect `PING-REQ` probes on timeout; lack of a matching authenticated ACK creates `Suspect`, and the suspicion timer eventually produces `Dead`. A node refutes suspicion by publishing a higher-incarnation `Alive`; `Dead` and `Left` are retained as tombstones to prevent stale resurrection. Membership events and snapshots are copied, bounded views: slow subscribers receive a resynchronization marker instead of blocking SWIM. Recovery is scoped to the returned subscription handle: call `Subscription.Snapshot` after its marker; a general `Service.Snapshot` does not resume any subscriber.
+The SWIM event loop owns membership state. It runs direct probes, then indirect `PING-REQ` probes on timeout; lack of a matching authenticated ACK creates `Suspect`, and the suspicion timer eventually produces `Dead`. A node refutes suspicion by publishing a higher-incarnation `Alive`; `Dead` and `Left` are retained as tombstones to prevent stale resurrection. If a join acceptance is lost after admission, the client performs one exact idempotent retry without advancing durable incarnation state again. Membership events and snapshots are copied, bounded views: slow subscribers receive a resynchronization marker instead of blocking SWIM. Recovery is scoped to the returned subscription handle: call `Subscription.Snapshot` after its marker; a general `Service.Snapshot` does not resume any subscriber. `Service.Stats` exposes only fixed-label, saturating counts for rejected UDP datagrams and transient send failures; it does not retain endpoints, request IDs, payloads, or secrets.
 
 Membership failure does not terminate a process, delete data, alter the configured Raft voter set, or reassign Crane work. Authenticating, replay-checking, and schema validation happen before SWIM state mutation. The real-process integration test covers local admission, failure detection, restart with a higher incarnation, and continued operation after seed loss.
 
-This milestone implements the runtime foundation and SWIM membership only. Raft replication and Crane modernization, including their operational behavior, remain later scope; the static voter configuration is present solely as a validated contract for that work.
+This milestone implements the runtime foundation and SWIM membership only. Raft replication and Crane modernization, including their operational behavior, remain later scope; the static voter configuration is present solely as a validated contract for that work. The portable, structurally validated legacy data schemas under `pkg/topology` are retained for that later Crane migration, but no topology runtime or plugin execution is enabled by this milestone.
