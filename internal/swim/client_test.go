@@ -496,7 +496,7 @@ func startLostJoinAcceptedServer(t *testing.T, authenticator wire.Authenticator,
 				_ = stream.Close()
 				continue
 			}
-			accepted, err := wire.EncodeGob(JoinAccepted{Member: announce.Member})
+			accepted, err := wire.EncodeGob(JoinAccepted(announce))
 			if err != nil {
 				_ = stream.Close()
 				fail("encode join acceptance: %v", err)

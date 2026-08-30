@@ -2,7 +2,7 @@ package config
 
 import "testing"
 
-var serviceOffsetMustRemainUint16 uint16 = ServiceSpec{}.Offset
+var _ uint16 = ServiceSpec{}.Offset
 
 func TestTransportNumericOrderMatchesWireContract(t *testing.T) {
 	if TransportUDP != 0 || TransportTCP != 1 {
