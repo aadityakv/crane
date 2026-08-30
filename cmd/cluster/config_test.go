@@ -59,6 +59,9 @@ func TestGenerateConfigsBuildsStrictSharedLocalLayout(t *testing.T) {
 		if !reflect.DeepEqual(generated.RaftVoters, wantVoters) {
 			t.Errorf("config %d voters = %#v, want %#v", index, generated.RaftVoters, wantVoters)
 		}
+		if generated.Raft != config.DefaultRaftConfig() {
+			t.Errorf("config %d raft = %#v, want defaults %#v", index, generated.Raft, config.DefaultRaftConfig())
+		}
 		wantStorage := filepath.Join(dataRoot, "node-"+string(rune('1'+index)))
 		if generated.StorageDir != wantStorage {
 			t.Errorf("config %d storage = %q, want %q", index, generated.StorageDir, wantStorage)

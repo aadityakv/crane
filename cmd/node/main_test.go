@@ -67,8 +67,8 @@ func TestLoadNodeConfigurationAppliesOnlyLocalOverrides(t *testing.T) {
 	if got.ClusterID != configuration.ClusterID || got.Introducer != configuration.Introducer || got.ClusterSecretFile != configuration.ClusterSecretFile {
 		t.Fatalf("file-controlled security or cluster fields changed: %#v", got)
 	}
-	if !reflect.DeepEqual(got.RaftVoters, configuration.RaftVoters) || got.Timing != configuration.Timing {
-		t.Fatalf("file-controlled voters or timing changed: %#v", got)
+	if !reflect.DeepEqual(got.RaftVoters, configuration.RaftVoters) || got.Timing != configuration.Timing || got.Raft != configuration.Raft {
+		t.Fatalf("file-controlled voters, timing, or raft settings changed: %#v", got)
 	}
 }
 
@@ -166,6 +166,7 @@ func writeNodeTestConfig(t *testing.T) config.NodeConfig {
 			{NodeID: 3, Endpoint: "127.0.0.1:8208"},
 		},
 		Timing: config.DefaultTimingConfig(),
+		Raft:   config.DefaultRaftConfig(),
 	}
 }
 

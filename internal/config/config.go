@@ -32,6 +32,8 @@ type NodeConfig struct {
 	ClusterSecretFile string `json:"cluster_secret_file"`
 	// RaftVoters is the identical fixed voter ID/endpoint map configured on every node.
 	RaftVoters []RaftVoter `json:"raft_voters"`
+	// Raft controls fixed-voter protocol timing and bounded persistence behavior.
+	Raft RaftConfig `json:"raft"`
 	// Timing controls validated SWIM and replay-protection intervals.
 	Timing TimingConfig `json:"timing"`
 }
@@ -77,7 +79,7 @@ func DefaultTimingConfig() TimingConfig {
 
 // Decode strictly decodes, defaults, and validates one JSON node configuration.
 func Decode(reader io.Reader) (NodeConfig, error) {
-	config := NodeConfig{Timing: DefaultTimingConfig()}
+	config := NodeConfig{Timing: DefaultTimingConfig(), Raft: DefaultRaftConfig()}
 	decoder := json.NewDecoder(reader)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&config); err != nil {
@@ -140,6 +142,9 @@ func (c NodeConfig) Validate() error {
 	if err := validateTiming(c.Timing); err != nil {
 		return err
 	}
+	if err := validateRaft(c.Raft); err != nil {
+		return err
+	}
 	if len(c.RaftVoters) != 3 && len(c.RaftVoters) != 5 {
 		return fmt.Errorf("raft voters must contain exactly three or five voters")
 	}
@@ -172,6 +177,16 @@ func (c NodeConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// RaftVoterByID returns an owned copy of the configured voter with id.
+func (c NodeConfig) RaftVoterByID(id uint16) (RaftVoter, bool) {
+	for _, voter := range c.RaftVoters {
+		if voter.NodeID == id {
+			return voter, true
+		}
+	}
+	return RaftVoter{}, false
 }
 
 func validateUUID(value string) error {

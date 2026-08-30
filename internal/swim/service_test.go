@@ -2551,6 +2551,7 @@ func serviceTestConfig(t *testing.T, nodeID uint16) config.NodeConfig {
 		StorageDir:        t.TempDir(),
 		ClusterSecretFile: secretPath,
 		Timing:            config.DefaultTimingConfig(),
+		Raft:              config.DefaultRaftConfig(),
 		RaftVoters: []config.RaftVoter{
 			{NodeID: nodeID, Endpoint: config.Endpoint{Host: "127.0.0.1", Port: basePort + 8}.String()},
 			{NodeID: nodeID + 100, Endpoint: "127.0.0.2:30008"},

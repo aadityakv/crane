@@ -292,6 +292,7 @@ func integrationConfigs(t *testing.T, startingBasePort uint16, secretFile string
 				IndirectChecks:       2,
 				ReplayWindow:         config.Duration(time.Minute),
 			},
+			Raft: config.DefaultRaftConfig(),
 		}
 		if err := configuration.Validate(); err != nil {
 			t.Fatalf("validate node %d config: %v", index+1, err)

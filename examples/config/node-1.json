@@ -21,6 +21,16 @@
       "endpoint": "127.0.0.1:8208"
     }
   ],
+  "raft": {
+    "election_timeout_min": "750ms",
+    "election_timeout_max": "1.5s",
+    "heartbeat_interval": "150ms",
+    "rpc_timeout": "500ms",
+    "max_append_entries": 64,
+    "snapshot_entry_threshold": 4096,
+    "snapshot_byte_threshold": 67108864,
+    "max_snapshot_bytes": 16777216
+  },
   "timing": {
     "probe_interval": "1s",
     "direct_probe_timeout": "300ms",

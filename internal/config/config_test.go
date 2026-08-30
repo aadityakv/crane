@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestValidateTimingRejectsOverflowingTimeoutSum(t *testing.T) {
@@ -82,6 +83,7 @@ func validConfig(secretPath string) NodeConfig {
 			{NodeID: 3, Endpoint: "127.0.0.1:8208"},
 		},
 		Timing: DefaultTimingConfig(),
+		Raft:   DefaultRaftConfig(),
 	}
 }
 
@@ -264,6 +266,40 @@ func TestDecodeAppliesTimingDefaults(t *testing.T) {
 	if cfg.Timing != DefaultTimingConfig() {
 		t.Fatalf("Timing = %#v, want defaults %#v", cfg.Timing, DefaultTimingConfig())
 	}
+}
+
+func TestDecodeAppliesAndMergesRaftDefaults(t *testing.T) {
+	secret := createSecret(t, 0o600)
+	base := fmt.Sprintf(`{
+"node_id":1,"cluster_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+"bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
+"introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
+"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}]`, secret)
+	t.Run("omitted", func(t *testing.T) {
+		cfg, err := Decode(bytes.NewBufferString(base + `}`))
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if cfg.Raft != DefaultRaftConfig() {
+			t.Fatalf("Raft = %#v, want defaults %#v", cfg.Raft, DefaultRaftConfig())
+		}
+	})
+	t.Run("partial", func(t *testing.T) {
+		cfg, err := Decode(bytes.NewBufferString(base + `,"raft":{"heartbeat_interval":"200ms"}}`))
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		want := DefaultRaftConfig()
+		want.HeartbeatInterval = Duration(200 * time.Millisecond)
+		if cfg.Raft != want {
+			t.Fatalf("Raft = %#v, want %#v", cfg.Raft, want)
+		}
+	})
+	t.Run("nested_unknown_field", func(t *testing.T) {
+		if _, err := Decode(bytes.NewBufferString(base + `,"raft":{"unknown":true}}`)); err == nil {
+			t.Fatal("Decode accepted an unknown raft field")
+		}
+	})
 }
 
 func TestAdvertiseEndpointsUseRegistry(t *testing.T) {

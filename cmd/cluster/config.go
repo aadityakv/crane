@@ -79,6 +79,7 @@ func GenerateConfigs(options ClusterOptions) ([]config.NodeConfig, error) {
 			ClusterSecretFile: options.SecretFile,
 			RaftVoters:        append([]config.RaftVoter(nil), voters...),
 			Timing:            config.DefaultTimingConfig(),
+			Raft:              config.DefaultRaftConfig(),
 		}
 		if err := result[index].Validate(); err != nil {
 			return nil, fmt.Errorf("validate generated config for node %d: %w", index+1, err)
