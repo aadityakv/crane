@@ -20,11 +20,42 @@ import (
 	internalrandom "github.com/aaditya/cs425mp3/internal/random"
 )
 
+func TestTask10StateMachineCachesDistinctIndexRetryWithoutSecondMutation(t *testing.T) {
+	tracker := newTask10KVTracker()
+	machine := newTask10KVStateMachine(tracker)
+	command := task10KVCommand{ID: "ambiguous-client-retry", Key: "key", Value: "value"}
+
+	first, err := machine.Apply(2, 1, encodeTask10KVCommand(command))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := machine.Apply(4, 3, encodeTask10KVCommand(command))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retry, first) {
+		t.Fatalf("retry result = %q, want cached first result %q", retry, first)
+	}
+	if got := machine.mutationCount(command.ID); got != 1 {
+		t.Fatalf("state mutation count = %d, want 1", got)
+	}
+	if err := validateTask10DuplicateEvidence(tracker.duplicateEvidence()); err != nil {
+		t.Fatalf("distinct-index retry evidence: %v", err)
+	}
+
+	sameIndex := tracker.duplicateEvidence()[0]
+	sameIndex.Index = sameIndex.FirstIndex
+	if err := validateTask10DuplicateEvidence([]task10DuplicateApply{sameIndex}); err == nil {
+		t.Fatal("same-index duplicate Apply evidence was accepted")
+	}
+}
+
 func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	configurations, secret, reservations := task10ClusterConfigurations(t)
 	nodes := make([]*task10ClusterNode, 3)
+	trackers := []*task10KVTracker{newTask10KVTracker(), newTask10KVTracker(), newTask10KVTracker()}
 	for index := range nodes {
-		nodes[index] = startTask10ClusterNode(t, configurations[index], secret, int64(index+1), reservations[index])
+		nodes[index] = startTask10ClusterNode(t, configurations[index], secret, int64(index+1), reservations[index], trackers[index])
 	}
 	defer func() {
 		for _, node := range nodes {
@@ -36,6 +67,7 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 
 	leader := awaitTask10Leader(t, nodes, 5*time.Second)
 	expected := make(map[string]string)
+	setTask10Phase(trackers, "initial proposals")
 	for index := 1; index <= 2; index++ {
 		command := task10KVCommand{ID: fmt.Sprintf("initial-%02d", index), Key: fmt.Sprintf("key-%02d", index), Value: fmt.Sprintf("value-%02d", index)}
 		leader = proposeTask10Command(t, nodes, command)
@@ -48,6 +80,7 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	}
 	cancelBarrier()
 	awaitTask10State(t, nodes, expected, 5*time.Second)
+	assertTask10IdempotencyEvidence(t, nodes, trackers, "initial commits")
 
 	failedID := leader.configuration.NodeID
 	leader.stop(t)
@@ -55,6 +88,7 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	if leader.configuration.NodeID == failedID {
 		t.Fatalf("stopped leader %d remained leader", failedID)
 	}
+	setTask10Phase(trackers, "failover proposals")
 	for index := 1; index <= 2; index++ {
 		command := task10KVCommand{ID: fmt.Sprintf("failover-%02d", index), Key: fmt.Sprintf("failover-key-%02d", index), Value: fmt.Sprintf("failover-value-%02d", index)}
 		leader = proposeTask10Command(t, task10RunningNodes(nodes), command)
@@ -62,8 +96,9 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	}
 
 	failedIndex := int(failedID - 1)
-	nodes[failedIndex] = startTask10ClusterNode(t, configurations[failedIndex], secret, 100+int64(failedIndex), nil)
+	nodes[failedIndex] = startTask10ClusterNode(t, configurations[failedIndex], secret, 100+int64(failedIndex), nil, trackers[failedIndex])
 	awaitTask10State(t, nodes, expected, 5*time.Second)
+	assertTask10IdempotencyEvidence(t, nodes, trackers, "old leader catch-up")
 
 	leader = awaitTask10Leader(t, nodes, 5*time.Second)
 	lagging := task10FollowerOtherThan(nodes, leader.configuration.NodeID)
@@ -72,6 +107,10 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 		t.Fatalf("lagging voter already had a snapshot before isolation: %v", err)
 	}
 	lagging.stop(t)
+	configurations[laggingIndex].Raft.SnapshotEntryThreshold = math.MaxUint64
+	configurations[laggingIndex].Raft.SnapshotByteThreshold = math.MaxUint64
+	remoteRestoresBefore := trackers[laggingIndex].snapshotRestoreCount()
+	setTask10Phase(trackers, "snapshot threshold proposals")
 	for index := 1; index <= 20; index++ {
 		command := task10KVCommand{ID: fmt.Sprintf("snapshot-%02d", index), Key: fmt.Sprintf("snapshot-key-%02d", index), Value: fmt.Sprintf("snapshot-value-%02d", index)}
 		leader = proposeTask10Command(t, task10RunningNodes(nodes), command)
@@ -79,19 +118,30 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	}
 	awaitTask10File(t, filepath.Join(leader.configuration.StorageDir, RaftStorageDirectoryName, RaftSnapshotFilename), 5*time.Second)
 
-	nodes[laggingIndex] = startTask10ClusterNode(t, configurations[laggingIndex], secret, 200+int64(laggingIndex), nil)
+	setTask10Phase(trackers, "lagging snapshot restart")
+	nodes[laggingIndex] = startTask10ClusterNode(t, configurations[laggingIndex], secret, 200+int64(laggingIndex), nil, trackers[laggingIndex])
+	awaitTask10(t, nodes, 8*time.Second, "remote InstallSnapshot Restore on restarted lagging voter", func() bool {
+		return trackers[laggingIndex].snapshotRestoreCount() > remoteRestoresBefore
+	})
 	awaitTask10State(t, nodes, expected, 8*time.Second)
+	assertTask10IdempotencyEvidence(t, nodes, trackers, "lagging snapshot catch-up")
 	awaitTask10File(t, filepath.Join(configurations[laggingIndex].StorageDir, RaftStorageDirectoryName, RaftSnapshotFilename), 5*time.Second)
 	postSnapshot := task10KVCommand{ID: "post-snapshot", Key: "post-snapshot-key", Value: "post-snapshot-value"}
+	setTask10Phase(trackers, "post-snapshot append")
 	leader = proposeTask10Command(t, nodes, postSnapshot)
 	expected[postSnapshot.Key] = postSnapshot.Value
 	awaitTask10State(t, nodes, expected, 5*time.Second)
+	if got := nodes[laggingIndex].machine.applyCount(postSnapshot.ID); got != 1 {
+		t.Fatalf("lagging voter post-snapshot Append apply count = %d, want exactly one", got)
+	}
+	assertTask10IdempotencyEvidence(t, nodes, trackers, "post-snapshot append")
 
+	setTask10Phase(trackers, "complete disk restart")
 	for _, node := range nodes {
 		node.stop(t)
 	}
 	for index := range nodes {
-		nodes[index] = startTask10ClusterNode(t, configurations[index], secret, 300+int64(index), nil)
+		nodes[index] = startTask10ClusterNode(t, configurations[index], secret, 300+int64(index), nil, trackers[index])
 	}
 	_ = awaitTask10Leader(t, nodes, 5*time.Second)
 	awaitTask10State(t, nodes, expected, 8*time.Second)
@@ -114,10 +164,8 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 		if status.CommitIndex != commit || status.AppliedIndex != commit {
 			t.Fatalf("restart status node=%d got=%#v want commit/applied=%d; all=%s", node.configuration.NodeID, status, commit, task10Statuses(nodes))
 		}
-		if duplicates := node.machine.duplicateCount(); duplicates != 0 {
-			t.Fatalf("node %d applied %d duplicate application IDs", node.configuration.NodeID, duplicates)
-		}
 	}
+	assertTask10IdempotencyEvidence(t, nodes, trackers, "complete disk recovery")
 }
 
 type task10ClusterNode struct {
@@ -129,9 +177,9 @@ type task10ClusterNode struct {
 	stopOnce      sync.Once
 }
 
-func startTask10ClusterNode(t *testing.T, configuration config.NodeConfig, secret []byte, seed int64, reservation net.Listener) *task10ClusterNode {
+func startTask10ClusterNode(t *testing.T, configuration config.NodeConfig, secret []byte, seed int64, reservation net.Listener, tracker *task10KVTracker) *task10ClusterNode {
 	t.Helper()
-	machine := newTask10KVStateMachine()
+	machine := newTask10KVStateMachine(tracker)
 	service, err := NewService(ServiceOptions{
 		Config: configuration, Secret: secret, Clock: clock.NewReal(),
 		Random: internalrandom.NewLockedSource(seed), StateMachine: machine,
@@ -261,8 +309,12 @@ func proposeTask10Command(t *testing.T, nodes []*task10ClusterNode, command task
 			return false
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		_, err := leader.service.Propose(ctx, encoded)
+		result, err := leader.service.Propose(ctx, encoded)
 		cancel()
+		leader.machine.tracker.recordProposalAttempt(task10ProposalAttempt{
+			ID: command.ID, VoterID: leader.configuration.NodeID, ResultIndex: result.Index, ResultTerm: result.Term,
+			Err: fmt.Sprint(err),
+		})
 		return err == nil
 	})
 	return leader
@@ -309,6 +361,45 @@ func task10Statuses(nodes []*task10ClusterNode) string {
 	return statuses
 }
 
+func setTask10Phase(trackers []*task10KVTracker, phase string) {
+	for _, tracker := range trackers {
+		tracker.mu.Lock()
+		tracker.phase = phase
+		tracker.mu.Unlock()
+	}
+}
+
+func assertTask10IdempotencyEvidence(t *testing.T, nodes []*task10ClusterNode, trackers []*task10KVTracker, checkpoint string) {
+	t.Helper()
+	for index, tracker := range trackers {
+		duplicates := tracker.duplicateEvidence()
+		tracker.mu.Lock()
+		attempts := append([]task10ProposalAttempt(nil), tracker.proposalAttempts...)
+		tracker.mu.Unlock()
+		if err := validateTask10DuplicateEvidence(duplicates); err != nil {
+			t.Fatalf("checkpoint %q voter %d invalid duplicate evidence: %v; duplicate applies=%#v; proposal attempts=%#v; statuses=%s", checkpoint, index+1, err, duplicates, attempts, task10Statuses(nodes))
+		}
+	}
+}
+
+func validateTask10DuplicateEvidence(duplicates []task10DuplicateApply) error {
+	for _, duplicate := range duplicates {
+		if duplicate.FirstIndex == 0 {
+			return fmt.Errorf("command %q retry at index %d has no persisted origin", duplicate.ID, duplicate.Index)
+		}
+		if duplicate.FirstIndex == duplicate.Index {
+			return fmt.Errorf("command %q was applied twice at log index %d", duplicate.ID, duplicate.Index)
+		}
+		if duplicate.CachedResult != duplicate.CommandValue {
+			return fmt.Errorf("command %q retry returned %q, want cached result %q", duplicate.ID, duplicate.CachedResult, duplicate.CommandValue)
+		}
+		if duplicate.MutationCount > 1 {
+			return fmt.Errorf("command %q caused %d mutations in incarnation %d", duplicate.ID, duplicate.MutationCount, duplicate.Incarnation)
+		}
+	}
+	return nil
+}
+
 func task10RunningNodes(nodes []*task10ClusterNode) []*task10ClusterNode {
 	result := make([]*task10ClusterNode, 0, len(nodes))
 	for _, node := range nodes {
@@ -335,54 +426,125 @@ type task10KVCommand struct {
 }
 
 type task10KVStateMachine struct {
-	mu         sync.Mutex
-	values     map[string]string
-	results    map[string]string
-	duplicates int
+	mu               sync.Mutex
+	values           map[string]string
+	results          map[string]string
+	applies          map[string]int
+	mutations        map[string]int
+	tracker          *task10KVTracker
+	incarnation      int
+	restoredBase     uint64
+	restoredBaseTerm uint64
+	firstApplies     map[string]task10ApplyRecord
 }
 
-func newTask10KVStateMachine() *task10KVStateMachine {
-	return &task10KVStateMachine{values: make(map[string]string), results: make(map[string]string)}
+type task10KVTracker struct {
+	mu               sync.Mutex
+	phase            string
+	nextIncarnation  int
+	duplicates       []task10DuplicateApply
+	proposalAttempts []task10ProposalAttempt
+	snapshotRestores int
 }
 
-func (machine *task10KVStateMachine) Apply(_ uint64, _ uint64, encoded []byte) ([]byte, error) {
+type task10ApplyRecord struct {
+	Index uint64
+	Term  uint64
+}
+
+type task10ProposalAttempt struct {
+	ID          string
+	VoterID     uint16
+	ResultIndex uint64
+	ResultTerm  uint64
+	Err         string
+}
+
+type task10DuplicateApply struct {
+	ID               string
+	Index            uint64
+	Term             uint64
+	Incarnation      int
+	Phase            string
+	RestoredBase     uint64
+	RestoredBaseTerm uint64
+	FirstIndex       uint64
+	FirstTerm        uint64
+	CommandValue     string
+	CachedResult     string
+	MutationCount    int
+}
+
+func newTask10KVTracker() *task10KVTracker { return &task10KVTracker{} }
+
+func newTask10KVStateMachine(tracker *task10KVTracker) *task10KVStateMachine {
+	tracker.mu.Lock()
+	tracker.nextIncarnation++
+	incarnation := tracker.nextIncarnation
+	tracker.mu.Unlock()
+	return &task10KVStateMachine{
+		values: make(map[string]string), results: make(map[string]string), applies: make(map[string]int), mutations: make(map[string]int), firstApplies: make(map[string]task10ApplyRecord),
+		tracker: tracker, incarnation: incarnation,
+	}
+}
+
+func (machine *task10KVStateMachine) Apply(index uint64, term uint64, encoded []byte) ([]byte, error) {
 	command, err := decodeTask10KVCommand(encoded)
 	if err != nil {
 		return nil, err
 	}
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
+	machine.applies[command.ID]++
 	if result, duplicate := machine.results[command.ID]; duplicate {
-		machine.duplicates++
+		first := machine.firstApplies[command.ID]
+		machine.tracker.mu.Lock()
+		machine.tracker.duplicates = append(machine.tracker.duplicates, task10DuplicateApply{
+			ID: command.ID, Index: index, Term: term, Incarnation: machine.incarnation,
+			Phase: machine.tracker.phase, RestoredBase: machine.restoredBase, RestoredBaseTerm: machine.restoredBaseTerm,
+			FirstIndex: first.Index, FirstTerm: first.Term, CommandValue: command.Value, CachedResult: result,
+			MutationCount: machine.mutations[command.ID],
+		})
+		machine.tracker.mu.Unlock()
 		return []byte(result), nil
 	}
 	machine.values[command.Key] = command.Value
 	machine.results[command.ID] = command.Value
+	machine.mutations[command.ID]++
+	machine.firstApplies[command.ID] = task10ApplyRecord{Index: index, Term: term}
 	return []byte(command.Value), nil
 }
 
-func (machine *task10KVStateMachine) Capture(uint64, uint64) (SnapshotCapture, error) {
+func (machine *task10KVStateMachine) Capture(index uint64, term uint64) (SnapshotCapture, error) {
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
-	return task10KVSnapshot{encoded: encodeTask10KVSnapshot(machine.values, machine.results)}, nil
+	return task10KVSnapshot{encoded: encodeTask10KVSnapshot(index, term, machine.values, machine.results, machine.firstApplies)}, nil
 }
 
 func (machine *task10KVStateMachine) Restore(schema uint32, encoded []byte) error {
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
+	machine.applies = make(map[string]int)
+	machine.mutations = make(map[string]int)
+	machine.firstApplies = make(map[string]task10ApplyRecord)
 	if schema == 0 && len(encoded) == 0 {
 		machine.values = make(map[string]string)
 		machine.results = make(map[string]string)
+		machine.restoredBase, machine.restoredBaseTerm = 0, 0
 		return nil
 	}
 	if schema != 1 {
 		return fmt.Errorf("unknown test KV schema %d", schema)
 	}
-	values, results, err := decodeTask10KVSnapshot(encoded)
+	machine.tracker.mu.Lock()
+	machine.tracker.snapshotRestores++
+	machine.tracker.mu.Unlock()
+	base, baseTerm, values, results, firstApplies, err := decodeTask10KVSnapshot(encoded)
 	if err != nil {
 		return err
 	}
-	machine.values, machine.results = values, results
+	machine.values, machine.results, machine.firstApplies = values, results, firstApplies
+	machine.restoredBase, machine.restoredBaseTerm = base, baseTerm
 	return nil
 }
 
@@ -392,10 +554,34 @@ func (machine *task10KVStateMachine) valuesSnapshot() map[string]string {
 	return cloneTask10StringMap(machine.values)
 }
 
-func (machine *task10KVStateMachine) duplicateCount() int {
+func (machine *task10KVStateMachine) applyCount(id string) int {
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
-	return machine.duplicates
+	return machine.applies[id]
+}
+
+func (machine *task10KVStateMachine) mutationCount(id string) int {
+	machine.mu.Lock()
+	defer machine.mu.Unlock()
+	return machine.mutations[id]
+}
+
+func (tracker *task10KVTracker) duplicateEvidence() []task10DuplicateApply {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return append([]task10DuplicateApply(nil), tracker.duplicates...)
+}
+
+func (tracker *task10KVTracker) snapshotRestoreCount() int {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.snapshotRestores
+}
+
+func (tracker *task10KVTracker) recordProposalAttempt(attempt task10ProposalAttempt) {
+	tracker.mu.Lock()
+	tracker.proposalAttempts = append(tracker.proposalAttempts, attempt)
+	tracker.mu.Unlock()
 }
 
 type task10KVSnapshot struct{ encoded []byte }
@@ -429,22 +615,53 @@ func decodeTask10KVCommand(encoded []byte) (task10KVCommand, error) {
 	return task10KVCommand{ID: id, Key: key, Value: value}, nil
 }
 
-func encodeTask10KVSnapshot(values, results map[string]string) []byte {
-	encoded := appendTask10Map(nil, values)
-	return appendTask10Map(encoded, results)
+func encodeTask10KVSnapshot(index, term uint64, values, results map[string]string, firstApplies map[string]task10ApplyRecord) []byte {
+	encoded := make([]byte, 16)
+	binary.BigEndian.PutUint64(encoded[0:8], index)
+	binary.BigEndian.PutUint64(encoded[8:16], term)
+	encoded = appendTask10Map(encoded, values)
+	encoded = appendTask10Map(encoded, results)
+	return appendTask10ApplyRecords(encoded, firstApplies)
 }
 
-func decodeTask10KVSnapshot(encoded []byte) (map[string]string, map[string]string, error) {
-	decoder := task10StringDecoder{encoded: encoded}
+func decodeTask10KVSnapshot(encoded []byte) (uint64, uint64, map[string]string, map[string]string, map[string]task10ApplyRecord, error) {
+	if len(encoded) < 16 {
+		return 0, 0, nil, nil, nil, fmt.Errorf("malformed test KV snapshot base")
+	}
+	base, term := binary.BigEndian.Uint64(encoded[0:8]), binary.BigEndian.Uint64(encoded[8:16])
+	decoder := task10StringDecoder{encoded: encoded, offset: 16}
 	values, err := decoder.nextMap()
 	if err != nil {
-		return nil, nil, err
+		return 0, 0, nil, nil, nil, err
 	}
 	results, err := decoder.nextMap()
-	if err != nil || decoder.offset != len(encoded) {
-		return nil, nil, fmt.Errorf("malformed test KV snapshot")
+	if err != nil {
+		return 0, 0, nil, nil, nil, err
 	}
-	return values, results, nil
+	firstApplies, err := decoder.nextApplyRecords()
+	if err != nil || decoder.offset != len(encoded) {
+		return 0, 0, nil, nil, nil, fmt.Errorf("malformed test KV snapshot")
+	}
+	return base, term, values, results, firstApplies, nil
+}
+
+func appendTask10ApplyRecords(encoded []byte, records map[string]task10ApplyRecord) []byte {
+	keys := make([]string, 0, len(records))
+	for key := range records {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var word [8]byte
+	binary.BigEndian.PutUint64(word[:], uint64(len(keys)))
+	encoded = append(encoded, word[:]...)
+	for _, key := range keys {
+		encoded = appendTask10String(encoded, key)
+		binary.BigEndian.PutUint64(word[:], records[key].Index)
+		encoded = append(encoded, word[:]...)
+		binary.BigEndian.PutUint64(word[:], records[key].Term)
+		encoded = append(encoded, word[:]...)
+	}
+	return encoded
 }
 
 func appendTask10Map(encoded []byte, values map[string]string) []byte {
@@ -511,6 +728,37 @@ func (decoder *task10StringDecoder) nextMap() (map[string]string, error) {
 		values[key] = value
 	}
 	return values, nil
+}
+
+func (decoder *task10StringDecoder) nextApplyRecords() (map[string]task10ApplyRecord, error) {
+	if len(decoder.encoded)-decoder.offset < 8 {
+		return nil, fmt.Errorf("missing apply record count")
+	}
+	count := binary.BigEndian.Uint64(decoder.encoded[decoder.offset : decoder.offset+8])
+	decoder.offset += 8
+	if count > uint64(len(decoder.encoded)-decoder.offset) {
+		return nil, fmt.Errorf("invalid apply record count")
+	}
+	records := make(map[string]task10ApplyRecord, count)
+	for index := uint64(0); index < count; index++ {
+		key, err := decoder.next()
+		if err != nil {
+			return nil, err
+		}
+		if len(decoder.encoded)-decoder.offset < 16 {
+			return nil, fmt.Errorf("missing apply record")
+		}
+		record := task10ApplyRecord{
+			Index: binary.BigEndian.Uint64(decoder.encoded[decoder.offset : decoder.offset+8]),
+			Term:  binary.BigEndian.Uint64(decoder.encoded[decoder.offset+8 : decoder.offset+16]),
+		}
+		decoder.offset += 16
+		if _, duplicate := records[key]; duplicate {
+			return nil, fmt.Errorf("duplicate apply record")
+		}
+		records[key] = record
+	}
+	return records, nil
 }
 
 func cloneTask10StringMap(values map[string]string) map[string]string {

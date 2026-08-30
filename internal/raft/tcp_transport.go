@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"container/heap"
 	"context"
 	cryptorand "crypto/rand"
 	"errors"
@@ -27,6 +28,7 @@ const (
 
 const (
 	tcpTransportNew uint32 = iota
+	tcpTransportStarting
 	tcpTransportRunning
 	tcpTransportStopped
 )
@@ -95,9 +97,14 @@ type TCPTransport struct {
 	queues map[uint16]*peerIntentQueue
 
 	requestMu sync.Mutex
-	issued    map[wire.RequestID]struct{}
+	issued    map[wire.RequestID]time.Time
+	expires   outgoingRequestExpiryHeap
 
 	connections sync.Map
+
+	// beforeOwnerStart is a same-package observation/failure seam invoked by
+	// each owner before it acknowledges startup.
+	beforeOwnerStart func(context.Context, string, uint16) error
 }
 
 // NewTCPTransport validates and owns options without opening sockets or starting goroutines.
@@ -141,7 +148,7 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 		replay:     wire.NewReplayGuard(options.Clock, options.ReplayWindow, TransportFutureSkew, TransportReplayEntries),
 		requestIDs: requestIDs, dialContext: dialContext, backoff: backoff,
 		ready: make(chan struct{}), done: make(chan struct{}), queues: queues,
-		issued: make(map[wire.RequestID]struct{}),
+		issued: make(map[wire.RequestID]time.Time),
 	}
 	return transport, nil
 }
@@ -182,25 +189,46 @@ func (transport *TCPTransport) Run(ctx context.Context, listener net.Listener, i
 	if transport == nil || ctx == nil || listener == nil || ingress == nil {
 		return fmt.Errorf("%w: nil TCP transport Run dependency", ErrTransportInvariant)
 	}
-	if !transport.state.CompareAndSwap(tcpTransportNew, tcpTransportRunning) {
+	if !transport.state.CompareAndSwap(tcpTransportNew, tcpTransportStarting) {
 		return ErrTransportStopped
 	}
 	workerContext, cancelWorkers := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	fatal := make(chan error, 1)
+	started := make(chan struct{}, len(transport.queues)+1)
 	for peerID, queue := range transport.queues {
 		voter, _ := transport.voters.Voter(peerID)
 		workers.Add(1)
-		go transport.runPeerWorker(workerContext, voter, queue, fatal, &workers)
+		go transport.runPeerWorker(workerContext, voter, queue, started, fatal, &workers)
 	}
 	workers.Add(1)
-	go transport.acceptConnections(workerContext, listener, ingress, fatal, &workers)
-	close(transport.ready)
+	go transport.acceptConnections(workerContext, listener, ingress, started, fatal, &workers)
 
+	owners := len(transport.queues) + 1
+	for acknowledged := 0; acknowledged < owners; {
+		select {
+		case <-started:
+			acknowledged++
+		case <-ctx.Done():
+			goto shutdown
+		case runErr = <-fatal:
+			goto shutdown
+		}
+	}
+	select {
+	case runErr = <-fatal:
+		goto shutdown
+	default:
+	}
+	transport.state.Store(tcpTransportRunning)
+	close(transport.ready)
 	select {
 	case <-ctx.Done():
 	case runErr = <-fatal:
 	}
+
+shutdown:
+	transport.state.Store(tcpTransportStopped)
 	cancelWorkers()
 	_ = listener.Close()
 	transport.closeConnections()
@@ -208,13 +236,18 @@ func (transport *TCPTransport) Run(ctx context.Context, listener net.Listener, i
 		queue.close()
 	}
 	workers.Wait()
-	transport.state.Store(tcpTransportStopped)
 	close(transport.done)
 	return runErr
 }
 
-func (transport *TCPTransport) runPeerWorker(ctx context.Context, voter Voter, queue *peerIntentQueue, fatal chan<- error, workers *sync.WaitGroup) {
+func (transport *TCPTransport) runPeerWorker(ctx context.Context, voter Voter, queue *peerIntentQueue, started chan<- struct{}, fatal chan<- error, workers *sync.WaitGroup) {
 	defer workers.Done()
+	if err := transport.acknowledgeOwner(ctx, "peer", voter.ID, started); err != nil {
+		if ctx.Err() == nil {
+			transport.reportFatal(ctx, fatal, fmt.Errorf("start Raft peer worker %d: %w", voter.ID, err))
+		}
+		return
+	}
 	var stream *wire.TCPFrameStream
 	var connection net.Conn
 	defer func() {
@@ -278,9 +311,9 @@ func (transport *TCPTransport) runPeerWorker(ctx context.Context, voter Voter, q
 }
 
 func (transport *TCPTransport) dialPeer(ctx context.Context, voter Voter) (*wire.TCPFrameStream, net.Conn, error) {
-	dialContext, cancelDial := context.WithTimeout(ctx, transport.rpcTimeout)
-	defer cancelDial()
-	connection, err := transport.dialContext(dialContext, "tcp", voter.Endpoint.String())
+	attemptContext, cancelAttempt := context.WithTimeout(ctx, transport.rpcTimeout)
+	defer cancelAttempt()
+	connection, err := transport.dialContext(attemptContext, "tcp", voter.Endpoint.String())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -294,11 +327,11 @@ func (transport *TCPTransport) dialPeer(ctx context.Context, voter Voter) (*wire
 	}
 	messageType, payload, err := EncodeRPC(Handshake{SenderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint()}, transport.codecLimits)
 	if err == nil {
-		err = stream.WriteFrame(ctx, wire.Frame{Header: transport.outboundHeader(messageType, requestID), Payload: payload})
+		err = stream.WriteFrame(attemptContext, wire.Frame{Header: transport.outboundHeader(messageType, requestID), Payload: payload})
 	}
 	var response wire.Frame
 	if err == nil {
-		response, err = stream.ReadFrame(ctx)
+		response, err = stream.ReadFrame(attemptContext)
 	}
 	if err == nil {
 		err = transport.acceptHandshakeAck(response, voter.ID, requestID)
@@ -346,8 +379,14 @@ func (transport *TCPTransport) outboundHeader(message wire.MessageType, requestI
 	}
 }
 
-func (transport *TCPTransport) acceptConnections(ctx context.Context, listener net.Listener, ingress RPCIngress, fatal chan<- error, workers *sync.WaitGroup) {
+func (transport *TCPTransport) acceptConnections(ctx context.Context, listener net.Listener, ingress RPCIngress, started chan<- struct{}, fatal chan<- error, workers *sync.WaitGroup) {
 	defer workers.Done()
+	if err := transport.acknowledgeOwner(ctx, "accept", 0, started); err != nil {
+		if ctx.Err() == nil {
+			transport.reportFatal(ctx, fatal, fmt.Errorf("start Raft accept owner: %w", err))
+		}
+		return
+	}
 	capacity := make(chan struct{}, TransportMaxInboundConnections)
 	for {
 		connection, err := listener.Accept()
@@ -370,6 +409,20 @@ func (transport *TCPTransport) acceptConnections(ctx context.Context, listener n
 		default:
 			_ = connection.Close()
 		}
+	}
+}
+
+func (transport *TCPTransport) acknowledgeOwner(ctx context.Context, owner string, peerID uint16, started chan<- struct{}) error {
+	if transport.beforeOwnerStart != nil {
+		if err := transport.beforeOwnerStart(ctx, owner, peerID); err != nil {
+			return err
+		}
+	}
+	select {
+	case started <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -471,11 +524,49 @@ func (transport *TCPTransport) nextRequestID() (wire.RequestID, error) {
 	if err != nil || id == (wire.RequestID{}) {
 		return wire.RequestID{}, fmt.Errorf("%w: %v", ErrRequestIDExhausted, err)
 	}
+	now := transport.clock.Now()
+	for transport.expires.Len() != 0 && !transport.expires[0].expiresAt.After(now) {
+		expired := heap.Pop(&transport.expires).(outgoingRequestExpiry)
+		if expiresAt, exists := transport.issued[expired.id]; exists && expiresAt.Equal(expired.expiresAt) {
+			delete(transport.issued, expired.id)
+		}
+	}
 	if _, reused := transport.issued[id]; reused {
 		return wire.RequestID{}, ErrRequestIDExhausted
 	}
-	transport.issued[id] = struct{}{}
+	if len(transport.issued) >= TransportReplayEntries {
+		return wire.RequestID{}, ErrRequestIDExhausted
+	}
+	expiresAt := now.Add(transport.replayWindow)
+	transport.issued[id] = expiresAt
+	heap.Push(&transport.expires, outgoingRequestExpiry{id: id, expiresAt: expiresAt})
 	return id, nil
+}
+
+type outgoingRequestExpiry struct {
+	id        wire.RequestID
+	expiresAt time.Time
+}
+
+type outgoingRequestExpiryHeap []outgoingRequestExpiry
+
+func (expirations outgoingRequestExpiryHeap) Len() int { return len(expirations) }
+func (expirations outgoingRequestExpiryHeap) Less(left, right int) bool {
+	return expirations[left].expiresAt.Before(expirations[right].expiresAt)
+}
+func (expirations outgoingRequestExpiryHeap) Swap(left, right int) {
+	expirations[left], expirations[right] = expirations[right], expirations[left]
+}
+func (expirations *outgoingRequestExpiryHeap) Push(value any) {
+	*expirations = append(*expirations, value.(outgoingRequestExpiry))
+}
+func (expirations *outgoingRequestExpiryHeap) Pop() any {
+	old := *expirations
+	last := len(old) - 1
+	value := old[last]
+	old[last] = outgoingRequestExpiry{}
+	*expirations = old[:last]
+	return value
 }
 
 func (transport *TCPTransport) closeConnections() {
@@ -486,6 +577,11 @@ func (transport *TCPTransport) closeConnections() {
 }
 
 func (transport *TCPTransport) reportFatal(ctx context.Context, fatal chan<- error, err error) {
+	select {
+	case fatal <- err:
+		return
+	default:
+	}
 	select {
 	case fatal <- err:
 	case <-ctx.Done():

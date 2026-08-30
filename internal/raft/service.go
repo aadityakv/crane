@@ -233,84 +233,42 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	}
 
 	childContext, cancelChildren := context.WithCancel(ctx)
-	transportResult := make(chan error, 1)
-	go func() { transportResult <- transport.Run(childContext, listener, node) }()
-	transportDone := false
-	var transportErr error
-	select {
-	case <-transport.Ready():
-	case transportErr = <-transportResult:
-		transportDone = true
+	results := make(chan serviceChildResult, 2)
+	observed := make([]serviceChildResult, 0, 2)
+	launched := 1
+	go func() {
+		results <- serviceChildResult{name: "Raft transport", err: transport.Run(childContext, listener, node)}
+	}()
+	finish := func() error {
 		cancelChildren()
 		_ = listener.Close()
-		return childError("Raft transport", transportErr)
-	case <-ctx.Done():
-		cancelChildren()
-		_ = listener.Close()
-		transportErr = <-transportResult
-		transportDone = true
-		return childError("Raft transport", transportErr)
+		for len(observed) < launched {
+			observed = append(observed, <-results)
+		}
+		return firstServiceChildError(observed)
+	}
+	if !awaitServiceChildReady(ctx, transport.Ready(), results, &observed) {
+		return finish()
 	}
 
-	nodeResult := make(chan error, 1)
 	storeOwnedByNode = true
-	go func() { nodeResult <- node.Run(childContext) }()
-	nodeDone := false
-	var nodeErr error
+	launched++
+	go func() { results <- serviceChildResult{name: "Raft Node", err: node.Run(childContext)} }()
+	if !awaitServiceChildReady(ctx, node.Ready(), results, &observed) {
+		return finish()
+	}
+	if drainServiceChildResults(results, &observed) {
+		return finish()
+	}
+	service.state.Store(raftServiceRunning)
+	close(service.ready)
 	select {
-	case <-node.Ready():
-		service.state.Store(raftServiceRunning)
-		close(service.ready)
-	case nodeErr = <-nodeResult:
-		nodeDone = true
-		cancelChildren()
-		_ = listener.Close()
-		if !transportDone {
-			transportErr = <-transportResult
-			transportDone = true
-		}
-		return firstChildError(nodeErr, transportErr)
-	case transportErr = <-transportResult:
-		transportDone = true
-		cancelChildren()
-		_ = listener.Close()
-		nodeErr = <-nodeResult
-		nodeDone = true
-		return firstChildError(transportErr, nodeErr)
+	case result := <-results:
+		observed = append(observed, result)
 	case <-ctx.Done():
-		cancelChildren()
-		_ = listener.Close()
-		nodeErr = <-nodeResult
-		nodeDone = true
-		if !transportDone {
-			transportErr = <-transportResult
-			transportDone = true
-		}
-		return firstChildError(nodeErr, transportErr)
+		drainServiceChildResults(results, &observed)
 	}
-
-	var firstErr error
-	select {
-	case nodeErr = <-nodeResult:
-		nodeDone = true
-		firstErr = childError("Raft Node", nodeErr)
-	case transportErr = <-transportResult:
-		transportDone = true
-		firstErr = childError("Raft transport", transportErr)
-	case <-ctx.Done():
-	}
-	cancelChildren()
-	_ = listener.Close()
-	if !nodeDone {
-		nodeErr = <-nodeResult
-	}
-	if !transportDone {
-		transportErr = <-transportResult
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	return firstChildError(nodeErr, transportErr)
+	return finish()
 }
 
 func (service *Service) lifecycleError() error {
@@ -334,11 +292,44 @@ func childError(name string, err error) error {
 	return fmt.Errorf("%s failed: %w", name, err)
 }
 
-func firstChildError(first, second error) error {
-	if err := childError("Raft child", first); err != nil {
-		return err
+type serviceChildResult struct {
+	name string
+	err  error
+}
+
+func awaitServiceChildReady(ctx context.Context, ready <-chan struct{}, results <-chan serviceChildResult, observed *[]serviceChildResult) bool {
+	select {
+	case result := <-results:
+		*observed = append(*observed, result)
+		return false
+	case <-ctx.Done():
+		drainServiceChildResults(results, observed)
+		return false
+	case <-ready:
+		return !drainServiceChildResults(results, observed)
 	}
-	return childError("Raft child", second)
+}
+
+func drainServiceChildResults(results <-chan serviceChildResult, observed *[]serviceChildResult) bool {
+	drained := false
+	for {
+		select {
+		case result := <-results:
+			*observed = append(*observed, result)
+			drained = true
+		default:
+			return drained
+		}
+	}
+}
+
+func firstServiceChildError(results []serviceChildResult) error {
+	for _, result := range results {
+		if err := childError(result.name, result.err); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func parseRaftClusterID(value string) ([16]byte, error) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -188,6 +189,41 @@ func TestServiceStorageAndRestoreFailuresOccurBeforeBindAndReady(t *testing.T) {
 	}
 }
 
+func TestServiceRecoveredInvariantFailurePrecedesBindAndClosesStore(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33450)
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &task8Store{
+		state:         RecoveredState{Identity: service.identity, HardState: HardState{Term: 1, CommitIndex: 1}},
+		snapshotLimit: configuration.Raft.MaxSnapshotBytes,
+	}
+	service.openStore = func(string, StorageIdentity, VoterSet, StoreOptions) (StableStore, error) { return store, nil }
+	bound := false
+	service.listen = func(string, string) (net.Listener, error) {
+		bound = true
+		return newBlockingListener(), nil
+	}
+	if err := service.Run(context.Background()); !errors.Is(err, ErrInvalidStorageState) {
+		t.Fatalf("Run error = %v, want recovered invariant failure", err)
+	}
+	if bound {
+		t.Fatal("recovered invariant failure bound listener")
+	}
+	if store.closes != 1 {
+		t.Fatalf("store closes = %d, want exactly one", store.closes)
+	}
+	select {
+	case <-service.Ready():
+		t.Fatal("recovered invariant failure closed Ready")
+	default:
+	}
+}
+
 func TestServiceRuntimeListenerFailureIsFatalAndStopsNode(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33500)
 	service, err := NewService(ServiceOptions{
@@ -215,6 +251,68 @@ func TestServiceRuntimeListenerFailureIsFatalAndStopsNode(t *testing.T) {
 	}
 	if _, err := service.Barrier(context.Background()); !errors.Is(err, ErrStopped) {
 		t.Fatalf("post-fatal Barrier error = %v, want ErrStopped", err)
+	}
+}
+
+func TestServiceReadyDoesNotBeatAlreadyReportedNodeStartupFailure(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+	configuration, secret := task10ServiceConfig(t, 1, 33550)
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: newTask10StartupFailureClock(),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.listen = func(string, string) (net.Listener, error) { return newBlockingListener(), nil }
+	service.newTransport = func(TCPTransportOptions) (serviceTransport, error) {
+		return newTask10ServiceTransport(nil), nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- service.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrTickRegression) {
+			t.Fatalf("Run error = %v, want startup ErrTickRegression", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("startup owner failure did not terminate Service")
+	}
+	select {
+	case <-service.Ready():
+		t.Fatal("Service Ready beat an already-reported Node startup failure")
+	default:
+	}
+}
+
+func TestServiceReportedFatalWinsConcurrentCancellation(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33570)
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.listen = func(string, string) (net.Listener, error) { return newBlockingListener(), nil }
+	failure := errors.New("reported transport failure")
+	transport := newTask10FailingServiceTransport(failure)
+	service.newTransport = func(TCPTransportOptions) (serviceTransport, error) { return transport, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	awaitClosed(t, service.Ready())
+	close(transport.fail)
+	awaitClosed(t, transport.returning)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, failure) {
+			t.Fatalf("Run error = %v, want already-reported fatal over cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fatal/cancellation race did not join children")
 	}
 }
 
@@ -260,6 +358,38 @@ type task10RecordingClock struct {
 	once   sync.Once
 }
 
+type task10StartupFailureClock struct {
+	mu    sync.Mutex
+	epoch time.Time
+	calls int
+}
+
+func newTask10StartupFailureClock() *task10StartupFailureClock {
+	return &task10StartupFailureClock{epoch: time.Unix(5000, 0)}
+}
+
+func (source *task10StartupFailureClock) Now() time.Time {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.calls++
+	if source.calls == 1 {
+		return source.epoch
+	}
+	return source.epoch.Add(-time.Second)
+}
+
+func (source *task10StartupFailureClock) NewTimer(time.Duration) clock.Timer {
+	channel := make(chan time.Time, 1)
+	channel <- source.epoch
+	return task10ImmediateTimer{channel: channel}
+}
+
+type task10ImmediateTimer struct{ channel chan time.Time }
+
+func (timer task10ImmediateTimer) C() <-chan time.Time { return timer.channel }
+func (task10ImmediateTimer) Stop() bool                { return true }
+func (task10ImmediateTimer) Reset(time.Duration) bool  { return false }
+
 func (source *task10RecordingClock) NewTimer(duration time.Duration) clock.Timer {
 	source.once.Do(func() { source.events.add("owner") })
 	return source.Clock.NewTimer(duration)
@@ -270,6 +400,30 @@ type task10ServiceTransport struct {
 	done      chan struct{}
 	events    *task8EventLog
 	readyOnce sync.Once
+}
+
+type task10FailingServiceTransport struct {
+	ready     chan struct{}
+	fail      chan struct{}
+	returning chan struct{}
+	err       error
+}
+
+func newTask10FailingServiceTransport(err error) *task10FailingServiceTransport {
+	return &task10FailingServiceTransport{ready: make(chan struct{}), fail: make(chan struct{}), returning: make(chan struct{}), err: err}
+}
+
+func (*task10FailingServiceTransport) Handoff(PeerMessage) (TransportHandoff, error) {
+	return TransportUnavailable, nil
+}
+
+func (transport *task10FailingServiceTransport) Ready() <-chan struct{} { return transport.ready }
+
+func (transport *task10FailingServiceTransport) Run(context.Context, net.Listener, RPCIngress) error {
+	close(transport.ready)
+	<-transport.fail
+	close(transport.returning)
+	return transport.err
 }
 
 func newTask10ServiceTransport(events *task8EventLog) *task10ServiceTransport {

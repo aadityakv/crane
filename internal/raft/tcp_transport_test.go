@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aaditya/cs425mp3/internal/clock"
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
@@ -243,6 +244,145 @@ func TestTCPHandshakeReadDeadlineCoversOversizedPrefixAndSlowloris(t *testing.T)
 	}
 }
 
+func TestTCPOutboundHandshakeRejectsEveryUncorrelatedAck(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		respond    bool
+		seedReplay bool
+		build      func(*TCPTransport, wire.Frame) wire.Frame
+	}{
+		{name: "wrong sender", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			return transportFrame(t, transport, 3, handshake.Header.RequestID, HandshakeAck{ResponderID: 3, VoterFingerprint: transport.voters.Fingerprint()})
+		}},
+		{name: "wrong cluster header", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			frame := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame.Header.ClusterID[0]++
+			return frame
+		}},
+		{name: "wrong payload responder", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 3, VoterFingerprint: transport.voters.Fingerprint()})
+		}},
+		{name: "wrong fingerprint", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			fingerprint := transport.voters.Fingerprint()
+			fingerprint[0]++
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: fingerprint})
+		}},
+		{name: "wrong request ID", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			requestID := handshake.Header.RequestID
+			requestID[0]++
+			return transportFrame(t, transport, 2, requestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+		}},
+		{name: "wrong message", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, AppendEntriesRequest{LeaderID: 2, Term: 1, Generation: 1})
+		}},
+		{name: "wrong codec", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			frame := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame.Header.Codec = wire.CodecGob
+			return frame
+		}},
+		{name: "replayed ack", respond: true, seedReplay: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+		}},
+		{name: "ack timeout", respond: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			serverDone := make(chan error, 1)
+			var transport *TCPTransport
+			transport = newTask10Transport(t, task10TransportOptions{
+				requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{{1}}},
+				dial: func(context.Context, string, string) (net.Conn, error) {
+					client, server := net.Pipe()
+					go func() {
+						defer server.Close()
+						stream := wire.NewTCPFrameStream(server, transport.authenticator, transport.limits, time.Second)
+						handshake, err := readFrameOrError(stream)
+						if err != nil {
+							serverDone <- err
+							return
+						}
+						if !test.respond {
+							_, err = readFrameOrError(stream)
+							serverDone <- err
+							return
+						}
+						if test.seedReplay {
+							err = transport.replay.Commit(2, handshake.Header.RequestID, transport.clock.Now())
+						}
+						if err == nil {
+							err = writeFrameForTest(stream, test.build(transport, handshake))
+						}
+						serverDone <- err
+					}()
+					return client, nil
+				},
+			})
+			voter, _ := transport.voters.Voter(2)
+			stream, _, err := transport.dialPeer(context.Background(), voter)
+			if stream != nil {
+				_ = stream.Close()
+			}
+			if err == nil {
+				t.Fatal("uncorrelated handshake acknowledgement was accepted")
+			}
+			select {
+			case <-serverDone:
+			case <-time.After(time.Second):
+				t.Fatal("outbound peer did not exit")
+			}
+		})
+	}
+}
+
+func TestTCPDialAndHandshakeShareOneAggregateRPCTimeout(t *testing.T) {
+	const rpcTimeout = 120 * time.Millisecond
+	const phaseDelay = 80 * time.Millisecond
+	serverDone := make(chan error, 1)
+	var transport *TCPTransport
+	transport = newTask10Transport(t, task10TransportOptions{
+		requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{{1}}},
+		rpcTimeout: rpcTimeout,
+		dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			timer := time.NewTimer(phaseDelay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			client, server := net.Pipe()
+			go func() {
+				defer server.Close()
+				stream := wire.NewTCPFrameStream(server, transport.authenticator, transport.limits, time.Second)
+				handshake, err := readFrameOrError(stream)
+				if err == nil {
+					time.Sleep(phaseDelay)
+					ack := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+					err = writeFrameForTest(stream, ack)
+				}
+				serverDone <- err
+			}()
+			return client, nil
+		},
+	})
+	voter, _ := transport.voters.Voter(2)
+	started := time.Now()
+	stream, _, err := transport.dialPeer(context.Background(), voter)
+	if stream != nil {
+		_ = stream.Close()
+	}
+	if err == nil {
+		t.Fatal("dial plus handshake exceeded aggregate RPCTimeout without failing")
+	}
+	if elapsed := time.Since(started); elapsed >= 2*phaseDelay {
+		t.Fatalf("aggregate timeout elapsed %s, want before two %s phases", elapsed, phaseDelay)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("delayed peer did not exit")
+	}
+}
+
 func TestTCPRetryUsesFreshWireRequestIDForSameSemanticRPC(t *testing.T) {
 	requestIDs := &task10RequestIDs{}
 	var dialMu sync.Mutex
@@ -371,6 +511,61 @@ func TestTCPRejectsZeroOrReusedGeneratedRequestID(t *testing.T) {
 				t.Fatalf("reused request ID error = %v", err)
 			}
 		}
+	}
+}
+
+func TestTCPOutgoingRequestIDsAreReplayWindowBounded(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(2000, 0))
+	ids := make([]wire.RequestID, 0, TransportReplayEntries+1)
+	for index := 1; index <= TransportReplayEntries+1; index++ {
+		ids = append(ids, wire.RequestID{byte(index >> 8), byte(index)})
+	}
+	transport := newTask10Transport(t, task10TransportOptions{requestIDs: &fixedTask10RequestIDs{ids: ids}, clock: manualClock})
+	for index := 0; index < TransportReplayEntries; index++ {
+		if _, err := transport.nextRequestID(); err != nil {
+			t.Fatalf("request ID %d/%d: %v", index+1, TransportReplayEntries, err)
+		}
+	}
+	if _, err := transport.nextRequestID(); !errors.Is(err, ErrRequestIDExhausted) {
+		t.Fatalf("capacity+1 error = %v, want ErrRequestIDExhausted", err)
+	}
+	if got := len(transport.issued); got != TransportReplayEntries {
+		t.Fatalf("tracked request IDs = %d, want fixed cap %d", got, TransportReplayEntries)
+	}
+}
+
+func TestTCPOutgoingRequestIDReuseExpiresWithReplayWindow(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(3000, 0))
+	id := wire.RequestID{9}
+	transport := newTask10Transport(t, task10TransportOptions{
+		requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{id, id, id}},
+		clock:      manualClock,
+	})
+	if _, err := transport.nextRequestID(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.nextRequestID(); !errors.Is(err, ErrRequestIDExhausted) {
+		t.Fatalf("within-window reuse error = %v, want ErrRequestIDExhausted", err)
+	}
+	manualClock.Advance(transport.replayWindow)
+	if got, err := transport.nextRequestID(); err != nil || got != id {
+		t.Fatalf("expired reuse = (%x, %v), want accepted %x", got, err, id)
+	}
+}
+
+func TestTCPOutgoingRequestIDTrackingStaysBoundedAcrossLongHeartbeatRun(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(4000, 0))
+	transport := newTask10Transport(t, task10TransportOptions{requestIDs: &task10RequestIDs{}, clock: manualClock})
+	for window := 0; window < 4; window++ {
+		for index := 0; index < TransportReplayEntries; index++ {
+			if _, err := transport.nextRequestID(); err != nil {
+				t.Fatalf("window %d request %d: %v", window, index, err)
+			}
+		}
+		if got := len(transport.issued); got > TransportReplayEntries {
+			t.Fatalf("window %d tracked %d request IDs, cap %d", window, got, TransportReplayEntries)
+		}
+		manualClock.Advance(transport.replayWindow)
 	}
 }
 

@@ -64,10 +64,25 @@ func (queue *peerIntentQueue) offer(message PeerMessage) TransportHandoff {
 func canCoalesceAppend(current, replacement PeerMessage) bool {
 	left, leftOK := normalizeRPC(current.RPC).(AppendEntriesRequest)
 	right, rightOK := normalizeRPC(replacement.RPC).(AppendEntriesRequest)
-	if !leftOK || !rightOK || current.To != replacement.To || left.Term != right.Term || right.Generation < left.Generation {
+	if !leftOK || !rightOK ||
+		current.To != replacement.To ||
+		left.LeaderID != right.LeaderID ||
+		left.Term != right.Term ||
+		left.PrevLogIndex != right.PrevLogIndex ||
+		left.PrevLogTerm != right.PrevLogTerm ||
+		right.Generation <= left.Generation ||
+		right.LeaderCommit < left.LeaderCommit ||
+		current.Requires.HardState && !replacement.Requires.HardState ||
+		replacement.Requires.EntriesThrough < current.Requires.EntriesThrough ||
+		len(left.Entries) != len(right.Entries) {
 		return false
 	}
-	return len(left.Entries) == 0 || len(right.Entries) != 0
+	for index := range left.Entries {
+		if !sameEntry(left.Entries[index], right.Entries[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (queue *peerIntentQueue) take(ctx context.Context) (PeerMessage, bool) {

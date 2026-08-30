@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -84,6 +85,103 @@ func TestTransportQueueCoalescesOnlyTailAppendIntent(t *testing.T) {
 	}
 }
 
+func TestTransportQueueCoalescesOnlyProvableAppendSupersession(t *testing.T) {
+	entry, err := NewEntry(5, 3, EntryCommand, []byte("same"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	different, err := NewEntry(5, 3, EntryCommand, []byte("different"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := PeerMessage{To: 2, RPC: AppendEntriesRequest{
+		LeaderID: 1, Term: 3, Generation: 7, PrevLogIndex: 4, PrevLogTerm: 2,
+		LeaderCommit: 4, Entries: []Entry{entry},
+	}, Requires: DurabilityPrerequisite{HardState: true, EntriesThrough: 5}}
+	for _, test := range []struct {
+		name   string
+		mutate func(*PeerMessage)
+	}{
+		{name: "hard state requirement weakens", mutate: func(message *PeerMessage) { message.Requires.HardState = false }},
+		{name: "entries requirement decreases", mutate: func(message *PeerMessage) { message.Requires.EntriesThrough = 4 }},
+		{name: "previous index changes", mutate: func(message *PeerMessage) {
+			rpc := message.RPC.(AppendEntriesRequest)
+			rpc.PrevLogIndex++
+			message.RPC = rpc
+		}},
+		{name: "previous term changes", mutate: func(message *PeerMessage) {
+			rpc := message.RPC.(AppendEntriesRequest)
+			rpc.PrevLogTerm++
+			message.RPC = rpc
+		}},
+		{name: "entry content changes", mutate: func(message *PeerMessage) {
+			rpc := message.RPC.(AppendEntriesRequest)
+			rpc.Entries = []Entry{different}
+			message.RPC = rpc
+		}},
+		{name: "equal generation changes commit", mutate: func(message *PeerMessage) {
+			rpc := message.RPC.(AppendEntriesRequest)
+			rpc.Generation = 7
+			rpc.LeaderCommit++
+			message.RPC = rpc
+		}},
+		{name: "leader commit decreases", mutate: func(message *PeerMessage) {
+			rpc := message.RPC.(AppendEntriesRequest)
+			rpc.LeaderCommit--
+			message.RPC = rpc
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			queue := newPeerIntentQueue(2)
+			replacement := PeerMessage{To: base.To, RPC: CloneRPC(base.RPC), Requires: base.Requires}
+			rpc := replacement.RPC.(AppendEntriesRequest)
+			rpc.Generation++
+			replacement.RPC = rpc
+			test.mutate(&replacement)
+			if queue.offer(base) != TransportAccepted || queue.offer(replacement) != TransportAccepted {
+				t.Fatal("append offers were unavailable")
+			}
+			if got := queue.length(); got != 2 {
+				t.Fatalf("queue length = %d, want semantically distinct intents retained", got)
+			}
+		})
+	}
+}
+
+func TestTransportQueueSafeAppendCoalescingPreservesOwnedReplacement(t *testing.T) {
+	command := []byte("owned replacement")
+	entry, err := NewEntry(5, 3, EntryCommand, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := PeerMessage{To: 2, RPC: AppendEntriesRequest{
+		LeaderID: 1, Term: 3, Generation: 7, PrevLogIndex: 4, PrevLogTerm: 2,
+		LeaderCommit: 4, Entries: []Entry{entry},
+	}, Requires: DurabilityPrerequisite{HardState: true, EntriesThrough: 5}}
+	replacement := PeerMessage{To: first.To, RPC: CloneRPC(first.RPC), Requires: first.Requires}
+	rpc := replacement.RPC.(AppendEntriesRequest)
+	rpc.Generation = 8
+	rpc.LeaderCommit = 5
+	replacement.RPC = rpc
+	queue := newPeerIntentQueue(2)
+	if queue.offer(first) != TransportAccepted || queue.offer(replacement) != TransportAccepted {
+		t.Fatal("append offers were unavailable")
+	}
+	if got := queue.length(); got != 1 {
+		t.Fatalf("safe supersession length = %d, want one", got)
+	}
+	command[0] = 'X'
+	replacement.RPC.(AppendEntriesRequest).Entries[0].command[0] = 'Y'
+	got, ok := queue.takeNow()
+	if !ok {
+		t.Fatal("coalesced queue is empty")
+	}
+	appendRPC := got.RPC.(AppendEntriesRequest)
+	if appendRPC.Generation != 8 || appendRPC.LeaderCommit != 5 || string(appendRPC.Entries[0].CommandBytes()) != "owned replacement" {
+		t.Fatalf("owned replacement = %#v command=%q", appendRPC, appendRPC.Entries[0].CommandBytes())
+	}
+}
+
 func TestTransportQueueDoesNotCoalesceAwayEntryBearingAppend(t *testing.T) {
 	queue := newPeerIntentQueue(2)
 	entry, err := NewEntry(1, 3, EntryCommand, []byte("keep"))
@@ -114,6 +212,176 @@ func TestTransportHandoffIsUnavailableOutsideRun(t *testing.T) {
 	if got, err := transport.Handoff(message); err != nil || got != TransportUnavailable {
 		t.Fatalf("before Run handoff = (%d, %v), want unavailable", got, err)
 	}
+}
+
+func TestTransportHandoffUnavailableUntilEveryOwnerAcknowledgesStartup(t *testing.T) {
+	transport := newTask10Transport(t, task10TransportOptions{})
+	ownersEntered := make(chan struct{}, 3)
+	releaseOwners := make(chan struct{})
+	transport.beforeOwnerStart = func(context.Context, string, uint16) error {
+		ownersEntered <- struct{}{}
+		<-releaseOwners
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- transport.Run(ctx, newBlockingListener(), task10Ingress{}) }()
+	for owner := 0; owner < 3; owner++ {
+		select {
+		case <-ownersEntered:
+		case <-time.After(time.Second):
+			t.Fatal("owner did not enter startup gate")
+		}
+	}
+	if got, err := transport.Handoff(PeerMessage{To: 2, RPC: RequestVoteRequest{CandidateID: 1, Term: 1}}); err != nil || got != TransportUnavailable {
+		t.Fatalf("pre-ownership Handoff = (%d, %v), want unavailable", got, err)
+	}
+	select {
+	case <-transport.Ready():
+		t.Fatal("Ready closed before owner acknowledgements")
+	default:
+	}
+	close(releaseOwners)
+	awaitClosed(t, transport.Ready())
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportImmediateOwnerStartupFailurePrecedesReady(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		owner  string
+		peerID uint16
+	}{
+		{name: "accept owner", owner: "accept"},
+		{name: "peer worker", owner: "peer", peerID: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failure := errors.New("injected owner startup failure")
+			transport := newTask10Transport(t, task10TransportOptions{})
+			transport.beforeOwnerStart = func(_ context.Context, owner string, peerID uint16) error {
+				if owner == test.owner && peerID == test.peerID {
+					return failure
+				}
+				return nil
+			}
+			err := transport.Run(context.Background(), newBlockingListener(), task10Ingress{})
+			if !errors.Is(err, failure) {
+				t.Fatalf("Run error = %v, want owner failure", err)
+			}
+			select {
+			case <-transport.Ready():
+				t.Fatal("startup failure closed Ready")
+			default:
+			}
+			awaitClosed(t, transport.Done())
+		})
+	}
+}
+
+func TestTransportReportedFatalIsNotMaskedByConcurrentCancellation(t *testing.T) {
+	failure := errors.New("reported fatal")
+	transport := newTask10Transport(t, task10TransportOptions{})
+	for attempt := 0; attempt < 100; attempt++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		fatal := make(chan error, 1)
+		transport.reportFatal(ctx, fatal, failure)
+		select {
+		case err := <-fatal:
+			if !errors.Is(err, failure) {
+				t.Fatalf("attempt %d fatal = %v", attempt, err)
+			}
+		default:
+			t.Fatalf("attempt %d cancellation masked an already-reported fatal", attempt)
+		}
+	}
+}
+
+func TestTransportCancellationDrainsTrulyFullQueueAndJoins(t *testing.T) {
+	dialStarted := make(chan struct{})
+	var dialOnce sync.Once
+	transport := newTask10Transport(t, task10TransportOptions{dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		dialOnce.Do(func() { close(dialStarted) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- transport.Run(ctx, newBlockingListener(), task10Ingress{}) }()
+	awaitClosed(t, transport.Ready())
+	if got, err := transport.Handoff(PeerMessage{To: 2, RPC: RequestVoteRequest{CandidateID: 1, Term: 1}}); err != nil || got != TransportAccepted {
+		t.Fatalf("in-flight Handoff = (%d, %v)", got, err)
+	}
+	awaitClosed(t, dialStarted)
+	for index := 0; index < PeerQueueCapacity; index++ {
+		message := PeerMessage{To: 2, RPC: RequestVoteRequest{CandidateID: 1, Term: uint64(index + 2)}}
+		if got, err := transport.Handoff(message); err != nil || got != TransportAccepted {
+			t.Fatalf("fill Handoff %d = (%d, %v)", index, got, err)
+		}
+	}
+	if got := transport.queues[2].length(); got != PeerQueueCapacity {
+		t.Fatalf("queue length = %d, want truly full %d", got, PeerQueueCapacity)
+	}
+	if got, err := transport.Handoff(PeerMessage{To: 2, RPC: RequestVoteRequest{CandidateID: 1, Term: 100}}); err != nil || got != TransportUnavailable {
+		t.Fatalf("full+1 Handoff = (%d, %v), want unavailable", got, err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not join full-queue worker")
+	}
+	if got := transport.queues[2].length(); got != 0 {
+		t.Fatalf("drained queue length = %d, want zero", got)
+	}
+}
+
+func TestTransportCapsInboundHandlersAndJoinsThemOnCancellation(t *testing.T) {
+	listener := newTask10QueuedListener()
+	transport := newTask10Transport(t, task10TransportOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- transport.Run(ctx, listener, task10Ingress{}) }()
+	awaitClosed(t, transport.Ready())
+	clients := make([]net.Conn, 0, TransportMaxInboundConnections+1)
+	defer func() {
+		for _, client := range clients {
+			_ = client.Close()
+		}
+	}()
+	for index := 0; index < TransportMaxInboundConnections; index++ {
+		client, server := net.Pipe()
+		clients = append(clients, client)
+		listener.offer(server)
+		awaitTask10ConnectionCount(t, transport, index+1)
+	}
+	overflowClient, overflowServer := net.Pipe()
+	clients = append(clients, overflowClient)
+	listener.offer(overflowServer)
+	if err := overflowClient.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := overflowClient.Read(one[:]); err == nil {
+		t.Fatal("handler capacity+1 connection remained open")
+	}
+	awaitTask10ConnectionCount(t, transport, TransportMaxInboundConnections)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transport did not join maximum inbound handlers")
+	}
+	awaitTask10ConnectionCount(t, transport, 0)
 }
 
 func TestTransportRunKeepsSlowPeerFromDelayingAnotherAndJoins(t *testing.T) {
@@ -188,6 +456,8 @@ type task10TransportOptions struct {
 	dial       TCPDialContext
 	requestIDs RequestIDSource
 	backoff    BackoffFunc
+	clock      clock.Clock
+	rpcTimeout time.Duration
 }
 
 func newTask10Transport(t *testing.T, seams task10TransportOptions) *TCPTransport {
@@ -199,12 +469,18 @@ func newTask10Transport(t *testing.T, seams task10TransportOptions) *TCPTranspor
 		Voters:        voters,
 		ClusterID:     clusterID,
 		Authenticator: wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901")),
-		Clock:         clock.NewManual(time.Unix(1000, 0)),
+		Clock:         seams.clock,
 		ReplayWindow:  2 * time.Minute,
-		RPCTimeout:    100 * time.Millisecond,
+		RPCTimeout:    seams.rpcTimeout,
 		RequestIDs:    seams.requestIDs,
 		DialContext:   seams.dial,
 		Backoff:       seams.backoff,
+	}
+	if options.RPCTimeout == 0 {
+		options.RPCTimeout = 100 * time.Millisecond
+	}
+	if options.Clock == nil {
+		options.Clock = clock.NewManual(time.Unix(1000, 0))
 	}
 	if options.RequestIDs == nil {
 		options.RequestIDs = &task10RequestIDs{}
@@ -247,7 +523,7 @@ func task10Voters(t *testing.T) VoterSet {
 
 type task10RequestIDs struct {
 	mu    sync.Mutex
-	next  byte
+	next  uint64
 	calls []wire.RequestID
 }
 
@@ -255,7 +531,7 @@ func (source *task10RequestIDs) NextRequestID() (wire.RequestID, error) {
 	source.mu.Lock()
 	defer source.mu.Unlock()
 	source.next++
-	id := wire.RequestID{source.next}
+	id := wire.RequestID{byte(source.next), byte(source.next >> 8), byte(source.next >> 16), byte(source.next >> 24)}
 	source.calls = append(source.calls, id)
 	return id, nil
 }
@@ -274,6 +550,59 @@ func (ingress task10Ingress) SubmitRPC(_ context.Context, _ uint16, rpc RPC) err
 type blockingListener struct {
 	closed chan struct{}
 	once   sync.Once
+}
+
+type task10QueuedListener struct {
+	connections chan net.Conn
+	closed      chan struct{}
+	once        sync.Once
+}
+
+func newTask10QueuedListener() *task10QueuedListener {
+	return &task10QueuedListener{connections: make(chan net.Conn), closed: make(chan struct{})}
+}
+
+func (listener *task10QueuedListener) Accept() (net.Conn, error) {
+	select {
+	case connection := <-listener.connections:
+		return connection, nil
+	case <-listener.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (listener *task10QueuedListener) offer(connection net.Conn) {
+	select {
+	case listener.connections <- connection:
+	case <-listener.closed:
+		_ = connection.Close()
+	}
+}
+
+func (listener *task10QueuedListener) Close() error {
+	listener.once.Do(func() { close(listener.closed) })
+	return nil
+}
+
+func (*task10QueuedListener) Addr() net.Addr { return task10Addr("127.0.0.1:0") }
+
+func awaitTask10ConnectionCount(t *testing.T, transport *TCPTransport, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		got := 0
+		transport.connections.Range(func(_, _ any) bool {
+			got++
+			return true
+		})
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tracked connections = %d, want %d", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func newBlockingListener() *blockingListener { return &blockingListener{closed: make(chan struct{})} }
