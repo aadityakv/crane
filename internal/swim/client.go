@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -216,72 +217,108 @@ func (p *pendingSnapshot) close() {
 }
 
 func (c *protocolClient) join(ctx context.Context, endpoint config.Endpoint, store IncarnationStore, self Member) (joinClientResult, error) {
+	result, prepared, uncertain, err := c.joinExchange(ctx, endpoint, store, self, nil, 0)
+	if !uncertain {
+		return result, err
+	}
+	recovered, _, _, recoveryError := c.joinExchange(ctx, endpoint, nil, self, &prepared, result.seedID)
+	if recoveryError != nil {
+		return joinClientResult{}, errors.Join(
+			fmt.Errorf("join acceptance was uncertain: %w", err),
+			fmt.Errorf("recover join acceptance idempotently: %w", recoveryError),
+		)
+	}
+	return recovered, nil
+}
+
+func (c *protocolClient) joinExchange(ctx context.Context, endpoint config.Endpoint, store IncarnationStore, self Member, retryPrepared *Member, expectedSeedID uint16) (joinClientResult, Member, bool, error) {
 	stream, remoteEndpoint, stopCancellation, err := c.dial(ctx, endpoint)
 	if err != nil {
-		return joinClientResult{}, err
+		return joinClientResult{}, Member{}, false, err
 	}
 	defer stopCancellation()
 	defer stream.Close()
 
 	requestID := c.nextRequestID()
 	if err := c.writePayload(ctx, stream, wire.MessageSWIMJoinRequest, requestID, JoinRequest{NodeID: self.NodeID}); err != nil {
-		return joinClientResult{}, err
+		return joinClientResult{}, Member{}, false, err
 	}
-	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMJoinSnapshot, 0)
+	frame, err := c.readResponse(ctx, stream, requestID, wire.MessageSWIMJoinSnapshot, expectedSeedID)
 	if err != nil {
-		return joinClientResult{}, err
+		return joinClientResult{}, Member{}, false, err
 	}
 	var snapshot JoinSnapshot
 	if err := wire.DecodeGob(frame.Payload, &snapshot); err != nil {
 		c.recordInvalidResponse(frame)
-		return joinClientResult{}, fmt.Errorf("%w: decode join snapshot: %v", ErrSnapshotProtocol, err)
+		return joinClientResult{}, Member{}, false, fmt.Errorf("%w: decode join snapshot: %v", ErrSnapshotProtocol, err)
 	}
 	if err := validateSnapshotState(snapshot.Members, snapshot.Floors); err != nil {
 		c.recordInvalidResponse(frame)
-		return joinClientResult{}, err
+		return joinClientResult{}, Member{}, false, err
 	}
 	if err := validateJoinResponder(ctx, c.addresses, remoteEndpoint, c.senderID, frame.Header.SenderID, snapshot.Members); err != nil {
 		c.recordInvalidResponse(frame)
-		return joinClientResult{}, err
+		return joinClientResult{}, Member{}, false, err
 	}
 	if err := c.acceptResponse(frame); err != nil {
-		return joinClientResult{}, err
+		return joinClientResult{}, Member{}, false, err
 	}
-	prepared, err := PrepareJoinWithFloors(store, snapshot.Members, snapshot.Floors, self)
-	if err != nil {
-		return joinClientResult{}, err
+	partial := joinClientResult{
+		seedID:   frame.Header.SenderID,
+		snapshot: append([]Member(nil), snapshot.Members...),
+		floors:   append([]Member(nil), snapshot.Floors...),
+	}
+	var prepared Member
+	if retryPrepared == nil {
+		prepared, err = PrepareJoinWithFloors(store, snapshot.Members, snapshot.Floors, self)
+		if err != nil {
+			return joinClientResult{}, Member{}, false, err
+		}
+	} else {
+		prepared = *retryPrepared
+		if prepared.NodeID != self.NodeID || prepared.Host != self.Host || prepared.BasePort != self.BasePort || prepared.Incarnation == 0 || prepared.Status != Alive {
+			return joinClientResult{}, Member{}, false, fmt.Errorf("%w: invalid prepared join retry %#v", ErrSnapshotProtocol, prepared)
+		}
 	}
 
 	announceID := c.nextRequestID()
 	if err := c.writePayload(ctx, stream, wire.MessageSWIMJoinAnnounce, announceID, JoinAnnounce{Member: prepared}); err != nil {
-		return joinClientResult{}, err
+		return partial, prepared, retryableJoinAcceptanceError(err), err
 	}
 	acceptedFrame, err := c.readResponse(ctx, stream, announceID, wire.MessageSWIMJoinAccepted, frame.Header.SenderID)
 	if err != nil {
-		return joinClientResult{}, err
+		return partial, prepared, retryableJoinAcceptanceError(err), err
 	}
 	if acceptedFrame.Header.SenderID != frame.Header.SenderID {
 		c.recordInvalidResponse(acceptedFrame)
-		return joinClientResult{}, fmt.Errorf("%w: join responder changed from %d to %d", ErrSnapshotProtocol, frame.Header.SenderID, acceptedFrame.Header.SenderID)
+		return partial, prepared, false, fmt.Errorf("%w: join responder changed from %d to %d", ErrSnapshotProtocol, frame.Header.SenderID, acceptedFrame.Header.SenderID)
 	}
 	var accepted JoinAccepted
 	if err := wire.DecodeGob(acceptedFrame.Payload, &accepted); err != nil {
 		c.recordInvalidResponse(acceptedFrame)
-		return joinClientResult{}, fmt.Errorf("%w: decode join acceptance: %v", ErrSnapshotProtocol, err)
+		return partial, prepared, false, fmt.Errorf("%w: decode join acceptance: %v", ErrSnapshotProtocol, err)
 	}
 	if accepted.Member != prepared {
 		c.recordInvalidResponse(acceptedFrame)
-		return joinClientResult{}, fmt.Errorf("%w: accepted member %#v does not match announced %#v", ErrSnapshotProtocol, accepted.Member, prepared)
+		return partial, prepared, false, fmt.Errorf("%w: accepted member %#v does not match announced %#v", ErrSnapshotProtocol, accepted.Member, prepared)
 	}
 	if err := c.acceptResponse(acceptedFrame); err != nil {
-		return joinClientResult{}, err
+		return partial, prepared, false, err
 	}
 	return joinClientResult{
 		seedID:   frame.Header.SenderID,
 		snapshot: append([]Member(nil), snapshot.Members...),
 		floors:   append([]Member(nil), snapshot.Floors...),
 		accepted: accepted.Member,
-	}, nil
+	}, prepared, false, nil
+}
+
+func retryableJoinAcceptanceError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
 }
 
 func validateJoinResponder(ctx context.Context, addresses *addressMatcher, endpoint config.Endpoint, localSenderID, senderID uint16, members []Member) error {

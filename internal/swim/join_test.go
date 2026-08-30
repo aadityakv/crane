@@ -161,6 +161,19 @@ func TestValidateJoinRejectsConcurrentIdentity(t *testing.T) {
 	}
 }
 
+func TestValidateJoinAcceptsExactAliveRetryWithoutMutation(t *testing.T) {
+	table := NewTable()
+	member := Member{NodeID: 2, Host: "node-2.example.test", BasePort: 8200, Incarnation: 4, Status: Alive}
+	mustMerge(t, table, Update{Member: member, ReporterID: member.NodeID})
+
+	if err := ValidateJoinAnnouncement(table, JoinAnnounce{Member: member}); err != nil {
+		t.Fatalf("exact idempotent join retry error = %v", err)
+	}
+	if got := table.MustGet(member.NodeID); got != member {
+		t.Fatalf("idempotent validation mutated member to %#v", got)
+	}
+}
+
 func TestValidateJoinRejectsSuspectIdentity(t *testing.T) {
 	table := NewTable()
 	mustMerge(t, table, Update{Member: Member{NodeID: 2, Host: "old", BasePort: 8100, Incarnation: 4, Status: Suspect}, ReporterID: 1})

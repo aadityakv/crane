@@ -126,7 +126,12 @@ func ValidateJoinAnnouncement(table *Table, announce JoinAnnounce) error {
 		return nil
 	}
 	switch current.Status {
-	case Alive, Suspect:
+	case Alive:
+		if current == joining {
+			return nil
+		}
+		return fmt.Errorf("%w: node %d is currently %v", ErrDuplicateNodeID, joining.NodeID, current.Status)
+	case Suspect:
 		return fmt.Errorf("%w: node %d is currently %v", ErrDuplicateNodeID, joining.NodeID, current.Status)
 	case Dead, Left:
 		if joining.Incarnation <= current.Incarnation {

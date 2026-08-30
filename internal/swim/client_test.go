@@ -3,9 +3,11 @@ package swim
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"net/netip"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -247,6 +249,38 @@ func TestJoinClientRequiresOneResponderIdentity(t *testing.T) {
 	}
 }
 
+func TestJoinClientRecoversLostJoinAcceptedWithoutAdvancingAgain(t *testing.T) {
+	now := time.Unix(4468, 0)
+	configuration := serviceTestConfig(t, 1)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	clusterID := decodedTestClusterID(t, testClusterID)
+	endpoint, serverResult := startLostJoinAcceptedServer(t, authenticator, clusterID, now)
+	client, err := newProtocolClient(configuration, authenticator, clock.NewManual(now), random.NewLockedSource(201), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &recordingIncarnationStore{loaded: 1}
+	self := Member{NodeID: configuration.NodeID, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort}
+
+	result, err := client.join(testContext(t), endpoint, store, self)
+	if err != nil {
+		t.Fatalf("join recovery error = %v", err)
+	}
+	if result.accepted.NodeID != self.NodeID || result.accepted.Incarnation != 2 || result.accepted.Status != Alive {
+		t.Fatalf("recovered join result = %#v", result)
+	}
+	if store.loads != 1 || !reflect.DeepEqual(store.stored, []uint64{2}) {
+		t.Fatalf("durable calls = loads:%d stores:%v, want one advance to 2", store.loads, store.stored)
+	}
+	server := <-serverResult
+	if server.err != nil {
+		t.Fatal(server.err)
+	}
+	if len(server.announcements) != 2 || server.announcements[0] != server.announcements[1] || server.announcements[0] != result.accepted {
+		t.Fatalf("join announcements = %#v, want exact idempotent retry", server.announcements)
+	}
+}
+
 func TestJoinClientRejectsMismatchedErrorResponderBeforeReplayAcceptance(t *testing.T) {
 	now := time.Unix(4475, 0)
 	configuration := serviceTestConfig(t, 1)
@@ -380,6 +414,92 @@ func TestJoinClientAcceptsResolvedResponderMatchingNumericConnectionTarget(t *te
 	if result.seedID != 2 || result.accepted.NodeID != self.NodeID {
 		t.Fatalf("resolved responder join result = %#v", result)
 	}
+}
+
+type lostJoinAcceptedServerResult struct {
+	announcements []Member
+	err           error
+}
+
+func startLostJoinAcceptedServer(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, now time.Time) (config.Endpoint, <-chan lostJoinAcceptedServerResult) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	address := listener.Addr().(*net.TCPAddr)
+	endpoint := config.Endpoint{Host: address.IP.String(), Port: uint16(address.Port)}
+	seed := Member{NodeID: 2, Host: endpoint.Host, BasePort: endpoint.Port - 2, Incarnation: 1, Status: Alive}
+	result := make(chan lostJoinAcceptedServerResult, 1)
+	go func() {
+		announcements := make([]Member, 0, 2)
+		var admitted Member
+		fail := func(format string, args ...any) {
+			result <- lostJoinAcceptedServerResult{announcements: announcements, err: fmt.Errorf(format, args...)}
+		}
+		for attempt := 0; attempt < 2; attempt++ {
+			connection, err := listener.Accept()
+			if err != nil {
+				fail("accept join attempt %d: %v", attempt+1, err)
+				return
+			}
+			stream := wire.NewTCPFrameStream(connection, authenticator, clientTestWireLimits(clusterID), time.Second)
+			request, err := stream.ReadFrame(context.Background())
+			if err != nil {
+				_ = stream.Close()
+				fail("read join request %d: %v", attempt+1, err)
+				return
+			}
+			members := []Member{seed}
+			if admitted.NodeID != 0 {
+				members = append(members, admitted)
+			}
+			snapshot, err := wire.EncodeGob(JoinSnapshot{Members: members})
+			if err != nil {
+				_ = stream.Close()
+				fail("encode join snapshot: %v", err)
+				return
+			}
+			if err := stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, seed.NodeID, request.Header.RequestID, now, wire.MessageSWIMJoinSnapshot, snapshot)); err != nil {
+				_ = stream.Close()
+				fail("write join snapshot %d: %v", attempt+1, err)
+				return
+			}
+			announceFrame, err := stream.ReadFrame(context.Background())
+			if err != nil {
+				_ = stream.Close()
+				fail("read join announcement %d: %v", attempt+1, err)
+				return
+			}
+			var announce JoinAnnounce
+			if err := wire.DecodeGob(announceFrame.Payload, &announce); err != nil {
+				_ = stream.Close()
+				fail("decode join announcement %d: %v", attempt+1, err)
+				return
+			}
+			announcements = append(announcements, announce.Member)
+			admitted = announce.Member
+			if attempt == 0 {
+				_ = stream.Close()
+				continue
+			}
+			accepted, err := wire.EncodeGob(JoinAccepted{Member: announce.Member})
+			if err != nil {
+				_ = stream.Close()
+				fail("encode join acceptance: %v", err)
+				return
+			}
+			if err := stream.WriteFrame(context.Background(), tcpServiceTestFrameWithPayload(clusterID, seed.NodeID, announceFrame.Header.RequestID, now, wire.MessageSWIMJoinAccepted, accepted)); err != nil {
+				_ = stream.Close()
+				fail("write recovered join acceptance: %v", err)
+				return
+			}
+			_ = stream.Close()
+		}
+		result <- lostJoinAcceptedServerResult{announcements: announcements}
+	}()
+	return endpoint, result
 }
 
 func startScriptedTCPServer(t *testing.T, authenticator wire.Authenticator, clusterID [16]byte, scripts []func(wire.Frame) wire.Frame) config.Endpoint {
