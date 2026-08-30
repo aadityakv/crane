@@ -96,15 +96,18 @@ type TCPTransport struct {
 	done   chan struct{}
 	queues map[uint16]*peerIntentQueue
 
-	requestMu sync.Mutex
-	issued    map[wire.RequestID]time.Time
-	expires   outgoingRequestExpiryHeap
+	requestMu       sync.Mutex
+	requestTrackers map[uint16]*outgoingRequestTracker
 
 	connections sync.Map
+	fatalMu     sync.Mutex
+	firstFatal  error
 
 	// beforeOwnerStart is a same-package observation/failure seam invoked by
 	// each owner before it acknowledges startup.
 	beforeOwnerStart func(context.Context, string, uint16) error
+	// afterFatalRecorded is a same-package causal observation seam.
+	afterFatalRecorded func()
 }
 
 // NewTCPTransport validates and owns options without opening sockets or starting goroutines.
@@ -136,9 +139,11 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 	clusterID := options.ClusterID
 	limits.ExpectedClusterID = &clusterID
 	queues := make(map[uint16]*peerIntentQueue, len(options.Voters.voters)-1)
+	requestTrackers := make(map[uint16]*outgoingRequestTracker, len(options.Voters.voters)-1)
 	for _, voter := range options.Voters.Voters() {
 		if voter.ID != options.LocalID {
 			queues[voter.ID] = newPeerIntentQueue(PeerQueueCapacity)
+			requestTrackers[voter.ID] = &outgoingRequestTracker{issued: make(map[wire.RequestID]time.Time)}
 		}
 	}
 	transport := &TCPTransport{
@@ -148,7 +153,7 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 		replay:     wire.NewReplayGuard(options.Clock, options.ReplayWindow, TransportFutureSkew, TransportReplayEntries),
 		requestIDs: requestIDs, dialContext: dialContext, backoff: backoff,
 		ready: make(chan struct{}), done: make(chan struct{}), queues: queues,
-		issued: make(map[wire.RequestID]time.Time),
+		requestTrackers: requestTrackers,
 	}
 	return transport, nil
 }
@@ -237,6 +242,9 @@ shutdown:
 	}
 	workers.Wait()
 	close(transport.done)
+	if recorded := transport.recordedFatal(); recorded != nil {
+		return recorded
+	}
 	return runErr
 }
 
@@ -280,9 +288,10 @@ func (transport *TCPTransport) runPeerWorker(ctx context.Context, voter Voter, q
 			}
 			if err == nil {
 				var requestID wire.RequestID
-				requestID, err = transport.nextRequestID()
+				var timestamp time.Time
+				requestID, timestamp, err = transport.nextRequestIDForPeer(ctx, voter.ID)
 				if err == nil {
-					frame := wire.Frame{Header: transport.outboundHeader(messageType, requestID), Payload: payload}
+					frame := wire.Frame{Header: transport.outboundHeaderAt(messageType, requestID, timestamp), Payload: payload}
 					err = stream.WriteFrame(ctx, frame)
 				}
 				if errors.Is(err, ErrRequestIDExhausted) {
@@ -319,7 +328,7 @@ func (transport *TCPTransport) dialPeer(ctx context.Context, voter Voter) (*wire
 	}
 	transport.connections.Store(connection, struct{}{})
 	stream := wire.NewTCPFrameStream(connection, transport.authenticator, transport.limits, transport.rpcTimeout)
-	requestID, err := transport.nextRequestID()
+	requestID, timestamp, err := transport.nextRequestIDForPeer(attemptContext, voter.ID)
 	if err != nil {
 		transport.connections.Delete(connection)
 		_ = stream.Close()
@@ -327,7 +336,7 @@ func (transport *TCPTransport) dialPeer(ctx context.Context, voter Voter) (*wire
 	}
 	messageType, payload, err := EncodeRPC(Handshake{SenderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint()}, transport.codecLimits)
 	if err == nil {
-		err = stream.WriteFrame(attemptContext, wire.Frame{Header: transport.outboundHeader(messageType, requestID), Payload: payload})
+		err = stream.WriteFrame(attemptContext, wire.Frame{Header: transport.outboundHeaderAt(messageType, requestID, timestamp), Payload: payload})
 	}
 	var response wire.Frame
 	if err == nil {
@@ -372,10 +381,14 @@ func (transport *TCPTransport) acceptHandshakeAck(frame wire.Frame, peerID uint1
 }
 
 func (transport *TCPTransport) outboundHeader(message wire.MessageType, requestID wire.RequestID) wire.Header {
+	return transport.outboundHeaderAt(message, requestID, transport.clock.Now())
+}
+
+func (transport *TCPTransport) outboundHeaderAt(message wire.MessageType, requestID wire.RequestID, timestamp time.Time) wire.Header {
 	return wire.Header{
 		Version: wire.Version1, Message: message, ClusterID: transport.clusterID,
 		SenderID: transport.localID, RequestID: requestID,
-		TimestampMillis: transport.clock.Now().UnixMilli(), Codec: wire.CodecBinary,
+		TimestampMillis: timestamp.UnixMilli(), Codec: wire.CodecBinary,
 	}
 }
 
@@ -517,30 +530,58 @@ func (transport *TCPTransport) recordInvalidFrame(frame wire.Frame) {
 	transport.replay.RecordInvalid(frame.Header.SenderID, frame.Header.RequestID, time.UnixMilli(frame.Header.TimestampMillis))
 }
 
-func (transport *TCPTransport) nextRequestID() (wire.RequestID, error) {
-	transport.requestMu.Lock()
-	defer transport.requestMu.Unlock()
-	id, err := transport.requestIDs.NextRequestID()
-	if err != nil || id == (wire.RequestID{}) {
-		return wire.RequestID{}, fmt.Errorf("%w: %v", ErrRequestIDExhausted, err)
+func (transport *TCPTransport) nextRequestIDForPeer(ctx context.Context, peerID uint16) (wire.RequestID, time.Time, error) {
+	for {
+		transport.requestMu.Lock()
+		tracker := transport.requestTrackers[peerID]
+		if tracker == nil {
+			transport.requestMu.Unlock()
+			return wire.RequestID{}, time.Time{}, fmt.Errorf("%w: invalid request-ID destination %d", ErrTransportInvariant, peerID)
+		}
+		timestamp := time.UnixMilli(transport.clock.Now().UnixMilli())
+		tracker.purgeExpired(timestamp)
+		if len(tracker.issued) < TransportReplayEntries {
+			id, err := transport.requestIDs.NextRequestID()
+			if err != nil || id == (wire.RequestID{}) {
+				transport.requestMu.Unlock()
+				return wire.RequestID{}, time.Time{}, fmt.Errorf("%w: %v", ErrRequestIDExhausted, err)
+			}
+			if _, reused := tracker.issued[id]; reused {
+				transport.requestMu.Unlock()
+				return wire.RequestID{}, time.Time{}, ErrRequestIDExhausted
+			}
+			expiresAt := timestamp.Add(transport.replayWindow + TransportFutureSkew)
+			tracker.issued[id] = expiresAt
+			heap.Push(&tracker.expires, outgoingRequestExpiry{id: id, expiresAt: expiresAt})
+			transport.requestMu.Unlock()
+			return id, timestamp, nil
+		}
+		wait := tracker.expires[0].expiresAt.Sub(timestamp)
+		transport.requestMu.Unlock()
+
+		timer := transport.clock.NewTimer(wait)
+		select {
+		case <-timer.C():
+		case <-ctx.Done():
+			timer.Stop()
+			return wire.RequestID{}, time.Time{}, ctx.Err()
+		}
+		timer.Stop()
 	}
-	now := transport.clock.Now()
-	for transport.expires.Len() != 0 && !transport.expires[0].expiresAt.After(now) {
-		expired := heap.Pop(&transport.expires).(outgoingRequestExpiry)
-		if expiresAt, exists := transport.issued[expired.id]; exists && expiresAt.Equal(expired.expiresAt) {
-			delete(transport.issued, expired.id)
+}
+
+type outgoingRequestTracker struct {
+	issued  map[wire.RequestID]time.Time
+	expires outgoingRequestExpiryHeap
+}
+
+func (tracker *outgoingRequestTracker) purgeExpired(now time.Time) {
+	for tracker.expires.Len() != 0 && !tracker.expires[0].expiresAt.After(now) {
+		expired := heap.Pop(&tracker.expires).(outgoingRequestExpiry)
+		if expiresAt, exists := tracker.issued[expired.id]; exists && expiresAt.Equal(expired.expiresAt) {
+			delete(tracker.issued, expired.id)
 		}
 	}
-	if _, reused := transport.issued[id]; reused {
-		return wire.RequestID{}, ErrRequestIDExhausted
-	}
-	if len(transport.issued) >= TransportReplayEntries {
-		return wire.RequestID{}, ErrRequestIDExhausted
-	}
-	expiresAt := now.Add(transport.replayWindow)
-	transport.issued[id] = expiresAt
-	heap.Push(&transport.expires, outgoingRequestExpiry{id: id, expiresAt: expiresAt})
-	return id, nil
 }
 
 type outgoingRequestExpiry struct {
@@ -577,6 +618,9 @@ func (transport *TCPTransport) closeConnections() {
 }
 
 func (transport *TCPTransport) reportFatal(ctx context.Context, fatal chan<- error, err error) {
+	if !transport.recordFatal(err) {
+		return
+	}
 	select {
 	case fatal <- err:
 		return
@@ -587,6 +631,29 @@ func (transport *TCPTransport) reportFatal(ctx context.Context, fatal chan<- err
 	case <-ctx.Done():
 	default:
 	}
+}
+
+func (transport *TCPTransport) recordFatal(err error) bool {
+	if err == nil {
+		return false
+	}
+	transport.fatalMu.Lock()
+	if transport.firstFatal != nil {
+		transport.fatalMu.Unlock()
+		return false
+	}
+	transport.firstFatal = err
+	transport.fatalMu.Unlock()
+	if transport.afterFatalRecorded != nil {
+		transport.afterFatalRecorded()
+	}
+	return true
+}
+
+func (transport *TCPTransport) recordedFatal() error {
+	transport.fatalMu.Lock()
+	defer transport.fatalMu.Unlock()
+	return transport.firstFatal
 }
 
 func reconnectDelay(attempt uint) time.Duration {

@@ -50,6 +50,53 @@ func TestTask10StateMachineCachesDistinctIndexRetryWithoutSecondMutation(t *test
 	}
 }
 
+func TestTask10StateMachineSnapshotDurablyDeduplicatesConflictingRetry(t *testing.T) {
+	tracker := newTask10KVTracker()
+	original := newTask10KVStateMachine(tracker)
+	command := task10KVCommand{ID: "durable-command", Key: "original-key", Value: "original-value"}
+	result, err := original.Apply(2, 1, encodeTask10KVCommand(command))
+	if err != nil || string(result) != "original-value" {
+		t.Fatalf("initial Apply = (%q, %v)", result, err)
+	}
+	capture, err := original.Capture(2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := capture.MarshalBinary()
+	if err != nil || len(encoded) == 0 {
+		t.Fatalf("MarshalBinary = (%d bytes, %v)", len(encoded), err)
+	}
+
+	restored := newTask10KVStateMachine(tracker)
+	if err := restored.Restore(capture.SchemaVersion(), encoded); err != nil {
+		t.Fatal(err)
+	}
+	conflict := task10KVCommand{ID: command.ID, Key: "conflicting-key", Value: "conflicting-value"}
+	retry, err := restored.Apply(5, 3, encodeTask10KVCommand(conflict))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(retry) != "original-value" {
+		t.Fatalf("retry result = %q, want persisted original result", retry)
+	}
+	if got := original.mutationCount(command.ID) + restored.mutationCount(command.ID); got != 1 {
+		t.Fatalf("cumulative state mutations = %d, want exactly one", got)
+	}
+	if got := restored.valuesSnapshot(); !reflect.DeepEqual(got, map[string]string{"original-key": "original-value"}) {
+		t.Fatalf("restored values after conflicting retry = %#v", got)
+	}
+	evidence := tracker.duplicateEvidence()
+	if len(evidence) != 1 {
+		t.Fatalf("cumulative retry evidence = %#v, want one nonempty record", evidence)
+	}
+	if duplicate := evidence[0]; duplicate.FirstIndex != 2 || duplicate.FirstTerm != 1 || duplicate.Index != 5 || duplicate.Term != 3 || duplicate.CachedResult != "original-value" {
+		t.Fatalf("persisted retry evidence = %#v", duplicate)
+	}
+	if err := validateTask10DuplicateEvidence(evidence); err != nil {
+		t.Fatalf("durable retry evidence: %v", err)
+	}
+}
+
 func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	configurations, secret, reservations := task10ClusterConfigurations(t)
 	nodes := make([]*task10ClusterNode, 3)
@@ -166,6 +213,53 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 		}
 	}
 	assertTask10IdempotencyEvidence(t, nodes, trackers, "complete disk recovery")
+
+	const durableRetryID = "initial-01"
+	mutationsBefore := make([]int, len(nodes))
+	duplicatesBefore := make([]int, len(nodes))
+	for index, node := range nodes {
+		base, origin, cached, ok := node.machine.restoredCommand(durableRetryID)
+		if !ok || base < origin.Index || origin.Index == 0 || cached != "value-01" {
+			t.Fatalf("node %d restored command %q = base=%d origin=%#v cached=%q ok=%t", node.configuration.NodeID, durableRetryID, base, origin, cached, ok)
+		}
+		mutationsBefore[index] = node.machine.mutationCount(durableRetryID)
+		duplicatesBefore[index] = len(trackers[index].duplicateEvidence())
+	}
+	setTask10Phase(trackers, "durable conflicting retry")
+	conflictingRetry := task10KVCommand{ID: durableRetryID, Key: "must-not-appear", Value: "must-not-replace-original"}
+	var retryResult ProposalResult
+	leader, retryResult = proposeTask10CommandWithResult(t, nodes, conflictingRetry)
+	if string(retryResult.Result) != "value-01" {
+		t.Fatalf("durable conflicting retry result = %q, want cached value-01", retryResult.Result)
+	}
+	awaitTask10State(t, nodes, expected, 5*time.Second)
+	awaitTask10(t, nodes, 5*time.Second, "cumulative durable retry evidence on every voter", func() bool {
+		for index, tracker := range trackers {
+			if len(tracker.duplicateEvidence()) <= duplicatesBefore[index] {
+				return false
+			}
+		}
+		return true
+	})
+	for index, node := range nodes {
+		if got := node.machine.mutationCount(durableRetryID); got != mutationsBefore[index] {
+			t.Fatalf("node %d durable retry mutations = %d, before %d", node.configuration.NodeID, got, mutationsBefore[index])
+		}
+		newEvidence := trackers[index].duplicateEvidence()[duplicatesBefore[index]:]
+		matchedResultIndex := false
+		for _, duplicate := range newEvidence {
+			if duplicate.ID != durableRetryID || duplicate.FirstIndex == duplicate.Index || duplicate.CachedResult != "value-01" || duplicate.CommandValue != conflictingRetry.Value {
+				t.Fatalf("node %d durable retry evidence = %#v", node.configuration.NodeID, duplicate)
+			}
+			if duplicate.Index == retryResult.Index {
+				matchedResultIndex = true
+			}
+		}
+		if !matchedResultIndex {
+			t.Fatalf("node %d evidence %#v omitted successful retry index %d", node.configuration.NodeID, newEvidence, retryResult.Index)
+		}
+	}
+	assertTask10IdempotencyEvidence(t, nodes, trackers, "durable conflicting retry")
 }
 
 type task10ClusterNode struct {
@@ -294,9 +388,15 @@ func awaitTask10Leader(t *testing.T, nodes []*task10ClusterNode, timeout time.Du
 }
 
 func proposeTask10Command(t *testing.T, nodes []*task10ClusterNode, command task10KVCommand) *task10ClusterNode {
+	leader, _ := proposeTask10CommandWithResult(t, nodes, command)
+	return leader
+}
+
+func proposeTask10CommandWithResult(t *testing.T, nodes []*task10ClusterNode, command task10KVCommand) (*task10ClusterNode, ProposalResult) {
 	t.Helper()
 	encoded := encodeTask10KVCommand(command)
 	var leader *task10ClusterNode
+	var completed ProposalResult
 	awaitTask10(t, nodes, 5*time.Second, "proposal "+command.ID, func() bool {
 		leader = nil
 		for _, node := range nodes {
@@ -315,9 +415,12 @@ func proposeTask10Command(t *testing.T, nodes []*task10ClusterNode, command task
 			ID: command.ID, VoterID: leader.configuration.NodeID, ResultIndex: result.Index, ResultTerm: result.Term,
 			Err: fmt.Sprint(err),
 		})
+		if err == nil {
+			completed = result
+		}
 		return err == nil
 	})
-	return leader
+	return leader, completed
 }
 
 func awaitTask10State(t *testing.T, nodes []*task10ClusterNode, want map[string]string, timeout time.Duration) {
@@ -389,9 +492,6 @@ func validateTask10DuplicateEvidence(duplicates []task10DuplicateApply) error {
 		}
 		if duplicate.FirstIndex == duplicate.Index {
 			return fmt.Errorf("command %q was applied twice at log index %d", duplicate.ID, duplicate.Index)
-		}
-		if duplicate.CachedResult != duplicate.CommandValue {
-			return fmt.Errorf("command %q retry returned %q, want cached result %q", duplicate.ID, duplicate.CachedResult, duplicate.CommandValue)
 		}
 		if duplicate.MutationCount > 1 {
 			return fmt.Errorf("command %q caused %d mutations in incarnation %d", duplicate.ID, duplicate.MutationCount, duplicate.Incarnation)
@@ -564,6 +664,14 @@ func (machine *task10KVStateMachine) mutationCount(id string) int {
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
 	return machine.mutations[id]
+}
+
+func (machine *task10KVStateMachine) restoredCommand(id string) (uint64, task10ApplyRecord, string, bool) {
+	machine.mu.Lock()
+	defer machine.mu.Unlock()
+	origin, originExists := machine.firstApplies[id]
+	result, resultExists := machine.results[id]
+	return machine.restoredBase, origin, result, originExists && resultExists
 }
 
 func (tracker *task10KVTracker) duplicateEvidence() []task10DuplicateApply {

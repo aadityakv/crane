@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,6 +67,11 @@ type Service struct {
 	openStore      serviceStoreOpener
 	newTransport   serviceTransportFactory
 	newTransferIDs func() TransferIDSource
+
+	// Lifecycle publication seams are same-package causal test observations.
+	beforeReadyPublish        func()
+	afterChildResultPublished func(string)
+	afterReadyPublished       func()
 }
 
 // NewService validates and owns dependencies without touching storage, the application,
@@ -233,11 +239,12 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	}
 
 	childContext, cancelChildren := context.WithCancel(ctx)
-	results := make(chan serviceChildResult, 2)
+	lifecycle := newServiceLifecycleGate(2)
+	results := lifecycle.results
 	observed := make([]serviceChildResult, 0, 2)
 	launched := 1
 	go func() {
-		results <- serviceChildResult{name: "Raft transport", err: transport.Run(childContext, listener, node)}
+		lifecycle.publishResult(serviceChildResult{name: "Raft transport", err: transport.Run(childContext, listener, node)}, service.afterChildResultPublished)
 	}()
 	finish := func() error {
 		cancelChildren()
@@ -253,15 +260,24 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 
 	storeOwnedByNode = true
 	launched++
-	go func() { results <- serviceChildResult{name: "Raft Node", err: node.Run(childContext)} }()
+	go func() {
+		lifecycle.publishResult(serviceChildResult{name: "Raft Node", err: node.Run(childContext)}, service.afterChildResultPublished)
+	}()
 	if !awaitServiceChildReady(ctx, node.Ready(), results, &observed) {
 		return finish()
 	}
 	if drainServiceChildResults(results, &observed) {
 		return finish()
 	}
-	service.state.Store(raftServiceRunning)
-	close(service.ready)
+	if service.beforeReadyPublish != nil {
+		service.beforeReadyPublish()
+	}
+	if !lifecycle.publishReady(ctx, func() {
+		service.state.Store(raftServiceRunning)
+		close(service.ready)
+	}, service.afterReadyPublished) {
+		return finish()
+	}
 	select {
 	case result := <-results:
 		observed = append(observed, result)
@@ -295,6 +311,39 @@ func childError(name string, err error) error {
 type serviceChildResult struct {
 	name string
 	err  error
+}
+
+type serviceLifecycleGate struct {
+	mu       sync.Mutex
+	results  chan serviceChildResult
+	reported bool
+}
+
+func newServiceLifecycleGate(capacity int) *serviceLifecycleGate {
+	return &serviceLifecycleGate{results: make(chan serviceChildResult, capacity)}
+}
+
+func (gate *serviceLifecycleGate) publishResult(result serviceChildResult, after func(string)) {
+	gate.mu.Lock()
+	gate.results <- result
+	gate.reported = true
+	if after != nil {
+		after(result.name)
+	}
+	gate.mu.Unlock()
+}
+
+func (gate *serviceLifecycleGate) publishReady(ctx context.Context, publish func(), after func()) bool {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.reported || ctx.Err() != nil {
+		return false
+	}
+	publish()
+	if after != nil {
+		after()
+	}
+	return true
 }
 
 func awaitServiceChildReady(ctx context.Context, ready <-chan struct{}, results <-chan serviceChildResult, observed *[]serviceChildResult) bool {

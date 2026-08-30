@@ -745,6 +745,84 @@ func TestExecutionOrderAcceptsAlreadyDurableVoteAndEntryRetransmits(t *testing.T
 	})
 }
 
+func TestExecutionOrderAcceptsSuccessfulAppendResponseAtDurableSnapshotBase(t *testing.T) {
+	identity, voters := testStorageIdentity(t, 1)
+	entry4 := mustStorageEntry(t, 4, 3, "four")
+	base := SnapshotMetadata{LastIncludedIndex: 3, LastIncludedTerm: 2, StateMachineSchemaVersion: 1}
+	log, err := NewLog(3, 2, 3, 3, []Entry{entry4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := NewCore(CoreOptions{
+		LocalID: 1, Voters: voters, HardState: HardState{Term: 3, CommitIndex: 3}, Log: log, AppliedIndex: 3,
+		ElectionTimeoutMin: 5, ElectionTimeoutMax: 10, HeartbeatInterval: 1, Random: task8ZeroOffsetRandom{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable := RecoveredState{Identity: identity, HardState: core.HardState(), SnapshotBase: base, AppliedIndex: 3, Entries: []Entry{entry4}}
+	node := &Node{core: core, durableState: durable}
+	responseAt := func(index uint64) PeerMessage {
+		return PeerMessage{To: 2, RPC: AppendEntriesResponse{
+			ResponderID: 1, LeaderID: 2, Term: 3, RequestTerm: 3, Generation: 1, Success: true, MatchIndex: index,
+		}}
+	}
+
+	for _, test := range []struct {
+		name    string
+		index   uint64
+		wantErr bool
+	}{
+		{name: "snapshot base", index: 3},
+		{name: "base minus one", index: 2, wantErr: true},
+		{name: "base plus one retained entry", index: 4},
+		{name: "beyond last", index: 5, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := node.validateMessageDurability(responseAt(test.index), durable, durable)
+			if test.wantErr && !errors.Is(err, ErrInvalidCoreState) {
+				t.Fatalf("MatchIndex %d error = %v, want ErrInvalidCoreState", test.index, err)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("MatchIndex %d: %v", test.index, err)
+			}
+		})
+	}
+
+	t.Run("prospective snapshot term mismatch", func(t *testing.T) {
+		mismatched := durable.Clone()
+		mismatched.SnapshotBase.LastIncludedTerm = 1
+		if err := node.validateMessageDurability(responseAt(3), durable, mismatched); !errors.Is(err, ErrInvalidCoreState) {
+			t.Fatalf("snapshot term mismatch error = %v, want ErrInvalidCoreState", err)
+		}
+	})
+	t.Run("prospective retained term mismatch", func(t *testing.T) {
+		mismatched := durable.Clone()
+		mismatched.Entries[0] = mustStorageEntry(t, 4, 2, "four")
+		if err := node.validateMessageDurability(responseAt(4), durable, mismatched); !errors.Is(err, ErrInvalidCoreState) {
+			t.Fatalf("retained term mismatch error = %v, want ErrInvalidCoreState", err)
+		}
+	})
+
+	emptyLog, err := NewLog(0, 0, 0, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyCore, err := NewCore(CoreOptions{
+		LocalID: 1, Voters: voters, Log: emptyLog, ElectionTimeoutMin: 5, ElectionTimeoutMax: 10,
+		HeartbeatInterval: 1, Random: task8ZeroOffsetRandom{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyNode := &Node{core: emptyCore, durableState: RecoveredState{Identity: identity}}
+	if err := emptyNode.validateMessageDurability(PeerMessage{To: 2, RPC: AppendEntriesResponse{
+		ResponderID: 1, LeaderID: 2, RequestTerm: 1, Generation: 1, Success: true,
+	}}, emptyNode.durableState, emptyNode.durableState); err != nil {
+		t.Fatalf("empty log MatchIndex zero: %v", err)
+	}
+}
+
 func TestExecutionOrderLeaderDeclaresCommitBeforeFollowupAppendHandoff(t *testing.T) {
 	core, _ := authorizedLeader(t)
 	if _, err := core.ProposeEntry([]byte("two")); err != nil {

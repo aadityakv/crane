@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -182,6 +183,39 @@ func TestTransportQueueSafeAppendCoalescingPreservesOwnedReplacement(t *testing.
 	}
 }
 
+func TestTransportQueueDoesNotCoalesceStrongerPersistenceRequirement(t *testing.T) {
+	entry, err := NewEntry(5, 3, EntryCommand, []byte("same"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := PeerMessage{To: 2, RPC: AppendEntriesRequest{
+		LeaderID: 1, Term: 3, Generation: 7, PrevLogIndex: 4, PrevLogTerm: 2,
+		LeaderCommit: 4, Entries: []Entry{entry},
+	}}
+	for _, test := range []struct {
+		name     string
+		requires DurabilityPrerequisite
+	}{
+		{name: "stronger HardState", requires: DurabilityPrerequisite{HardState: true}},
+		{name: "stronger EntriesThrough", requires: DurabilityPrerequisite{EntriesThrough: 5}},
+		{name: "both stronger", requires: DurabilityPrerequisite{HardState: true, EntriesThrough: 5}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			queue := newPeerIntentQueue(2)
+			replacement := PeerMessage{To: base.To, RPC: CloneRPC(base.RPC), Requires: test.requires}
+			rpc := replacement.RPC.(AppendEntriesRequest)
+			rpc.Generation++
+			replacement.RPC = rpc
+			if queue.offer(base) != TransportAccepted || queue.offer(replacement) != TransportAccepted {
+				t.Fatal("append offers were unavailable")
+			}
+			if got := queue.length(); got != 2 {
+				t.Fatalf("queue length = %d, want stronger persistence intent retained", got)
+			}
+		})
+	}
+}
+
 func TestTransportQueueDoesNotCoalesceAwayEntryBearingAppend(t *testing.T) {
 	queue := newPeerIntentQueue(2)
 	entry, err := NewEntry(1, 3, EntryCommand, []byte("keep"))
@@ -283,8 +317,8 @@ func TestTransportImmediateOwnerStartupFailurePrecedesReady(t *testing.T) {
 
 func TestTransportReportedFatalIsNotMaskedByConcurrentCancellation(t *testing.T) {
 	failure := errors.New("reported fatal")
-	transport := newTask10Transport(t, task10TransportOptions{})
 	for attempt := 0; attempt < 100; attempt++ {
+		transport := newTask10Transport(t, task10TransportOptions{})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		fatal := make(chan error, 1)
@@ -297,6 +331,54 @@ func TestTransportReportedFatalIsNotMaskedByConcurrentCancellation(t *testing.T)
 		default:
 			t.Fatalf("attempt %d cancellation masked an already-reported fatal", attempt)
 		}
+	}
+}
+
+func TestTransportRunReturnsRecordedFatalOverSimultaneousCancellation(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+	for _, phase := range []string{"startup", "runtime"} {
+		t.Run(phase, func(t *testing.T) {
+			for attempt := 0; attempt < 25; attempt++ {
+				listener := newTask10QueuedListener()
+				if phase == "startup" {
+					_ = listener.Close()
+				}
+				transport := newTask10Transport(t, task10TransportOptions{})
+				recorded := make(chan struct{})
+				releaseFatal := make(chan struct{})
+				var recordedOnce sync.Once
+				transport.afterFatalRecorded = func() {
+					recordedOnce.Do(func() { close(recorded) })
+					<-releaseFatal
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan error, 1)
+				go func() { done <- transport.Run(ctx, listener, task10Ingress{}) }()
+				if phase == "runtime" {
+					awaitClosed(t, transport.Ready())
+					_ = listener.Close()
+				}
+				awaitClosed(t, recorded)
+				cancel()
+				close(releaseFatal)
+				if err := <-done; !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("attempt %d Run error = %v, want recorded accept fatal", attempt, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTransportIntentionalCancellationDoesNotManufactureFatal(t *testing.T) {
+	transport := newTask10Transport(t, task10TransportOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- transport.Run(ctx, newBlockingListener(), task10Ingress{}) }()
+	awaitClosed(t, transport.Ready())
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("intentional cancellation error = %v, want nil", err)
 	}
 }
 

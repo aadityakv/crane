@@ -72,8 +72,7 @@ func canCoalesceAppend(current, replacement PeerMessage) bool {
 		left.PrevLogTerm != right.PrevLogTerm ||
 		right.Generation <= left.Generation ||
 		right.LeaderCommit < left.LeaderCommit ||
-		current.Requires.HardState && !replacement.Requires.HardState ||
-		replacement.Requires.EntriesThrough < current.Requires.EntriesThrough ||
+		current.Requires != replacement.Requires ||
 		len(left.Entries) != len(right.Entries) {
 		return false
 	}

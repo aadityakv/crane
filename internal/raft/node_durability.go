@@ -89,8 +89,19 @@ func (node *Node) validateMessageDurability(message PeerMessage, current, prospe
 		}
 		return nil
 	}
-	requireCoreEntry := func(index uint64) error {
+	requireCorePosition := func(index uint64) error {
 		if index == 0 {
+			return nil
+		}
+		coreTerm, err := node.core.log.Term(index)
+		if err != nil {
+			return fmt.Errorf("%w: outbound RPC references unavailable Core position %d", ErrInvalidCoreState, index)
+		}
+		prospectiveTerm, err := recoveredTermAt(prospective, index)
+		if err != nil || prospectiveTerm != coreTerm {
+			return fmt.Errorf("%w: outbound RPC position %d is not durably identical", ErrInvalidCoreState, index)
+		}
+		if index == node.core.log.SnapshotIndex() {
 			return nil
 		}
 		coreEntry, err := node.core.log.Entry(index)
@@ -158,7 +169,7 @@ func (node *Node) validateMessageDurability(message PeerMessage, current, prospe
 				return fmt.Errorf("%w: outbound AppendEntries previous position is not durable", ErrInvalidCoreState)
 			}
 			if rpc.PrevLogIndex > prospective.SnapshotBase.LastIncludedIndex {
-				if err := requireCoreEntry(rpc.PrevLogIndex); err != nil {
+				if err := requireCorePosition(rpc.PrevLogIndex); err != nil {
 					return err
 				}
 			}
@@ -176,7 +187,7 @@ func (node *Node) validateMessageDurability(message PeerMessage, current, prospe
 			if err := requireCommit(node.core.HardState().CommitIndex); err != nil {
 				return err
 			}
-			if err := requireCoreEntry(rpc.MatchIndex); err != nil {
+			if err := requireCorePosition(rpc.MatchIndex); err != nil {
 				return err
 			}
 		}

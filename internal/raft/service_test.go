@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -313,6 +314,111 @@ func TestServiceReportedFatalWinsConcurrentCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("fatal/cancellation race did not join children")
+	}
+}
+
+func TestServiceChildResultPublicationLinearizesBeforeReady(t *testing.T) {
+	configuration, secret := task10ServiceConfig(t, 1, 33580)
+	service, err := NewService(ServiceOptions{
+		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.listen = func(string, string) (net.Listener, error) { return newBlockingListener(), nil }
+	failure := errors.New("transport failed in final Ready gap")
+	transport := newTask10FailingServiceTransport(failure)
+	service.newTransport = func(TCPTransportOptions) (serviceTransport, error) { return transport, nil }
+	readyGap := make(chan struct{})
+	releaseReady := make(chan struct{})
+	resultPublished := make(chan struct{})
+	var gapOnce, resultOnce sync.Once
+	service.beforeReadyPublish = func() {
+		gapOnce.Do(func() { close(readyGap) })
+		<-releaseReady
+	}
+	service.afterChildResultPublished = func(name string) {
+		if name == "Raft transport" {
+			resultOnce.Do(func() { close(resultPublished) })
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- service.Run(context.Background()) }()
+	awaitClosed(t, readyGap)
+	close(transport.fail)
+	awaitClosed(t, resultPublished)
+	close(releaseReady)
+	if err := <-done; !errors.Is(err, failure) {
+		t.Fatalf("Run error = %v, want result published before Ready", err)
+	}
+	select {
+	case <-service.Ready():
+		t.Fatal("Ready closed after child result linearized first")
+	default:
+	}
+}
+
+func TestServiceReadyAndChildResultSimultaneousStressIsLinearizable(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+	for attempt := 0; attempt < 50; attempt++ {
+		configuration, secret := task10ServiceConfig(t, 1, uint16(33600+attempt*10))
+		service, err := NewService(ServiceOptions{
+			Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+			Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		service.listen = func(string, string) (net.Listener, error) { return newBlockingListener(), nil }
+		failure := errors.New("simultaneous transport failure")
+		transport := newTask10FailingServiceTransport(failure)
+		service.newTransport = func(TCPTransportOptions) (serviceTransport, error) { return transport, nil }
+		readyGap := make(chan struct{})
+		releaseReady := make(chan struct{})
+		var gapOnce sync.Once
+		var sequence atomic.Int64
+		var resultOrder atomic.Int64
+		var readyOrder atomic.Int64
+		service.beforeReadyPublish = func() {
+			gapOnce.Do(func() { close(readyGap) })
+			<-releaseReady
+		}
+		service.afterChildResultPublished = func(name string) {
+			if name == "Raft transport" {
+				resultOrder.CompareAndSwap(0, sequence.Add(1))
+			}
+		}
+		service.afterReadyPublished = func() { readyOrder.CompareAndSwap(0, sequence.Add(1)) }
+		done := make(chan error, 1)
+		go func() { done <- service.Run(context.Background()) }()
+		awaitClosed(t, readyGap)
+		start := make(chan struct{})
+		go func() { <-start; close(transport.fail) }()
+		go func() { <-start; close(releaseReady) }()
+		close(start)
+		if err := <-done; !errors.Is(err, failure) {
+			t.Fatalf("attempt %d Run error = %v", attempt, err)
+		}
+		result := resultOrder.Load()
+		ready := readyOrder.Load()
+		if result == 0 {
+			t.Fatalf("attempt %d child result was not published", attempt)
+		}
+		if ready != 0 && result < ready {
+			t.Fatalf("attempt %d Ready published after an earlier child result: result=%d ready=%d", attempt, result, ready)
+		}
+		select {
+		case <-service.Ready():
+			if ready == 0 || ready >= result {
+				t.Fatalf("attempt %d closed Ready without linearizing first: result=%d ready=%d", attempt, result, ready)
+			}
+		default:
+			if ready != 0 {
+				t.Fatalf("attempt %d recorded Ready order %d without closing Ready", attempt, ready)
+			}
+		}
 	}
 }
 

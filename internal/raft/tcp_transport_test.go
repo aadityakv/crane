@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -500,14 +501,15 @@ func TestTCPRejectsZeroOrReusedGeneratedRequestID(t *testing.T) {
 	for _, ids := range []RequestIDSource{
 		&fixedTask10RequestIDs{ids: []wire.RequestID{{}}},
 		&fixedTask10RequestIDs{ids: []wire.RequestID{{1}, {1}}},
+		&fixedTask10RequestIDs{},
 	} {
 		transport := newTask10Transport(t, task10TransportOptions{requestIDs: ids})
-		first, err := transport.nextRequestID()
+		first, _, err := task10AllocateRequestID(context.Background(), transport, 2)
 		if first == (wire.RequestID{}) && !errors.Is(err, ErrRequestIDExhausted) {
 			t.Fatalf("zero request ID error = %v", err)
 		}
 		if err == nil {
-			if _, err = transport.nextRequestID(); !errors.Is(err, ErrRequestIDExhausted) {
+			if _, _, err = task10AllocateRequestID(context.Background(), transport, 2); !errors.Is(err, ErrRequestIDExhausted) {
 				t.Fatalf("reused request ID error = %v", err)
 			}
 		}
@@ -516,20 +518,17 @@ func TestTCPRejectsZeroOrReusedGeneratedRequestID(t *testing.T) {
 
 func TestTCPOutgoingRequestIDsAreReplayWindowBounded(t *testing.T) {
 	manualClock := clock.NewManual(time.Unix(2000, 0))
-	ids := make([]wire.RequestID, 0, TransportReplayEntries+1)
-	for index := 1; index <= TransportReplayEntries+1; index++ {
+	ids := make([]wire.RequestID, 0, TransportReplayEntries)
+	for index := 1; index <= TransportReplayEntries; index++ {
 		ids = append(ids, wire.RequestID{byte(index >> 8), byte(index)})
 	}
 	transport := newTask10Transport(t, task10TransportOptions{requestIDs: &fixedTask10RequestIDs{ids: ids}, clock: manualClock})
 	for index := 0; index < TransportReplayEntries; index++ {
-		if _, err := transport.nextRequestID(); err != nil {
+		if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil {
 			t.Fatalf("request ID %d/%d: %v", index+1, TransportReplayEntries, err)
 		}
 	}
-	if _, err := transport.nextRequestID(); !errors.Is(err, ErrRequestIDExhausted) {
-		t.Fatalf("capacity+1 error = %v, want ErrRequestIDExhausted", err)
-	}
-	if got := len(transport.issued); got != TransportReplayEntries {
+	if got := task10TrackedRequestCount(transport, 2); got != TransportReplayEntries {
 		t.Fatalf("tracked request IDs = %d, want fixed cap %d", got, TransportReplayEntries)
 	}
 }
@@ -541,14 +540,14 @@ func TestTCPOutgoingRequestIDReuseExpiresWithReplayWindow(t *testing.T) {
 		requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{id, id, id}},
 		clock:      manualClock,
 	})
-	if _, err := transport.nextRequestID(); err != nil {
+	if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := transport.nextRequestID(); !errors.Is(err, ErrRequestIDExhausted) {
+	if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); !errors.Is(err, ErrRequestIDExhausted) {
 		t.Fatalf("within-window reuse error = %v, want ErrRequestIDExhausted", err)
 	}
-	manualClock.Advance(transport.replayWindow)
-	if got, err := transport.nextRequestID(); err != nil || got != id {
+	manualClock.Advance(transport.replayWindow + TransportFutureSkew)
+	if got, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil || got != id {
 		t.Fatalf("expired reuse = (%x, %v), want accepted %x", got, err, id)
 	}
 }
@@ -558,15 +557,300 @@ func TestTCPOutgoingRequestIDTrackingStaysBoundedAcrossLongHeartbeatRun(t *testi
 	transport := newTask10Transport(t, task10TransportOptions{requestIDs: &task10RequestIDs{}, clock: manualClock})
 	for window := 0; window < 4; window++ {
 		for index := 0; index < TransportReplayEntries; index++ {
-			if _, err := transport.nextRequestID(); err != nil {
+			if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil {
 				t.Fatalf("window %d request %d: %v", window, index, err)
 			}
 		}
-		if got := len(transport.issued); got > TransportReplayEntries {
+		if got := task10TrackedRequestCount(transport, 2); got > TransportReplayEntries {
 			t.Fatalf("window %d tracked %d request IDs, cap %d", window, got, TransportReplayEntries)
 		}
-		manualClock.Advance(transport.replayWindow)
+		manualClock.Advance(transport.replayWindow + TransportFutureSkew)
 	}
+}
+
+func TestTCPRequestIDRetentionUsesExactFrameTimestamp(t *testing.T) {
+	advancingClock := &task10AdvancingClock{now: time.Unix(5000, 750*int64(time.Microsecond)), step: time.Millisecond}
+	handshakeReceived := make(chan wire.Frame, 1)
+	releaseServer := make(chan struct{})
+	var transport *TCPTransport
+	transport = newTask10Transport(t, task10TransportOptions{
+		clock: advancingClock, requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{{1}}},
+		dial: func(context.Context, string, string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer server.Close()
+				stream := wire.NewTCPFrameStream(server, transport.authenticator, transport.limits, time.Second)
+				handshake, err := readFrameOrError(stream)
+				if err != nil {
+					return
+				}
+				handshakeReceived <- handshake
+				ack := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+				_ = writeFrameForTest(stream, ack)
+				<-releaseServer
+			}()
+			return client, nil
+		},
+	})
+	voter, _ := transport.voters.Voter(2)
+	stream, _, err := transport.dialPeer(context.Background(), voter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stream.Close()
+		close(releaseServer)
+	}()
+	handshake := <-handshakeReceived
+	frameTime := time.UnixMilli(handshake.Header.TimestampMillis)
+	wantExpiry := frameTime.Add(transport.replayWindow + TransportFutureSkew)
+	if got := task10TrackedRequestExpiry(transport, 2, handshake.Header.RequestID); !got.Equal(wantExpiry) {
+		t.Fatalf("tracked expiry = %s, want frame timestamp retention %s", got, wantExpiry)
+	}
+}
+
+func TestTCPRequestIDReuseWaitsForReplayWindowAndReceiverSkew(t *testing.T) {
+	senderClock := clock.NewManual(time.Unix(6000, 0))
+	receiverClock := clock.NewManual(senderClock.Now().Add(-TransportFutureSkew))
+	id := wire.RequestID{7}
+	transport := newTask10Transport(t, task10TransportOptions{
+		clock: senderClock, requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{id, id, id, id}},
+	})
+	receiver := wire.NewReplayGuard(receiverClock, transport.replayWindow, TransportFutureSkew, TransportReplayEntries)
+	first, firstTime, err := task10AllocateRequestID(context.Background(), transport, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := receiver.Commit(1, first, firstTime); err != nil {
+		t.Fatalf("receiver rejected first ID: %v", err)
+	}
+	senderClock.Advance(transport.replayWindow)
+	receiverClock.Advance(transport.replayWindow)
+	if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); !errors.Is(err, ErrRequestIDExhausted) {
+		t.Fatalf("reuse before future-skew retention error = %v, want ErrRequestIDExhausted", err)
+	}
+	senderClock.Advance(TransportFutureSkew - time.Millisecond)
+	receiverClock.Advance(TransportFutureSkew - time.Millisecond)
+	if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); !errors.Is(err, ErrRequestIDExhausted) {
+		t.Fatalf("reuse one millisecond before safe boundary error = %v, want ErrRequestIDExhausted", err)
+	}
+	senderClock.Advance(time.Millisecond)
+	receiverClock.Advance(time.Millisecond)
+	reused, reusedTime, err := task10AllocateRequestID(context.Background(), transport, 2)
+	if err != nil || reused != id {
+		t.Fatalf("safe post-expiry reuse = (%x, %v), want %x", reused, err, id)
+	}
+	if err := receiver.Commit(1, reused, reusedTime); err != nil {
+		t.Fatalf("receiver 30s behind rejected safe reuse: %v", err)
+	}
+}
+
+func TestTCPRequestIDTrackingIsBoundedPerDestinationPeer(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(7000, 0))
+	transport := newTask10Transport(t, task10TransportOptions{clock: manualClock, requestIDs: &task10RequestIDs{}})
+	const perPeer = 5000
+	for index := 0; index < perPeer; index++ {
+		for _, peerID := range []uint16{2, 3} {
+			if _, _, err := task10AllocateRequestID(context.Background(), transport, peerID); err != nil {
+				t.Fatalf("peer %d allocation %d: %v", peerID, index, err)
+			}
+		}
+	}
+	for _, peerID := range []uint16{2, 3} {
+		if got := task10TrackedRequestCount(transport, peerID); got != perPeer {
+			t.Fatalf("peer %d tracked IDs = %d, want %d", peerID, got, perPeer)
+		}
+	}
+}
+
+func TestTCPRequestIDMayRepeatAcrossIndependentDestinationPeers(t *testing.T) {
+	id := wire.RequestID{33}
+	transport := newTask10Transport(t, task10TransportOptions{requestIDs: &fixedTask10RequestIDs{ids: []wire.RequestID{id, id}}})
+	for _, peerID := range []uint16{2, 3} {
+		got, _, err := task10AllocateRequestID(context.Background(), transport, peerID)
+		if err != nil || got != id {
+			t.Fatalf("peer %d allocation = (%x, %v), want safe shared ID %x", peerID, got, err, id)
+		}
+	}
+}
+
+func TestTCPRequestIDCapacityWaitsAndRecoversAfterSafeExpiry(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(8000, 0))
+	transport := newTask10Transport(t, task10TransportOptions{clock: manualClock, requestIDs: &task10RequestIDs{}})
+	for index := 0; index < TransportReplayEntries; index++ {
+		if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil {
+			t.Fatalf("fill allocation %d: %v", index, err)
+		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := task10AllocateRequestID(context.Background(), transport, 2)
+		result <- err
+	}()
+	requireTask10RequestCapacityWaiting(t, manualClock, result)
+	manualClock.Advance(transport.replayWindow + TransportFutureSkew)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("post-expiry allocation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capacity waiter did not resume after safe expiry")
+	}
+	if got := task10TrackedRequestCount(transport, 2); got != 1 {
+		t.Fatalf("post-expiry tracked IDs = %d, want 1", got)
+	}
+	if got := task10TrackedExpiryCount(transport, 2); got != 1 {
+		t.Fatalf("post-expiry heap entries = %d, want 1", got)
+	}
+}
+
+func TestTCPRequestIDCapacityWaitIsCancellationAware(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(9000, 0))
+	source := &task10RequestIDs{}
+	transport := newTask10Transport(t, task10TransportOptions{clock: manualClock, requestIDs: source})
+	for index := 0; index < TransportReplayEntries; index++ {
+		if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := task10AllocateRequestID(ctx, transport, 2)
+		result <- err
+	}()
+	requireTask10RequestCapacityWaiting(t, manualClock, result)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("capacity cancellation error = %v, want context.Canceled", err)
+	}
+	source.mu.Lock()
+	calls := len(source.calls)
+	source.mu.Unlock()
+	if calls != TransportReplayEntries {
+		t.Fatalf("ID source calls = %d, want no allocation while capacity-blocked", calls)
+	}
+}
+
+func TestTCPWorkerCapacityWaitDoesNotFatallyStopTransport(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(9500, 0))
+	source := &task10RequestIDs{}
+	transport := newTask10Transport(t, task10TransportOptions{
+		clock: manualClock, requestIDs: source,
+		dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				<-ctx.Done()
+				_ = server.Close()
+			}()
+			return client, nil
+		},
+	})
+	for index := 0; index < TransportReplayEntries; index++ {
+		if _, _, err := task10AllocateRequestID(context.Background(), transport, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- transport.Run(ctx, newBlockingListener(), task10Ingress{}) }()
+	awaitClosed(t, transport.Ready())
+	if got, err := transport.Handoff(PeerMessage{To: 2, RPC: RequestVoteRequest{CandidateID: 1, Term: 1}}); err != nil || got != TransportAccepted {
+		t.Fatalf("capacity Handoff = (%d, %v)", got, err)
+	}
+	for attempt := 0; attempt < 1_000_000 && manualClock.PendingTimers() == 0; attempt++ {
+		runtime.Gosched()
+	}
+	if manualClock.PendingTimers() == 0 {
+		t.Fatal("worker did not wait on safe request-ID expiry")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("capacity wait fatally stopped transport: %v", err)
+	default:
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("capacity-wait cancellation: %v", err)
+	}
+}
+
+func TestTCPRequestIDTrackingSustainsTwentyMillisecondHeartbeats(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(10000, 0))
+	transport := newTask10Transport(t, task10TransportOptions{clock: manualClock, requestIDs: &task10RequestIDs{}})
+	for heartbeat := 0; heartbeat < 9000; heartbeat++ {
+		for _, peerID := range []uint16{2, 3} {
+			if _, _, err := task10AllocateRequestID(context.Background(), transport, peerID); err != nil {
+				t.Fatalf("heartbeat %d peer %d: %v", heartbeat, peerID, err)
+			}
+		}
+		manualClock.Advance(20 * time.Millisecond)
+	}
+	for _, peerID := range []uint16{2, 3} {
+		if got := task10TrackedRequestCount(transport, peerID); got > TransportReplayEntries {
+			t.Fatalf("peer %d map grew to %d", peerID, got)
+		}
+		if got := task10TrackedExpiryCount(transport, peerID); got > TransportReplayEntries {
+			t.Fatalf("peer %d heap grew to %d", peerID, got)
+		}
+	}
+}
+
+func task10AllocateRequestID(ctx context.Context, transport *TCPTransport, peerID uint16) (wire.RequestID, time.Time, error) {
+	return transport.nextRequestIDForPeer(ctx, peerID)
+}
+
+func task10TrackedRequestExpiry(transport *TCPTransport, peerID uint16, id wire.RequestID) time.Time {
+	transport.requestMu.Lock()
+	defer transport.requestMu.Unlock()
+	return transport.requestTrackers[peerID].issued[id]
+}
+
+func task10TrackedRequestCount(transport *TCPTransport, peerID uint16) int {
+	transport.requestMu.Lock()
+	defer transport.requestMu.Unlock()
+	return len(transport.requestTrackers[peerID].issued)
+}
+
+func task10TrackedExpiryCount(transport *TCPTransport, peerID uint16) int {
+	transport.requestMu.Lock()
+	defer transport.requestMu.Unlock()
+	return transport.requestTrackers[peerID].expires.Len()
+}
+
+func requireTask10RequestCapacityWaiting(t *testing.T, manualClock *clock.Manual, result <-chan error) {
+	t.Helper()
+	for attempt := 0; attempt < 1_000_000; attempt++ {
+		select {
+		case err := <-result:
+			t.Fatalf("capacity allocation returned before release: %v", err)
+		default:
+		}
+		if manualClock.PendingTimers() != 0 {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatal("capacity allocation neither returned nor registered its clock wait")
+}
+
+type task10AdvancingClock struct {
+	mu   sync.Mutex
+	now  time.Time
+	step time.Duration
+}
+
+func (source *task10AdvancingClock) Now() time.Time {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	now := source.now
+	source.now = source.now.Add(source.step)
+	return now
+}
+
+func (*task10AdvancingClock) NewTimer(duration time.Duration) clock.Timer {
+	return clock.NewReal().NewTimer(duration)
 }
 
 type fixedTask10RequestIDs struct {
