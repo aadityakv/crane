@@ -39,4 +39,22 @@ var (
 	ErrLogOverflow = errors.New("raft log index overflow")
 	// ErrLogInvariant classifies an operation or recovered state that violates a Raft log invariant.
 	ErrLogInvariant = errors.New("raft log invariant violation")
+	// ErrInvalidCoreState classifies inconsistent recovered state or deterministic core options.
+	ErrInvalidCoreState = errors.New("invalid raft core state")
+	// ErrReadyOutstanding classifies input attempted before the current protocol batch advances.
+	ErrReadyOutstanding = errors.New("raft Ready batch is outstanding")
+	// ErrAdvanceToken classifies a missing, stale, or mismatched Ready token.
+	ErrAdvanceToken = errors.New("invalid raft Ready advance token")
+	// ErrDeadlineOverflow classifies election deadline arithmetic outside uint64.
+	ErrDeadlineOverflow = errors.New("raft election deadline overflow")
+	// ErrTickRegression classifies a logical tick earlier than the last accepted tick.
+	ErrTickRegression = errors.New("raft logical tick regressed")
+	// ErrTermOverflow classifies an election that cannot increment MaxUint64.
+	ErrTermOverflow = errors.New("raft term overflow")
+	// ErrNotLeader classifies a proposal submitted while the local voter is not leader.
+	ErrNotLeader = errors.New("raft voter is not leader")
+	// ErrLeadershipNotAuthorized classifies a leader fenced until a current-term commit.
+	ErrLeadershipNotAuthorized = errors.New("raft leadership is not authorized by a current-term commit")
+	// ErrUnsupportedCoreRPC classifies a validated payload outside the current core task boundary.
+	ErrUnsupportedCoreRPC = errors.New("unsupported raft core RPC")
 )
