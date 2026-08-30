@@ -1219,6 +1219,121 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 	harness.stop(t)
 }
 
+func TestSubscriptionSnapshotReportsRevisionRaceAndRemainsPaused(t *testing.T) {
+	now := time.Unix(2260, 0)
+	configuration := config.NodeConfig{NodeID: 1, BindHost: "127.0.0.1", AdvertiseHost: "127.0.0.1", BasePort: 11000}
+	self := Member{NodeID: 1, Host: "127.0.0.1", BasePort: 11000, Incarnation: 1, Status: Alive}
+	sender := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	table := NewTable()
+	for _, member := range []Member{self, sender} {
+		mustMerge(t, table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	dissemination := NewDisseminator(16, serviceRetransmitFactor)
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       1,
+		SuspicionMultiplier:  5,
+	}, table, dissemination, random.NewLockedSource(320))
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscriptions := NewSubscriptions()
+	defer subscriptions.Close()
+	subscriptionID, events := subscriptions.Subscribe(1)
+	subscriptions.Publish(MembershipEvent{Current: Member{NodeID: 3, Incarnation: 1, Status: Alive}})
+	subscriptions.Publish(MembershipEvent{Current: Member{NodeID: 4, Incarnation: 1, Status: Alive}})
+	if event := <-events; event.Cause != EventResyncRequired {
+		t.Fatalf("overflow event = %#v, want resync marker", event)
+	}
+	manualClock := clock.NewManual(now)
+	service := &Service{
+		options: ServiceOptions{
+			Config:        configuration,
+			Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+			Clock:         manualClock,
+			Store:         newServiceStore(1),
+		},
+		clusterID: decodedTestClusterID(t, testClusterID),
+		limits:    wire.DefaultLimits(),
+		replay:    wire.NewReplayGuard(manualClock, time.Minute, time.Minute, 8),
+		events:    make(chan serviceEvent, 8),
+		done:      make(chan struct{}),
+	}
+	service.state.Store(serviceStateRunning)
+	service.active.Store(map[uint16]Member{self.NodeID: self, sender.NodeID: sender})
+	loop := &serviceLoop{
+		service:       service,
+		engine:        engine,
+		dissemination: dissemination,
+		subscriptions: subscriptions,
+		datagram:      &capturingSourceDatagram{},
+		runContext:    context.Background(),
+		admitted:      true,
+	}
+	loop.refreshActiveMembership()
+	runResult := make(chan error, 1)
+	go func() { runResult <- loop.run(context.Background()) }()
+	stopError := errors.New("stop snapshot race test")
+	defer func() {
+		service.events <- fatalServiceEvent{err: stopError}
+		if err := <-runResult; !errors.Is(err, stopError) {
+			t.Errorf("service loop stop error = %v, want %v", err, stopError)
+		}
+	}()
+
+	blockerResponse := make(chan snapshotResult)
+	service.events <- snapshotServiceEvent{response: blockerResponse}
+	deadline := time.Now().Add(time.Second)
+	for len(service.events) != 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if len(service.events) != 0 {
+		t.Fatal("owner did not enter blocking snapshot response")
+	}
+	subscription := &Subscription{service: service, id: subscriptionID, events: events}
+
+	snapshotErr := make(chan error, 1)
+	go func() {
+		_, err := subscription.Snapshot(testContext(t))
+		snapshotErr <- err
+	}()
+	waitServiceEventQueue(t, service, 1)
+	fifth := Member{NodeID: 5, Host: "127.0.0.5", BasePort: 15000, Incarnation: 1, Status: Alive}
+	service.events <- datagramServiceEvent{
+		sender:    sender,
+		senderID:  sender.NodeID,
+		requestID: wire.RequestID{1},
+		timestamp: now,
+		message:   GossipMessage{Updates: []Update{{Member: fifth, ReporterID: sender.NodeID}}},
+		updates:   []Update{{Member: fifth, ReporterID: sender.NodeID}},
+	}
+	<-blockerResponse
+	if err := <-snapshotErr; !errors.Is(err, ErrSnapshotSuperseded) {
+		t.Fatalf("Snapshot revision-race error = %v, want ErrSnapshotSuperseded", err)
+	}
+
+	sixth := Member{NodeID: 6, Host: "127.0.0.6", BasePort: 16000, Incarnation: 1, Status: Alive}
+	service.events <- datagramServiceEvent{
+		sender:    sender,
+		senderID:  sender.NodeID,
+		requestID: wire.RequestID{2},
+		timestamp: now,
+		message:   GossipMessage{Updates: []Update{{Member: sixth, ReporterID: sender.NodeID}}},
+		updates:   []Update{{Member: sixth, ReporterID: sender.NodeID}},
+	}
+	barrier := make(chan snapshotResult, 1)
+	service.events <- snapshotServiceEvent{response: barrier}
+	<-barrier
+	select {
+	case event := <-events:
+		t.Fatalf("superseded Snapshot resumed paused subscription: %#v", event)
+	default:
+	}
+}
+
 func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testing.T) {
 	store := newBarrierServiceStore(1, 99, nil)
 	harness := startPersistenceService(t, store)
@@ -1253,7 +1368,16 @@ func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testi
 	}
 	fifth := Member{NodeID: 5, Host: "127.0.0.5", BasePort: 15000, Incarnation: 1, Status: Alive}
 	harness.enqueuePeerGossip([]Update{{Member: fifth, ReporterID: 2}})
-	harness.service.events <- snapshotDeliveredServiceEvent{subscriptionID: subscription.id, revision: captured.revision}
+	deliveryResponse := make(chan error, 1)
+	harness.service.events <- snapshotDeliveredServiceEvent{
+		subscriptionID: subscription.id,
+		revision:       captured.revision,
+		response:       deliveryResponse,
+		state:          new(snapshotDeliveryState),
+	}
+	if err := <-deliveryResponse; !errors.Is(err, ErrSnapshotSuperseded) {
+		t.Fatalf("stale snapshot acknowledgment error = %v, want ErrSnapshotSuperseded", err)
+	}
 	if _, err := harness.service.requestTCPSnapshot(testContext(t)); err != nil {
 		t.Fatal(err)
 	}

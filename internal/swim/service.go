@@ -45,6 +45,9 @@ var (
 	ErrServiceNotRunning = errors.New("swim: service is not running")
 	// ErrServiceNotAdmitted reports peer traffic received before local admission completes.
 	ErrServiceNotAdmitted = errors.New("swim: service is not admitted")
+	// ErrSnapshotSuperseded reports that membership changed between a scoped
+	// subscription snapshot and its owner-confined delivery acknowledgment.
+	ErrSnapshotSuperseded = errors.New("swim: subscription snapshot superseded by membership change")
 )
 
 // ServiceOptions supplies the validated identity and deterministic seams used
@@ -210,13 +213,39 @@ func (s *Service) snapshot(ctx context.Context, subscriptionID uint64) ([]Member
 		if subscriptionID == 0 {
 			return result.members, nil
 		}
+		deliveryState := new(snapshotDeliveryState)
+		deliveryResponse := make(chan error, 1)
+		delivery := snapshotDeliveredServiceEvent{
+			subscriptionID: subscriptionID,
+			revision:       result.revision,
+			response:       deliveryResponse,
+			state:          deliveryState,
+		}
 		select {
-		case s.events <- snapshotDeliveredServiceEvent{subscriptionID: subscriptionID, revision: result.revision}:
-			return result.members, nil
+		case s.events <- delivery:
 		case <-s.done:
 			return nil, ErrServiceNotRunning
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		}
+		ctxDone := ctx.Done()
+		for {
+			select {
+			case err := <-deliveryResponse:
+				if err != nil {
+					return nil, err
+				}
+				return result.members, nil
+			case <-s.done:
+				return nil, ErrServiceNotRunning
+			case <-ctxDone:
+				if deliveryState.state.CompareAndSwap(snapshotDeliveryPending, snapshotDeliveryCanceled) {
+					return nil, ctx.Err()
+				}
+				// The owner claimed the acknowledgment concurrently and will
+				// publish its definitive result on deliveryResponse.
+				ctxDone = nil
+			}
 		}
 	case <-s.done:
 		return nil, ErrServiceNotRunning
@@ -500,9 +529,19 @@ func (snapshotServiceEvent) serviceEvent() {}
 type snapshotDeliveredServiceEvent struct {
 	subscriptionID uint64
 	revision       uint64
+	response       chan<- error
+	state          *snapshotDeliveryState
 }
 
 func (snapshotDeliveredServiceEvent) serviceEvent() {}
+
+const (
+	snapshotDeliveryPending uint32 = iota
+	snapshotDeliveryAccepted
+	snapshotDeliveryCanceled
+)
+
+type snapshotDeliveryState struct{ state atomic.Uint32 }
 
 type subscriptionResult struct {
 	id     uint64
@@ -650,9 +689,15 @@ func (l *serviceLoop) run(parent context.Context) error {
 			case snapshotServiceEvent:
 				event.response <- snapshotResult{members: l.engine.Snapshot(), revision: l.membershipRevision}
 			case snapshotDeliveredServiceEvent:
-				if event.revision == l.membershipRevision {
-					l.subscriptions.MarkResynchronized(event.subscriptionID)
+				if event.state == nil || !event.state.state.CompareAndSwap(snapshotDeliveryPending, snapshotDeliveryAccepted) {
+					continue
 				}
+				if event.revision != l.membershipRevision {
+					event.response <- ErrSnapshotSuperseded
+					continue
+				}
+				l.subscriptions.MarkResynchronized(event.subscriptionID)
+				event.response <- nil
 			case subscribeServiceEvent:
 				if event.state == nil || !event.state.state.CompareAndSwap(subscribeRequestPending, subscribeRequestAccepted) {
 					continue
