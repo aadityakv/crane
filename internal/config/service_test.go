@@ -2,6 +2,14 @@ package config
 
 import "testing"
 
+var serviceOffsetMustRemainUint16 uint16 = ServiceSpec{}.Offset
+
+func TestTransportNumericOrderMatchesWireContract(t *testing.T) {
+	if TransportUDP != 0 || TransportTCP != 1 {
+		t.Fatalf("transport values = UDP:%d TCP:%d, want UDP:0 TCP:1", TransportUDP, TransportTCP)
+	}
+}
+
 func TestServiceRegistryMatchesApprovedLayout(t *testing.T) {
 	want := []ServiceSpec{
 		{Service: ServiceSWIMPing, Name: "swim-ping", Offset: 0, Transport: TransportUDP},
@@ -34,38 +42,38 @@ func TestServiceRegistryHasUniqueFields(t *testing.T) {
 	services := Services()
 	checks := []struct {
 		name  string
-		check func(ServiceSpec, map[Service]bool, map[string]bool, map[int]bool) bool
+		check func(ServiceSpec, map[Service]bool, map[string]bool, map[uint16]bool) bool
 	}{
-		{name: "unique IDs", check: func(spec ServiceSpec, ids map[Service]bool, _ map[string]bool, _ map[int]bool) bool {
+		{name: "unique IDs", check: func(spec ServiceSpec, ids map[Service]bool, _ map[string]bool, _ map[uint16]bool) bool {
 			if ids[spec.Service] {
 				return false
 			}
 			ids[spec.Service] = true
 			return true
 		}},
-		{name: "unique names", check: func(spec ServiceSpec, _ map[Service]bool, names map[string]bool, _ map[int]bool) bool {
+		{name: "unique names", check: func(spec ServiceSpec, _ map[Service]bool, names map[string]bool, _ map[uint16]bool) bool {
 			if names[spec.Name] {
 				return false
 			}
 			names[spec.Name] = true
 			return true
 		}},
-		{name: "unique offsets", check: func(spec ServiceSpec, _ map[Service]bool, _ map[string]bool, offsets map[int]bool) bool {
+		{name: "unique offsets", check: func(spec ServiceSpec, _ map[Service]bool, _ map[string]bool, offsets map[uint16]bool) bool {
 			if offsets[spec.Offset] {
 				return false
 			}
 			offsets[spec.Offset] = true
 			return true
 		}},
-		{name: "offset range", check: func(spec ServiceSpec, _ map[Service]bool, _ map[string]bool, _ map[int]bool) bool {
-			return spec.Offset >= 0 && spec.Offset <= 8
+		{name: "offset range", check: func(spec ServiceSpec, _ map[Service]bool, _ map[string]bool, _ map[uint16]bool) bool {
+			return spec.Offset <= 8
 		}},
 	}
 	for _, check := range checks {
 		t.Run(check.name, func(t *testing.T) {
 			ids := make(map[Service]bool)
 			names := make(map[string]bool)
-			offsets := make(map[int]bool)
+			offsets := make(map[uint16]bool)
 			for _, spec := range services {
 				if !check.check(spec, ids, names, offsets) {
 					t.Errorf("invalid registry entry: %#v", spec)

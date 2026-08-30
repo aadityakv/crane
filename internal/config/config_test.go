@@ -261,7 +261,7 @@ func TestAdvertiseEndpointsUseRegistry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AdvertiseEndpoint(%v): %v", spec.Service, err)
 		}
-		if endpoint.Host != "127.0.0.1" || int(endpoint.Port) != 8000+spec.Offset {
+		if endpoint.Host != "127.0.0.1" || int(endpoint.Port) != 8000+int(spec.Offset) {
 			t.Fatalf("endpoint = %#v for %#v", endpoint, spec)
 		}
 	}

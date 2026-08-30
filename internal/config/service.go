@@ -5,30 +5,45 @@ package config
 type Transport uint8
 
 const (
-	TransportTCP Transport = iota
-	TransportUDP
+	// TransportUDP identifies a datagram endpoint.
+	TransportUDP Transport = iota
+	// TransportTCP identifies a stream endpoint.
+	TransportTCP
 )
 
 // Service identifies a registered runtime service.
 type Service uint8
 
 const (
+	// ServiceSWIMPing carries direct probes, indirect requests, gossip, and digests.
 	ServiceSWIMPing Service = iota
+	// ServiceSWIMACK carries direct and relayed probe acknowledgments.
 	ServiceSWIMACK
+	// ServiceSWIMSnapshot carries join and membership snapshot exchanges.
 	ServiceSWIMSnapshot
+	// ServiceFileRPC reserves the future distributed-file RPC endpoint.
 	ServiceFileRPC
+	// ServiceGrepRPC reserves the future distributed-grep RPC endpoint.
 	ServiceGrepRPC
+	// ServiceCraneWorker reserves the future Crane worker-control endpoint.
 	ServiceCraneWorker
+	// ServiceTopologyControl reserves the future topology-control endpoint.
 	ServiceTopologyControl
+	// ServiceCraneTupleACK reserves the future Crane tuple-acknowledgment endpoint.
 	ServiceCraneTupleACK
+	// ServiceRaftRPC reserves the future fixed-voter Raft RPC endpoint.
 	ServiceRaftRPC
 )
 
 // ServiceSpec describes a service's stable name, port offset, and transport.
 type ServiceSpec struct {
-	Service   Service
-	Name      string
-	Offset    int
+	// Service is the stable typed registry key.
+	Service Service
+	// Name is the stable human-readable service label.
+	Name string
+	// Offset is added to a validated base port with checked arithmetic.
+	Offset uint16
+	// Transport selects the listener/socket kind for this service.
 	Transport Transport
 }
 
@@ -53,7 +68,7 @@ func Services() []ServiceSpec {
 
 // LookupService returns the specification for service, if it is registered.
 func LookupService(service Service) (ServiceSpec, bool) {
-	if int(service) < 0 || int(service) >= len(serviceSpecs) {
+	if int(service) >= len(serviceSpecs) {
 		return ServiceSpec{}, false
 	}
 	spec := serviceSpecs[service]

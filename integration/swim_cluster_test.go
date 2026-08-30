@@ -41,13 +41,13 @@ func TestTypedPortAllocatorUsesAuthoritativeRegistryBounds(t *testing.T) {
 	if !ok {
 		t.Fatal("SWIM snapshot service is not registered")
 	}
-	if snapshotOffset != snapshot.Offset {
+	if snapshotOffset != int(snapshot.Offset) {
 		t.Fatalf("snapshot offset = %d, want registry offset %d", snapshotOffset, snapshot.Offset)
 	}
 	wantMax := 0
 	for _, service := range config.Services() {
-		if service.Offset > wantMax {
-			wantMax = service.Offset
+		if int(service.Offset) > wantMax {
+			wantMax = int(service.Offset)
 		}
 	}
 	if maxOffset != wantMax {
@@ -354,7 +354,7 @@ func reserveTypedClusterPorts(t *testing.T, nodes int) (uint16, func()) {
 		for nodeIndex := 0; nodeIndex < nodes && valid; nodeIndex++ {
 			base := candidate + nodeIndex*integrationNodePortStride
 			for _, service := range config.Services() {
-				address := fmt.Sprintf("127.0.0.1:%d", base+service.Offset)
+				address := fmt.Sprintf("127.0.0.1:%d", base+int(service.Offset))
 				var closer io.Closer
 				if service.Transport == config.TransportUDP {
 					udpAddress, resolveErr := net.ResolveUDPAddr("udp", address)
@@ -387,23 +387,17 @@ func typedServicePortBounds() (int, int, error) {
 	if !ok {
 		return 0, 0, fmt.Errorf("SWIM snapshot service is not registered")
 	}
-	if snapshot.Offset < 0 {
-		return 0, 0, fmt.Errorf("SWIM snapshot service has negative port offset %d", snapshot.Offset)
-	}
 	services := config.Services()
 	if len(services) == 0 {
 		return 0, 0, fmt.Errorf("service registry is empty")
 	}
 	maxOffset := 0
 	for _, service := range services {
-		if service.Offset < 0 {
-			return 0, 0, fmt.Errorf("service %q has negative port offset", service.Name)
-		}
-		if service.Offset > maxOffset {
-			maxOffset = service.Offset
+		if int(service.Offset) > maxOffset {
+			maxOffset = int(service.Offset)
 		}
 	}
-	return snapshot.Offset, maxOffset, nil
+	return int(snapshot.Offset), maxOffset, nil
 }
 
 type synchronizedLog struct {

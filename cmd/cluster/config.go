@@ -108,11 +108,8 @@ func validateGeneratedPortRanges(bases []uint64, services []config.ServiceSpec) 
 	if len(services) == 0 {
 		return fmt.Errorf("service registry is empty")
 	}
-	maxOffset := 0
+	var maxOffset uint16
 	for _, service := range services {
-		if service.Offset < 0 {
-			return fmt.Errorf("service %q has negative port offset", service.Name)
-		}
 		if service.Offset > maxOffset {
 			maxOffset = service.Offset
 		}
