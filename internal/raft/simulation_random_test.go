@@ -198,6 +198,7 @@ func runSimulationSchedule(t *testing.T, seed uint64, steps int) {
 		cluster.fail(t, "required phase coverage missing: %+v", coverage)
 	}
 
+	simulationRecordSchedule(cluster, steps, 100, "final-healed-recovery")
 	simulationRecoverLiveness(t, cluster, seed)
 }
 
