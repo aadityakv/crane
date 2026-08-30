@@ -8,6 +8,7 @@ import (
 	"net"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -117,9 +118,7 @@ func TestTCPHandshakeRejectsPayloadMismatchAndReplayAcrossReconnect(t *testing.T
 	client, server := net.Pipe()
 	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
-	if err := writeFrameForTest(stream, transportFrame(t, transport, 2, wire.RequestID{1}, bad)); err != nil {
-		t.Fatal(err)
-	}
+	writeRejectedFrameForTest(t, stream, transportFrame(t, transport, 2, wire.RequestID{1}, bad))
 	expectClosedStream(t, stream)
 
 	valid := transportFrame(t, transport, 2, wire.RequestID{2}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
@@ -127,18 +126,33 @@ func TestTCPHandshakeRejectsPayloadMismatchAndReplayAcrossReconnect(t *testing.T
 		client, server = net.Pipe()
 		go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 		stream = wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
-		if err := writeFrameForTest(stream, valid); err != nil {
-			t.Fatal(err)
-		}
 		if attempt == 0 {
+			if err := writeFrameForTest(stream, valid); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := readFrameOrError(stream); err != nil {
 				t.Fatalf("first handshake: %v", err)
 			}
 			_ = stream.Close()
 		} else {
+			writeRejectedFrameForTest(t, stream, valid)
 			expectClosedStream(t, stream)
 		}
 	}
+}
+
+func writeRejectedFrameForTest(t *testing.T, stream *wire.TCPFrameStream, frame wire.Frame) {
+	t.Helper()
+	err := writeFrameForTest(stream, frame)
+	if err == nil {
+		return
+	}
+	// The rejecting peer may close after consuming the frame but before the
+	// writer clears its deadline. Errors from encoding or the write itself stay fatal.
+	if errors.Is(err, io.ErrClosedPipe) && strings.HasPrefix(err.Error(), "clear TCP write deadline:") {
+		return
+	}
+	t.Fatalf("write rejected frame: %v", err)
 }
 
 func TestTCPInvalidPayloadDoesNotConsumeAcceptedReplayCapacity(t *testing.T) {
