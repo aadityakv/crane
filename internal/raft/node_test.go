@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -170,6 +172,33 @@ func (transport *task8Transport) Handoff(message PeerMessage) (TransportHandoff,
 type task8ZeroOffsetRandom struct{}
 
 func (task8ZeroOffsetRandom) Uint64() uint64 { return 10_000_000_000 }
+
+type task8ObservableCancelContext struct {
+	done     chan struct{}
+	canceled atomic.Bool
+	once     sync.Once
+}
+
+func newTask8ObservableCancelContext() *task8ObservableCancelContext {
+	return &task8ObservableCancelContext{done: make(chan struct{})}
+}
+
+func (*task8ObservableCancelContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (ctx *task8ObservableCancelContext) Done() <-chan struct{}   { return ctx.done }
+func (ctx *task8ObservableCancelContext) Err() error {
+	if ctx.canceled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+func (*task8ObservableCancelContext) Value(any) any { return nil }
+func (ctx *task8ObservableCancelContext) observeCancellation() {
+	ctx.canceled.Store(true)
+}
+func (ctx *task8ObservableCancelContext) finishCancellation() {
+	ctx.observeCancellation()
+	ctx.once.Do(func() { close(ctx.done) })
+}
 
 func TestNodeConstructorHasNoStorageApplicationTimerOrGoroutineEffect(t *testing.T) {
 	options, store, machine, manual := task8NodeOptions(t, RecoveredState{})
@@ -337,6 +366,67 @@ func TestRecoveryReturnsRestoreAndApplyFailures(t *testing.T) {
 	})
 }
 
+func TestRecoveryConstructsCoreBeforeAnyApplicationMutation(t *testing.T) {
+	state := RecoveredState{
+		HardState: HardState{Term: 1, CommitIndex: 1},
+		Entries:   []Entry{mustStorageEntry(t, 1, 1, "must-not-apply")},
+	}
+	options, store, machine, _ := task8NodeOptions(t, state)
+	node, err := NewNode(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coreFailure := fmt.Errorf("%w: initial deadline: %w", ErrInvalidCoreState, ErrDeadlineOverflow)
+	node.newCore = func(CoreOptions) (*Core, error) { return nil, coreFailure }
+	if err := node.Run(context.Background()); !errors.Is(err, coreFailure) {
+		t.Fatalf("Run error = %v, want injected Core construction failure", err)
+	}
+	if machine.restoreCalls != 0 || len(machine.applyCalls) != 0 {
+		t.Fatalf("invalid Core reached application: restore=%d apply=%d", machine.restoreCalls, len(machine.applyCalls))
+	}
+	if store.closes != 1 {
+		t.Fatalf("store closes = %d, want 1", store.closes)
+	}
+	if got := node.Status(); got != (Status{Role: RoleFollower}) {
+		t.Fatalf("status published before Core/application recovery = %#v", got)
+	}
+	select {
+	case <-node.Ready():
+		t.Fatal("Ready closed after Core construction failure")
+	default:
+	}
+}
+
+func TestRecoveryOrdersCoreValidationBeforeRestoreAndExactReplay(t *testing.T) {
+	events := &task8EventLog{}
+	state := RecoveredState{
+		HardState: HardState{Term: 1, CommitIndex: 1},
+		Entries:   []Entry{mustStorageEntry(t, 1, 1, "replay")},
+	}
+	options, store, machine, _ := task8NodeOptions(t, state)
+	store.events = events
+	machine.events = events
+	node, err := NewNode(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.newCore = func(options CoreOptions) (*Core, error) {
+		events.add("core")
+		return NewCore(options)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() { runResult <- node.Run(ctx) }()
+	<-node.Ready()
+	cancel()
+	if err := <-runResult; err != nil {
+		t.Fatal(err)
+	}
+	if got, want := events.snapshot(), []string{"recover", "core", "restore", "apply:1", "close"}; !equalStrings(got, want) {
+		t.Fatalf("recovery order = %v, want %v", got, want)
+	}
+}
+
 func TestExecutionOrderPersistsBeforeHandoffAndAdvancesWhenPeerUnavailable(t *testing.T) {
 	events := &task8EventLog{}
 	options, store, machine, _ := task8NodeOptions(t, RecoveredState{})
@@ -396,6 +486,9 @@ func TestExecutionOrderStopsWithoutLaterEffectsAfterPersistenceFailure(t *testin
 	if got, want := events.snapshot(), []string{"recover", "restore", "persist", "close"}; !equalStrings(got, want) {
 		t.Fatalf("failure events = %v, want no later effects %v", got, want)
 	}
+	if node.durableState.HardState != (HardState{}) || len(node.durableState.Entries) != 0 {
+		t.Fatalf("failed Persist changed acknowledged durable model: %#v", node.durableState)
+	}
 }
 
 func TestExecutionOrderHandsOffBeforeApplyingSameReady(t *testing.T) {
@@ -438,6 +531,238 @@ func TestExecutionOrderValidatesProposalDependencyGraphBeforeEffects(t *testing.
 	}
 }
 
+func TestExecutionOrderRejectsSemanticallyIncompleteVoteDurability(t *testing.T) {
+	t.Run("newly granted vote response", func(t *testing.T) {
+		node := stoppedTask8ValidationNode(t, RecoveredState{})
+		if err := node.core.Step(2, RequestVoteRequest{CandidateID: 2, Term: 1}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		withoutDeclaration := ready.Clone()
+		withoutDeclaration.Messages[0].Requires.HardState = false
+		requireTask8InvalidReady(t, node, withoutDeclaration, "granted vote missing HardState declaration")
+		withoutState := withoutDeclaration.Clone()
+		withoutState.HardState = nil
+		requireTask8InvalidReady(t, node, withoutState, "granted vote missing durable HardState content")
+	})
+
+	t.Run("higher-term denied vote response", func(t *testing.T) {
+		entry := mustStorageEntry(t, 1, 1, "newer-local-log")
+		state := RecoveredState{HardState: HardState{Term: 1}, Entries: []Entry{entry}}
+		node := stoppedTask8ValidationNode(t, state)
+		if err := node.core.Step(2, RequestVoteRequest{CandidateID: 2, Term: 2}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		response := ready.Messages[0].RPC.(RequestVoteResponse)
+		if response.Granted || response.Term != 2 {
+			t.Fatalf("higher-term response = %#v, want denied term 2", response)
+		}
+		withoutDeclaration := ready.Clone()
+		withoutDeclaration.Messages[0].Requires.HardState = false
+		requireTask8InvalidReady(t, node, withoutDeclaration, "higher-term response missing HardState declaration")
+		withoutState := withoutDeclaration.Clone()
+		withoutState.HardState = nil
+		requireTask8InvalidReady(t, node, withoutState, "higher-term response missing durable HardState content")
+	})
+
+	t.Run("election RequestVote", func(t *testing.T) {
+		node := stoppedTask8ValidationNode(t, RecoveredState{})
+		if err := node.core.Tick(uint64(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		advanceReady(t, node.core)
+		if err := node.core.Step(2, PreVoteResponse{
+			ResponderID: 2, CandidateID: 1, RequestCurrentTerm: 0, ProspectiveTerm: 1, Granted: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		for index := range ready.Messages {
+			ready.Messages[index].Requires.HardState = false
+		}
+		requireTask8InvalidReady(t, node, ready, "election requests missing HardState declaration")
+		ready.HardState = nil
+		requireTask8InvalidReady(t, node, ready, "election requests missing term/vote persistence")
+	})
+}
+
+func TestExecutionOrderRejectsSemanticallyIncompleteAppendDurability(t *testing.T) {
+	t.Run("success after new entry", func(t *testing.T) {
+		node := stoppedTask8ValidationNode(t, RecoveredState{HardState: HardState{Term: 1}})
+		entry := mustStorageEntry(t, 1, 1, "new")
+		if err := node.core.Step(2, AppendEntriesRequest{
+			LeaderID: 2, Term: 1, Generation: 1, Entries: []Entry{entry},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		withoutDeclaration := ready.Clone()
+		withoutDeclaration.Messages[0].Requires.EntriesThrough = 0
+		requireTask8InvalidReady(t, node, withoutDeclaration, "append success missing entry declaration")
+		withoutEntries := withoutDeclaration.Clone()
+		withoutEntries.Entries = nil
+		requireTask8InvalidReady(t, node, withoutEntries, "append success missing durable entry content")
+	})
+
+	t.Run("success after replaced entry", func(t *testing.T) {
+		oldEntry := mustStorageEntry(t, 1, 1, "old")
+		node := stoppedTask8ValidationNode(t, RecoveredState{HardState: HardState{Term: 2}, Entries: []Entry{oldEntry}})
+		replacement := mustStorageEntry(t, 1, 2, "replacement")
+		if err := node.core.Step(2, AppendEntriesRequest{
+			LeaderID: 2, Term: 2, Generation: 1, Entries: []Entry{replacement},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		withoutDeclaration := ready.Clone()
+		withoutDeclaration.Messages[0].Requires.EntriesThrough = 0
+		requireTask8InvalidReady(t, node, withoutDeclaration, "append success missing replacement declaration")
+		withoutEntries := withoutDeclaration.Clone()
+		withoutEntries.Entries = nil
+		requireTask8InvalidReady(t, node, withoutEntries, "append success missing replacement content")
+	})
+
+	t.Run("success after new commit", func(t *testing.T) {
+		node := stoppedTask8ValidationNode(t, RecoveredState{HardState: HardState{Term: 1}})
+		entry := mustStorageEntry(t, 1, 1, "committed")
+		if err := node.core.Step(2, AppendEntriesRequest{
+			LeaderID: 2, Term: 1, Generation: 1, LeaderCommit: 1, Entries: []Entry{entry},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		withoutDeclaration := ready.Clone()
+		withoutDeclaration.Messages[0].Requires.HardState = false
+		requireTask8InvalidReady(t, node, withoutDeclaration, "append success missing commit declaration")
+		withoutState := withoutDeclaration.Clone()
+		withoutState.HardState = nil
+		requireTask8InvalidReady(t, node, withoutState, "append success missing durable commit content")
+	})
+
+	t.Run("leader request carrying unstable entry", func(t *testing.T) {
+		node := stoppedAuthorizedTask8ValidationNode(t)
+		if _, _, err := node.core.proposeTracked(EntryCommand, []byte("unstable")); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		for index := range ready.Messages {
+			request, ok := ready.Messages[index].RPC.(AppendEntriesRequest)
+			if ok && len(request.Entries) != 0 {
+				ready.Messages[index].Requires.EntriesThrough = 0
+			}
+		}
+		requireTask8InvalidReady(t, node, ready, "leader append missing unstable-entry declaration")
+	})
+
+	t.Run("leader request depending on same-term replaced previous entry", func(t *testing.T) {
+		node := stoppedAuthorizedTask8ValidationNode(t)
+		oldEntry := mustStorageEntry(t, 2, 1, "old")
+		replacement := mustStorageEntry(t, 2, 1, "replacement")
+		node.durableState.Entries = append(node.durableState.Entries, oldEntry)
+		node.core.log.entries = append(node.core.log.entries, replacement)
+		node.core.log.lastIndex = 2
+		ready := Ready{
+			Token: 1, Entries: []Entry{replacement},
+			Messages: []PeerMessage{{To: 2, RPC: AppendEntriesRequest{
+				LeaderID: 1, Term: 1, Generation: 101, PrevLogIndex: 2, PrevLogTerm: 1, LeaderCommit: 1,
+			}}},
+		}
+		requireTask8InvalidReady(t, node, ready, "leader append missing exact previous-entry declaration")
+	})
+
+	t.Run("leader request carrying newly advanced commit", func(t *testing.T) {
+		node := stoppedAuthorizedTask8ValidationNode(t)
+		entry, err := NewEntry(2, 1, EntryCommand, []byte("durable-entry"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		node.core.log.entries = append(node.core.log.entries, entry)
+		node.core.log.lastIndex = 2
+		node.core.hardState.CommitIndex = 2
+		if err := node.core.log.AdvanceCommit(2); err != nil {
+			t.Fatal(err)
+		}
+		ready := Ready{
+			Token:     1,
+			HardState: hardStatePointer(HardState{Term: 1, VotedFor: 1, CommitIndex: 2}),
+			Entries:   []Entry{entry},
+			Messages: []PeerMessage{{To: 2, RPC: AppendEntriesRequest{
+				LeaderID: 1, Term: 1, Generation: 100, PrevLogIndex: 2, PrevLogTerm: 1, LeaderCommit: 2,
+			}}},
+		}
+		requireTask8InvalidReady(t, node, ready, "leader append missing new-commit declaration")
+		ready.HardState = nil
+		requireTask8InvalidReady(t, node, ready, "leader append missing durable commit content")
+	})
+}
+
+func TestExecutionOrderAcceptsAlreadyDurableVoteAndEntryRetransmits(t *testing.T) {
+	t.Run("vote", func(t *testing.T) {
+		node := stoppedTask8ValidationNode(t, RecoveredState{HardState: HardState{Term: 1, VotedFor: 2}})
+		if err := node.core.Step(2, RequestVoteRequest{CandidateID: 2, Term: 1}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		if ready.HardState != nil || ready.Messages[0].Requires != (DurabilityPrerequisite{}) {
+			t.Fatalf("idempotent vote Ready = %#v", ready)
+		}
+		if err := node.validateReady(ready); err != nil {
+			t.Fatalf("validate durable vote retransmit: %v", err)
+		}
+	})
+
+	t.Run("entry", func(t *testing.T) {
+		entry := mustStorageEntry(t, 1, 1, "durable")
+		node := stoppedTask8ValidationNode(t, RecoveredState{HardState: HardState{Term: 1}, Entries: []Entry{entry}})
+		if err := node.core.Step(2, AppendEntriesRequest{
+			LeaderID: 2, Term: 1, Generation: 1, Entries: []Entry{entry},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ready := requireReady(t, node.core)
+		if ready.HardState != nil || len(ready.Entries) != 0 || ready.Messages[0].Requires != (DurabilityPrerequisite{}) {
+			t.Fatalf("idempotent append Ready = %#v", ready)
+		}
+		if err := node.validateReady(ready); err != nil {
+			t.Fatalf("validate durable entry retransmit: %v", err)
+		}
+	})
+}
+
+func TestExecutionOrderLeaderDeclaresCommitBeforeFollowupAppendHandoff(t *testing.T) {
+	core, _ := authorizedLeader(t)
+	if _, err := core.ProposeEntry([]byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	advanceReady(t, core)
+	if _, err := core.ProposeEntry([]byte("three")); err != nil {
+		t.Fatal(err)
+	}
+	latest := advanceReady(t, core)
+	request := appendRequestTo(t, latest, 2)
+	progress := core.progress[2]
+	progress.activeMatchIndex = 2
+	core.progress[2] = progress
+	if err := core.Step(2, AppendEntriesResponse{
+		ResponderID: 2, LeaderID: 1, Term: 1, RequestTerm: 1,
+		Generation: request.Generation, Success: true, MatchIndex: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ready := requireReady(t, core)
+	if ready.HardState == nil || ready.HardState.CommitIndex != 2 {
+		t.Fatalf("commit Ready hard state = %#v, want commit 2", ready.HardState)
+	}
+	followup := appendRequestTo(t, ready, 2)
+	if followup.LeaderCommit != 2 || len(followup.Entries) != 1 || followup.Entries[0].Index != 3 {
+		t.Fatalf("followup append = %#v, want commit 2 carrying entry 3", followup)
+	}
+	if got, want := ready.Messages[0].Requires, (DurabilityPrerequisite{HardState: true}); got != want {
+		t.Fatalf("followup durability = %#v, want %#v", got, want)
+	}
+}
+
 func TestNodeCallerCancellationDoesNotBlockOrAbandonStartedPersistence(t *testing.T) {
 	events := &task8EventLog{}
 	persistStarted := make(chan struct{})
@@ -475,6 +800,217 @@ func TestNodeCallerCancellationDoesNotBlockOrAbandonStartedPersistence(t *testin
 		t.Fatalf("effects after persistence release = %v, want %v", got, want)
 	}
 	stopTask8Node(t, cancelNode, runResult)
+}
+
+func TestNodeCancellationPriorityRejectsQueuedBackgroundCoreActions(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		submit    func(*Node) <-chan error
+		wantError error
+	}{
+		{
+			name: "inbound Step",
+			submit: func(node *Node) <-chan error {
+				result := make(chan error, 1)
+				go func() {
+					result <- node.SubmitRPC(context.Background(), 3, RequestVoteRequest{CandidateID: 3, Term: 2})
+				}()
+				return result
+			},
+			wantError: ErrStopped,
+		},
+		{
+			name: "local propose",
+			submit: func(node *Node) <-chan error {
+				result := make(chan error, 1)
+				go func() {
+					_, err := node.Propose(context.Background(), []byte("must-not-append"))
+					result <- err
+				}()
+				return result
+			},
+			wantError: ErrStopped,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := &task8EventLog{}
+			persistStarted := make(chan struct{})
+			persistRelease := make(chan struct{})
+			options, store, machine, _ := task8NodeOptions(t, RecoveredState{})
+			store.events = events
+			store.persistStarted = persistStarted
+			store.persistRelease = persistRelease
+			machine.events = events
+			transport := options.Transport.(*task8Transport)
+			transport.events = events
+			node, err := NewNode(options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			node.afterAdvance = func(ReadyToken) { events.add("advance") }
+			runCtx := newTask8ObservableCancelContext()
+			runResult := make(chan error, 1)
+			go func() { runResult <- node.Run(runCtx) }()
+			joined := false
+			var releaseOnce sync.Once
+			defer func() {
+				releaseOnce.Do(func() { close(persistRelease) })
+				runCtx.finishCancellation()
+				if !joined {
+					<-runResult
+				}
+			}()
+			<-node.Ready()
+
+			entry := mustStorageEntry(t, 1, 1, "committed-before-cancel")
+			blockerResult := make(chan error, 1)
+			go func() {
+				blockerResult <- node.SubmitRPC(context.Background(), 2, AppendEntriesRequest{
+					LeaderID: 2, Term: 1, Generation: 1, LeaderCommit: 1, Entries: []Entry{entry},
+				})
+			}()
+			<-persistStarted
+			targetResult := test.submit(node)
+			waitTask8QueuedEvents(t, node, 1)
+			runCtx.observeCancellation()
+			releaseOnce.Do(func() { close(persistRelease) })
+
+			if err := <-blockerResult; err != nil {
+				t.Fatalf("already-started SubmitRPC error = %v", err)
+			}
+			if err := <-targetResult; !errors.Is(err, test.wantError) {
+				t.Fatalf("queued call error = %v, want %v without Core invocation", err, test.wantError)
+			}
+			if err := <-runResult; err != nil {
+				t.Fatalf("Run cancellation error = %v", err)
+			}
+			joined = true
+			if got, want := events.snapshot(), []string{"recover", "restore", "persist", "handoff", "apply:1", "advance", "close"}; !equalStrings(got, want) {
+				t.Fatalf("cancellation effects = %v, want only the already-started Ready %v", got, want)
+			}
+			if got := node.pendingReservations.Load(); got != 0 {
+				t.Fatalf("pending reservations after canceled queued call = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestNodeCancellationPriorityRejectsQueuedTimerAfterStartedReady(t *testing.T) {
+	events := &task8EventLog{}
+	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
+	options, store, machine, manual := task8NodeOptions(t, RecoveredState{})
+	store.events = events
+	store.persistStarted = persistStarted
+	store.persistRelease = persistRelease
+	machine.events = events
+	transport := options.Transport.(*task8Transport)
+	transport.events = events
+	transport.notify = make(chan PeerMessage, 8)
+	node, err := NewNode(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.afterAdvance = func(ReadyToken) { events.add("advance") }
+	runCtx := newTask8ObservableCancelContext()
+	runResult := make(chan error, 1)
+	go func() { runResult <- node.Run(runCtx) }()
+	joined := false
+	var releaseOnce sync.Once
+	defer func() {
+		releaseOnce.Do(func() { close(persistRelease) })
+		runCtx.finishCancellation()
+		if !joined {
+			<-runResult
+		}
+	}()
+	<-node.Ready()
+
+	entry := mustStorageEntry(t, 1, 1, "committed-before-cancel")
+	blockerResult := make(chan error, 1)
+	go func() {
+		blockerResult <- node.SubmitRPC(context.Background(), 2, AppendEntriesRequest{
+			LeaderID: 2, Term: 1, Generation: 1, LeaderCommit: 1, Entries: []Entry{entry},
+		})
+	}()
+	<-persistStarted
+	manual.Advance(5 * time.Second)
+	runCtx.observeCancellation()
+	releaseOnce.Do(func() { close(persistRelease) })
+
+	_ = task8RPCTo(t, transport.notify, 2, func(rpc RPC) bool { _, ok := rpc.(AppendEntriesResponse); return ok })
+	if err := <-blockerResult; err != nil {
+		t.Fatalf("already-started SubmitRPC error = %v", err)
+	}
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("Run cancellation error = %v", err)
+		}
+		joined = true
+	case message := <-transport.notify:
+		t.Fatalf("canceled owner emitted post-cancellation timer message %#v", message)
+	}
+	if got, want := events.snapshot(), []string{"recover", "restore", "persist", "handoff", "apply:1", "advance", "close"}; !equalStrings(got, want) {
+		t.Fatalf("timer cancellation effects = %v, want only the already-started Ready %v", got, want)
+	}
+}
+
+func TestNodeCancellationFinishesStartedCommitApplyResultAndAdvance(t *testing.T) {
+	events := &task8EventLog{}
+	options, store, machine, manual := task8NodeOptions(t, RecoveredState{})
+	store.events = events
+	machine.events = events
+	transport := options.Transport.(*task8Transport)
+	transport.events = events
+	transport.notify = make(chan PeerMessage, 64)
+	node, cancelNode, runResult := startAuthorizedTask8Node(t, options, manual, transport)
+	node.afterAdvance = func(ReadyToken) { events.add("advance") }
+	node.afterResult = func(ProposalID) { events.add("result") }
+
+	proposalResult := make(chan struct {
+		result ProposalResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := node.Propose(context.Background(), []byte("finish-after-cancel"))
+		proposalResult <- struct {
+			result ProposalResult
+			err    error
+		}{result: result, err: err}
+	}()
+	request := task8AppendRequestTo(t, transport.notify, 2, EntryCommand)
+	_ = task8AppendRequestTo(t, transport.notify, 3, EntryCommand)
+	if err := node.SubmitRPC(context.Background(), 99, PreVoteRequest{}); !errors.Is(err, ErrNotVoter) {
+		t.Fatalf("owner synchronization error = %v, want ErrNotVoter", err)
+	}
+
+	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
+	store.mu.Lock()
+	store.persistStarted = persistStarted
+	store.persistRelease = persistRelease
+	store.mu.Unlock()
+	events.clear()
+	commitResult := make(chan error, 1)
+	go func() { commitResult <- node.SubmitRPC(context.Background(), 2, appendSuccess(request, 2)) }()
+	<-persistStarted
+	cancelNode()
+	close(persistRelease)
+
+	completed := <-proposalResult
+	if completed.err != nil || completed.result.Index != 2 || completed.result.Term != 1 || string(completed.result.Result) != "result:2" {
+		t.Fatalf("proposal after node cancellation = (%#v,%v), want exact applied result", completed.result, completed.err)
+	}
+	if err := <-commitResult; err != nil {
+		t.Fatalf("already-started commit RPC error = %v", err)
+	}
+	if err := <-runResult; err != nil {
+		t.Fatalf("Run cancellation error = %v", err)
+	}
+	if got, want := events.snapshot(), []string{"persist", "apply:2", "result", "advance", "close"}; !equalStrings(got, want) {
+		t.Fatalf("started commit cancellation effects = %v, want %v", got, want)
+	}
 }
 
 func TestProposalAndBarrierCompleteOnlyAfterExactApplyAndAdvanceOrdering(t *testing.T) {
@@ -967,4 +1503,40 @@ func equalStrings(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func waitTask8QueuedEvents(t *testing.T, node *Node, want int) {
+	t.Helper()
+	for attempt := 0; attempt < 1_000_000; attempt++ {
+		if len(node.events) >= want {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("owner event queue length = %d, want at least %d", len(node.events), want)
+}
+
+func stoppedTask8ValidationNode(t *testing.T, state RecoveredState) *Node {
+	t.Helper()
+	options, _, _, _ := task8NodeOptions(t, state)
+	node, cancel, runResult := startTask8Follower(t, options)
+	stopTask8Node(t, cancel, runResult)
+	return node
+}
+
+func stoppedAuthorizedTask8ValidationNode(t *testing.T) *Node {
+	t.Helper()
+	options, _, _, manual := task8NodeOptions(t, RecoveredState{})
+	transport := options.Transport.(*task8Transport)
+	transport.notify = make(chan PeerMessage, 64)
+	node, cancel, runResult := startAuthorizedTask8Node(t, options, manual, transport)
+	stopTask8Node(t, cancel, runResult)
+	return node
+}
+
+func requireTask8InvalidReady(t *testing.T, node *Node, ready Ready, reason string) {
+	t.Helper()
+	if err := node.validateReady(ready); !errors.Is(err, ErrInvalidCoreState) {
+		t.Fatalf("%s: validateReady error = %v, want ErrInvalidCoreState", reason, err)
+	}
 }

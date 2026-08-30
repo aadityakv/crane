@@ -109,6 +109,7 @@ type pendingLocalRequest struct {
 // Node is the serialized owner of one local Raft core and application.
 type Node struct {
 	options NodeOptions
+	newCore func(CoreOptions) (*Core, error)
 
 	lifecycle atomic.Uint32
 	status    atomic.Value
@@ -117,9 +118,10 @@ type Node struct {
 	ready     chan struct{}
 	done      chan struct{}
 
-	core  *Core
-	timer clock.Timer
-	epoch time.Time
+	core         *Core
+	timer        clock.Timer
+	epoch        time.Time
+	durableState RecoveredState
 
 	pendingReservations atomic.Int64
 	pendingLocal        map[ProposalID]pendingLocalRequest
@@ -168,6 +170,7 @@ func NewNode(options NodeOptions) (*Node, error) {
 	}
 	node := &Node{
 		options: options,
+		newCore: NewCore,
 		events:  make(chan any, MaxNodeEventQueue),
 		ready:   make(chan struct{}),
 		done:    make(chan struct{}),
@@ -274,6 +277,9 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 			runErr = fmt.Errorf("close raft stable store: %w", closeErr)
 		}
 	}()
+	if ctx == nil || ctx.Err() != nil {
+		return nil
+	}
 
 	recovered, err := node.options.Store.Recover()
 	if err != nil {
@@ -285,13 +291,6 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 	if recovered.SnapshotBase.LastIncludedIndex != 0 || recovered.SnapshotBase.LastIncludedTerm != 0 || recovered.SnapshotBase.StateMachineSchemaVersion != 0 {
 		return fmt.Errorf("%w: recovered snapshot index=%d schema=%d", ErrSnapshotUnavailable, recovered.SnapshotBase.LastIncludedIndex, recovered.SnapshotBase.StateMachineSchemaVersion)
 	}
-	if err := node.options.StateMachine.Restore(0, cloneBytes(nil)); err != nil {
-		return fmt.Errorf("restore empty raft application base: %w", err)
-	}
-	if err := node.replayRecovered(recovered); err != nil {
-		return err
-	}
-
 	log, err := NewLog(
 		recovered.SnapshotBase.LastIncludedIndex,
 		recovered.SnapshotBase.LastIncludedTerm,
@@ -302,7 +301,7 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("build recovered raft log: %w", err)
 	}
-	node.core, err = NewCore(CoreOptions{
+	node.core, err = node.newCore(CoreOptions{
 		LocalID: node.options.LocalID, Voters: node.options.Voters,
 		HardState: recovered.HardState, Log: log, AppliedIndex: recovered.HardState.CommitIndex,
 		ElectionTimeoutMin: uint64(node.options.ElectionTimeoutMin),
@@ -313,6 +312,13 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 		Random:             node.options.Random,
 	})
 	if err != nil {
+		return err
+	}
+	node.durableState = recovered.Clone()
+	if err := node.options.StateMachine.Restore(0, cloneBytes(nil)); err != nil {
+		return fmt.Errorf("restore empty raft application base: %w", err)
+	}
+	if err := node.replayRecovered(recovered); err != nil {
 		return err
 	}
 	node.pendingLocal = make(map[ProposalID]pendingLocalRequest)
@@ -326,18 +332,27 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 	close(node.ready)
 
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-node.timer.C():
+			if ctx.Err() != nil {
+				return nil
+			}
 			now, tickErr := node.logicalNow()
 			if tickErr != nil {
 				return tickErr
 			}
+			if ctx.Err() != nil {
+				return nil
+			}
 			if tickErr = node.core.Tick(now); tickErr != nil {
 				return tickErr
 			}
-			if tickErr = node.drainReady(); tickErr != nil {
+			if tickErr = node.drainReady(ctx); tickErr != nil {
 				return tickErr
 			}
 			if tickErr = node.publishStatus(); tickErr != nil {
@@ -347,9 +362,17 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 		case rawEvent := <-node.events:
 			switch event := rawEvent.(type) {
 			case inboundRPCEvent:
+				if ctx.Err() != nil {
+					event.response <- ErrStopped
+					return nil
+				}
 				if event.ctx.Err() != nil {
 					event.response <- event.ctx.Err()
 					continue
+				}
+				if ctx.Err() != nil {
+					event.response <- ErrStopped
+					return nil
 				}
 				stepErr := node.core.Step(event.senderID, event.rpc)
 				if stepErr != nil {
@@ -359,7 +382,7 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 					event.response <- stepErr
 					continue
 				}
-				if stepErr = node.drainReady(); stepErr != nil {
+				if stepErr = node.drainReady(ctx); stepErr != nil {
 					return stepErr
 				}
 				if stepErr = node.publishStatus(); stepErr != nil {
@@ -372,10 +395,20 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 				node.resetTimer(now)
 				event.response <- nil
 			case localRequestEvent:
+				if ctx.Err() != nil {
+					node.releaseLocalReservation()
+					event.response <- localRequestResponse{err: ErrStopped}
+					return nil
+				}
 				if event.ctx.Err() != nil {
 					node.releaseLocalReservation()
 					event.response <- localRequestResponse{err: event.ctx.Err()}
 					continue
+				}
+				if ctx.Err() != nil {
+					node.releaseLocalReservation()
+					event.response <- localRequestResponse{err: ErrStopped}
+					return nil
 				}
 				proposalID, entry, proposalErr := node.core.proposeTracked(event.kind, event.command)
 				if proposalErr != nil {
@@ -384,7 +417,7 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 					continue
 				}
 				node.pendingLocal[proposalID] = pendingLocalRequest{entry: entry.Clone(), response: event.response}
-				if proposalErr = node.drainReady(); proposalErr != nil {
+				if proposalErr = node.drainReady(ctx); proposalErr != nil {
 					return proposalErr
 				}
 				if proposalErr = node.publishStatus(); proposalErr != nil {
@@ -396,13 +429,24 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 				}
 				node.resetTimer(now)
 			case leadershipRequestEvent:
+				if ctx.Err() != nil {
+					event.response <- leadershipRequestResponse{err: ErrStopped}
+					return nil
+				}
 				if event.ctx.Err() != nil {
 					event.response <- leadershipRequestResponse{err: event.ctx.Err()}
 					continue
 				}
+				if ctx.Err() != nil {
+					event.response <- leadershipRequestResponse{err: ErrStopped}
+					return nil
+				}
 				subscription, subscribeErr := node.addLeadershipSubscription(event.ctx, event.capacity)
 				event.response <- leadershipRequestResponse{subscription: subscription, err: subscribeErr}
 			case leadershipCancelEvent:
+				if ctx.Err() != nil {
+					return nil
+				}
 				if subscriber := node.subscribers[event.id]; subscriber != nil {
 					node.terminateLeadershipSubscriber(subscriber, event.err)
 				}
@@ -427,20 +471,21 @@ func (node *Node) replayRecovered(recovered RecoveredState) error {
 	return nil
 }
 
-func (node *Node) drainReady() error {
+func (node *Node) drainReady(ctx context.Context) error {
 	for {
 		ready, ok := node.core.Ready()
 		if !ok {
 			return node.core.Err()
 		}
-		if err := node.validateReady(ready); err != nil {
+		batch, prospectiveDurable, err := node.validateReadyAndDerive(ready)
+		if err != nil {
 			return err
 		}
-		batch := persistenceBatchForReady(ready)
-		if batch.HardState != nil || batch.ReplaceFrom != 0 {
+		if persistenceBatchHasEffects(batch) {
 			if err := node.options.Store.Persist(batch); err != nil {
 				return fmt.Errorf("persist raft Ready %d: %w", ready.Token, err)
 			}
+			node.durableState = prospectiveDurable
 		}
 		for _, message := range ready.Messages {
 			owned := PeerMessage{To: message.To, RPC: CloneRPC(message.RPC), Requires: message.Requires}
@@ -496,6 +541,9 @@ func (node *Node) drainReady() error {
 		if node.afterAdvance != nil {
 			node.afterAdvance(ready.Token)
 		}
+		if ctx.Err() != nil {
+			return nil
+		}
 	}
 }
 
@@ -512,7 +560,7 @@ func persistenceBatchForReady(ready Ready) PersistenceBatch {
 	return batch
 }
 
-func (node *Node) validateReady(ready Ready) error {
+func (node *Node) validateReadyStructure(ready Ready) error {
 	if ready.Token == 0 {
 		return ErrAdvanceToken
 	}

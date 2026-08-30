@@ -959,6 +959,9 @@ func (core *Core) issueAppend(peerID uint16) error {
 		matchIndex = request.Entries[len(request.Entries)-1].Index
 	}
 	requires := DurabilityPrerequisite{}
+	if core.pendingReady.HardState != nil {
+		requires.HardState = true
+	}
 	if len(request.Entries) != 0 && readyContainsEntry(core.pendingReady.Entries, request.Entries[len(request.Entries)-1].Index) {
 		requires.EntriesThrough = request.Entries[len(request.Entries)-1].Index
 	}
