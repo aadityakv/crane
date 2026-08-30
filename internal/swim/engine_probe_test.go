@@ -77,9 +77,10 @@ func TestEngineBeginProbeSelectsAlivePeerAndSchedulesDirectTimeout(t *testing.T)
 		t.Fatalf("outbound = %#v, want %#v", effects.Outbound, wantOutbound)
 	}
 	wantTimers := []TimerRequest{{
-		Kind:     TimerDirectProbe,
-		Sequence: 41,
-		Deadline: now.Add(300 * time.Millisecond),
+		Kind:      TimerDirectProbe,
+		Sequence:  41,
+		RequestID: requestID,
+		Deadline:  now.Add(300 * time.Millisecond),
 	}}
 	if !reflect.DeepEqual(effects.Timers, wantTimers) {
 		t.Fatalf("timers = %#v, want %#v", effects.Timers, wantTimers)
@@ -116,6 +117,34 @@ func TestEngineProbeSequencesStayNonzeroAndIncreasingAtSeedBoundary(t *testing.T
 	second := engine.BeginProbe(time.Time{}.Add(time.Second)).Outbound[0].Message.(Ping).Sequence
 	if first != math.MaxInt64 || second != uint64(math.MaxInt64)+1 {
 		t.Fatalf("sequences = %d, %d, want %d, %d", first, second, uint64(math.MaxInt64), uint64(math.MaxInt64)+1)
+	}
+}
+
+func TestEngineProductionProbeTimeoutRequiresCompleteProbeID(t *testing.T) {
+	self := Member{NodeID: 1, Status: Alive}
+	target := Member{NodeID: 2, Status: Alive}
+	engine := newTestEngineWithSelf(self)
+	mustMerge(t, engine.table, Update{Member: target, ReporterID: target.NodeID})
+	now := time.Date(2026, 8, 29, 14, 5, 0, 0, time.UTC)
+
+	first := engine.BeginProbe(now)
+	firstPing := first.Outbound[0].Message.(Ping)
+	engine.HandleAck(target, Ack{OriginID: self.NodeID, Sequence: firstPing.Sequence, RequestID: firstPing.RequestID}, now)
+	engine.nextSequence = firstPing.Sequence
+	second := engine.BeginProbe(now)
+	secondPing := second.Outbound[0].Message.(Ping)
+	if secondPing.RequestID == firstPing.RequestID {
+		t.Fatal("replacement probe reused request UUID")
+	}
+
+	if got := engine.HandleDirectTimeoutRequest(firstPing.ID(), now.Add(300*time.Millisecond)); !reflect.DeepEqual(got, Effects{}) {
+		t.Fatalf("stale complete probe timeout effects = %#v, want zero", got)
+	}
+	if probe := engine.activeProbes[secondPing.Sequence]; probe == nil || probe.phase != probeDirect {
+		t.Fatalf("replacement probe after stale timeout = %#v, want direct phase", probe)
+	}
+	if got := engine.HandleDirectTimeoutRequest(secondPing.ID(), now.Add(300*time.Millisecond)); len(got.Timers) != 1 || got.Timers[0].Kind != TimerIndirectProbe {
+		t.Fatalf("current complete probe timeout effects = %#v, want indirect phase", got)
 	}
 }
 
@@ -166,9 +195,10 @@ func TestEngineProbeDirectTimeoutSelectsDistinctRelaysAndIgnoresDuplicate(t *tes
 		}
 	}
 	wantTimers := []TimerRequest{{
-		Kind:     TimerIndirectProbe,
-		Sequence: ping.Sequence,
-		Deadline: now.Add(time.Second),
+		Kind:      TimerIndirectProbe,
+		Sequence:  ping.Sequence,
+		RequestID: ping.RequestID,
+		Deadline:  now.Add(time.Second),
 	}}
 	if !reflect.DeepEqual(effects.Timers, wantTimers) {
 		t.Fatalf("timers = %#v, want %#v", effects.Timers, wantTimers)

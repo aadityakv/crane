@@ -17,6 +17,27 @@ import (
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
+func TestProtocolClientDialUsesConfiguredIOTimeout(t *testing.T) {
+	configuration := config.NodeConfig{NodeID: 1, ClusterID: testClusterID, Timing: config.DefaultTimingConfig()}
+	client, err := newProtocolClient(configuration, wire.NewHMACAuthenticator(testServiceKey()), clock.NewManual(time.Unix(4455, 0)), random.NewLockedSource(194), 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.dialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	started := time.Now()
+	_, _, _, err = client.dial(context.Background(), config.Endpoint{Host: "192.0.2.1", Port: 12002})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dial error = %v, want configured deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("configured 20ms dial timeout took %s", elapsed)
+	}
+}
+
 func TestSnapshotClientInvalidResponseCannotPoisonReplayCapacity(t *testing.T) {
 	now := time.Unix(4460, 0)
 	configuration := serviceTestConfig(t, 1)
@@ -110,7 +131,10 @@ func TestInternalSnapshotResyncRejectsUnexpectedFirstResponderBeforeReplayAccept
 				workerContext: workerContext,
 				workers:       &workers,
 				resyncing:     make(map[uint16]bool),
+				resyncJobs:    make(chan snapshotResyncJob, serviceResyncQueueSize),
+				beginSnapshot: client.beginSnapshot,
 			}
+			loop.startSnapshotResyncWorkers()
 			expected := Member{NodeID: 2, Host: endpoint.Host, BasePort: endpoint.Port - 2, Incarnation: 1, Status: Alive}
 
 			loop.startSnapshotResync(expected)
@@ -126,6 +150,7 @@ func TestInternalSnapshotResyncRejectsUnexpectedFirstResponderBeforeReplayAccept
 				t.Fatalf("valid expected response after unexpected %s = %#v", test.name, second)
 			}
 			second.applied <- ErrSnapshotProtocol
+			cancelWorkers()
 			workers.Wait()
 		})
 	}

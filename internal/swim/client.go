@@ -82,6 +82,7 @@ type protocolClient struct {
 	requestPrefix uint64
 	requestCount  uint64
 	addresses     *addressMatcher
+	dialContext   func(context.Context, string, string) (net.Conn, error)
 }
 
 type joinClientResult struct {
@@ -125,6 +126,7 @@ func newProtocolClientWithAddressMatcher(configuration config.NodeConfig, authen
 	}
 	limits := wire.DefaultLimits()
 	limits.ExpectedClusterID = &clusterID
+	dialer := &net.Dialer{Timeout: ioTimeout}
 	return &protocolClient{
 		clusterID:     clusterID,
 		senderID:      configuration.NodeID,
@@ -136,6 +138,7 @@ func newProtocolClientWithAddressMatcher(configuration config.NodeConfig, authen
 		requestPrefix: source.Uint64(),
 		requestCount:  source.Uint64(),
 		addresses:     addresses,
+		dialContext:   dialer.DialContext,
 	}, nil
 }
 
@@ -301,7 +304,9 @@ func (c *protocolClient) dial(ctx context.Context, endpoint config.Endpoint) (*w
 	if endpoint.Host == "" || endpoint.Port == 0 {
 		return nil, config.Endpoint{}, func() {}, fmt.Errorf("%w: invalid snapshot endpoint %s", ErrSnapshotProtocol, endpoint)
 	}
-	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", endpoint.String())
+	dialContext, cancelDial := context.WithTimeout(ctx, c.ioTimeout)
+	defer cancelDial()
+	connection, err := c.dialContext(dialContext, "tcp", endpoint.String())
 	if err != nil {
 		return nil, config.Endpoint{}, func() {}, fmt.Errorf("dial SWIM snapshot %s: %w", endpoint, err)
 	}

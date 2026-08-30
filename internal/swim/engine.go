@@ -125,11 +125,23 @@ func (e *Engine) BeginProbe(now time.Time) Effects {
 			Message: Ping{OriginID: e.config.SelfID, Sequence: sequence, RequestID: requestID},
 		}},
 		Timers: []TimerRequest{{
-			Kind:     TimerDirectProbe,
-			Sequence: sequence,
-			Deadline: now.Add(e.config.DirectProbeTimeout),
+			Kind:      TimerDirectProbe,
+			Sequence:  sequence,
+			RequestID: requestID,
+			Deadline:  now.Add(e.config.DirectProbeTimeout),
 		}},
 	}
+}
+
+// HandleDirectTimeoutRequest advances only the exact production probe UUID
+// generation named by id. This prevents a late timer from crossing a wrapped
+// or deliberately reused sequence number.
+func (e *Engine) HandleDirectTimeoutRequest(id ProbeID, now time.Time) Effects {
+	probe, exists := e.activeProbes[id.Sequence]
+	if !exists || probe.id != id {
+		return Effects{}
+	}
+	return e.HandleDirectTimeout(id.Sequence, now)
 }
 
 // HandleDirectTimeout advances a still-current direct probe generation into
@@ -165,9 +177,10 @@ func (e *Engine) HandleDirectTimeout(sequence uint64, now time.Time) Effects {
 	return Effects{
 		Outbound: outbound,
 		Timers: []TimerRequest{{
-			Kind:     TimerIndirectProbe,
-			Sequence: sequence,
-			Deadline: now.Add(e.config.IndirectProbeTimeout),
+			Kind:      TimerIndirectProbe,
+			Sequence:  sequence,
+			RequestID: probe.id.RequestID,
+			Deadline:  now.Add(e.config.IndirectProbeTimeout),
 		}},
 	}
 }
@@ -328,6 +341,16 @@ func (e *Engine) HandleIndirectTimeout(sequence uint64, now time.Time) Effects {
 	suspect := current
 	suspect.Status = Suspect
 	return e.ApplyUpdate(Update{Member: suspect, ReporterID: e.config.SelfID}, now)
+}
+
+// HandleIndirectTimeoutRequest consumes only the exact production probe UUID
+// generation named by id.
+func (e *Engine) HandleIndirectTimeoutRequest(id ProbeID, now time.Time) Effects {
+	probe, exists := e.activeProbes[id.Sequence]
+	if !exists || probe.id != id {
+		return Effects{}
+	}
+	return e.HandleIndirectTimeout(id.Sequence, now)
 }
 
 // Snapshot returns the engine owner's immutable, sorted membership view.

@@ -27,6 +27,8 @@ const (
 	serviceFutureSkew       = 30 * time.Second
 	serviceTCPConnections   = 64
 	serviceTCPIOTimeout     = 5 * time.Second
+	serviceResyncWorkers    = 4
+	serviceResyncQueueSize  = 64
 )
 
 var (
@@ -335,6 +337,8 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 		stopWorkers()
 		return err
 	}
+	loop.beginSnapshot = loop.client.beginSnapshot
+	loop.resyncJobs = make(chan snapshotResyncJob, serviceResyncQueueSize)
 	defer loop.subscriptions.Close()
 
 	seed, err := config.ParseEndpoint(s.options.Config.Introducer)
@@ -366,6 +370,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 		loop.refreshActiveMembership()
 	}
 
+	loop.startSnapshotResyncWorkers()
 	workers.Add(1)
 	go s.receiveDatagrams(workerContext, datagram, &workers)
 	workers.Add(1)
@@ -499,6 +504,13 @@ type snapshotResyncServiceEvent struct {
 
 func (snapshotResyncServiceEvent) serviceEvent() {}
 
+type snapshotResyncJob struct {
+	sender   Member
+	endpoint config.Endpoint
+}
+
+type beginSnapshotFunc func(context.Context, config.Endpoint, uint16) (*pendingSnapshot, error)
+
 type snapshotServedServiceEvent struct {
 	requester        Member
 	digestGeneration uint64
@@ -522,9 +534,14 @@ type serviceLoop struct {
 	requestCount       uint64
 	membershipRevision uint64
 	resyncing          map[uint16]bool
+	resyncJobs         chan snapshotResyncJob
+	beginSnapshot      beginSnapshotFunc
+	timerScheduler     serviceTimerScheduler
+	clockTimer         clock.Timer
 }
 
 func (l *serviceLoop) run(parent context.Context) error {
+	defer l.stopClockTimer()
 	for {
 		select {
 		case event := <-l.service.events:
@@ -571,6 +588,10 @@ func (l *serviceLoop) run(parent context.Context) error {
 				}
 			case snapshotServedServiceEvent:
 				l.handleSnapshotServed(event)
+			}
+		case <-l.timerChannel():
+			if err := l.dispatchDueTimers(); err != nil {
+				return err
 			}
 		case <-parent.Done():
 			if l.admitted {
@@ -1060,10 +1081,16 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 		effects = l.engine.HandlePing(sender, message.Ping, now)
 	case AckMessage:
 		effects = l.engine.HandleAck(sender, message.Ack, now)
+		if message.Ack.OriginID == l.service.options.Config.NodeID {
+			l.cancelClockEvent(serviceTimerKeyFor(TimerRequest{Kind: TimerDirectProbe, Sequence: message.Ack.Sequence, RequestID: message.Ack.RequestID}))
+		} else {
+			l.cancelClockEvent(serviceTimerKeyFor(TimerRequest{Kind: TimerRelayProbe, OriginID: message.Ack.OriginID, Sequence: message.Ack.Sequence, RequestID: message.Ack.RequestID}))
+		}
 	case PingReqMessage:
 		effects = l.engine.HandlePingReq(sender, message.PingReq, now)
 	case IndirectAckMessage:
 		effects = l.engine.HandleIndirectAck(sender, message.IndirectAck, now)
+		l.cancelClockEvent(serviceTimerKeyFor(TimerRequest{Kind: TimerDirectProbe, Sequence: message.IndirectAck.Sequence, RequestID: message.IndirectAck.RequestID}))
 	case GossipMessage:
 		return nil
 	case DigestMessage:
@@ -1141,31 +1168,57 @@ func (l *serviceLoop) startSnapshotResync(sender Member) {
 		return
 	}
 	l.resyncing[sender.NodeID] = true
-	l.workers.Add(1)
-	go func() {
-		defer l.workers.Done()
-		pending, err := l.client.beginSnapshot(l.workerContext, endpoint, sender.NodeID)
-		if err != nil {
-			l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, err: err})
-			return
-		}
-		defer pending.close()
-		if pending.senderID != sender.NodeID {
-			l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, err: fmt.Errorf("%w: snapshot responder %d, expected %d", ErrSnapshotProtocol, pending.senderID, sender.NodeID)})
-			return
-		}
-		applied := make(chan error, 1)
-		if !l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: sender, members: pending.members, floors: pending.floors, applied: applied}) {
-			return
-		}
-		select {
-		case applyError := <-applied:
-			if applyError == nil {
-				_ = pending.acknowledge(l.workerContext)
+	job := snapshotResyncJob{sender: sender, endpoint: endpoint}
+	select {
+	case l.resyncJobs <- job:
+	default:
+		delete(l.resyncing, sender.NodeID)
+	}
+}
+
+func (l *serviceLoop) startSnapshotResyncWorkers() {
+	for range serviceResyncWorkers {
+		l.workers.Add(1)
+		go func() {
+			defer l.workers.Done()
+			for {
+				select {
+				case job := <-l.resyncJobs:
+					l.runSnapshotResync(job)
+				case <-l.workerContext.Done():
+					return
+				}
 			}
-		case <-l.workerContext.Done():
+		}()
+	}
+}
+
+func (l *serviceLoop) runSnapshotResync(job snapshotResyncJob) {
+	pending, err := l.beginSnapshot(l.workerContext, job.endpoint, job.sender.NodeID)
+	if err != nil {
+		l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: job.sender, err: err})
+		return
+	}
+	if pending == nil {
+		l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: job.sender, err: fmt.Errorf("%w: nil snapshot response", ErrSnapshotProtocol)})
+		return
+	}
+	defer pending.close()
+	if pending.senderID != job.sender.NodeID {
+		l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: job.sender, err: fmt.Errorf("%w: snapshot responder %d, expected %d", ErrSnapshotProtocol, pending.senderID, job.sender.NodeID)})
+		return
+	}
+	applied := make(chan error, 1)
+	if !l.service.enqueueWorkerEvent(l.workerContext, snapshotResyncServiceEvent{sender: job.sender, members: pending.members, floors: pending.floors, applied: applied}) {
+		return
+	}
+	select {
+	case applyError := <-applied:
+		if applyError == nil {
+			_ = pending.acknowledge(l.workerContext)
 		}
-	}()
+	case <-l.workerContext.Done():
+	}
 }
 
 func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) error {
@@ -1225,9 +1278,9 @@ func (l *serviceLoop) handleTimer(event timerServiceEvent) error {
 	var effects Effects
 	switch request.Kind {
 	case TimerDirectProbe:
-		effects = l.engine.HandleDirectTimeout(request.Sequence, now)
+		effects = l.engine.HandleDirectTimeoutRequest(ProbeID{Sequence: request.Sequence, RequestID: request.RequestID}, now)
 	case TimerIndirectProbe:
-		effects = l.engine.HandleIndirectTimeout(request.Sequence, now)
+		effects = l.engine.HandleIndirectTimeoutRequest(ProbeID{Sequence: request.Sequence, RequestID: request.RequestID}, now)
 	case TimerRelayProbe:
 		effects = l.engine.HandleRelayTimeoutRequest(request.OriginID, request.Sequence, request.RequestID, now)
 	case TimerSuspicion:
@@ -1244,6 +1297,18 @@ func (l *serviceLoop) executeEffects(ctx context.Context, effects Effects) error
 	if effects.PersistIncarnation != nil {
 		if err := l.service.options.Store.Store(*effects.PersistIncarnation); err != nil {
 			return fmt.Errorf("persist SWIM incarnation %d: %w", *effects.PersistIncarnation, err)
+		}
+	}
+	for _, event := range effects.Events {
+		nodeID := event.Current.NodeID
+		switch event.Current.Status {
+		case Alive:
+			l.cancelClockEvent(serviceTimerKeyFor(TimerRequest{Kind: TimerSuspicion, NodeID: nodeID}))
+			l.cancelClockEvent(serviceTimerKeyFor(TimerRequest{Kind: TimerTombstone, NodeID: nodeID}))
+		case Suspect:
+			l.cancelClockEvent(serviceTimerKeyFor(TimerRequest{Kind: TimerTombstone, NodeID: nodeID}))
+		case Dead, Left:
+			l.cancelClockEvent(serviceTimerKeyFor(TimerRequest{Kind: TimerSuspicion, NodeID: nodeID}))
 		}
 	}
 	for _, timer := range effects.Timers {
@@ -1389,29 +1454,11 @@ func datagramMessageDescriptor(message any) (wire.MessageType, config.Service, f
 
 func (l *serviceLoop) scheduleProbe() {
 	deadline := l.service.options.Clock.Now().Add(time.Duration(l.service.options.Config.Timing.ProbeInterval))
-	l.scheduleClockEvent(deadline, timerServiceEvent{probe: true})
+	l.scheduleClockEvent(probeCycleTimerKey(), deadline, timerServiceEvent{probe: true})
 }
 
 func (l *serviceLoop) scheduleTimer(request TimerRequest) {
-	l.scheduleClockEvent(request.Deadline, timerServiceEvent{request: request})
-}
-
-func (l *serviceLoop) scheduleClockEvent(deadline time.Time, event timerServiceEvent) {
-	duration := deadline.Sub(l.service.options.Clock.Now())
-	if duration < 0 {
-		duration = 0
-	}
-	timer := l.service.options.Clock.NewTimer(duration)
-	l.workers.Add(1)
-	go func() {
-		defer l.workers.Done()
-		defer timer.Stop()
-		select {
-		case <-timer.C():
-			l.service.enqueueWorkerEvent(l.workerContext, event)
-		case <-l.workerContext.Done():
-		}
-	}()
+	l.scheduleClockEvent(serviceTimerKeyFor(request), request.Deadline, timerServiceEvent{request: request})
 }
 
 func (l *serviceLoop) refreshActiveMembership() {

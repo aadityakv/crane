@@ -324,6 +324,33 @@ func TestSimulationManualTimerStateRemainsBounded(t *testing.T) {
 	}
 }
 
+func TestServiceTimerReplacementUsesOneLiveClockTimer(t *testing.T) {
+	manualClock := clock.NewManual(time.Unix(8075, 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	var workers sync.WaitGroup
+	service := &Service{options: ServiceOptions{Clock: manualClock}, events: make(chan serviceEvent, 1), done: make(chan struct{})}
+	loop := &serviceLoop{service: service, workerContext: ctx, workers: &workers}
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
+
+	for replacement := 0; replacement < 5_000; replacement++ {
+		loop.scheduleTimer(TimerRequest{
+			Kind:        TimerSuspicion,
+			NodeID:      9,
+			Incarnation: uint64(replacement + 1),
+			Deadline:    manualClock.Now().Add(time.Duration(replacement+1) * time.Millisecond),
+		})
+	}
+	if got := manualClock.PendingTimers(); got != 1 {
+		t.Fatalf("live clock timers after 5,000 keyed replacements = %d, want 1", got)
+	}
+	if got := runtime.NumGoroutine(); got > 100 {
+		t.Fatalf("timer replacement spawned unbounded goroutines: %d", got)
+	}
+}
+
 func TestSimulationUnexpectedDatagramClosureFailsService(t *testing.T) {
 	network := transport.NewMemoryNetwork()
 	configuration := serviceTestConfig(t, 1)
