@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -552,6 +553,93 @@ func TestServiceProbeFrameRequestUUIDMatchesPayload(t *testing.T) {
 	}
 	if frames[0].Header.RequestID != requestID || payload.Ping.RequestID != requestID {
 		t.Fatalf("frame request ID=%x payload request ID=%x want=%x", frames[0].Header.RequestID, payload.Ping.RequestID, requestID)
+	}
+}
+
+func TestServiceFanoutPrioritizesAliveWithoutChargingSuspects(t *testing.T) {
+	now := time.Unix(2095, 0)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	configuration := config.NodeConfig{NodeID: 1, BindHost: "127.0.0.1", BasePort: 11000}
+	self := Member{NodeID: 1, Host: "127.0.0.1", BasePort: 11000, Incarnation: 1, Status: Alive}
+	suspectLow := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Suspect}
+	suspectHigh := Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Suspect}
+	healthy := Member{NodeID: 9, Host: "127.0.0.9", BasePort: 19000, Incarnation: 1, Status: Alive}
+	table := NewTable()
+	for _, member := range []Member{self, suspectLow, suspectHigh, healthy} {
+		mustMerge(t, table, Update{Member: member, ReporterID: member.NodeID})
+	}
+	dissemination := NewDisseminator(8, 1)
+	update := Update{Member: Member{NodeID: 10, Host: "127.0.0.10", BasePort: 20000, Incarnation: 1, Status: Alive}, ReporterID: self.NodeID}
+	dissemination.Enqueue(update, 2)
+	engine := &Engine{table: table, dissemination: dissemination}
+	datagram := &capturingSourceDatagram{}
+	service := &Service{
+		options:   ServiceOptions{Config: configuration, Authenticator: authenticator, Clock: clock.NewManual(now)},
+		clusterID: decodedTestClusterID(t, testClusterID),
+		limits:    wire.DefaultLimits(),
+	}
+	loop := &serviceLoop{service: service, engine: engine, dissemination: dissemination, datagram: datagram}
+	loop.refreshActiveMembership()
+	if err := loop.sendGossipRound(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	sends := datagram.snapshot()
+	if len(sends) != 3 {
+		t.Fatalf("fanout sends = %d, want 3", len(sends))
+	}
+	healthyDestination, _ := (config.NodeConfig{AdvertiseHost: healthy.Host, BasePort: healthy.BasePort}).AdvertiseEndpoint(config.ServiceSWIMPing)
+	if sends[0].destination != healthyDestination {
+		t.Fatalf("first fanout destination = %s, want healthy %s", sends[0].destination, healthyDestination)
+	}
+	frame, err := wire.Decode(sends[0].payload, authenticator, wire.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gossip GossipMessage
+	if err := wire.DecodeGob(frame.Payload, &gossip); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gossip.Updates, []Update{update}) {
+		t.Fatalf("healthy gossip updates = %#v, want %#v", gossip.Updates, []Update{update})
+	}
+	remaining, err := dissemination.Peek(1, 2, countEncoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(remaining.Updates, []Update{update}) {
+		t.Fatalf("pending update after suspect repair = %#v, want one healthy-budget remainder", remaining.Updates)
+	}
+}
+
+func TestServiceFailedDatagramDoesNotCommitDissemination(t *testing.T) {
+	now := time.Unix(2097, 0)
+	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	configuration := config.NodeConfig{NodeID: 1, BindHost: "127.0.0.1", BasePort: 11000}
+	self := Member{NodeID: 1, Host: "127.0.0.1", BasePort: 11000, Incarnation: 2, Status: Left}
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	table := NewTable()
+	mustMerge(t, table, Update{Member: self, ReporterID: self.NodeID})
+	mustMerge(t, table, Update{Member: peer, ReporterID: peer.NodeID})
+	dissemination := NewDisseminator(8, 1)
+	update := Update{Member: Member{NodeID: 3, Host: "127.0.0.3", BasePort: 13000, Incarnation: 1, Status: Alive}, ReporterID: peer.NodeID}
+	dissemination.Enqueue(update, 1)
+	service := &Service{
+		options:   ServiceOptions{Config: configuration, Authenticator: authenticator, Clock: clock.NewManual(now)},
+		clusterID: decodedTestClusterID(t, testClusterID),
+		limits:    wire.DefaultLimits(),
+	}
+	delivery := &capturingSourceDatagram{failure: errors.New("injected send failure")}
+	loop := &serviceLoop{service: service, engine: &Engine{table: table}, dissemination: dissemination, datagram: delivery}
+	if delivered, err := loop.sendMessage(context.Background(), peer, GossipMessage{}); err != nil || delivered {
+		t.Fatalf("failed send delivered=%v error=%v, want false and nil", delivered, err)
+	}
+	remaining, err := dissemination.Peek(1, 1, countEncoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(remaining.Updates, []Update{update}) {
+		t.Fatalf("pending updates after failed send = %#v, want %#v", remaining.Updates, []Update{update})
 	}
 }
 
@@ -1872,6 +1960,47 @@ type observingDatagram struct {
 	violation atomic.Bool
 }
 
+type capturedSourceDatagramSend struct {
+	destination config.Endpoint
+	payload     []byte
+}
+
+type capturingSourceDatagram struct {
+	mu      sync.Mutex
+	sends   []capturedSourceDatagramSend
+	failure error
+}
+
+func (d *capturingSourceDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
+	return d.SendFrom(ctx, config.Endpoint{}, destination, payload)
+}
+
+func (d *capturingSourceDatagram) SendFrom(ctx context.Context, _ config.Endpoint, destination config.Endpoint, payload []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.sends = append(d.sends, capturedSourceDatagramSend{destination: destination, payload: append([]byte(nil), payload...)})
+	failure := d.failure
+	d.mu.Unlock()
+	return failure
+}
+
+func (d *capturingSourceDatagram) Receive(ctx context.Context) (transport.Packet, error) {
+	<-ctx.Done()
+	return transport.Packet{}, ctx.Err()
+}
+
+func (*capturingSourceDatagram) Close() error { return nil }
+
+func (d *capturingSourceDatagram) snapshot() []capturedSourceDatagramSend {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	result := make([]capturedSourceDatagramSend, len(d.sends))
+	copy(result, d.sends)
+	return result
+}
+
 func (d *observingDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
 	d.observeSend()
 	return d.Datagram.Send(ctx, destination, payload)
@@ -1944,7 +2073,7 @@ func startPersistenceService(t *testing.T, store *barrierServiceStore) *persiste
 	}
 	network.Advance()
 	waitForSnapshot(t, service, func(members []Member) bool { return len(members) == 2 && members[1] == peer })
-	network.Advance()
+	settleMemoryServices(network, service)
 	return &persistenceHarness{
 		service:       service,
 		network:       network,

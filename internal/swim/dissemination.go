@@ -37,6 +37,19 @@ type disseminationItem struct {
 	transmissions int
 }
 
+type disseminationToken struct {
+	nodeID   uint16
+	sequence uint64
+}
+
+// DisseminationBatch is a non-mutating encoded-size selection. The owner calls
+// Commit only after the datagram carrying Updates succeeds to a healthy peer.
+type DisseminationBatch struct {
+	Updates []Update
+	tokens  []disseminationToken
+	budget  int
+}
+
 // NewDisseminator returns an empty bounded dissemination queue. Non-positive
 // bounds disable admission; a later valid Enqueue then sets DigestRequired.
 func NewDisseminator(maxItems int, retransmitMultiplier int) *Disseminator {
@@ -105,14 +118,26 @@ func (d *Disseminator) markDigestRepaired(generation uint64) bool {
 // maxBytes. Only updates in a successfully encoded returned prefix count as
 // transmissions. A zero byte limit still performs exhaustion cleanup.
 func (d *Disseminator) Take(maxBytes int, aliveMembers int, encode func([]Update) ([]byte, error)) ([]Update, error) {
+	batch, err := d.Peek(maxBytes, aliveMembers, encode)
+	if err != nil {
+		return nil, err
+	}
+	d.Commit(batch)
+	return batch.Updates, nil
+}
+
+// Peek removes already exhausted items and returns a size-bounded selection
+// without charging any retransmission. The returned batch remains safe to
+// commit after newer state replaces one or more selected items.
+func (d *Disseminator) Peek(maxBytes int, aliveMembers int, encode func([]Update) ([]byte, error)) (DisseminationBatch, error) {
 	if maxBytes < 0 {
-		return nil, ErrInvalidByteBudget
+		return DisseminationBatch{}, ErrInvalidByteBudget
 	}
 	if encode == nil {
-		return nil, ErrNilBatchEncoder
+		return DisseminationBatch{}, ErrNilBatchEncoder
 	}
 	if len(d.items) == 0 {
-		return []Update{}, nil
+		return DisseminationBatch{Updates: []Update{}}, nil
 	}
 
 	currentBudget := RetransmitBudget(d.retransmitMultiplier, aliveMembers)
@@ -125,7 +150,7 @@ func (d *Disseminator) Take(maxBytes int, aliveMembers int, encode func([]Update
 		candidates = append(candidates, item)
 	}
 	if maxBytes == 0 || len(candidates) == 0 {
-		return []Update{}, nil
+		return DisseminationBatch{Updates: []Update{}, budget: currentBudget}, nil
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
@@ -143,7 +168,7 @@ func (d *Disseminator) Take(maxBytes int, aliveMembers int, encode func([]Update
 		trial := append(selected, item.update)
 		encoded, err := encode(append([]Update(nil), trial...))
 		if err != nil {
-			return nil, fmt.Errorf("encode dissemination batch: %w", err)
+			return DisseminationBatch{}, fmt.Errorf("encode dissemination batch: %w", err)
 		}
 		if len(encoded) > maxBytes {
 			break
@@ -151,14 +176,30 @@ func (d *Disseminator) Take(maxBytes int, aliveMembers int, encode func([]Update
 		selected = trial
 	}
 
+	tokens := make([]disseminationToken, 0, len(selected))
 	for _, update := range selected {
 		item := d.items[update.Member.NodeID]
+		tokens = append(tokens, disseminationToken{nodeID: update.Member.NodeID, sequence: item.sequence})
+	}
+	return DisseminationBatch{Updates: selected, tokens: tokens, budget: currentBudget}, nil
+}
+
+// Commit charges one successful healthy delivery for every still-current item
+// selected by batch. Replaced items are ignored by sequence.
+func (d *Disseminator) Commit(batch DisseminationBatch) {
+	if batch.budget <= 0 {
+		return
+	}
+	for _, token := range batch.tokens {
+		item, exists := d.items[token.nodeID]
+		if !exists || item.sequence != token.sequence {
+			continue
+		}
 		item.transmissions++
-		if item.transmissions >= currentBudget {
-			delete(d.items, update.Member.NodeID)
+		if item.transmissions >= batch.budget {
+			delete(d.items, token.nodeID)
 		}
 	}
-	return selected, nil
 }
 
 // RetransmitBudget returns multiplier*ceil(log2(aliveMembers+1)). Invalid

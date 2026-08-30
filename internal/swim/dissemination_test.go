@@ -8,6 +8,35 @@ import (
 	"testing"
 )
 
+func TestDisseminatorPeekRequiresExplicitSuccessfulCommit(t *testing.T) {
+	d := NewDisseminator(1, 1)
+	update := updateFor(2, 1, Alive)
+	d.Enqueue(update, 1)
+
+	batch, err := d.Peek(1, 1, countEncoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(batch.Updates, []Update{update}) {
+		t.Fatalf("peeked updates = %#v, want %#v", batch.Updates, []Update{update})
+	}
+	retry, err := d.Peek(1, 1, countEncoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retry.Updates, []Update{update}) {
+		t.Fatalf("uncommitted retry = %#v, want %#v", retry.Updates, []Update{update})
+	}
+	d.Commit(batch)
+	afterCommit, err := d.Peek(1, 1, countEncoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterCommit.Updates) != 0 {
+		t.Fatalf("updates after successful commit = %#v, want empty", afterCommit.Updates)
+	}
+}
+
 func TestDisseminatorPrioritizesAndBoundsEncodedBatch(t *testing.T) {
 	d := NewDisseminator(32, 3)
 	d.Enqueue(updateFor(2, 1, Alive), 8)

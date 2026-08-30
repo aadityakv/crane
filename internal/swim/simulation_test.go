@@ -117,6 +117,91 @@ func TestSimulationGracefulLeaveSendsOneRetransmitBudget(t *testing.T) {
 	second.stop(t)
 }
 
+func TestGracefulLeaveRetriesAfterNoProgressUntilClockBackoff(t *testing.T) {
+	now := time.Unix(5125, 0)
+	manualClock := clock.NewManual(now)
+	self := Member{NodeID: 1, Host: "127.0.0.1", BasePort: 11000, Incarnation: 1, Status: Alive}
+	peer := Member{NodeID: 2, Host: "127.0.0.2", BasePort: 12000, Incarnation: 1, Status: Alive}
+	table := NewTable()
+	mustMerge(t, table, Update{Member: self, ReporterID: self.NodeID})
+	mustMerge(t, table, Update{Member: peer, ReporterID: peer.NodeID})
+	dissemination := NewDisseminator(16, serviceRetransmitFactor)
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       1,
+		SuspicionMultiplier:  5,
+	}, table, dissemination, random.NewLockedSource(311))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := &retryingLeaveDatagram{failures: 2, calls: make(chan int, 32)}
+	service := &Service{
+		options: ServiceOptions{
+			Config:        config.NodeConfig{NodeID: self.NodeID, BindHost: self.Host, BasePort: self.BasePort},
+			Authenticator: wire.NewHMACAuthenticator(testServiceKey()),
+			Clock:         manualClock,
+			Store:         newServiceStore(1),
+		},
+		clusterID: decodedTestClusterID(t, testClusterID),
+		limits:    wire.DefaultLimits(),
+		addresses: newAddressMatcherWithClock(nil, manualClock),
+	}
+	loop := &serviceLoop{
+		service:       service,
+		engine:        engine,
+		dissemination: dissemination,
+		subscriptions: NewSubscriptions(),
+		datagram:      delivery,
+		runContext:    context.Background(),
+		admitted:      true,
+	}
+	defer loop.subscriptions.Close()
+	result := make(chan error, 1)
+	go func() { result <- loop.gracefulLeave() }()
+	for call := 1; call <= 2; call++ {
+		select {
+		case got := <-delivery.calls:
+			if got != call {
+				t.Fatalf("leave send call = %d, want %d", got, call)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for leave send %d", call)
+		}
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("graceful leave returned after one no-progress pass: %v", err)
+	default:
+	}
+	retryTimerDeadline := time.Now().Add(time.Second)
+	for manualClock.PendingTimers() < 3 && time.Now().Before(retryTimerDeadline) {
+		select {
+		case err := <-result:
+			t.Fatalf("graceful leave returned before retry timer: %v", err)
+		default:
+			runtime.Gosched()
+		}
+	}
+	if got := manualClock.PendingTimers(); got < 3 {
+		t.Fatalf("pending timers before retry = %d, want scheduler, leave deadline, and backoff", got)
+	}
+	manualClock.Advance(100 * time.Millisecond)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("graceful leave retry error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("graceful leave did not resume after injected-clock backoff")
+	}
+	if got, want := delivery.count(), 2+RetransmitBudget(serviceRetransmitFactor, 2); got != want {
+		t.Fatalf("leave send attempts = %d, want two failures plus budget %d", got, want)
+	}
+}
+
 func TestSimulationDirectProbeSuccess(t *testing.T) {
 	cluster := newSimulationCluster(t, 3)
 	cluster.clearRecordings()
@@ -1018,6 +1103,46 @@ type contextBlockingDatagram struct {
 	closeOnce sync.Once
 	mu        sync.Mutex
 	sends     int
+}
+
+type retryingLeaveDatagram struct {
+	mu       sync.Mutex
+	failures int
+	attempts int
+	calls    chan int
+}
+
+func (d *retryingLeaveDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
+	return d.SendFrom(ctx, config.Endpoint{}, destination, payload)
+}
+
+func (d *retryingLeaveDatagram) SendFrom(ctx context.Context, _ config.Endpoint, _ config.Endpoint, _ []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.attempts++
+	call := d.attempts
+	fail := call <= d.failures
+	d.mu.Unlock()
+	d.calls <- call
+	if fail {
+		return errors.New("injected transient send failure")
+	}
+	return nil
+}
+
+func (*retryingLeaveDatagram) Receive(ctx context.Context) (transport.Packet, error) {
+	<-ctx.Done()
+	return transport.Packet{}, ctx.Err()
+}
+
+func (*retryingLeaveDatagram) Close() error { return nil }
+
+func (d *retryingLeaveDatagram) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.attempts
 }
 
 func newContextBlockingDatagram() *contextBlockingDatagram {

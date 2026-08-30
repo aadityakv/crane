@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,7 @@ const (
 	serviceResyncQueueSize  = 64
 	serviceSendWorkers      = 4
 	serviceSendQueueSize    = 4096
+	serviceLeaveRetryDelay  = 100 * time.Millisecond
 )
 
 var (
@@ -468,7 +470,17 @@ type datagramSendJob struct {
 	source      config.Endpoint
 	destination config.Endpoint
 	payload     []byte
+	recipient   Member
+	batch       DisseminationBatch
 }
+
+type datagramSendCompletedServiceEvent struct {
+	recipient Member
+	batch     DisseminationBatch
+	err       error
+}
+
+func (datagramSendCompletedServiceEvent) serviceEvent() {}
 
 type timerServiceEvent struct {
 	request TimerRequest
@@ -577,6 +589,8 @@ func (l *serviceLoop) run(parent context.Context) error {
 				if err := l.handleDatagram(event); err != nil {
 					return err
 				}
+			case datagramSendCompletedServiceEvent:
+				l.handleDatagramSendCompleted(event)
 			case timerServiceEvent:
 				if err := l.handleTimer(event); err != nil {
 					return err
@@ -662,6 +676,12 @@ func (l *serviceLoop) gracefulLeave() error {
 			peers = append(peers, member)
 		}
 	}
+	sort.SliceStable(peers, func(i, j int) bool {
+		if (peers[i].Status == Alive) != (peers[j].Status == Alive) {
+			return peers[i].Status == Alive
+		}
+		return peers[i].NodeID < peers[j].NodeID
+	})
 	if len(peers) == 0 {
 		return nil
 	}
@@ -683,10 +703,31 @@ func (l *serviceLoop) gracefulLeave() error {
 			}
 		}
 		if !progress {
-			break
+			if !l.waitForLeaveRetry(cleanupContext, deadline) {
+				break
+			}
 		}
 	}
 	return nil
+}
+
+func (l *serviceLoop) waitForLeaveRetry(ctx context.Context, deadline time.Time) bool {
+	remaining := deadline.Sub(l.service.options.Clock.Now())
+	if remaining <= 0 {
+		return false
+	}
+	delay := serviceLeaveRetryDelay
+	if delay > remaining {
+		delay = remaining
+	}
+	timer := l.service.options.Clock.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C():
+		return ctx.Err() == nil
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (l *serviceLoop) sendDirectUpdate(ctx context.Context, member Member, update Update) (bool, error) {
@@ -1113,6 +1154,17 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 	return l.executeEffects(l.runContext, effects)
 }
 
+func (l *serviceLoop) handleDatagramSendCompleted(event datagramSendCompletedServiceEvent) {
+	if event.err != nil || len(event.batch.tokens) == 0 {
+		return
+	}
+	current, exists := l.engine.table.Get(event.recipient.NodeID)
+	if !exists || current != event.recipient || current.Status != Alive {
+		return
+	}
+	l.dissemination.Commit(event.batch)
+}
+
 func (l *serviceLoop) handleJoinAdmission(event joinAdmissionServiceEvent) error {
 	if !l.admitted {
 		event.response <- joinAdmissionResult{err: ErrServiceNotAdmitted}
@@ -1244,8 +1296,34 @@ func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) err
 		}
 		return nil
 	}
+	pending := Effects{}
+	pendingEffects := false
+	flush := func() error {
+		if !pendingEffects {
+			return nil
+		}
+		err := l.executeEffects(l.runContext, pending)
+		pending = Effects{}
+		pendingEffects = false
+		return err
+	}
+	apply := func(effects Effects) error {
+		if effects.PersistIncarnation != nil {
+			if err := flush(); err != nil {
+				return err
+			}
+			return l.executeEffects(l.runContext, effects)
+		}
+		pending.Outbound = append(pending.Outbound, effects.Outbound...)
+		pending.Timers = append(pending.Timers, effects.Timers...)
+		pending.Events = append(pending.Events, effects.Events...)
+		pending.SnapshotRequired = pending.SnapshotRequired || effects.SnapshotRequired
+		pendingEffects = pendingEffects || len(effects.Outbound) > 0 || len(effects.Timers) > 0 || len(effects.Events) > 0 || effects.SnapshotRequired
+		return nil
+	}
+	now := l.service.options.Clock.Now()
 	for _, floor := range event.floors {
-		if err := l.executeEffects(l.runContext, l.engine.ApplyIncarnationFloor(floor, event.sender.NodeID, l.service.options.Clock.Now())); err != nil {
+		if err := apply(l.engine.ApplyIncarnationFloor(floor, event.sender.NodeID, now)); err != nil {
 			if event.applied != nil {
 				event.applied <- err
 			}
@@ -1253,12 +1331,18 @@ func (l *serviceLoop) handleSnapshotResync(event snapshotResyncServiceEvent) err
 		}
 	}
 	for _, member := range event.members {
-		if err := l.executeEffects(l.runContext, l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.sender.NodeID}, l.service.options.Clock.Now())); err != nil {
+		if err := apply(l.engine.ApplyUpdate(Update{Member: member, ReporterID: event.sender.NodeID}, now)); err != nil {
 			if event.applied != nil {
 				event.applied <- err
 			}
 			return err
 		}
+	}
+	if err := flush(); err != nil {
+		if event.applied != nil {
+			event.applied <- err
+		}
+		return err
 	}
 	if event.applied != nil {
 		event.applied <- nil
@@ -1424,31 +1508,33 @@ func (l *serviceLoop) sendMessage(ctx context.Context, member Member, message an
 	}
 	sizingLimits := l.service.limits
 	sizingLimits.MaxSWIMDatagramSize = sizingLimits.MaxFrameSize
-	updates, err := l.dissemination.Take(l.service.limits.MaxSWIMDatagramSize, l.engine.aliveMembers(), func(updates []Update) ([]byte, error) {
+	batch, err := l.dissemination.Peek(l.service.limits.MaxSWIMDatagramSize, l.engine.aliveMembers(), func(updates []Update) ([]byte, error) {
 		return encodeWithLimits(updates, sizingLimits)
 	})
 	if err != nil {
 		return false, err
 	}
-	encoded, err := encodeWithLimits(updates, l.service.limits)
+	encoded, err := encodeWithLimits(batch.Updates, l.service.limits)
 	if err != nil {
 		return false, err
 	}
-	if err := l.sendDatagram(ctx, endpointService, destination, encoded); err != nil {
+	if err := l.sendDatagram(ctx, endpointService, destination, encoded, member, batch); err != nil {
 		return false, nil
 	}
 	return true, nil
 }
 
-func (l *serviceLoop) sendDatagram(ctx context.Context, sourceService config.Service, destination config.Endpoint, encoded []byte) error {
+func (l *serviceLoop) sendDatagram(ctx context.Context, sourceService config.Service, destination config.Endpoint, encoded []byte, recipient Member, batch DisseminationBatch) error {
 	source, err := l.service.options.Config.BindEndpoint(sourceService)
 	if err != nil {
 		return err
 	}
 	if l.sendJobs == nil {
-		return l.datagram.SendFrom(ctx, source, destination, encoded)
+		err := l.datagram.SendFrom(ctx, source, destination, encoded)
+		l.handleDatagramSendCompleted(datagramSendCompletedServiceEvent{recipient: recipient, batch: batch, err: err})
+		return err
 	}
-	job := datagramSendJob{source: source, destination: destination, payload: encoded}
+	job := datagramSendJob{source: source, destination: destination, payload: encoded, recipient: recipient, batch: batch}
 	select {
 	case l.sendJobs <- job:
 		return nil
@@ -1480,7 +1566,8 @@ func (l *serviceLoop) startDatagramSendWorkers() {
 				}
 				select {
 				case job := <-l.sendJobs:
-					_ = l.datagram.SendFrom(l.workerContext, job.source, job.destination, job.payload)
+					err := l.datagram.SendFrom(l.workerContext, job.source, job.destination, job.payload)
+					l.service.enqueueWorkerEvent(l.workerContext, datagramSendCompletedServiceEvent{recipient: job.recipient, batch: job.batch, err: err})
 				case <-l.workerContext.Done():
 					return
 				}
@@ -1527,6 +1614,13 @@ func (l *serviceLoop) refreshActiveMembership() {
 		}
 	}
 	l.activeMembers = activeMembers
+	sort.SliceStable(l.activeMembers, func(i, j int) bool {
+		left, right := l.activeMembers[i], l.activeMembers[j]
+		if (left.Status == Alive) != (right.Status == Alive) {
+			return left.Status == Alive
+		}
+		return left.NodeID < right.NodeID
+	})
 	l.service.active.Store(active)
 }
 
