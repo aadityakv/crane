@@ -7,8 +7,33 @@ import (
 	"github.com/aaditya/cs425mp3/internal/config"
 )
 
+const (
+	// DefaultSnapshotLimitBytes is the immutable per-store snapshot limit used by legacy constructors.
+	DefaultSnapshotLimitBytes uint64 = 16 << 20
+)
+
+// StoreOptions fixes bounded snapshot storage behavior for one store lifetime.
+type StoreOptions struct {
+	// MaxSnapshotBytes bounds every recovered, staged, and locally persisted snapshot state.
+	// Zero selects DefaultSnapshotLimitBytes.
+	MaxSnapshotBytes uint64
+}
+
+func (options StoreOptions) snapshotLimit() (uint64, error) {
+	limit := options.MaxSnapshotBytes
+	if limit == 0 {
+		limit = DefaultSnapshotLimitBytes
+	}
+	if limit > config.MaxRaftSnapshotBytes {
+		return 0, fmt.Errorf("%w: snapshot limit %d exceeds protocol maximum %d", ErrInvalidStorageState, limit, config.MaxRaftSnapshotBytes)
+	}
+	return limit, nil
+}
+
 // StableStore durably owns all safety-critical Raft state for one voter.
 type StableStore interface {
+	// SnapshotLimit is the immutable maximum state bytes accepted by this store.
+	SnapshotLimit() uint64
 	// Recover returns an independently owned, fully validated state.
 	Recover() (RecoveredState, error)
 	// Persist atomically makes every effect in one owned batch durable.
@@ -87,6 +112,10 @@ func (batch PersistenceBatch) Clone() PersistenceBatch {
 
 // ValidateRecoveredState verifies identity and every durable Raft state invariant.
 func ValidateRecoveredState(state RecoveredState, expected StorageIdentity, voters VoterSet) error {
+	return validateRecoveredStateWithSnapshotLimit(state, expected, voters, config.MaxRaftSnapshotBytes)
+}
+
+func validateRecoveredStateWithSnapshotLimit(state RecoveredState, expected StorageIdentity, voters VoterSet, snapshotLimit uint64) error {
 	if expected.FormatVersion != StorageFormatVersion1 || state.Identity != expected {
 		return fmt.Errorf("%w: got format=%d cluster=%x local=%d voters=%x", ErrInvalidStorageState, state.Identity.FormatVersion, state.Identity.ClusterID, state.Identity.LocalVoterID, state.Identity.VoterFingerprint)
 	}
@@ -115,7 +144,10 @@ func ValidateRecoveredState(state RecoveredState, expected StorageIdentity, vote
 		if base.LastIncludedIndex == 0 || state.Snapshot.Metadata != base {
 			return fmt.Errorf("%w: snapshot payload does not match snapshot base", ErrInvalidStorageState)
 		}
-		decoded, err := DecodeSnapshotEnvelope(state.Snapshot.EnvelopeBytes(), expected, config.MaxRaftSnapshotBytes)
+		if uint64(len(state.Snapshot.state)) > snapshotLimit {
+			return fmt.Errorf("%w: snapshot state length %d exceeds configured limit %d", ErrInvalidStorageState, len(state.Snapshot.state), snapshotLimit)
+		}
+		decoded, err := DecodeSnapshotEnvelope(state.Snapshot.EnvelopeBytes(), expected, snapshotLimit)
 		if err != nil || decoded.ID != state.Snapshot.ID || decoded.StateChecksum != state.Snapshot.StateChecksum {
 			return fmt.Errorf("%w: snapshot payload validation failed: %v", ErrInvalidStorageState, err)
 		}
@@ -313,8 +345,11 @@ func applyValidatedPersistenceBatch(current RecoveredState, batch PersistenceBat
 	return prospective.Clone(), nil
 }
 
-func compactRecoveredState(current RecoveredState, snapshot Snapshot, expected StorageIdentity, voters VoterSet) (RecoveredState, error) {
-	decoded, err := DecodeSnapshotEnvelope(snapshot.EnvelopeBytes(), expected, config.MaxRaftSnapshotBytes)
+func compactRecoveredState(current RecoveredState, snapshot Snapshot, expected StorageIdentity, voters VoterSet, snapshotLimit uint64) (RecoveredState, error) {
+	if uint64(len(snapshot.state)) > snapshotLimit {
+		return RecoveredState{}, fmt.Errorf("%w: local snapshot state length %d exceeds configured limit %d", ErrInvalidStorageState, len(snapshot.state), snapshotLimit)
+	}
+	decoded, err := DecodeSnapshotEnvelope(snapshot.EnvelopeBytes(), expected, snapshotLimit)
 	if err != nil || decoded.ID != snapshot.ID || decoded.Metadata != snapshot.Metadata || decoded.StateChecksum != snapshot.StateChecksum {
 		return RecoveredState{}, fmt.Errorf("%w: invalid local snapshot payload: %v", ErrInvalidStorageState, err)
 	}
@@ -344,7 +379,7 @@ func compactRecoveredState(current RecoveredState, snapshot Snapshot, expected S
 	if prospective.AppliedIndex < metadata.LastIncludedIndex {
 		prospective.AppliedIndex = metadata.LastIncludedIndex
 	}
-	if err := ValidateRecoveredState(prospective, expected, voters); err != nil {
+	if err := validateRecoveredStateWithSnapshotLimit(prospective, expected, voters, snapshotLimit); err != nil {
 		return RecoveredState{}, err
 	}
 	return prospective.Clone(), nil

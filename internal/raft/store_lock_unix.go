@@ -18,8 +18,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-
-	"github.com/aaditya/cs425mp3/internal/config"
 )
 
 const (
@@ -95,6 +93,7 @@ type FileStore struct {
 	mu            sync.Mutex
 	identity      StorageIdentity
 	voters        VoterSet
+	snapshotLimit uint64
 	directoryPath string
 	directory     *os.File
 	root          *os.Root
@@ -118,7 +117,12 @@ type fileSnapshotStage struct {
 // OpenFileStore opens or securely initializes <storageDir>/raft and recovers
 // only complete committed WAL transactions.
 func OpenFileStore(storageDir string, identity StorageIdentity, voters VoterSet) (*FileStore, error) {
-	return openFileStore(storageDir, identity, voters, defaultFileStoreOperations())
+	return OpenFileStoreWithOptions(storageDir, identity, voters, StoreOptions{})
+}
+
+// OpenFileStoreWithOptions opens a store with one immutable snapshot limit.
+func OpenFileStoreWithOptions(storageDir string, identity StorageIdentity, voters VoterSet, options StoreOptions) (*FileStore, error) {
+	return openFileStoreWithOptions(storageDir, identity, voters, options, defaultFileStoreOperations())
 }
 
 // NewFileStore is an alias for OpenFileStore.
@@ -126,7 +130,20 @@ func NewFileStore(storageDir string, identity StorageIdentity, voters VoterSet) 
 	return OpenFileStore(storageDir, identity, voters)
 }
 
+// NewFileStoreWithOptions is an alias for OpenFileStoreWithOptions.
+func NewFileStoreWithOptions(storageDir string, identity StorageIdentity, voters VoterSet, options StoreOptions) (*FileStore, error) {
+	return OpenFileStoreWithOptions(storageDir, identity, voters, options)
+}
+
 func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet, operations fileStoreOperations) (_ *FileStore, resultErr error) {
+	return openFileStoreWithOptions(storageDir, identity, voters, StoreOptions{}, operations)
+}
+
+func openFileStoreWithOptions(storageDir string, identity StorageIdentity, voters VoterSet, options StoreOptions, operations fileStoreOperations) (_ *FileStore, resultErr error) {
+	limit, err := options.snapshotLimit()
+	if err != nil {
+		return nil, err
+	}
 	if storageDir == "" || filepath.Clean(storageDir) == string(filepath.Separator) {
 		return nil, fmt.Errorf("%w: unsafe storage root %q", ErrStorageCorrupt, storageDir)
 	}
@@ -160,6 +177,7 @@ func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet,
 	store := &FileStore{
 		identity:      identity,
 		voters:        voters,
+		snapshotLimit: limit,
 		directoryPath: directoryPath,
 		directory:     directory,
 		ops:           operations,
@@ -258,6 +276,9 @@ func openFileStore(storageDir string, identity StorageIdentity, voters VoterSet,
 	return store, nil
 }
 
+// SnapshotLimit returns the immutable maximum snapshot state bytes.
+func (store *FileStore) SnapshotLimit() uint64 { return store.snapshotLimit }
+
 // PersistSnapshot writes and syncs the canonical snapshot before atomically
 // replacing the WAL with the exact compacted base and retained suffix.
 func (store *FileStore) PersistSnapshot(snapshot Snapshot) error {
@@ -269,7 +290,7 @@ func (store *FileStore) PersistSnapshot(snapshot Snapshot) error {
 	if store.poisoned {
 		return fmt.Errorf("%w: persistence outcome requires reopen", ErrStorageCorrupt)
 	}
-	prospective, err := compactRecoveredState(store.state, snapshot, store.identity, store.voters)
+	prospective, err := compactRecoveredState(store.state, snapshot, store.identity, store.voters, store.snapshotLimit)
 	if err != nil {
 		return err
 	}
@@ -400,7 +421,9 @@ func (store *FileStore) StageSnapshotChunk(request InstallSnapshotRequest) (Snap
 	if store.poisoned {
 		return SnapshotStageResult{}, fmt.Errorf("%w: persistence outcome requires reopen", ErrStorageCorrupt)
 	}
-	if err := validateSnapshotRequest(request, DefaultCodecLimits()); err != nil {
+	limits := DefaultCodecLimits()
+	limits.MaxSnapshotBytes = store.snapshotLimit
+	if err := validateSnapshotRequest(request, limits); err != nil {
 		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: %v", ErrSnapshotRejected, err))
 	}
 	metadata := snapshotTransferMetadataFor(request)
@@ -478,7 +501,7 @@ func (store *FileStore) StageSnapshotChunk(request InstallSnapshotRequest) (Snap
 	if SnapshotChecksum(checksum) != request.Checksum {
 		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: complete state checksum mismatch", ErrSnapshotRejected))
 	}
-	snapshot, err := NewSnapshot(store.identity, metadata.metadata, stateBytes, config.MaxRaftSnapshotBytes)
+	snapshot, err := NewSnapshot(store.identity, metadata.metadata, stateBytes, store.snapshotLimit)
 	if err != nil || snapshot.ID != request.SnapshotID {
 		return SnapshotStageResult{}, store.rejectFileStageLocked(fmt.Errorf("%w: complete snapshot identity mismatch: %v", ErrSnapshotRejected, err))
 	}
@@ -546,6 +569,9 @@ func (store *FileStore) Recover() (RecoveredState, error) {
 	if store.closed {
 		return RecoveredState{}, ErrStoreClosed
 	}
+	if err := validateRecoveredStateWithSnapshotLimit(store.state, store.identity, store.voters, store.snapshotLimit); err != nil {
+		return RecoveredState{}, err
+	}
 	return store.state.Clone(), nil
 }
 
@@ -578,6 +604,9 @@ func (store *FileStore) Persist(batch PersistenceBatch) error {
 	}
 	if err := validatePersistenceBatchBounds(batch); err != nil {
 		return err
+	}
+	if batch.Snapshot != nil && uint64(len(batch.Snapshot.state)) > store.snapshotLimit {
+		return fmt.Errorf("%w: snapshot state length %d exceeds configured limit %d", ErrInvalidStorageState, len(batch.Snapshot.state), store.snapshotLimit)
 	}
 	if store.nextTxnID == 0 {
 		return fmt.Errorf("%w: WAL transaction ID exhausted", ErrInvalidStorageState)
@@ -795,7 +824,7 @@ func (store *FileStore) loadSnapshotFile(name string) (*Snapshot, error) {
 	if err := validateRegularFileInfo(info, filepath.Join(store.directoryPath, name)); err != nil {
 		return nil, err
 	}
-	maximumEnvelopeBytes := uint64(snapshotEnvelopeHeaderBytes) + config.MaxRaftSnapshotBytes
+	maximumEnvelopeBytes := uint64(snapshotEnvelopeHeaderBytes) + store.snapshotLimit
 	if info.Size() < 0 || uint64(info.Size()) > maximumEnvelopeBytes {
 		return nil, fmt.Errorf("%w: snapshot file size %d exceeds maximum", ErrStorageCorrupt, info.Size())
 	}
@@ -803,15 +832,27 @@ func (store *FileStore) loadSnapshotFile(name string) (*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open raft snapshot: %w", err)
 	}
-	content, readErr := io.ReadAll(io.LimitReader(file, int64(maximumEnvelopeBytes)+1))
-	closeErr := store.ops.close(file)
-	if readErr != nil {
-		return nil, fmt.Errorf("read raft snapshot: %w", readErr)
+	header := make([]byte, snapshotEnvelopeHeaderBytes)
+	if _, readErr := io.ReadFull(file, header); readErr != nil {
+		return nil, errors.Join(fmt.Errorf("read raft snapshot header: %w", readErr), store.ops.close(file))
 	}
-	if closeErr != nil {
+	stateLength := binary.BigEndian.Uint64(header[snapshotEnvelopeStateLengthOffset:snapshotEnvelopeStateChecksumOffset])
+	if stateLength > store.snapshotLimit || stateLength > uint64(math.MaxInt)-snapshotEnvelopeHeaderBytes {
+		return nil, errors.Join(fmt.Errorf("%w: declared snapshot state length %d exceeds configured maximum %d", ErrStorageCorrupt, stateLength, store.snapshotLimit), store.ops.close(file))
+	}
+	totalLength := uint64(snapshotEnvelopeHeaderBytes) + stateLength
+	if uint64(info.Size()) != totalLength {
+		return nil, errors.Join(fmt.Errorf("%w: snapshot file size %d does not match declared length %d", ErrStorageCorrupt, info.Size(), totalLength), store.ops.close(file))
+	}
+	content := make([]byte, int(totalLength))
+	copy(content, header)
+	if _, readErr := io.ReadFull(file, content[snapshotEnvelopeHeaderBytes:]); readErr != nil {
+		return nil, errors.Join(fmt.Errorf("read raft snapshot payload: %w", readErr), store.ops.close(file))
+	}
+	if closeErr := store.ops.close(file); closeErr != nil {
 		return nil, fmt.Errorf("close raft snapshot: %w", closeErr)
 	}
-	snapshot, err := DecodeSnapshotEnvelope(content, store.identity, config.MaxRaftSnapshotBytes)
+	snapshot, err := DecodeSnapshotEnvelope(content, store.identity, store.snapshotLimit)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrStorageCorrupt, err)
 	}
@@ -839,12 +880,12 @@ func (store *FileStore) reconcileRecoveredSnapshot(state RecoveredState, snapsho
 		}
 	} else {
 		var err error
-		state, err = compactRecoveredState(state, snapshot.Clone(), store.identity, store.voters)
+		state, err = compactRecoveredState(state, snapshot.Clone(), store.identity, store.voters, store.snapshotLimit)
 		if err != nil {
 			return RecoveredState{}, fmt.Errorf("%w: reconcile snapshot with fuller WAL: %v", ErrStorageCorrupt, err)
 		}
 	}
-	if err := ValidateRecoveredState(state, store.identity, store.voters); err != nil {
+	if err := validateRecoveredStateWithSnapshotLimit(state, store.identity, store.voters, store.snapshotLimit); err != nil {
 		return RecoveredState{}, fmt.Errorf("%w: recovered snapshot state: %v", ErrStorageCorrupt, err)
 	}
 	return state.Clone(), nil

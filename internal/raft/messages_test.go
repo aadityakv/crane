@@ -83,6 +83,7 @@ func TestMessageValidAndInvalidDomains(t *testing.T) {
 		InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 4, LastIncludedTerm: 2, StateMachineSchemaVersion: 1, TotalLength: 0, Checksum: checksum, Done: true},
 		InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID, Success: true, Done: true},
 		InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID},
+		InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID, Success: true},
 		ErrorResponse{Code: ProtocolErrorMalformed, ResponderID: 2, Term: 3},
 	}
 	for _, rpc := range valid {
@@ -136,7 +137,6 @@ func TestMessageValidAndInvalidDomains(t *testing.T) {
 		{name: "snapshot_chunk_cap", rpc: InstallSnapshotRequest{LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID, LastIncludedIndex: 1, LastIncludedTerm: 1, StateMachineSchemaVersion: 1, TotalLength: 5, Checksum: checksum, Chunk: oversizedChunk, Done: true}, limits: CodecLimits{MaxSnapshotChunkBytes: 4}},
 		{name: "snapshot_response_missing_request_term", rpc: InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 3, TransferID: transferID, SnapshotID: snapshotID}},
 		{name: "snapshot_response_done_rejection", rpc: InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 3, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID, Done: true}},
-		{name: "snapshot_response_higher_term_success", rpc: InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 3, TransferID: transferID, SnapshotID: snapshotID, Success: true}},
 		{name: "unknown_protocol_error", rpc: ErrorResponse{Code: 99, ResponderID: 2, Term: 3}},
 	}
 	for _, test := range invalid {

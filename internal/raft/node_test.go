@@ -49,6 +49,14 @@ type task8Store struct {
 	persists       []PersistenceBatch
 	closes         int
 	events         *task8EventLog
+	snapshotLimit  uint64
+}
+
+func (store *task8Store) SnapshotLimit() uint64 {
+	if store.snapshotLimit == 0 {
+		return DefaultSnapshotLimitBytes
+	}
+	return store.snapshotLimit
 }
 
 func (store *task8Store) Recover() (RecoveredState, error) {

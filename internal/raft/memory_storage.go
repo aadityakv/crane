@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"math"
 	"sync"
-
-	"github.com/aaditya/cs425mp3/internal/config"
 )
 
 // StorageOperation names one fault-injection point shared by deterministic stores.
@@ -33,13 +31,14 @@ const (
 
 // MemoryStore is a deterministic, transaction-safe in-memory StableStore.
 type MemoryStore struct {
-	mu       sync.Mutex
-	identity StorageIdentity
-	voters   VoterSet
-	state    RecoveredState
-	closed   bool
-	faults   map[StorageOperation][]error
-	stage    *memorySnapshotStage
+	mu            sync.Mutex
+	identity      StorageIdentity
+	voters        VoterSet
+	snapshotLimit uint64
+	state         RecoveredState
+	closed        bool
+	faults        map[StorageOperation][]error
+	stage         *memorySnapshotStage
 }
 
 type memorySnapshotStage struct {
@@ -54,7 +53,9 @@ func (store *MemoryStore) StageSnapshotChunk(request InstallSnapshotRequest) (Sn
 	if store.closed {
 		return SnapshotStageResult{}, ErrStoreClosed
 	}
-	if err := validateSnapshotRequest(request, DefaultCodecLimits()); err != nil {
+	limits := DefaultCodecLimits()
+	limits.MaxSnapshotBytes = store.snapshotLimit
+	if err := validateSnapshotRequest(request, limits); err != nil {
 		store.stage = nil
 		return SnapshotStageResult{}, fmt.Errorf("%w: %v", ErrSnapshotRejected, err)
 	}
@@ -106,7 +107,7 @@ func (store *MemoryStore) StageSnapshotChunk(request InstallSnapshotRequest) (Sn
 		store.stage = nil
 		return SnapshotStageResult{}, fmt.Errorf("%w: complete state checksum mismatch", ErrSnapshotRejected)
 	}
-	snapshot, err := NewSnapshot(store.identity, metadata.metadata, stateBytes, config.MaxRaftSnapshotBytes)
+	snapshot, err := NewSnapshot(store.identity, metadata.metadata, stateBytes, store.snapshotLimit)
 	if err != nil || snapshot.ID != request.SnapshotID {
 		store.stage = nil
 		return SnapshotStageResult{}, fmt.Errorf("%w: complete snapshot identity mismatch: %v", ErrSnapshotRejected, err)
@@ -146,7 +147,7 @@ func (store *MemoryStore) PersistSnapshot(snapshot Snapshot) error {
 	if err := store.takeFault(StorageOperationSnapshotPersist); err != nil {
 		return fmt.Errorf("persist memory raft snapshot: %w", err)
 	}
-	prospective, err := compactRecoveredState(store.state, snapshot, store.identity, store.voters)
+	prospective, err := compactRecoveredState(store.state, snapshot, store.identity, store.voters, store.snapshotLimit)
 	if err != nil {
 		return err
 	}
@@ -174,17 +175,30 @@ func (store *MemoryStore) RetainedWALBytes() (uint64, error) {
 
 // NewMemoryStore returns an empty store bound to identity and voters.
 func NewMemoryStore(identity StorageIdentity, voters VoterSet) (*MemoryStore, error) {
+	return NewMemoryStoreWithOptions(identity, voters, StoreOptions{})
+}
+
+// NewMemoryStoreWithOptions returns an empty store with one immutable snapshot limit.
+func NewMemoryStoreWithOptions(identity StorageIdentity, voters VoterSet, options StoreOptions) (*MemoryStore, error) {
+	limit, err := options.snapshotLimit()
+	if err != nil {
+		return nil, err
+	}
 	state := RecoveredState{Identity: identity}
 	if err := ValidateRecoveredState(state, identity, voters); err != nil {
 		return nil, err
 	}
 	return &MemoryStore{
-		identity: identity,
-		voters:   voters,
-		state:    state,
-		faults:   make(map[StorageOperation][]error),
+		identity:      identity,
+		voters:        voters,
+		snapshotLimit: limit,
+		state:         state,
+		faults:        make(map[StorageOperation][]error),
 	}, nil
 }
+
+// SnapshotLimit returns the immutable maximum snapshot state bytes.
+func (store *MemoryStore) SnapshotLimit() uint64 { return store.snapshotLimit }
 
 // FailNext queues err at one deterministic operation boundary.
 func (store *MemoryStore) FailNext(operation StorageOperation, err error) {
@@ -206,6 +220,9 @@ func (store *MemoryStore) Recover() (RecoveredState, error) {
 	if err := store.takeFault(StorageOperationRecover); err != nil {
 		return RecoveredState{}, fmt.Errorf("recover memory raft store: %w", err)
 	}
+	if err := validateRecoveredStateWithSnapshotLimit(store.state, store.identity, store.voters, store.snapshotLimit); err != nil {
+		return RecoveredState{}, err
+	}
 	return store.state.Clone(), nil
 }
 
@@ -218,6 +235,9 @@ func (store *MemoryStore) Persist(batch PersistenceBatch) error {
 	}
 	if err := validatePersistenceBatchBounds(batch); err != nil {
 		return err
+	}
+	if batch.Snapshot != nil && uint64(len(batch.Snapshot.state)) > store.snapshotLimit {
+		return fmt.Errorf("%w: snapshot state length %d exceeds configured limit %d", ErrInvalidStorageState, len(batch.Snapshot.state), store.snapshotLimit)
 	}
 	if err := store.takeFault(StorageOperationPersist); err != nil {
 		return fmt.Errorf("persist memory raft store: %w", err)

@@ -176,6 +176,9 @@ func NewNode(options NodeOptions) (*Node, error) {
 	if options.SnapshotEntryThreshold == 0 || options.SnapshotByteThreshold == 0 || options.MaxSnapshotBytes == 0 || options.MaxSnapshotBytes > config.MaxRaftSnapshotBytes {
 		return nil, fmt.Errorf("%w: invalid node snapshot bounds", ErrInvalidCoreState)
 	}
+	if storeLimit := options.Store.SnapshotLimit(); storeLimit != options.MaxSnapshotBytes {
+		return nil, fmt.Errorf("%w: node snapshot limit %d does not match store limit %d", ErrInvalidCoreState, options.MaxSnapshotBytes, storeLimit)
+	}
 	if options.MaxSnapshotChunkBytes == 0 {
 		options.MaxSnapshotChunkBytes = config.MaxRaftSnapshotChunkBytes
 	}
@@ -312,14 +315,14 @@ func (node *Node) Run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("recover raft stable store: %w", err)
 	}
-	if err := ValidateRecoveredState(recovered, node.options.Identity, node.options.Voters); err != nil {
+	if err := validateRecoveredStateWithSnapshotLimit(recovered, node.options.Identity, node.options.Voters, node.options.MaxSnapshotBytes); err != nil {
 		return err
 	}
 	if recovered.SnapshotBase.LastIncludedIndex != 0 && recovered.Snapshot == nil {
 		return fmt.Errorf("%w: recovered snapshot index=%d schema=%d", ErrSnapshotUnavailable, recovered.SnapshotBase.LastIncludedIndex, recovered.SnapshotBase.StateMachineSchemaVersion)
 	}
 	if recovered.Snapshot != nil {
-		decoded, snapshotErr := DecodeSnapshotEnvelope(recovered.Snapshot.EnvelopeBytes(), node.options.Identity, config.MaxRaftSnapshotBytes)
+		decoded, snapshotErr := DecodeSnapshotEnvelope(recovered.Snapshot.EnvelopeBytes(), node.options.Identity, node.options.MaxSnapshotBytes)
 		if snapshotErr != nil || decoded.Metadata != recovered.SnapshotBase || decoded.ID != recovered.Snapshot.ID {
 			return fmt.Errorf("%w: recovered snapshot validation failed: %v", ErrSnapshotUnavailable, snapshotErr)
 		}
@@ -545,6 +548,9 @@ func (node *Node) maybeStartSnapshotCapture() (bool, error) {
 	if state.AppliedIndex < state.SnapshotIndex {
 		return false, fmt.Errorf("%w: applied index is below snapshot base", ErrLogInvariant)
 	}
+	if state.AppliedIndex == state.SnapshotIndex {
+		return false, nil
+	}
 	entryTriggered := state.AppliedIndex-state.SnapshotIndex > node.options.SnapshotEntryThreshold
 	byteTriggered := false
 	if reporter, ok := node.options.Store.(retainedWALByteReporter); ok {
@@ -555,9 +561,6 @@ func (node *Node) maybeStartSnapshotCapture() (bool, error) {
 		byteTriggered = retained > node.options.SnapshotByteThreshold
 	}
 	if !entryTriggered && !byteTriggered {
-		return false, nil
-	}
-	if state.AppliedIndex == 0 {
 		return false, nil
 	}
 	term, err := node.core.log.Term(state.AppliedIndex)
@@ -611,7 +614,7 @@ func (node *Node) finishSnapshotCapture(result snapshotCaptureResult) error {
 	if result.snapshot.Metadata.LastIncludedIndex > node.core.log.AppliedIndex() {
 		return fmt.Errorf("%w: completed snapshot is ahead of applied state", ErrInvalidCoreState)
 	}
-	prospective, err := compactRecoveredState(node.durableState, result.snapshot, node.options.Identity, node.options.Voters)
+	prospective, err := compactRecoveredState(node.durableState, result.snapshot, node.options.Identity, node.options.Voters, node.options.MaxSnapshotBytes)
 	if err != nil {
 		return fmt.Errorf("validate completed raft snapshot: %w", err)
 	}
@@ -738,6 +741,9 @@ func (node *Node) maybeStartSnapshotTransfer() (bool, error) {
 			snapshot.Metadata.LastIncludedTerm != node.core.log.SnapshotTerm() {
 			return false, fmt.Errorf("%w: snapshot-needed peer has no exact durable snapshot", ErrSnapshotUnavailable)
 		}
+		if uint64(len(snapshot.state)) > node.options.MaxSnapshotBytes {
+			return false, fmt.Errorf("%w: durable snapshot exceeds configured maximum", ErrSnapshotUnavailable)
+		}
 		if node.options.TransferIDs == nil {
 			return false, fmt.Errorf("%w: snapshot transfer source is nil", ErrTransferIDExhausted)
 		}
@@ -790,10 +796,13 @@ func (node *Node) executeSnapshotAction(token ReadyToken, action SnapshotAction)
 	}
 	result := SnapshotActionResult{NextOffset: staged.NextOffset, Done: staged.Done}
 	if staged.Done {
-		installed := staged.State.Clone()
-		if installed.Snapshot == nil {
+		if staged.State.Snapshot == nil {
 			return PeerMessage{}, fmt.Errorf("%w: installed snapshot bytes are absent", ErrInvalidCoreState)
 		}
+		if err := validateRecoveredStateWithSnapshotLimit(staged.State, node.options.Identity, node.options.Voters, node.options.MaxSnapshotBytes); err != nil {
+			return PeerMessage{}, fmt.Errorf("%w: installed snapshot state: %v", ErrInvalidCoreState, err)
+		}
+		installed := staged.State.Clone()
 		if err := node.options.StateMachine.Restore(installed.Snapshot.Metadata.StateMachineSchemaVersion, installed.Snapshot.StateBytes()); err != nil {
 			return PeerMessage{}, fmt.Errorf("restore installed raft snapshot: %w", err)
 		}
@@ -878,7 +887,9 @@ func (node *Node) validateReadyStructure(ready Ready) error {
 		if action.Request.LeaderID == node.options.LocalID || !node.options.Voters.Contains(action.Request.LeaderID) {
 			return fmt.Errorf("%w: invalid snapshot action leader %d", ErrInvalidCoreState, action.Request.LeaderID)
 		}
-		if err := validateSnapshotRequest(action.Request, DefaultCodecLimits()); err != nil {
+		limits := DefaultCodecLimits()
+		limits.MaxSnapshotBytes = node.options.MaxSnapshotBytes
+		if err := validateSnapshotRequest(action.Request, limits); err != nil {
 			return err
 		}
 	}

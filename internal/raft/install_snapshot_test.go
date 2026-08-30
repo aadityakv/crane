@@ -415,7 +415,7 @@ func TestInstallSnapshotCoreCompletionCorrelatesDurableOffsetAndInstalledState(t
 	}
 }
 
-func TestInstallSnapshotNodeStagesBeforeOffsetAndInstallsRestoresBeforeDone(t *testing.T) {
+func TestInstallSnapshotNodeStagesBeforeOffsetAndInstallsRestoresReplaysBeforeDone(t *testing.T) {
 	identity, voters := testStorageIdentity(t, 1)
 	memory, err := NewMemoryStore(identity, voters)
 	if err != nil {
@@ -424,7 +424,7 @@ func TestInstallSnapshotNodeStagesBeforeOffsetAndInstallsRestoresBeforeDone(t *t
 	defer memory.Close()
 	seedInstallStore(t, memory)
 	events := &task8EventLog{}
-	store := &installOrderingStore{MemoryStore: memory, events: events}
+	store := &installOrderingStore{MemoryStore: memory, events: events, completedCommit: 3}
 	machine := &task8StateMachine{events: events}
 	transport := &task8Transport{result: TransportAccepted, events: events, notify: make(chan PeerMessage, 2)}
 	durable, err := store.Recover()
@@ -458,7 +458,7 @@ func TestInstallSnapshotNodeStagesBeforeOffsetAndInstallsRestoresBeforeDone(t *t
 	if err := node.drainReady(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := events.snapshot(); !equalStrings(got, []string{"stage:3", "install", "restore", "handoff"}) {
+	if got := events.snapshot(); !equalStrings(got, []string{"stage:3", "install", "restore", "apply:3", "handoff"}) {
 		t.Fatalf("completion ordering = %v", got)
 	}
 	done := (<-transport.notify).RPC.(InstallSnapshotResponse)
@@ -467,6 +467,9 @@ func TestInstallSnapshotNodeStagesBeforeOffsetAndInstallsRestoresBeforeDone(t *t
 	}
 	if machine.restoreCalls != 1 || string(machine.restoreBytes[0]) != "abcde" {
 		t.Fatalf("restore calls=%d bytes=%q", machine.restoreCalls, machine.restoreBytes)
+	}
+	if len(machine.applyCalls) != 1 || machine.applyCalls[0].index != 3 {
+		t.Fatalf("replayed calls = %#v", machine.applyCalls)
 	}
 }
 
@@ -600,12 +603,12 @@ func TestInstallSnapshotLeaderRetriesIdenticalChunkCorrelatesAndResumesAppend(t 
 	}
 }
 
-func TestInstallSnapshotLeaderStepsDownOnlyForExactlyCorrelatedHigherTerm(t *testing.T) {
+func TestInstallSnapshotLeaderStepsDownForExactlyCorrelatedHigherTermAfterProgress(t *testing.T) {
 	identity, _ := testStorageIdentity(t, 1)
 	entries := testEntriesFrom(t, 4, testEntrySpec{term: 3, command: "four"})
 	core, initial := electReplicationLeader(t, 3, 2, HardState{Term: 3, CommitIndex: 3}, entries)
 	rejectInitialAppend(t, core, initial, 2)
-	snapshot, err := NewSnapshot(identity, SnapshotMetadata{LastIncludedIndex: 3, LastIncludedTerm: 2, StateMachineSchemaVersion: 6}, []byte("abc"), 64)
+	snapshot, err := NewSnapshot(identity, SnapshotMetadata{LastIncludedIndex: 3, LastIncludedTerm: 2, StateMachineSchemaVersion: 6}, []byte("abcde"), 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,21 +618,126 @@ func TestInstallSnapshotLeaderStepsDownOnlyForExactlyCorrelatedHigherTerm(t *tes
 	}
 	ready, _ := core.Ready()
 	advanceReadyToken(t, core, ready)
-	response := InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 5, RequestTerm: 4,
-		TransferID: transferID, SnapshotID: snapshot.ID}
-	uncorrelated := response
-	uncorrelated.NextOffset = 1
-	if err := core.Step(2, uncorrelated); err != nil {
+	accepted := InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+		TransferID: transferID, SnapshotID: snapshot.ID, NextOffset: 3, Success: true}
+	if err := core.Step(2, accepted); err != nil {
 		t.Fatal(err)
 	}
-	if core.Status().Role != RoleLeader || core.HardState().Term != 4 {
-		t.Fatal("future-offset higher term changed leader")
+	next, _ := core.Ready()
+	advanceReadyToken(t, core, next)
+	before, _ := core.Progress(2)
+	delete(core.quorumResponses, 2)
+
+	response := InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 5, RequestTerm: 4,
+		TransferID: transferID, SnapshotID: snapshot.ID, NextOffset: 1, Success: true}
+	for _, mutate := range []func(*InstallSnapshotResponse){
+		func(r *InstallSnapshotResponse) { r.RequestTerm++ },
+		func(r *InstallSnapshotResponse) { r.TransferID = TransferID{99} },
+		func(r *InstallSnapshotResponse) { r.SnapshotID = SnapshotID{99} },
+	} {
+		uncorrelated := response
+		mutate(&uncorrelated)
+		if err := core.Step(2, uncorrelated); err != nil {
+			t.Fatal(err)
+		}
+		if core.Status().Role != RoleLeader || core.HardState().Term != 4 {
+			t.Fatal("uncorrelated higher term changed leader")
+		}
+		after, _ := core.Progress(2)
+		if after != before {
+			t.Fatalf("uncorrelated higher term changed transfer: before=%#v after=%#v", before, after)
+		}
+		if _, counted := core.quorumResponses[2]; counted {
+			t.Fatal("uncorrelated higher term counted for check-quorum")
+		}
 	}
 	if err := core.Step(2, response); err != nil {
 		t.Fatal(err)
 	}
 	if core.Status().Role != RoleFollower || core.HardState().Term != 5 {
 		t.Fatalf("correlated higher term did not step down: %v %+v", core.Status().Role, core.HardState())
+	}
+}
+
+func TestInstallSnapshotLeaderAcceptsStaleDoneWhileFirstChunkIsActive(t *testing.T) {
+	identity, _ := testStorageIdentity(t, 1)
+	entries := testEntriesFrom(t, 4, testEntrySpec{term: 3, command: "four"})
+	core, initial := electReplicationLeader(t, 3, 2, HardState{Term: 3, CommitIndex: 3}, entries)
+	rejectInitialAppend(t, core, initial, 2)
+	snapshot, err := NewSnapshot(identity, SnapshotMetadata{LastIncludedIndex: 3, LastIncludedTerm: 2, StateMachineSchemaVersion: 6}, []byte("abcde"), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transferID := TransferID{13}
+	if err := core.StartSnapshotTransfer(2, snapshot, transferID, 3); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := core.Ready()
+	if request := installRequestTo(t, first, 2); request.Offset != 0 || request.TotalLength != 5 || request.Done {
+		t.Fatalf("first request = %#v", request)
+	}
+	advanceReadyToken(t, core, first)
+
+	done := InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+		TransferID: transferID, SnapshotID: snapshot.ID, NextOffset: 5, Success: true, Done: true}
+	if err := core.Step(2, done); err != nil {
+		t.Fatal(err)
+	}
+	ready, ok := core.Ready()
+	if !ok {
+		t.Fatal("stale durable completion did not resume append replication")
+	}
+	request := appendRequestTo(t, ready, 2)
+	if request.PrevLogIndex != 3 || len(request.Entries) == 0 || request.Entries[0].Index != 4 {
+		t.Fatalf("resumed append = %#v", request)
+	}
+}
+
+func TestInstallSnapshotLeaderRewindsRetryOffsetWithoutRegressingLogProgress(t *testing.T) {
+	identity, _ := testStorageIdentity(t, 1)
+	entries := testEntriesFrom(t, 4, testEntrySpec{term: 3, command: "four"})
+	core, initial := electReplicationLeader(t, 3, 2, HardState{Term: 3, CommitIndex: 3}, entries)
+	rejectInitialAppend(t, core, initial, 2)
+	snapshot, err := NewSnapshot(identity, SnapshotMetadata{LastIncludedIndex: 3, LastIncludedTerm: 2, StateMachineSchemaVersion: 6}, []byte("abcde"), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transferID := TransferID{14}
+	if err := core.StartSnapshotTransfer(2, snapshot, transferID, 3); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := core.Ready()
+	advanceReadyToken(t, core, first)
+	if err := core.Step(2, InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+		TransferID: transferID, SnapshotID: snapshot.ID, NextOffset: 3, Success: true}); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := core.Ready()
+	advanceReadyToken(t, core, second)
+	before, _ := core.Progress(2)
+	delete(core.quorumResponses, 2)
+
+	if err := core.Step(2, InstallSnapshotResponse{ResponderID: 2, LeaderID: 1, Term: 4, RequestTerm: 4,
+		TransferID: transferID, SnapshotID: snapshot.ID, NextOffset: 0}); err != nil {
+		t.Fatal(err)
+	}
+	retry, ok := core.Ready()
+	if !ok {
+		t.Fatal("rejection did not issue follower-required retry")
+	}
+	request := installRequestTo(t, retry, 2)
+	if request.Offset != 0 || string(request.Chunk) != "abc" || request.Done {
+		t.Fatalf("rewound request = %#v", request)
+	}
+	after, _ := core.Progress(2)
+	if after.MatchIndex < before.MatchIndex || after.NextIndex < before.NextIndex {
+		t.Fatalf("log progress regressed: before=%#v after=%#v", before, after)
+	}
+	if after.SnapshotNextOffset != before.SnapshotNextOffset {
+		t.Fatalf("reported snapshot progress regressed: before=%d after=%d", before.SnapshotNextOffset, after.SnapshotNextOffset)
+	}
+	if _, counted := core.quorumResponses[2]; !counted {
+		t.Fatal("exact current-term rejection did not count for check-quorum")
 	}
 }
 
@@ -675,7 +783,7 @@ func TestInstallSnapshotNodeStartsNeededTransferFromDurableSnapshotAndInjectedID
 	}
 	source := &fixedTransferIDSource{id: TransferID{19}}
 	node := &Node{core: core, durableState: RecoveredState{Identity: identity, HardState: core.HardState(), SnapshotBase: snapshot.Metadata, Snapshot: &snapshot, AppliedIndex: 3, Entries: cloneEntries(entries)},
-		options: NodeOptions{LocalID: 1, Voters: voters, Identity: identity, TransferIDs: source, MaxSnapshotChunkBytes: 3}}
+		options: NodeOptions{LocalID: 1, Voters: voters, Identity: identity, TransferIDs: source, MaxSnapshotBytes: 64, MaxSnapshotChunkBytes: 3}}
 	started, err := node.maybeStartSnapshotTransfer()
 	if err != nil || !started {
 		t.Fatalf("start needed transfer = %t, %v", started, err)
@@ -700,7 +808,7 @@ func TestInstallSnapshotNodeFailsClosedOnTransferIDExhaustion(t *testing.T) {
 		t.Fatal(err)
 	}
 	node := &Node{core: core, durableState: RecoveredState{Identity: identity, HardState: core.HardState(), SnapshotBase: snapshot.Metadata, Snapshot: &snapshot, AppliedIndex: 3, Entries: cloneEntries(entries)},
-		options: NodeOptions{LocalID: 1, Voters: voters, Identity: identity, TransferIDs: &fixedTransferIDSource{}, MaxSnapshotChunkBytes: 3}}
+		options: NodeOptions{LocalID: 1, Voters: voters, Identity: identity, TransferIDs: &fixedTransferIDSource{}, MaxSnapshotBytes: 64, MaxSnapshotChunkBytes: 3}}
 	if _, err := node.maybeStartSnapshotTransfer(); !errors.Is(err, ErrTransferIDExhausted) {
 		t.Fatalf("zero transfer identity error = %v", err)
 	}
@@ -734,7 +842,8 @@ func installRequestTo(t *testing.T, ready Ready, peerID uint16) InstallSnapshotR
 
 type installOrderingStore struct {
 	*MemoryStore
-	events *task8EventLog
+	events          *task8EventLog
+	completedCommit uint64
 }
 
 func (store *installOrderingStore) Persist(batch PersistenceBatch) error {
@@ -747,6 +856,9 @@ func (store *installOrderingStore) StageSnapshotChunk(request InstallSnapshotReq
 	result, err := store.MemoryStore.StageSnapshotChunk(request)
 	if result.Done {
 		store.events.add("install")
+		if store.completedCommit > result.State.HardState.CommitIndex {
+			result.State.HardState.CommitIndex = store.completedCommit
+		}
 	}
 	return result, err
 }

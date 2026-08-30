@@ -320,9 +320,6 @@ func validateSnapshotResponse(message InstallSnapshotResponse, limits CodecLimit
 	if message.Done && !message.Success {
 		return fmt.Errorf("%w: rejected snapshot response cannot be done", ErrInvalidRPC)
 	}
-	if message.Term > message.RequestTerm && message.Success {
-		return fmt.Errorf("%w: higher-term snapshot response cannot succeed", ErrInvalidRPC)
-	}
 	return nil
 }
 
