@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -81,7 +82,31 @@ type Service struct {
 	admitted    atomic.Bool
 	active      atomic.Value
 	connections sync.Map
+	udpDrops    boundedCounter
+	sendErrors  boundedCounter
 }
+
+// ServiceStats is a fixed-label snapshot of bounded SWIM transport counters.
+// It contains no endpoints, request IDs, payloads, or secret-derived values.
+type ServiceStats struct {
+	// UDPDatagramDrops counts received datagrams rejected before owner mutation.
+	UDPDatagramDrops uint64
+	// TransientSendFailures counts non-shutdown outbound UDP failures and queue drops.
+	TransientSendFailures uint64
+}
+
+type boundedCounter struct{ value atomic.Uint64 }
+
+func (c *boundedCounter) increment() {
+	for {
+		current := c.value.Load()
+		if current == math.MaxUint64 || c.value.CompareAndSwap(current, current+1) {
+			return
+		}
+	}
+}
+
+func (c *boundedCounter) load() uint64 { return c.value.Load() }
 
 // NewService validates dependencies and returns a side-effect-free service.
 func NewService(options ServiceOptions) (*Service, error) {
@@ -138,6 +163,17 @@ func (s *Service) Name() string {
 // Ready closes only after both UDP endpoints and the TCP snapshot listener are live.
 func (s *Service) Ready() <-chan struct{} {
 	return s.ready
+}
+
+// Stats returns one race-safe snapshot of fixed-label transport counters.
+func (s *Service) Stats() ServiceStats {
+	if s == nil {
+		return ServiceStats{}
+	}
+	return ServiceStats{
+		UDPDatagramDrops:      s.udpDrops.load(),
+		TransientSendFailures: s.sendErrors.load(),
+	}
 }
 
 // Snapshot returns a copied, sorted membership view from the owner goroutine.
@@ -1076,6 +1112,11 @@ func (s *Service) decodeDatagramContext(ctx context.Context, packet transport.Pa
 }
 
 func (s *Service) decodeDatagramContextWithDecoder(ctx context.Context, packet transport.Packet, decodeGob func([]byte, any) error) (_ datagramServiceEvent, accepted bool) {
+	defer func() {
+		if !accepted {
+			s.udpDrops.increment()
+		}
+	}()
 	if decodeGob == nil {
 		return datagramServiceEvent{}, false
 	}
@@ -1251,7 +1292,11 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 }
 
 func (l *serviceLoop) handleDatagramSendCompleted(event datagramSendCompletedServiceEvent) {
-	if event.err != nil || len(event.batch.tokens) == 0 {
+	if event.err != nil {
+		l.service.recordTransientSendFailure(event.err)
+		return
+	}
+	if len(event.batch.tokens) == 0 {
 		return
 	}
 	current, exists := l.engine.table.Get(event.recipient.NodeID)
@@ -1637,7 +1682,9 @@ func (l *serviceLoop) sendDatagram(ctx context.Context, sourceService config.Ser
 	case <-l.workerContext.Done():
 		return l.workerContext.Err()
 	default:
-		return errors.New("swim: outbound datagram queue full")
+		err := errors.New("swim: outbound datagram queue full")
+		l.service.recordTransientSendFailure(err)
+		return err
 	}
 }
 
@@ -1646,7 +1693,16 @@ func (l *serviceLoop) sendDatagramDirect(ctx context.Context, sourceService conf
 	if err != nil {
 		return err
 	}
-	return l.datagram.SendFrom(ctx, source, destination, encoded)
+	err = l.datagram.SendFrom(ctx, source, destination, encoded)
+	l.service.recordTransientSendFailure(err)
+	return err
+}
+
+func (s *Service) recordTransientSendFailure(err error) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, transport.ErrDatagramClosed) {
+		return
+	}
+	s.sendErrors.increment()
 }
 
 func (l *serviceLoop) startDatagramSendWorkers() {

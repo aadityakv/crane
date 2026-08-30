@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -475,6 +476,44 @@ func TestServiceInvalidDatagramsCannotPoisonReplayCapacity(t *testing.T) {
 	}
 	if event, ok := service.decodeDatagram(transport.Packet{From: source, Data: legitimate}); ok {
 		t.Fatalf("duplicate legitimate frame accepted as %#v", event)
+	}
+}
+
+func TestServiceStatsCountDropsAndTransientSendsWithoutLabels(t *testing.T) {
+	now := time.Unix(2065, 0)
+	service, peer, source, authenticator := newDatagramDecoderService(t, now, 2)
+	clusterID := decodedTestClusterID(t, testClusterID)
+	invalid := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 15, now, wire.MessageSWIMGossip, []byte("not-gob"))
+	for range 2 {
+		if _, accepted := service.decodeDatagram(transport.Packet{From: source, Data: invalid}); accepted {
+			t.Fatal("invalid datagram accepted")
+		}
+	}
+	valid := encodeServiceTestFrame(t, authenticator, clusterID, peer.NodeID, 16, now, wire.MessageSWIMGossip, mustEncodeGob(t, GossipMessage{}))
+	if _, accepted := service.decodeDatagram(transport.Packet{From: source, Data: valid}); !accepted {
+		t.Fatal("valid datagram rejected")
+	}
+
+	sendFailure := errors.New("injected transient send failure")
+	loop := &serviceLoop{service: service, datagram: &capturingSourceDatagram{failure: sendFailure}}
+	destination := config.Endpoint{Host: peer.Host, Port: peer.BasePort}
+	if err := loop.sendDatagramDirect(context.Background(), config.ServiceSWIMPing, destination, []byte("bounded metadata only")); !errors.Is(err, sendFailure) {
+		t.Fatalf("sendDatagramDirect() error = %v, want injected failure", err)
+	}
+
+	stats := service.Stats()
+	if stats.UDPDatagramDrops != 2 || stats.TransientSendFailures != 1 {
+		t.Fatalf("Stats() = %#v, want two drops and one transient send failure", stats)
+	}
+}
+
+func TestBoundedCounterSaturates(t *testing.T) {
+	var counter boundedCounter
+	counter.value.Store(math.MaxUint64 - 1)
+	counter.increment()
+	counter.increment()
+	if got := counter.load(); got != math.MaxUint64 {
+		t.Fatalf("bounded counter = %d, want saturation at MaxUint64", got)
 	}
 }
 
