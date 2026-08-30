@@ -287,6 +287,73 @@ func TestServiceDatagramBindsSenderIdentityToTypedSourceEndpoint(t *testing.T) {
 	}
 }
 
+func TestServiceQueuedDatagramCannotCrossSenderGeneration(t *testing.T) {
+	now := time.Unix(2052, 0)
+	service, oldSender, _, authenticator := newDatagramDecoderService(t, now, 1)
+	self := service.active.Load().(map[uint16]Member)[service.options.Config.NodeID]
+	oldSource, err := (config.NodeConfig{AdvertiseHost: oldSender.Host, BasePort: oldSender.BasePort}).AdvertiseEndpoint(config.ServiceSWIMACK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := wire.RequestID{88}
+	clusterID := decodedTestClusterID(t, testClusterID)
+	oldFrame := encodeServiceTestFrameWithRequestID(t, authenticator, clusterID, oldSender.NodeID, requestID, now, wire.MessageSWIMAck, mustEncodeGob(t, AckMessage{Ack: Ack{OriginID: self.NodeID, Sequence: 77, RequestID: requestID}}))
+	queued, accepted := service.decodeDatagram(transport.Packet{From: oldSource, Data: oldFrame})
+	if !accepted {
+		t.Fatal("old exact sender generation was not validated by the reader")
+	}
+	if queued.sender != oldSender {
+		t.Fatalf("queued sender = %#v, want exact validated %#v", queued.sender, oldSender)
+	}
+
+	table := NewTable()
+	mustMerge(t, table, Update{Member: self, ReporterID: self.NodeID})
+	mustMerge(t, table, Update{Member: oldSender, ReporterID: oldSender.NodeID})
+	newSender := oldSender
+	newSender.Host = "127.0.0.22"
+	newSender.BasePort += 100
+	newSender.Incarnation++
+	mustMerge(t, table, Update{Member: newSender, ReporterID: newSender.NodeID})
+	dissemination := NewDisseminator(8, serviceRetransmitFactor)
+	engine, err := NewEngine(EngineConfig{
+		SelfID:               self.NodeID,
+		ProbeInterval:        time.Second,
+		DirectProbeTimeout:   300 * time.Millisecond,
+		IndirectProbeTimeout: 200 * time.Millisecond,
+		IndirectChecks:       3,
+		SuspicionMultiplier:  5,
+	}, table, dissemination, random.NewLockedSource(305))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.activeProbes[77] = &activeProbe{target: newSender, phase: probeDirect, id: ProbeID{Sequence: 77, RequestID: requestID}}
+	loop := &serviceLoop{service: service, engine: engine, dissemination: dissemination, admitted: true, runContext: context.Background()}
+
+	if err := loop.handleDatagram(queued); err != nil {
+		t.Fatal(err)
+	}
+	if len(engine.activeProbes) != 1 {
+		t.Fatal("queued old-generation ACK mutated the replacement generation")
+	}
+
+	service.active.Store(map[uint16]Member{self.NodeID: self, newSender.NodeID: newSender})
+	newSource, err := (config.NodeConfig{AdvertiseHost: newSender.Host, BasePort: newSender.BasePort}).AdvertiseEndpoint(config.ServiceSWIMACK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFrame := encodeServiceTestFrameWithRequestID(t, authenticator, clusterID, newSender.NodeID, requestID, now, wire.MessageSWIMAck, mustEncodeGob(t, AckMessage{Ack: Ack{OriginID: self.NodeID, Sequence: 77, RequestID: requestID}}))
+	current, accepted := service.decodeDatagram(transport.Packet{From: newSource, Data: newFrame})
+	if !accepted {
+		t.Fatal("replacement generation frame was rejected before owner correlation")
+	}
+	if err := loop.handleDatagram(current); err != nil {
+		t.Fatal(err)
+	}
+	if len(engine.activeProbes) != 0 {
+		t.Fatal("replacement generation could not reuse replay capacity after stale queued frame")
+	}
+}
+
 func TestServiceDatagramSourceUsesCanonicalNumericAndResolvedAddresses(t *testing.T) {
 	now := time.Unix(2055, 0)
 	configuration := serviceTestConfig(t, 1)
@@ -1908,7 +1975,9 @@ func (h *persistenceHarness) sendSelfSuspicion(t *testing.T, peerID uint16) {
 }
 
 func (h *persistenceHarness) enqueuePeerGossip(updates []Update) {
+	sender := h.service.active.Load().(map[uint16]Member)[2]
 	h.service.events <- datagramServiceEvent{
+		sender:   sender,
 		senderID: 2,
 		message:  GossipMessage{Updates: append([]Update(nil), updates...)},
 		updates:  append([]Update(nil), updates...),

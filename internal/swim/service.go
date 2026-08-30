@@ -445,6 +445,7 @@ type subscriptionCountServiceEvent struct{ response chan<- int }
 func (subscriptionCountServiceEvent) serviceEvent() {}
 
 type datagramServiceEvent struct {
+	sender    Member
 	senderID  uint16
 	requestID wire.RequestID
 	timestamp time.Time
@@ -939,6 +940,7 @@ func (s *Service) decodeDatagramContext(ctx context.Context, packet transport.Pa
 		return datagramServiceEvent{}, false
 	}
 	event := datagramServiceEvent{
+		sender:    sender,
 		senderID:  frame.Header.SenderID,
 		requestID: frame.Header.RequestID,
 		timestamp: time.UnixMilli(frame.Header.TimestampMillis),
@@ -1022,7 +1024,7 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 		return nil
 	}
 	sender, exists := l.engine.table.Get(event.senderID)
-	if !exists || (sender.Status != Alive && sender.Status != Suspect) {
+	if !exists || sender != event.sender || (sender.Status != Alive && sender.Status != Suspect) {
 		return nil
 	}
 	switch message := event.message.(type) {
@@ -1047,7 +1049,7 @@ func (l *serviceLoop) handleDatagram(event datagramServiceEvent) error {
 		}
 	}
 	sender, exists = l.engine.table.Get(event.senderID)
-	if !exists || (sender.Status != Alive && sender.Status != Suspect) {
+	if !exists || sender != event.sender || (sender.Status != Alive && sender.Status != Suspect) {
 		return nil
 	}
 
