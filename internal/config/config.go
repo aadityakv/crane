@@ -128,7 +128,7 @@ func (c NodeConfig) Validate() error {
 			return fmt.Errorf("derive advertise endpoint for %s: %w", service.Name, err)
 		}
 	}
-	if _, err := ParseEndpoint(c.Introducer); err != nil {
+	if _, err := ParseRoutableEndpoint(c.Introducer); err != nil {
 		return fmt.Errorf("invalid introducer: %w", err)
 	}
 	if err := validateStorageDir(c.StorageDir); err != nil {
@@ -144,7 +144,7 @@ func (c NodeConfig) Validate() error {
 		return fmt.Errorf("raft voters must contain exactly three or five voters")
 	}
 	voterIDs := make(map[uint16]struct{}, len(c.RaftVoters))
-	voterEndpoints := make(map[string]struct{}, len(c.RaftVoters))
+	voterEndpoints := make(map[Endpoint]struct{}, len(c.RaftVoters))
 	localEndpoint, err := c.AdvertiseEndpoint(ServiceRaftRPC)
 	if err != nil {
 		return err
@@ -157,17 +157,16 @@ func (c NodeConfig) Validate() error {
 			return fmt.Errorf("duplicate raft voter ID %d", voter.NodeID)
 		}
 		voterIDs[voter.NodeID] = struct{}{}
-		endpoint, err := ParseEndpoint(voter.Endpoint)
+		endpoint, err := ParseRoutableEndpoint(voter.Endpoint)
 		if err != nil {
 			return fmt.Errorf("invalid raft voter endpoint for node %d: %w", voter.NodeID, err)
 		}
-		endpointKey := endpoint.String()
-		if _, exists := voterEndpoints[endpointKey]; exists {
-			return fmt.Errorf("duplicate raft voter endpoint %q", endpointKey)
+		if _, exists := voterEndpoints[endpoint]; exists {
+			return fmt.Errorf("duplicate raft voter endpoint %q", endpoint)
 		}
-		voterEndpoints[endpointKey] = struct{}{}
+		voterEndpoints[endpoint] = struct{}{}
 		if voter.NodeID == c.NodeID {
-			if endpoint != localEndpoint {
+			if !SameEndpoint(endpoint, localEndpoint) {
 				return fmt.Errorf("local raft voter endpoint %q does not match advertised endpoint %q", endpoint, localEndpoint)
 			}
 		}

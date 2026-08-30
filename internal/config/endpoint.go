@@ -3,7 +3,9 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 )
 
 // Endpoint identifies a host and nonzero TCP or UDP port without embedding transport policy.
@@ -30,11 +32,53 @@ func ParseEndpoint(value string) (Endpoint, error) {
 	if port == 0 {
 		return Endpoint{}, fmt.Errorf("endpoint port must be nonzero")
 	}
-	return Endpoint{Host: host, Port: uint16(port)}, nil
+	return CanonicalEndpoint(Endpoint{Host: host, Port: uint16(port)})
+}
+
+// ParseRoutableEndpoint parses and canonicalizes an endpoint that must not use
+// an unspecified IP address.
+func ParseRoutableEndpoint(value string) (Endpoint, error) {
+	endpoint, err := ParseEndpoint(value)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	if err := validateRoutableEndpoint(endpoint); err != nil {
+		return Endpoint{}, err
+	}
+	return endpoint, nil
+}
+
+// CanonicalEndpoint normalizes DNS case/root-dot aliases and IP spelling while
+// preserving the nonzero port.
+func CanonicalEndpoint(endpoint Endpoint) (Endpoint, error) {
+	if endpoint.Port == 0 {
+		return Endpoint{}, fmt.Errorf("endpoint port must be nonzero")
+	}
+	if err := validateHost(endpoint.Host); err != nil {
+		return Endpoint{}, fmt.Errorf("invalid endpoint host: %w", err)
+	}
+	host := endpoint.Host
+	if address, err := netip.ParseAddr(host); err == nil {
+		host = address.Unmap().String()
+	} else {
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
+	}
+	return Endpoint{Host: host, Port: endpoint.Port}, nil
+}
+
+// SameEndpoint reports whether two valid endpoints have the same canonical
+// host and port.
+func SameEndpoint(left, right Endpoint) bool {
+	canonicalLeft, leftError := CanonicalEndpoint(left)
+	canonicalRight, rightError := CanonicalEndpoint(right)
+	return leftError == nil && rightError == nil && canonicalLeft == canonicalRight
 }
 
 // String returns the endpoint with IPv6 hosts bracketed for unambiguous host/port parsing.
 func (e Endpoint) String() string {
+	if canonical, err := CanonicalEndpoint(e); err == nil {
+		e = canonical
+	}
 	return net.JoinHostPort(e.Host, strconv.FormatUint(uint64(e.Port), 10))
 }
 
@@ -69,5 +113,16 @@ func (c NodeConfig) deriveEndpoint(host string, service Service) (Endpoint, erro
 	if port == 0 {
 		return Endpoint{}, fmt.Errorf("derived endpoint port must be nonzero")
 	}
-	return Endpoint{Host: host, Port: uint16(port)}, nil
+	return CanonicalEndpoint(Endpoint{Host: host, Port: uint16(port)})
+}
+
+func validateRoutableEndpoint(endpoint Endpoint) error {
+	canonical, err := CanonicalEndpoint(endpoint)
+	if err != nil {
+		return err
+	}
+	if address, err := netip.ParseAddr(canonical.Host); err == nil && address.IsUnspecified() {
+		return fmt.Errorf("endpoint host must not be a wildcard address")
+	}
+	return nil
 }

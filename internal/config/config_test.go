@@ -115,6 +115,46 @@ func TestNodeConfigValidation(t *testing.T) {
 	}
 }
 
+func TestNodeConfigRejectsWildcardIntroducerAndVoters(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*NodeConfig)
+	}{
+		{name: "IPv4 introducer", mutate: func(c *NodeConfig) { c.Introducer = "0.0.0.0:8002" }},
+		{name: "IPv6 introducer", mutate: func(c *NodeConfig) { c.Introducer = "[::]:8002" }},
+		{name: "IPv4 voter", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "0.0.0.0:8108" }},
+		{name: "IPv6 voter", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "[::]:8108" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig(createSecret(t, 0o600))
+			test.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate accepted a wildcard routable endpoint")
+			}
+		})
+	}
+}
+
+func TestNodeConfigRejectsCanonicalDuplicateVoterEndpoints(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		first  string
+		second string
+	}{
+		{name: "DNS case and root dot", first: "Node.Example.Test.:8108", second: "node.example.test:8108"},
+		{name: "equivalent IPv6", first: "[2001:0db8:0:0:0:0:0:1]:8108", second: "[2001:db8::1]:8108"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig(createSecret(t, 0o600))
+			cfg.RaftVoters[1].Endpoint = test.first
+			cfg.RaftVoters[2].Endpoint = test.second
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate accepted semantically duplicate voter endpoints")
+			}
+		})
+	}
+}
+
 func TestNodeConfigRejectsUnreadableSecret(t *testing.T) {
 	secret := createSecret(t, 0o000)
 	if file, err := os.Open(secret); err == nil {

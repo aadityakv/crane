@@ -75,6 +75,25 @@ func TestServiceReadyRequiresSnapshotListenerAndSnapshotUsesEventLoop(t *testing
 	}
 }
 
+func TestServiceRecognizesCanonicalSelfIntroducer(t *testing.T) {
+	configuration := serviceTestConfig(t, 1)
+	configuration.AdvertiseHost = "LOCALHOST."
+	configuration.Introducer = config.Endpoint{Host: "localhost", Port: configuration.BasePort + 2}.String()
+	configuration.RaftVoters[0].Endpoint = config.Endpoint{Host: "localhost", Port: configuration.BasePort + 8}.String()
+	if err := configuration.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	running := startRunningService(t, configuration, newServiceStore(1), clock.NewManual(time.Unix(1025, 0)), transport.NewMemoryNetwork(), 302)
+	snapshot, err := running.service.Snapshot(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 1 || snapshot[0].NodeID != configuration.NodeID || snapshot[0].Status != Alive {
+		t.Fatalf("canonical self-seed snapshot = %#v, want admitted self", snapshot)
+	}
+	running.stop(t)
+}
+
 func TestServiceDoesNotReportReadyWhenSnapshotBindFails(t *testing.T) {
 	configuration := serviceTestConfig(t, 1)
 	snapshotEndpoint, err := configuration.BindEndpoint(config.ServiceSWIMSnapshot)

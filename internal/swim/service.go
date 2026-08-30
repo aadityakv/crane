@@ -395,7 +395,7 @@ func (s *Service) Run(ctx context.Context) (runError error) {
 		stopWorkers()
 		return err
 	}
-	if seed == selfSnapshot {
+	if config.SameEndpoint(seed, selfSnapshot) {
 		self, err := PrepareJoin(s.options.Store, nil, Member{
 			NodeID:   s.options.Config.NodeID,
 			Host:     s.options.Config.AdvertiseHost,
