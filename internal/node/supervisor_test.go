@@ -99,6 +99,22 @@ func TestSupervisorCausalityRejectsAggregateReadyAfterCompletionBeforeBufferedRe
 	assertChannelOpen(t, aggregateReady, "aggregate readiness after causally early completion")
 }
 
+func TestSupervisorCausalityPublishesAggregateReadyWhenReadinessClosesBeforeCompletion(t *testing.T) {
+	causality := &supervisorCausality{}
+	childReady := make(chan struct{})
+	aggregateReady := make(chan struct{})
+	close(childReady)
+	result := causality.linearizeCompletion(0, errors.New("running failure"), childReady, context.Background())
+
+	if !result.ready {
+		t.Fatal("completion did not observe readiness that causally closed first")
+	}
+	if !causality.publishReady(context.Background(), func() { close(aggregateReady) }) {
+		t.Fatal("aggregate readiness was suppressed by a completion that followed child readiness")
+	}
+	assertChannelClosed(t, aggregateReady, "aggregate readiness after causally later completion")
+}
+
 func TestSupervisorCancellationAfterReadyJoinsEveryService(t *testing.T) {
 	first := newFakeService("first")
 	second := newFakeService("second")

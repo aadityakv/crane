@@ -31,19 +31,22 @@ type completion struct {
 var errSupervisorShutdown = errors.New("supervisor initiated shutdown")
 
 type supervisorCausality struct {
-	mu                    sync.Mutex
-	cancellationInitiated bool
-	completionInitiated   bool
+	mu                      sync.Mutex
+	cancellationInitiated   bool
+	startupFailureInitiated bool
 }
 
 func (c *supervisorCausality) linearizeCompletion(index int, err error, ready <-chan struct{}, parent context.Context) completion {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.completionInitiated = true
+	serviceReady := channelClosed(ready)
+	if !serviceReady {
+		c.startupFailureInitiated = true
+	}
 	return completion{
 		index:                 index,
 		err:                   err,
-		ready:                 channelClosed(ready),
+		ready:                 serviceReady,
 		cancellationInitiated: c.cancellationInitiated,
 		parentCause:           context.Cause(parent),
 	}
@@ -52,7 +55,7 @@ func (c *supervisorCausality) linearizeCompletion(index int, err error, ready <-
 func (c *supervisorCausality) publishReady(parent context.Context, publish func()) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.completionInitiated || c.cancellationInitiated || context.Cause(parent) != nil {
+	if c.startupFailureInitiated || c.cancellationInitiated || context.Cause(parent) != nil {
 		return false
 	}
 	publish()
@@ -150,7 +153,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			shutdown = true
 		}
 	}
-	if !shutdown && readyCount == len(states) {
+	if readyCount == len(states) {
 		if !causality.publishReady(ctx, func() { s.readyOnce.Do(func() { close(s.ready) }) }) {
 			shutdown = true
 		}
