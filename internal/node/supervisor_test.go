@@ -83,36 +83,85 @@ func TestSupervisorReadyRemainsOpenWhenServiceFailsBeforeReadiness(t *testing.T)
 	assertChannelClosed(t, sibling.returned, "sibling joined before supervisor return")
 }
 
-func TestSupervisorCausalityRejectsAggregateReadyAfterCompletionBeforeBufferedReadiness(t *testing.T) {
-	causality := &supervisorCausality{}
-	childReady := make(chan struct{})
-	aggregateReady := make(chan struct{})
-	result := causality.linearizeCompletion(0, errors.New("startup failed"), childReady, context.Background())
-	close(childReady)
+func TestSupervisorCausalityPublishesWhenAllChildrenReadyBeforeHandledCompletion(t *testing.T) {
+	first := newFakeService("first")
+	second := newFakeService("second")
+	supervisor := NewSupervisor(first, second)
+	causality := newSupervisorCausality(first.Ready(), second.Ready())
+	first.markReady()
+	second.markReady()
+	completion := causality.linearizeCompletion(0, errors.New("running failure"), context.Background())
 
-	if result.ready {
-		t.Fatal("completion observed child ready even though completion linearized first")
+	if !completion.ready {
+		t.Fatal("completion did not observe its own readiness")
 	}
-	if causality.publishReady(context.Background(), func() { close(aggregateReady) }) {
-		t.Fatal("aggregate readiness published after a completion was already linearized")
+	if !supervisor.publishAggregateReady(context.Background(), causality) {
+		t.Fatal("aggregate readiness was suppressed because the second child's closed readiness event remained buffered")
 	}
-	assertChannelOpen(t, aggregateReady, "aggregate readiness after causally early completion")
+	assertChannelClosed(t, supervisor.Ready(), "aggregate readiness after every declared channel closed")
 }
 
-func TestSupervisorCausalityPublishesAggregateReadyWhenReadinessClosesBeforeCompletion(t *testing.T) {
-	causality := &supervisorCausality{}
-	childReady := make(chan struct{})
-	aggregateReady := make(chan struct{})
-	close(childReady)
-	result := causality.linearizeCompletion(0, errors.New("running failure"), childReady, context.Background())
+func TestSupervisorCausalityRejectsWhenCompletionPrecedesAllChildrenReady(t *testing.T) {
+	first := newFakeService("first")
+	second := newFakeService("second")
+	supervisor := NewSupervisor(first, second)
+	causality := newSupervisorCausality(first.Ready(), second.Ready())
+	first.markReady()
+	completion := causality.linearizeCompletion(0, errors.New("running failure"), context.Background())
+	second.markReady()
 
-	if !result.ready {
-		t.Fatal("completion did not observe readiness that causally closed first")
+	if !completion.ready {
+		t.Fatal("completion did not observe its own readiness")
 	}
-	if !causality.publishReady(context.Background(), func() { close(aggregateReady) }) {
-		t.Fatal("aggregate readiness was suppressed by a completion that followed child readiness")
+	if supervisor.publishAggregateReady(context.Background(), causality) {
+		t.Fatal("aggregate readiness published even though completion linearized before the second child was ready")
 	}
-	assertChannelClosed(t, aggregateReady, "aggregate readiness after causally later completion")
+	assertChannelOpen(t, supervisor.Ready(), "aggregate readiness after sibling became ready too late")
+}
+
+func TestSupervisorOwnReadyCompletionWhileSiblingUnreadyKeepsAggregateOpenAndJoins(t *testing.T) {
+	failed := newFakeService("failed")
+	sibling := newFakeService("sibling")
+	failed.markReady()
+	sibling.waitAfterCancellation = make(chan struct{})
+	supervisor := NewSupervisor(failed, sibling)
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Run(context.Background()) }()
+
+	<-failed.started
+	<-sibling.started
+	failure := errors.New("running failure")
+	failed.fail(failure)
+	<-sibling.canceled
+	assertChannelOpen(t, supervisor.Ready(), "aggregate readiness while sibling never became ready")
+	close(sibling.waitAfterCancellation)
+	if err := <-result; !errors.Is(err, failure) || strings.Contains(err.Error(), "before reporting ready") {
+		t.Fatalf("Run error = %v, want running failure %v", err, failure)
+	}
+	assertChannelClosed(t, sibling.returned, "unready sibling joined")
+}
+
+func TestSupervisorAllReadyThenRunningFailurePublishesAggregateAndJoins(t *testing.T) {
+	failed := newFakeService("failed")
+	sibling := newFakeService("sibling")
+	failed.markReady()
+	sibling.markReady()
+	sibling.waitAfterCancellation = make(chan struct{})
+	supervisor := NewSupervisor(failed, sibling)
+	result := make(chan error, 1)
+	go func() { result <- supervisor.Run(context.Background()) }()
+
+	<-failed.started
+	<-sibling.started
+	failure := errors.New("running failure")
+	failed.fail(failure)
+	<-sibling.canceled
+	assertChannelClosed(t, supervisor.Ready(), "aggregate readiness after every child was ready")
+	close(sibling.waitAfterCancellation)
+	if err := <-result; !errors.Is(err, failure) || strings.Contains(err.Error(), "before reporting ready") {
+		t.Fatalf("Run error = %v, want running failure %v", err, failure)
+	}
+	assertChannelClosed(t, sibling.returned, "ready sibling joined")
 }
 
 func TestSupervisorCancellationAfterReadyJoinsEveryService(t *testing.T) {
@@ -325,14 +374,14 @@ func TestSupervisorDoesNotLetEarlierNilCancellationMaskLaterFailure(t *testing.T
 }
 
 func TestSupervisorKeepsNilCompletionLinearizedBeforeCancellationUnexpectedWhenDeliveryIsDelayed(t *testing.T) {
-	causality := &supervisorCausality{}
 	ready := make(chan struct{})
 	close(ready)
+	causality := newSupervisorCausality(ready, ready)
 	linearized := make(chan struct{})
 	releaseDelivery := make(chan struct{})
 	earlierDelivery := make(chan completion, 1)
 	go func() {
-		result := causality.linearizeCompletion(0, nil, ready, context.Background())
+		result := causality.linearizeCompletion(0, nil, context.Background())
 		close(linearized)
 		<-releaseDelivery
 		earlierDelivery <- result
@@ -340,7 +389,7 @@ func TestSupervisorKeepsNilCompletionLinearizedBeforeCancellationUnexpectedWhenD
 	<-linearized
 
 	laterFailure := errors.New("later listener failed")
-	later := causality.linearizeCompletion(1, laterFailure, ready, context.Background())
+	later := causality.linearizeCompletion(1, laterFailure, context.Background())
 	derivedContext, cancel := context.WithCancelCause(context.Background())
 	causality.initiateCancellation(cancel)
 	if !errors.Is(context.Cause(derivedContext), errSupervisorShutdown) {
