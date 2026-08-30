@@ -31,7 +31,7 @@ const (
 	ServiceTopologyControl
 	// ServiceCraneTupleACK reserves the future Crane tuple-acknowledgment endpoint.
 	ServiceCraneTupleACK
-	// ServiceRaftRPC reserves the future fixed-voter Raft RPC endpoint.
+	// ServiceRaftRPC identifies the active fixed-voter Raft RPC endpoint.
 	ServiceRaftRPC
 )
 

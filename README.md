@@ -45,7 +45,7 @@ Do not commit or place the secret in JSON configuration. The example configurati
 - `advertise_host`: routable IP address or DNS name advertised to peers; wildcard addresses are rejected.
 - `base_port`: nonzero base used with the typed service registry below.
 - `introducer`: a seed node's SWIM snapshot endpoint, used only for initial admission.
-- `storage_dir`: non-root directory for the persisted SWIM incarnation state and future subsystem state.
+- `storage_dir`: non-root directory for persisted SWIM incarnation and fixed-voter Raft state, with space for later Crane/SDFS state.
 - `cluster_secret_file`: path to the owner-only HMAC key file.
 - `raft_voters`: the same static three- or five-member ID/endpoint map in every node configuration.
 - `timing`: positive SWIM and replay durations; direct plus indirect probe timeouts may not exceed the probe interval.
