@@ -138,6 +138,41 @@ func TestTupleDeliveryExactMaximumFitsCompleteDatagram(t *testing.T) {
 	}
 }
 
+func TestTupleTrafficExactSchemaSizeRules(t *testing.T) {
+	if TupleDeliveryFixedPayloadBytes != 4+98+2+86+86+56+34 {
+		t.Fatalf("delivery fixed bytes = %d, want schema+type+DeliveryID+tuple-length+producer+destination+set+epoch = 366", TupleDeliveryFixedPayloadBytes)
+	}
+	if TupleDeliveryMinPayloadBytes != TupleDeliveryFixedPayloadBytes+2 {
+		t.Fatalf("delivery minimum bytes = %d, want 368", TupleDeliveryMinPayloadBytes)
+	}
+	if TupleDeliveryMaxPayloadBytes() != TupleDeliveryFixedPayloadBytes+int(model.LimitsV1().MaxTuplePayloadBytes) {
+		t.Fatalf("delivery maximum bytes = %d, want 878", TupleDeliveryMaxPayloadBytes())
+	}
+	if TupleACKPayloadBytes != 4+98+86+56+34+1 {
+		t.Fatalf("ACK bytes = %d, want 279", TupleACKPayloadBytes)
+	}
+	if TupleNACKPayloadBytes != 4+98+86+56+34+2 {
+		t.Fatalf("NACK bytes = %d, want 280", TupleNACKPayloadBytes)
+	}
+
+	minimum := testTupleDelivery()
+	minimum.Tuple = model.Tuple{}
+	minimumBytes := mustMarshalDelivery(t, minimum)
+	if len(minimumBytes) != TupleDeliveryMinPayloadBytes {
+		t.Fatalf("minimum delivery bytes = %d, want %d", len(minimumBytes), TupleDeliveryMinPayloadBytes)
+	}
+	maximumBytes := mustMarshalDelivery(t, maximumTupleDelivery())
+	if len(maximumBytes) != TupleDeliveryMaxPayloadBytes() {
+		t.Fatalf("maximum delivery bytes = %d, want %d", len(maximumBytes), TupleDeliveryMaxPayloadBytes())
+	}
+	if got := len(mustMarshalACK(t, testTupleACK())); got != TupleACKPayloadBytes {
+		t.Fatalf("ACK bytes = %d, want %d", got, TupleACKPayloadBytes)
+	}
+	if got := len(mustMarshalNACK(t, testTupleNACK())); got != TupleNACKPayloadBytes {
+		t.Fatalf("NACK bytes = %d, want %d", got, TupleNACKPayloadBytes)
+	}
+}
+
 func maximumTupleDelivery() TupleDelivery {
 	job := model.JobID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 	source := model.TaskID{JobID: job, StageID: math.MaxUint16, Partition: math.MaxUint16}
@@ -193,17 +228,109 @@ func TestTupleDeliveryRejectsImpossibleDeclaredTupleLengthBeforeAllocation(t *te
 			t.Fatalf("declared tuple length %d error = %v, want ErrMalformedTupleMessage", declared, err)
 		}
 	}
+}
+
+func TestTupleDeliveryPreflightRejectsShapeBeforeTupleDecoder(t *testing.T) {
+	valid := mustMarshalDelivery(t, testTupleDelivery())
+	validCalls := 0
+	if _, err := unmarshalTupleDeliveryWith(valid, func(input []byte) (model.Tuple, error) {
+		validCalls++
+		return model.UnmarshalTuple(input)
+	}); err != nil {
+		t.Fatalf("valid injected decode: %v", err)
+	}
+	if validCalls != 1 {
+		t.Fatalf("valid tuple decoder calls = %d, want 1", validCalls)
+	}
+	tests := []struct {
+		name  string
+		input []byte
+	}{
+		{name: "fixed suffix missing one byte", input: valid[:len(valid)-1]},
+		{name: "valid frame plus one byte", input: append(append([]byte(nil), valid...), 0)},
+		{name: "maximum tuple prefix without fixed suffix", input: append(append([]byte(nil), valid[:102]...), 2, 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			decode := func([]byte) (model.Tuple, error) {
+				calls++
+				panic("tuple decoder must not run before exact frame-shape preflight")
+			}
+			if _, err := unmarshalTupleDeliveryWith(test.input, decode); !errors.Is(err, ErrMalformedTupleMessage) {
+				t.Fatalf("preflight error = %v, want ErrMalformedTupleMessage", err)
+			}
+			if calls != 0 {
+				t.Fatalf("tuple decoder calls = %d, want 0", calls)
+			}
+		})
+	}
+}
+
+func TestTupleTrafficExactSizesRejectPlusOneAndTruncatedSuffix(t *testing.T) {
+	tests := []struct {
+		name    string
+		encoded []byte
+		decode  func([]byte) error
+	}{
+		{name: "delivery", encoded: mustMarshalDelivery(t, testTupleDelivery()), decode: decodeDeliveryError},
+		{name: "ack", encoded: mustMarshalACK(t, testTupleACK()), decode: decodeACKError},
+		{name: "nack", encoded: mustMarshalNACK(t, testTupleNACK()), decode: decodeNACKError},
+	}
+	for _, test := range tests {
+		t.Run(test.name+"/plus-one", func(t *testing.T) {
+			input := append(append([]byte(nil), test.encoded...), 0)
+			if err := test.decode(input); !errors.Is(err, ErrMalformedTupleMessage) {
+				t.Fatalf("plus-one error = %v, want ErrMalformedTupleMessage", err)
+			}
+		})
+		t.Run(test.name+"/truncated-suffix", func(t *testing.T) {
+			if err := test.decode(test.encoded[:len(test.encoded)-1]); !errors.Is(err, ErrMalformedTupleMessage) {
+				t.Fatalf("truncated suffix error = %v, want ErrMalformedTupleMessage", err)
+			}
+		})
+	}
+	maximum := mustMarshalDelivery(t, maximumTupleDelivery())
+	if _, err := UnmarshalTupleDelivery(append(maximum, 0)); !errors.Is(err, ErrTupleMessageTooLarge) {
+		t.Fatalf("maximum delivery plus one error = %v, want ErrTupleMessageTooLarge", err)
+	}
+	minimum := mustMarshalDelivery(t, func() TupleDelivery {
+		value := testTupleDelivery()
+		value.Tuple = model.Tuple{}
+		return value
+	}())
+	if _, err := UnmarshalTupleDelivery(minimum[:len(minimum)-1]); !errors.Is(err, ErrMalformedTupleMessage) {
+		t.Fatalf("minimum delivery minus one error = %v, want ErrMalformedTupleMessage", err)
+	}
+}
+
+func TestTupleMalformedDeclarationAllocatesFixedBytesNotDeclaredBytes(t *testing.T) {
 	impossible := []byte{0, 1, 1, 24}
 	impossible = append(impossible, make([]byte, 98)...)
 	impossible = append(impossible, 0xff, 0xff)
-	allocations := testing.AllocsPerRun(100, func() {
-		_, _ = UnmarshalTupleDelivery(impossible)
+	declaredBytes := benchmarkTupleDecodeBytes(impossible)
+	t.Logf("65,535-declared malformed frame: %d allocated bytes/op", declaredBytes)
+	if declaredBytes > 2_048 {
+		t.Fatalf("65,535-declared malformed frame allocated %d bytes/op, want <= 2048", declaredBytes)
+	}
+
+	random := rand.New(rand.NewPCG(0x425, 0x65535))
+	randomMalformed := make([][]byte, 256)
+	for index := range randomMalformed {
+		length := random.IntN(TupleDeliveryMaxPayloadBytes() + 64)
+		randomMalformed[index] = make([]byte, length)
+		for offset := range randomMalformed[index] {
+			randomMalformed[index][offset] = byte(random.Uint32())
+		}
+	}
+	result := testing.Benchmark(func(benchmark *testing.B) {
+		for index := 0; index < benchmark.N; index++ {
+			_, _ = UnmarshalTupleDelivery(randomMalformed[index%len(randomMalformed)])
+		}
 	})
-	// Race instrumentation adds one allocation to the formatted error path. The
-	// fixed ceiling still proves the peer-controlled 65,535-byte declaration is
-	// rejected without an allocation proportional to that declaration.
-	if allocations > 8 {
-		t.Fatalf("impossible declared length allocations = %.1f, want <= 8", allocations)
+	t.Logf("deterministic randomized malformed frames: %d allocated bytes/op", result.AllocedBytesPerOp())
+	if got := result.AllocedBytesPerOp(); got > 2_048 {
+		t.Fatalf("random malformed frames allocated %d bytes/op, want <= 2048", got)
 	}
 }
 
@@ -479,6 +606,15 @@ func mustMarshalNACK(t testingFataler, value TupleNACK) []byte {
 func decodeDeliveryError(input []byte) error { _, err := UnmarshalTupleDelivery(input); return err }
 func decodeACKError(input []byte) error      { _, err := UnmarshalTupleACK(input); return err }
 func decodeNACKError(input []byte) error     { _, err := UnmarshalTupleNACK(input); return err }
+
+func benchmarkTupleDecodeBytes(input []byte) int64 {
+	result := testing.Benchmark(func(benchmark *testing.B) {
+		for index := 0; index < benchmark.N; index++ {
+			_, _ = UnmarshalTupleDelivery(input)
+		}
+	})
+	return result.AllocedBytesPerOp()
+}
 
 func assertNoTupleCodecPanic(t *testing.T, input []byte) {
 	t.Helper()

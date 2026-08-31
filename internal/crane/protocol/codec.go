@@ -11,6 +11,35 @@ import (
 
 const maxTupleMessagePayloadBytes = wire.MaxCraneDatagramBytesV1 - wire.FixedHeaderSize - wire.MACSize
 
+const (
+	tupleMessagePrefixBytes      = 2 + 2
+	tupleDeliveryIDBytes         = 16 + (16 + 2 + 2) + 8 + 32 + 2 + (16 + 2 + 2)
+	tupleAssignmentTokenBytes    = (16 + 2 + 2) + 2 + 16 + 8 + 32 + 8
+	tupleAssignmentIdentityBytes = 16 + 8 + 32
+	tupleCoordinatorEpochBytes   = 8 + 8 + 2 + 16
+	tupleLengthBytes             = 2
+	minimumCanonicalTupleBytes   = 2
+
+	// TupleDeliveryFixedPayloadBytes is schema/type + DeliveryID + tuple length
+	// + producer token + destination token + complete set identity + epoch.
+	TupleDeliveryFixedPayloadBytes = tupleMessagePrefixBytes + tupleDeliveryIDBytes + tupleLengthBytes +
+		2*tupleAssignmentTokenBytes + tupleAssignmentIdentityBytes + tupleCoordinatorEpochBytes
+	// TupleDeliveryMinPayloadBytes includes the canonical empty-tuple count.
+	TupleDeliveryMinPayloadBytes = TupleDeliveryFixedPayloadBytes + minimumCanonicalTupleBytes
+	// TupleACKPayloadBytes is the one exact v1 ACK payload size.
+	TupleACKPayloadBytes = tupleMessagePrefixBytes + tupleDeliveryIDBytes + tupleAssignmentTokenBytes +
+		tupleAssignmentIdentityBytes + tupleCoordinatorEpochBytes + 1
+	// TupleNACKPayloadBytes is the one exact v1 NACK payload size.
+	TupleNACKPayloadBytes = tupleMessagePrefixBytes + tupleDeliveryIDBytes + tupleAssignmentTokenBytes +
+		tupleAssignmentIdentityBytes + tupleCoordinatorEpochBytes + 2
+)
+
+// TupleDeliveryMaxPayloadBytes derives the exact v1 delivery ceiling from the
+// sole canonical tuple bound in model; it introduces no second tuple limit.
+func TupleDeliveryMaxPayloadBytes() int {
+	return TupleDeliveryFixedPayloadBytes + int(model.LimitsV1().MaxTuplePayloadBytes)
+}
+
 // MarshalTupleDelivery validates and encodes one canonical v1 tuple delivery payload.
 func MarshalTupleDelivery(message TupleDelivery) ([]byte, error) {
 	if err := message.validate(); err != nil {
@@ -47,8 +76,17 @@ func MarshalTupleDelivery(message TupleDelivery) ([]byte, error) {
 
 // UnmarshalTupleDelivery decodes one complete canonical v1 tuple delivery payload.
 func UnmarshalTupleDelivery(encoded []byte) (TupleDelivery, error) {
+	return unmarshalTupleDeliveryWith(encoded, model.UnmarshalTuple)
+}
+
+type tupleDecodeFunc func([]byte) (model.Tuple, error)
+
+func unmarshalTupleDeliveryWith(encoded []byte, decodeTuple tupleDecodeFunc) (TupleDelivery, error) {
 	decoder, err := newTupleDecoder(encoded, TupleDeliverySchemaVersion, wire.MessageCraneTupleDelivery)
 	if err != nil {
+		return TupleDelivery{}, err
+	}
+	if err := preflightTupleDelivery(encoded); err != nil {
 		return TupleDelivery{}, err
 	}
 	deliveryID, err := decoder.deliveryID()
@@ -59,7 +97,7 @@ func UnmarshalTupleDelivery(encoded []byte) (TupleDelivery, error) {
 	if err != nil {
 		return TupleDelivery{}, err
 	}
-	tuple, err := model.UnmarshalTuple(tupleBytes)
+	tuple, err := decodeTuple(tupleBytes)
 	if err != nil {
 		return TupleDelivery{}, fmt.Errorf("%w: tuple: %v", ErrInvalidTupleMessage, err)
 	}
@@ -126,6 +164,9 @@ func UnmarshalTupleACK(encoded []byte) (TupleACK, error) {
 	if err != nil {
 		return TupleACK{}, err
 	}
+	if len(encoded) != TupleACKPayloadBytes {
+		return TupleACK{}, fmt.Errorf("%w: ACK payload is %d bytes, want %d", ErrMalformedTupleMessage, len(encoded), TupleACKPayloadBytes)
+	}
 	deliveryID, err := decoder.deliveryID()
 	if err != nil {
 		return TupleACK{}, err
@@ -188,6 +229,9 @@ func UnmarshalTupleNACK(encoded []byte) (TupleNACK, error) {
 	decoder, err := newTupleDecoder(encoded, TupleNACKSchemaVersion, wire.MessageCraneTupleDeliveryNack)
 	if err != nil {
 		return TupleNACK{}, err
+	}
+	if len(encoded) != TupleNACKPayloadBytes {
+		return TupleNACK{}, fmt.Errorf("%w: NACK payload is %d bytes, want %d", ErrMalformedTupleMessage, len(encoded), TupleNACKPayloadBytes)
 	}
 	deliveryID, err := decoder.deliveryID()
 	if err != nil {
@@ -372,6 +416,26 @@ func newTupleDecoder(input []byte, schema uint16, message wire.MessageType) (tup
 		return tupleDecoder{}, fmt.Errorf("%w: got %d, want %d", ErrUnexpectedMessage, gotMessage, message)
 	}
 	return decoder, nil
+}
+
+func preflightTupleDelivery(input []byte) error {
+	maximum := TupleDeliveryMaxPayloadBytes()
+	if len(input) < TupleDeliveryMinPayloadBytes {
+		return fmt.Errorf("%w: delivery payload is %d bytes, minimum is %d", ErrMalformedTupleMessage, len(input), TupleDeliveryMinPayloadBytes)
+	}
+	if len(input) > maximum {
+		return fmt.Errorf("%w: delivery payload is %d bytes, maximum is %d", ErrTupleMessageTooLarge, len(input), maximum)
+	}
+	lengthOffset := tupleMessagePrefixBytes + tupleDeliveryIDBytes
+	declared := int(binary.BigEndian.Uint16(input[lengthOffset : lengthOffset+tupleLengthBytes]))
+	if uint64(declared) > model.LimitsV1().MaxTuplePayloadBytes {
+		return fmt.Errorf("%w: declared tuple length %d exceeds %d", ErrMalformedTupleMessage, declared, model.LimitsV1().MaxTuplePayloadBytes)
+	}
+	expected := TupleDeliveryFixedPayloadBytes + declared
+	if len(input) != expected {
+		return fmt.Errorf("%w: delivery payload is %d bytes, declared shape requires %d", ErrMalformedTupleMessage, len(input), expected)
+	}
+	return nil
 }
 
 func (decoder *tupleDecoder) remaining() int { return len(decoder.input) - decoder.offset }
