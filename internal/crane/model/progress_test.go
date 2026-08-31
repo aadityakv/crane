@@ -92,6 +92,10 @@ func TestCheckpointNoticeAndFailureValidation(t *testing.T) {
 	if err := notice.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	notice.Watermark = 0
+	if err := notice.Validate(); err != nil {
+		t.Fatalf("empty-source checkpoint zero rejected: %v", err)
+	}
 	failure := JobFailureReport{JobID: job, JobControlRevision: 1, AssignmentRevision: 2, Task: AssignmentToken{Task: task, WorkerID: 2, WorkerEpoch: WorkerEpoch{2}, Attempt: 1, SpecificationHash: [32]byte{3}, AssignmentRevision: 2}, Epoch: epoch, TransactionID: 3, Code: FailureOperator, DetailDigest: [32]byte{4}}
 	if err := failure.Validate(); err != nil {
 		t.Fatal(err)

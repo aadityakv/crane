@@ -391,6 +391,7 @@ func (e *workerEncoder) repair(v RepairResultPartition) {
 	e.add(v.SpecificationHash[:])
 	e.checkpoints(v.Checkpoints)
 	e.add(v.CheckpointDigest[:])
+	e.add(v.InventoryQueryDigest[:])
 	e.u64(v.ExpectedRecordCount)
 	e.u64(v.ExpectedTotalBytes)
 	e.add(v.ExpectedContentDigest[:])
@@ -542,6 +543,7 @@ func (e *workerEncoder) message(message WorkerMessage) error {
 			e.add(m.Inventory.ContentDigest[:])
 		} else if m.Repair != nil {
 			e.u8(2)
+			e.repair(m.Repair.Instruction)
 			e.add(m.Repair.RepairID[:])
 			e.add(m.Repair.InstructionDigest[:])
 			e.u8(byte(m.Repair.Role))
@@ -986,6 +988,10 @@ func (d *workerDecoder) repair() (v RepairResultPartition, err error) {
 		return
 	}
 	v.CheckpointDigest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.InventoryQueryDigest, err = d.fixed32()
 	if err != nil {
 		return
 	}
@@ -1663,6 +1669,10 @@ func (d *workerDecoder) status() (WorkerMessage, error) {
 		}
 		v.Inventory = &ResultInventorySummary{q, rc, total, content}
 	case 2:
+		instruction, er := d.repair()
+		if er != nil {
+			return nil, er
+		}
 		id, er := d.fixed16()
 		if er != nil {
 			return nil, er
@@ -1695,7 +1705,7 @@ func (d *workerDecoder) status() (WorkerMessage, error) {
 		if er != nil {
 			return nil, er
 		}
-		v.Repair = &ResultRepairStatus{id, dig, RepairEndpointRole(role), ResultRepairState(state), rc, total, content, WorkerErrorCode(code)}
+		v.Repair = &ResultRepairStatus{Instruction: instruction, RepairID: id, InstructionDigest: dig, Role: RepairEndpointRole(role), State: ResultRepairState(state), RecordCount: rc, TotalBytes: total, ContentDigest: content, ErrorCode: WorkerErrorCode(code)}
 	default:
 		return nil, ErrMalformedWorkerMessage
 	}

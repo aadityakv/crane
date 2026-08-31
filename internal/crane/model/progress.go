@@ -155,8 +155,8 @@ func (notice CheckpointNotice) Validate() error {
 	if err := notice.Source.Validate(); err != nil || notice.Source.JobID != notice.JobID {
 		return errors.New("invalid checkpoint source")
 	}
-	if notice.Watermark == 0 || notice.RaftIndex == 0 {
-		return errors.New("zero checkpoint watermark or Raft index")
+	if notice.RaftIndex == 0 {
+		return errors.New("zero checkpoint Raft index")
 	}
 	return notice.Epoch.Validate()
 }

@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -10,13 +11,13 @@ import (
 )
 
 const (
-	WorkerControlSchemaVersion   uint16 = 1
-	MaxWorkerControlPayloadBytes        = (1 << 20) - wire.FixedHeaderSize - wire.MACSize
-	MaxWorkerStatusEvents               = 256
-	MaxInventoryCheckpoints             = 256
-	MaxTransferChunkBytes               = 256 << 10
-	MaxTransferTotalBytes               = 64 << 20
-	MaxWorkerErrorDetailBytes           = 256
+	WorkerControlSchemaVersion   uint16 = model.WorkerControlSchemaVersionV1
+	MaxWorkerControlPayloadBytes        = model.WorkerControlMaxFrameBytesV1 - wire.FixedHeaderSize - wire.MACSize
+	MaxWorkerStatusEvents               = model.WorkerControlMaxStatusEventsV1
+	MaxInventoryCheckpoints             = model.WorkerControlMaxCheckpointsV1
+	MaxTransferChunkBytes               = model.WorkerControlMaxTransferChunkV1
+	MaxTransferTotalBytes               = model.WorkerControlMaxTransferTotalV1
+	MaxWorkerErrorDetailBytes           = model.WorkerControlMaxErrorDetailV1
 )
 
 var (
@@ -113,10 +114,7 @@ func (AssignmentSetInstallAck) MessageType() wire.MessageType {
 	return wire.MessageCraneAssignmentSetInstallAck
 }
 
-type SourceCheckpoint struct {
-	Source    model.TaskID
-	Watermark uint64
-}
+type SourceCheckpoint = model.SourceCheckpoint
 type ResultInventoryQuery struct {
 	JobID              model.JobID
 	SinkTask           model.TaskID
@@ -154,6 +152,7 @@ type RepairResultPartition struct {
 	SpecificationHash      [32]byte
 	Checkpoints            []SourceCheckpoint
 	CheckpointDigest       [32]byte
+	InventoryQueryDigest   [32]byte
 	ExpectedRecordCount    uint64
 	ExpectedTotalBytes     uint64
 	ExpectedContentDigest  [32]byte
@@ -173,6 +172,7 @@ const (
 )
 
 type ResultRepairStatus struct {
+	Instruction       RepairResultPartition
 	RepairID          [16]byte
 	InstructionDigest [32]byte
 	Role              RepairEndpointRole
@@ -356,55 +356,33 @@ type WorkerError struct {
 func (WorkerError) MessageType() wire.MessageType { return wire.MessageCraneWorkerError }
 
 func CheckpointVectorDigest(entries []SourceCheckpoint) [32]byte {
-	return sha256.Sum256(appendCheckpointVector([]byte("cs425/crane/checkpoint-vector/v1\x00"), entries))
+	return model.CheckpointVectorDigest(entries)
 }
 func InventoryQueryDigest(query ResultInventoryQuery) [32]byte {
-	b := append([]byte("cs425/crane/result-inventory-query/v1\x00"), query.JobID[:]...)
-	b = appendTaskIDWorker(b, query.SinkTask)
-	b = append(b, query.SpecificationHash[:]...)
-	b = appendUint64Worker(b, query.AssignmentRevision)
-	b = append(b, query.AssignmentDigest[:]...)
-	b = appendCheckpointVector(b, query.Checkpoints)
-	b = append(b, query.CheckpointDigest[:]...)
-	return sha256.Sum256(b)
+	return model.ResultInventoryQueryDigest(model.ResultInventoryQueryDefinition{
+		JobID: query.JobID, SinkTask: query.SinkTask, SpecificationHash: query.SpecificationHash,
+		AssignmentRevision: query.AssignmentRevision, AssignmentDigest: query.AssignmentDigest,
+		Checkpoints: query.Checkpoints, CheckpointDigest: query.CheckpointDigest,
+	})
 }
 func DeriveRepairID(instruction RepairResultPartition) [16]byte {
-	sum := sha256.Sum256(appendRepairDefinition([]byte("cs425/crane/repair-id/v1\x00"), instruction, false))
-	var id [16]byte
-	copy(id[:], sum[:16])
-	return id
+	return model.DeriveRepairID(repairDefinition(instruction))
 }
 func RepairInstructionDigest(instruction RepairResultPartition) [32]byte {
-	return sha256.Sum256(appendRepairDefinition([]byte("cs425/crane/repair-instruction/v1\x00"), instruction, true))
+	return model.RepairInstructionDigest(repairDefinition(instruction))
 }
 
-func appendCheckpointVector(b []byte, entries []SourceCheckpoint) []byte {
-	b = appendUint16Worker(b, uint16(len(entries)))
-	for _, entry := range entries {
-		b = appendTaskIDWorker(b, entry.Source)
-		b = appendUint64Worker(b, entry.Watermark)
+func repairDefinition(r RepairResultPartition) model.RepairResultPartitionDefinition {
+	return model.RepairResultPartitionDefinition{
+		RepairID: r.RepairID, CoordinatorEpoch: r.CoordinatorEpoch, JobID: r.JobID,
+		AssignmentRevision: r.AssignmentRevision, AssignmentDigest: r.AssignmentDigest,
+		SourceNodeID: r.SourceNodeID, SourceWorkerEpoch: r.SourceWorkerEpoch,
+		DestinationNodeID: r.DestinationNodeID, DestinationWorkerEpoch: r.DestinationWorkerEpoch,
+		SinkTask: r.SinkTask, SpecificationHash: r.SpecificationHash, Checkpoints: r.Checkpoints,
+		CheckpointDigest: r.CheckpointDigest, InventoryQueryDigest: r.InventoryQueryDigest,
+		ExpectedRecordCount: r.ExpectedRecordCount, ExpectedTotalBytes: r.ExpectedTotalBytes,
+		ExpectedContentDigest: r.ExpectedContentDigest,
 	}
-	return b
-}
-func appendRepairDefinition(b []byte, r RepairResultPartition, includeID bool) []byte {
-	if includeID {
-		b = append(b, r.RepairID[:]...)
-	}
-	b = appendCoordinatorWorker(b, r.CoordinatorEpoch)
-	b = append(b, r.JobID[:]...)
-	b = appendUint64Worker(b, r.AssignmentRevision)
-	b = append(b, r.AssignmentDigest[:]...)
-	b = appendUint16Worker(b, r.SourceNodeID)
-	b = append(b, r.SourceWorkerEpoch[:]...)
-	b = appendUint16Worker(b, r.DestinationNodeID)
-	b = append(b, r.DestinationWorkerEpoch[:]...)
-	b = appendTaskIDWorker(b, r.SinkTask)
-	b = append(b, r.SpecificationHash[:]...)
-	b = appendCheckpointVector(b, r.Checkpoints)
-	b = append(b, r.CheckpointDigest[:]...)
-	b = appendUint64Worker(b, r.ExpectedRecordCount)
-	b = appendUint64Worker(b, r.ExpectedTotalBytes)
-	return append(b, r.ExpectedContentDigest[:]...)
 }
 
 func validateHandshake(node uint16, epoch model.WorkerEpoch, consensus, registry [32]byte) error {
@@ -476,11 +454,34 @@ func (r RepairResultPartition) validate() error {
 	if err := validateCheckpoints(r.JobID, r.Checkpoints, r.CheckpointDigest); err != nil {
 		return err
 	}
+	wantQuery := InventoryQueryDigest(ResultInventoryQuery{JobID: r.JobID, SinkTask: r.SinkTask, SpecificationHash: r.SpecificationHash, AssignmentRevision: r.AssignmentRevision, AssignmentDigest: r.AssignmentDigest, Checkpoints: r.Checkpoints, CheckpointDigest: r.CheckpointDigest})
+	if r.InventoryQueryDigest == ([32]byte{}) || r.InventoryQueryDigest != wantQuery {
+		return errors.New("repair inventory query digest mismatch")
+	}
+	if err := validateResultAggregate(r.ExpectedRecordCount, r.ExpectedTotalBytes, r.ExpectedContentDigest, r.InventoryQueryDigest); err != nil {
+		return err
+	}
 	if r.RepairID == ([16]byte{}) || r.RepairID != DeriveRepairID(r) {
 		return errors.New("repair ID mismatch")
 	}
 	if r.InstructionDigest == ([32]byte{}) || r.InstructionDigest != RepairInstructionDigest(r) {
 		return errors.New("repair instruction digest mismatch")
+	}
+	return nil
+}
+
+func validateResultAggregate(count, total uint64, digest, context [32]byte) error {
+	if total > MaxTransferTotalBytes || (count == 0) != (total == 0) {
+		return errors.New("result aggregate count/bytes mismatch")
+	}
+	if count == 0 {
+		if digest != model.EmptyResultInventoryDigest(context) {
+			return errors.New("empty result aggregate digest mismatch")
+		}
+		return nil
+	}
+	if digest == ([32]byte{}) {
+		return errors.New("zero nonempty result aggregate digest")
 	}
 	return nil
 }
@@ -577,7 +578,7 @@ func validateWorkerMessage(message WorkerMessage) error {
 		}
 		return nil
 	case CheckpointAck:
-		if m.NodeID == 0 || m.WorkerEpoch.Validate() != nil || m.JobID.Validate() != nil || m.Source.Validate() != nil || m.Source.JobID != m.JobID || m.Watermark == 0 || m.RaftIndex == 0 || m.JobControlRevision == 0 || m.AssignmentRevision == 0 || m.AssignmentDigest == ([32]byte{}) {
+		if m.NodeID == 0 || m.WorkerEpoch.Validate() != nil || m.JobID.Validate() != nil || m.Source.Validate() != nil || m.Source.JobID != m.JobID || m.RaftIndex == 0 || m.JobControlRevision == 0 || m.AssignmentRevision == 0 || m.AssignmentDigest == ([32]byte{}) {
 			return errors.New("invalid checkpoint ACK")
 		}
 		return m.CoordinatorEpoch.Validate()
@@ -639,6 +640,9 @@ func (m WorkerStatusRequest) validate() error {
 		if m.Repair.Role < RepairSource || m.Repair.Role > RepairDestination {
 			return errors.New("invalid repair role")
 		}
+		if m.Repair.Instruction.CoordinatorEpoch != m.CoordinatorEpoch {
+			return errors.New("repair grant coordinator epoch mismatch")
+		}
 		return m.Repair.Instruction.validate()
 	}
 	return nil
@@ -675,18 +679,37 @@ func (m WorkerStatus) validate() error {
 		return errors.New("cursor exceeds store transaction")
 	}
 	if m.Inventory != nil {
-		if m.Inventory.QueryDigest == ([32]byte{}) || m.Inventory.ContentDigest == ([32]byte{}) || m.Inventory.TotalBytes > MaxTransferTotalBytes {
-			return errors.New("invalid inventory summary")
+		if m.Inventory.QueryDigest == ([32]byte{}) {
+			return errors.New("invalid inventory query digest")
+		}
+		if err := validateResultAggregate(m.Inventory.RecordCount, m.Inventory.TotalBytes, m.Inventory.ContentDigest, m.Inventory.QueryDigest); err != nil {
+			return err
 		}
 	}
 	if m.Repair != nil {
-		if m.Repair.RepairID == ([16]byte{}) || m.Repair.InstructionDigest == ([32]byte{}) || m.Repair.Role < RepairSource || m.Repair.Role > RepairDestination || m.Repair.State < RepairPending || m.Repair.State > RepairFailed || m.Repair.TotalBytes > MaxTransferTotalBytes {
+		if err := m.Repair.Instruction.validate(); err != nil {
+			return err
+		}
+		if m.Repair.Instruction.CoordinatorEpoch != m.CoordinatorEpoch {
+			return errors.New("repair status coordinator epoch mismatch")
+		}
+		if m.Repair.RepairID != m.Repair.Instruction.RepairID || m.Repair.InstructionDigest != m.Repair.Instruction.InstructionDigest || m.Repair.Role < RepairSource || m.Repair.Role > RepairDestination || m.Repair.State < RepairPending || m.Repair.State > RepairFailed {
 			return errors.New("invalid repair status")
 		}
 		failed := m.Repair.State == RepairFailed
 		validError := m.Repair.ErrorCode >= WorkerErrorMalformed && m.Repair.ErrorCode <= WorkerErrorCorrupt
-		if failed != validError || m.Repair.State == RepairComplete && m.Repair.ContentDigest == ([32]byte{}) || m.Repair.State != RepairFailed && (m.Repair.RecordCount != 0 || m.Repair.TotalBytes != 0) && m.Repair.ContentDigest == ([32]byte{}) {
+		if failed != validError {
 			return errors.New("repair state/error mismatch")
+		}
+		context := m.Repair.InstructionDigest
+		if m.Repair.State == RepairComplete {
+			context = m.Repair.Instruction.InventoryQueryDigest
+		}
+		if err := validateResultAggregate(m.Repair.RecordCount, m.Repair.TotalBytes, m.Repair.ContentDigest, context); err != nil {
+			return err
+		}
+		if m.Repair.State == RepairComplete && (m.Repair.RecordCount != m.Repair.Instruction.ExpectedRecordCount || m.Repair.TotalBytes != m.Repair.Instruction.ExpectedTotalBytes || m.Repair.ContentDigest != m.Repair.Instruction.ExpectedContentDigest) {
+			return errors.New("completed repair summary mismatch")
 		}
 	}
 	return nil
@@ -701,6 +724,15 @@ func (m ResultRecordChunk) validate() error {
 	}
 	if m.Transfer.JobID != m.Record.TupleID.JobID {
 		return errors.New("record transfer mismatch")
+	}
+	stream, err := model.MarshalResultRecord(m.Record)
+	if err != nil {
+		return err
+	}
+	wantChecksum := sha256.Sum256(stream)
+	end := m.Transfer.Offset + uint64(len(m.Transfer.Data))
+	if m.Transfer.TotalLength != uint64(len(stream)) || m.Transfer.Checksum != wantChecksum || end > uint64(len(stream)) || !bytes.Equal(m.Transfer.Data, stream[m.Transfer.Offset:end]) {
+		return errors.New("record transfer is not an exact canonical stream slice")
 	}
 	if err := m.Provenance.Validate(m.Record); err != nil {
 		return err
@@ -721,6 +753,21 @@ func (m ResultRecordAck) validate() error {
 	}
 	if (m.RepairID == ([16]byte{})) != (m.RepairInstructionDigest == ([32]byte{})) {
 		return errors.New("partial repair ACK binding")
+	}
+	return nil
+}
+
+// ValidateResultRecordAckCorrelation validates an ACK against the exact
+// canonical record transfer it advances.
+func ValidateResultRecordAckCorrelation(chunk ResultRecordChunk, ack ResultRecordAck) error {
+	if err := chunk.validate(); err != nil {
+		return err
+	}
+	if err := ack.validate(); err != nil {
+		return err
+	}
+	if ack.TransferID != chunk.Transfer.TransferID || ack.NodeID != chunk.DestinationNodeID || ack.WorkerEpoch != chunk.DestinationWorkerEpoch || ack.RepairID != chunk.RepairID || ack.RepairInstructionDigest != chunk.RepairInstructionDigest || ack.TotalLength != chunk.Transfer.TotalLength || ack.Checksum != chunk.Transfer.Checksum || ack.CoordinatorEpoch != chunk.Provenance.CoordinatorEpoch {
+		return errors.New("record ACK does not bind the canonical transfer")
 	}
 	return nil
 }
@@ -756,25 +803,6 @@ func (m ResultFetchChunk) validate() error {
 		return errors.New("invalid fetch chunk")
 	}
 	return m.CoordinatorEpoch.Validate()
-}
-
-func appendUint16Worker(b []byte, v uint16) []byte { return append(b, byte(v>>8), byte(v)) }
-func appendUint64Worker(b []byte, v uint64) []byte {
-	for shift := 56; shift >= 0; shift -= 8 {
-		b = append(b, byte(v>>uint(shift)))
-	}
-	return b
-}
-func appendTaskIDWorker(b []byte, t model.TaskID) []byte {
-	b = append(b, t.JobID[:]...)
-	b = appendUint16Worker(b, t.StageID)
-	return appendUint16Worker(b, t.Partition)
-}
-func appendCoordinatorWorker(b []byte, e model.CoordinatorEpoch) []byte {
-	b = appendUint64Worker(b, e.Term)
-	b = appendUint64Worker(b, e.BeginIndex)
-	b = appendUint16Worker(b, e.Coordinator)
-	return append(b, e.Nonce[:]...)
 }
 
 func invalidWorker(message WorkerMessage, err error) error {

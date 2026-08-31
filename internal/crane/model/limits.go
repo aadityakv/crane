@@ -69,9 +69,9 @@ const (
 	// ClientRequestID + complete client-command digest.
 	v1SubmitJobFixedBytes = v1Uint16Bytes + v1DigestBytes + v1Uint16Bytes + 1 + (16 + v1Uint64Bytes) + v1DigestBytes
 	// One AssignmentSetInstall excluding canonical topology bytes: authenticated
-	// frame, message schema, complete maximum AssignmentSet, specification digest,
+	// frame, message schema and message type, complete maximum AssignmentSet, specification digest,
 	// JobControlRevision, SchedulingState, and CoordinatorEpoch.
-	v1AssignmentSetInstallBaseBytes = v1AuthenticatedFrameBytes + v1Uint16Bytes +
+	v1AssignmentSetInstallBaseBytes = v1AuthenticatedFrameBytes + 2*v1Uint16Bytes +
 		(v1JobIDBytes + v1Uint64Bytes + v1DigestBytes) + v1Uint16Bytes +
 		v1Uint16Bytes + v1DigestBytes + v1Uint64Bytes + 1 + v1CoordinatorEpochBytes
 

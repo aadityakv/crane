@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -22,11 +23,11 @@ func TestWorkerMessageTableValidInvalidGoldenTruncationAndOwnership(t *testing.T
 		invalid WorkerMessage
 		golden  string
 	}{
-		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "45dad1b77b795cbf6a65966de64eb66d9543324b06278597dc6baf0e8de3d014"},
-		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "244dca4e2eed8e06031887e3aba3b912df69f9296ea587310f2db4da0ca3b915"},
+		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "64f4fe7842d40aa1b126657df3a0dc2d15a3582363072d31182d75720137b223"},
+		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "b61ed3924574c58bdf300a62adfd83afc5c0d7c0183611ba25b2df6168846067"},
 		{"fence_request", 202, fixture.fence, FenceRequest{}, "188908a1e60279df9bdf19b5f3f559c2a3749a3d5637c769a1f4947060cb236a"},
 		{"fence_response", 203, fixture.fenceResponse, FenceResponse{}, "d4b8e6ec7790fa83a009b8944bd2c12889059da4e9bd27ed68ed1ae4f92db417"},
-		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "268d696d8370d7e2640f3ba04ba3b434c2aca3e0d81e6929d72c3cc4cc5f0991"},
+		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "f801d79d7f87b249aea34bf04f40bec0999cbac7b7087475caa4f48355cb8d5e"},
 		{"register_response", 205, fixture.registerResponse, WorkerRegisterResponse{}, "754be824632090c1ccdc0a08ed2ff6d599c6c461d1f7027618687c691e41a4ad"},
 		{"assignment_install", 206, fixture.install, AssignmentSetInstall{}, "16e239886543b95509ee672c8226a31fb619ca8a37d81889b9967ee625c2eb6c"},
 		{"assignment_ack", 207, fixture.installAck, AssignmentSetInstallAck{}, "6f805e4bea27a0895c250671132928b832197be2d5141b01c29d4edac2a18b4f"},
@@ -34,12 +35,12 @@ func TestWorkerMessageTableValidInvalidGoldenTruncationAndOwnership(t *testing.T
 		{"status_report", 209, fixture.status, WorkerStatus{Events: []model.WorkerEvent{fixture.event, fixture.event}}, "5cff2c13ab9417d46f2f0e6eee187e6cbbf5cb7da5425f7044f8e4cbe60c884c"},
 		{"checkpoint_notice", 210, fixture.checkpoint, CheckpointNotice{}, "8e0f715b2cc1d3a88baba6309ad2be26b93c1245aff75d7ac5849403dfff91e8"},
 		{"checkpoint_ack", 211, fixture.checkpointAck, CheckpointAck{}, "8875adccca99f4cd0eb1c258547790cbd9cca1ffd6795d6bec457b1ca26ef979"},
-		{"record_chunk", 212, fixture.recordChunk, ResultRecordChunk{}, "401ec30eb687ef2abde401b609464174c2bce558d0251a0c7304a9ceebb3a5d6"},
-		{"record_ack", 213, fixture.recordAck, ResultRecordAck{}, "bdc34b3954f285d2aad6396cc0e525b2819f1e7c673f438538cb52e27c5c3ba0"},
-		{"artifact_chunk", 214, fixture.artifactChunk, ResultArtifactChunk{}, "8c5d1274f07060ab2e052b767dfb5ca600803c895a84141c4ab8994cb4153528"},
-		{"artifact_ack", 215, fixture.artifactAck, ResultArtifactAck{}, "ed76f72b7a23cb565f543c8065b153e6ddfc84def98a1c109f01920ddfc59621"},
+		{"record_chunk", 212, fixture.recordChunk, ResultRecordChunk{}, "20e79f134f010b00c1750f948469376b9d471f05beed105fa392ebceb55f3e16"},
+		{"record_ack", 213, fixture.recordAck, ResultRecordAck{}, "cf72ea4689552e93104e77c3d1a615d796314da1b4072ae98826273ee39e86b5"},
+		{"artifact_chunk", 214, fixture.artifactChunk, ResultArtifactChunk{}, "0c1856850cfff0ffad59f41c806d75d10d8930f261ddbbc44b30424b803e8eed"},
+		{"artifact_ack", 215, fixture.artifactAck, ResultArtifactAck{}, "a5cf440ba9aa7f45847ceb92902c9a848333d03cd7063f768e9328bddb7f118f"},
 		{"fetch_request", 216, fixture.fetch, ResultFetchRequest{}, "8800e24d5fff485a9abb7e750d758795b46f40cf098e6401d100bcab7ea6176f"},
-		{"fetch_chunk", 217, fixture.fetchChunk, ResultFetchChunk{}, "1dadb0d99080f5eb91cc1eadccde38a8a399d88101334477e2b46176ab02e9aa"},
+		{"fetch_chunk", 217, fixture.fetchChunk, ResultFetchChunk{}, "d1c467fc77a6928b0599afa68b0cc1bed0e983dad2b615f621297a50a07745d1"},
 		{"worker_error", 218, fixture.workerError, WorkerError{}, "661b53eb100ab237f3e379be80d7c1caf3d235f028a1c5c3cfc97d782c73c881"},
 	}
 	for _, test := range cases {
@@ -179,17 +180,39 @@ func TestAssignmentInstallWorstLegalShapeFitsAuthenticatedFrameAndPreflightsDecl
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := uint64(len(payload)) + model.LimitsV1().AuthenticatedFrameBytes; got > model.LimitsV1().MaxWorkerControlFrameBytes {
-		t.Fatalf("authenticated install = %d, max %d", got, model.LimitsV1().MaxWorkerControlFrameBytes)
+	limits := wire.DefaultLimits()
+	limits.MaxFrameSize = int(model.LimitsV1().MaxWorkerControlFrameBytes)
+	frame, err := wire.Encode(wire.Header{Version: wire.Version1, Message: wire.MessageCraneAssignmentSetInstall, ClusterID: [16]byte{1}, SenderID: 1, RequestID: wire.RequestID{1}, TimestampMillis: 1, Codec: wire.CodecBinary}, payload, wire.NewHMACAuthenticator([]byte("worker-control-max-frame-test-key")), limits)
+	if err != nil {
+		t.Fatalf("encode authenticated maximum install: %v", err)
 	}
-	t.Logf("actual 64-stage/1,024-task/256-replica authenticated install: %d bytes", uint64(len(payload))+model.LimitsV1().AuthenticatedFrameBytes)
+	if uint64(len(frame)) > model.LimitsV1().MaxWorkerControlFrameBytes {
+		t.Fatalf("authenticated install = %d, max %d", len(frame), model.LimitsV1().MaxWorkerControlFrameBytes)
+	}
+	if want, err := model.CompleteAssignmentSetInstallBytes(uint64(len(mustValidatedTopology(t, install.Specification).CanonicalBytes())), uint64(len(install.Assignment.Tasks)), uint64(len(install.Assignment.ResultReplicas))); err != nil || want != uint64(len(frame)) {
+		t.Fatalf("model/real frame accounting = %d/%d/%v", want, len(frame), err)
+	}
+	t.Logf("actual 64-stage/256-edge/1,024-task/256-replica authenticated install: %d bytes", len(frame))
 	if _, err := UnmarshalAssignmentSetInstall(payload); err != nil {
 		t.Fatalf("typed install decoder: %v", err)
 	}
-	malformed := append([]byte(nil), payload...)
-	// Assignment install begins with prefix, then an eight-byte topology length.
-	binary.BigEndian.PutUint64(malformed[4:12], model.LimitsV1().MaxTopologyBytes+1)
+	decodeSentinel := errors.New("decode reached")
+	exact := make([]byte, 4+model.LimitsV1().MaxTopologyBytes)
+	binary.BigEndian.PutUint16(exact[:2], WorkerControlSchemaVersion)
+	binary.BigEndian.PutUint16(exact[2:4], uint16(wire.MessageCraneAssignmentSetInstall))
+	binary.BigEndian.PutUint64(exact[4:12], model.LimitsV1().MaxTopologyBytes-8)
 	called := false
+	if _, err := unmarshalAssignmentSetInstallWith(exact, func([]byte) (model.ValidatedTopology, error) {
+		called = true
+		return model.ValidatedTopology{}, decodeSentinel
+	}); !called || err == nil || !strings.Contains(err.Error(), decodeSentinel.Error()) {
+		t.Fatalf("exact topology boundary did not reach decoder: err=%v called=%v", err, called)
+	}
+	malformed := make([]byte, 12)
+	binary.BigEndian.PutUint16(malformed[:2], WorkerControlSchemaVersion)
+	binary.BigEndian.PutUint16(malformed[2:4], uint16(wire.MessageCraneAssignmentSetInstall))
+	binary.BigEndian.PutUint64(malformed[4:12], model.LimitsV1().MaxTopologyBytes-8+1)
+	called = false
 	if _, err := unmarshalAssignmentSetInstallWith(malformed, func([]byte) (model.ValidatedTopology, error) {
 		called = true
 		return model.ValidatedTopology{}, nil
@@ -201,25 +224,31 @@ func TestAssignmentInstallWorstLegalShapeFitsAuthenticatedFrameAndPreflightsDecl
 func worstLegalAssignmentInstall(t *testing.T) AssignmentSetInstall {
 	t.Helper()
 	job := model.JobID{0x71}
-	stages := make([]model.StageSpec, 64)
+	limits := model.LimitsV1()
+	stages := make([]model.StageSpec, limits.MaxStages)
 	for index := range stages {
-		role, operator := model.Transform, model.OperatorSpec{Name: "even", Version: 1}
-		parallelism := uint16(12)
+		role, operator := model.Transform, model.OperatorSpec{Name: "multiply", Version: 1, Settings: []model.Setting{{Key: "factor", Value: "-9223372036854775808"}}}
+		parallelism := uint16(1)
 		if index == 0 {
-			role, operator = model.Source, model.OperatorSpec{Name: "range", Version: 1, Settings: []model.Setting{{Key: "end_exclusive", Value: "1000000"}, {Key: "start", Value: "0"}}}
+			role, operator, parallelism = model.Source, model.OperatorSpec{Name: "range", Version: 1, Settings: []model.Setting{{Key: "end_exclusive", Value: "-9223372036853775808"}, {Key: "start", Value: "-9223372036854775808"}}}, 256
+		} else if index == 1 {
+			parallelism = 256
+		} else if index == 2 {
+			parallelism = 196
 		}
 		if index == len(stages)-1 {
 			role, operator, parallelism = model.Sink, model.OperatorSpec{Name: "collect", Version: 1}, 256
 		}
-		// 62 transforms * 12 + source 24 + sink 256 = 1024 tasks.
-		if index == 0 {
-			parallelism = 24
-		}
-		stages[index] = model.StageSpec{StageID: uint16(index + 1), Name: string(bytes.Repeat([]byte{byte('a' + index%26)}, 62)) + string([]byte{'0' + byte(index/10), '0' + byte(index%10)}), Role: role, Parallelism: parallelism, Operator: operator}
+		name := fmt.Sprintf("stage-%03d", index+1)
+		name += strings.Repeat("x", int(limits.MaxIdentifierBytes)-len(name))
+		stages[index] = model.StageSpec{StageID: uint16(index + 1), Name: name, Role: role, Parallelism: parallelism, Operator: operator}
 	}
-	edges := make([]model.EdgeSpec, 63)
-	for index := range edges {
-		edges[index] = model.EdgeSpec{EdgeID: uint16(index + 1), SourceStageID: uint16(index + 1), DestinationStageID: uint16(index + 2), Routing: model.Shuffle}
+	edges := make([]model.EdgeSpec, 0, limits.MaxEdges)
+	for index := 0; index < len(stages)-1; index++ {
+		edges = append(edges, model.EdgeSpec{EdgeID: uint16(len(edges) + 1), SourceStageID: uint16(index + 1), DestinationStageID: uint16(index + 2), Routing: model.Shuffle})
+	}
+	for uint64(len(edges)) < limits.MaxEdges {
+		edges = append(edges, model.EdgeSpec{EdgeID: uint16(len(edges) + 1), SourceStageID: 1, DestinationStageID: uint16(len(stages)), Routing: model.Shuffle})
 	}
 	spec := model.TopologySpec{SchemaVersion: 1, Name: string(bytes.Repeat([]byte{'z'}, 64)), Stages: stages, Edges: edges, RegistryFingerprint: model.RegistryFingerprint()}
 	validated, err := model.ValidateTopology(spec)
@@ -238,6 +267,15 @@ func worstLegalAssignmentInstall(t *testing.T) AssignmentSetInstall {
 		t.Fatalf("worst assignment shape = %d tasks/%d replicas", len(set.Tasks), len(set.ResultReplicas))
 	}
 	return AssignmentSetInstall{Assignment: set, Specification: spec, SpecificationDigest: validated.Digest(), JobControlRevision: 1, SchedulingState: model.Closed, CoordinatorEpoch: model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}}
+}
+
+func mustValidatedTopology(t *testing.T, spec model.TopologySpec) model.ValidatedTopology {
+	t.Helper()
+	validated, err := model.ValidateTopology(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return validated
 }
 
 func TestWorkerStatusGlobalCursorInventoryAndRepairRules(t *testing.T) {
@@ -351,7 +389,7 @@ func TestResultRepairStatusUsesTypedErrorsOnlyForFailedState(t *testing.T) {
 	fixture := workerFixture(t)
 	base := fixture.status
 	base.Inventory = nil
-	base.Repair = &ResultRepairStatus{RepairID: fixture.grant.Instruction.RepairID, InstructionDigest: fixture.grant.Instruction.InstructionDigest, Role: RepairDestination, State: RepairPending}
+	base.Repair = &ResultRepairStatus{Instruction: fixture.grant.Instruction, RepairID: fixture.grant.Instruction.RepairID, InstructionDigest: fixture.grant.Instruction.InstructionDigest, Role: RepairDestination, State: RepairPending, ContentDigest: model.EmptyResultInventoryDigest(fixture.grant.Instruction.InstructionDigest)}
 	if _, err := MarshalWorkerMessage(base); err != nil {
 		t.Fatalf("pending repair status: %v", err)
 	}
@@ -406,8 +444,12 @@ func TestEmptyResultArtifactHasCanonicalZeroLengthTransfer(t *testing.T) {
 func TestTransferBoundsOffsetsChecksumsRepairAndReplicaOwnership(t *testing.T) {
 	fixture := workerFixture(t)
 	resumedFinal := fixture.recordChunk
-	resumedFinal.Transfer.TotalLength = 4
-	resumedFinal.Transfer.Offset = 2
+	stream, err := model.MarshalResultRecord(resumedFinal.Record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumedFinal.Transfer.Offset = uint64(len(stream) - 2)
+	resumedFinal.Transfer.Data = append([]byte(nil), stream[len(stream)-2:]...)
 	if _, err := MarshalWorkerMessage(resumedFinal); err != nil {
 		t.Fatalf("rejected exact resumed final record chunk: %v", err)
 	}
@@ -541,7 +583,7 @@ func makeWorkerFixture() (workerMessageFixture, error) {
 	query := ResultInventoryQuery{JobID: job, SinkTask: sink, SpecificationHash: validated.Digest(), AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, Checkpoints: checkpoints}
 	query.CheckpointDigest = CheckpointVectorDigest(checkpoints)
 	query.QueryDigest = InventoryQueryDigest(query)
-	instruction := RepairResultPartition{CoordinatorEpoch: epoch, JobID: job, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, SourceNodeID: 1, SourceWorkerEpoch: workerEpoch, DestinationNodeID: 2, DestinationWorkerEpoch: destinationEpoch, SinkTask: sink, SpecificationHash: validated.Digest(), Checkpoints: checkpoints, CheckpointDigest: query.CheckpointDigest, ExpectedRecordCount: 1, ExpectedTotalBytes: 2, ExpectedContentDigest: sha256.Sum256([]byte("records"))}
+	instruction := RepairResultPartition{CoordinatorEpoch: epoch, JobID: job, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, SourceNodeID: 1, SourceWorkerEpoch: workerEpoch, DestinationNodeID: 2, DestinationWorkerEpoch: destinationEpoch, SinkTask: sink, SpecificationHash: validated.Digest(), Checkpoints: checkpoints, CheckpointDigest: query.CheckpointDigest, InventoryQueryDigest: query.QueryDigest, ExpectedRecordCount: 1, ExpectedTotalBytes: 2, ExpectedContentDigest: sha256.Sum256([]byte("records"))}
 	instruction.RepairID = DeriveRepairID(instruction)
 	instruction.InstructionDigest = RepairInstructionDigest(instruction)
 	grant := RepairGrant{Instruction: instruction, Role: RepairSource}
@@ -556,8 +598,14 @@ func makeWorkerFixture() (workerMessageFixture, error) {
 	}
 	replica := assignment.ResultReplicas[0]
 	provenance := model.ResultCopyProvenance{AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, ReplicaSet: replica, DestinationRole: model.SecondaryReplica, CoordinatorEpoch: epoch}
-	transfer := TransferChunk{TransferID: TransferID{10}, JobID: job, TotalLength: 2, Checksum: sha256.Sum256([]byte{1, 2}), Offset: 0, Data: []byte{1, 2}, Final: true}
-	artifact := ResultArtifact{JobID: job, SinkTask: sink, SpecificationHash: validated.Digest(), RecordCount: 1, TotalLength: 2, Checksum: transfer.Checksum}
+	recordBytes, err := model.MarshalResultRecord(record)
+	if err != nil {
+		return workerMessageFixture{}, err
+	}
+	recordTransfer := TransferChunk{TransferID: TransferID{10}, JobID: job, TotalLength: uint64(len(recordBytes)), Checksum: sha256.Sum256(recordBytes), Offset: 0, Data: recordBytes, Final: true}
+	artifactBytes := []byte{1, 2}
+	artifactTransfer := TransferChunk{TransferID: TransferID{11}, JobID: job, TotalLength: uint64(len(artifactBytes)), Checksum: sha256.Sum256(artifactBytes), Offset: 0, Data: artifactBytes, Final: true}
+	artifact := ResultArtifact{JobID: job, SinkTask: sink, SpecificationHash: validated.Digest(), RecordCount: 1, TotalLength: uint64(len(artifactBytes)), Checksum: artifactTransfer.Checksum}
 	return workerMessageFixture{
 		handshake:    WorkerHandshake{NodeID: 1, WorkerEpoch: workerEpoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()},
 		handshakeAck: WorkerHandshakeAck{NodeID: 1, WorkerEpoch: workerEpoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()},
@@ -570,12 +618,12 @@ func makeWorkerFixture() (workerMessageFixture, error) {
 		status:           WorkerStatus{NodeID: sourceToken.WorkerID, WorkerEpoch: sourceToken.WorkerEpoch, CoordinatorEpoch: epoch, StoreTransactionID: 10, AfterTransactionID: 8, Assignments: []InstalledAssignmentStatus{{JobID: job, JobControlRevision: 8, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, SpecificationDigest: validated.Digest(), SchedulingState: model.Running}}, Events: []model.WorkerEvent{event}, LastTransactionID: 9, HasMore: false, Inventory: &ResultInventorySummary{QueryDigest: query.QueryDigest, RecordCount: 1, TotalBytes: 2, ContentDigest: instruction.ExpectedContentDigest}}, event: event,
 		checkpoint:    CheckpointNotice{Notice: model.CheckpointNotice{JobID: job, Source: source, Watermark: 1, RaftIndex: 11, Epoch: epoch}, JobControlRevision: 8, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest},
 		checkpointAck: CheckpointAck{NodeID: 1, WorkerEpoch: workerEpoch, JobID: job, Source: source, Watermark: 1, RaftIndex: 11, JobControlRevision: 8, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, CoordinatorEpoch: epoch},
-		recordChunk:   ResultRecordChunk{Transfer: transfer, Record: record, Provenance: provenance, DestinationNodeID: replica.SecondaryNodeID, DestinationWorkerEpoch: replica.SecondaryEpoch, RepairID: instruction.RepairID, RepairInstructionDigest: instruction.InstructionDigest},
-		recordAck:     ResultRecordAck{TransferID: transfer.TransferID, NodeID: 2, WorkerEpoch: destinationEpoch, RepairID: instruction.RepairID, RepairInstructionDigest: instruction.InstructionDigest, NextOffset: 2, TotalLength: 2, Checksum: transfer.Checksum, Complete: true, CoordinatorEpoch: epoch},
-		artifactChunk: ResultArtifactChunk{Transfer: transfer, Artifact: artifact, DestinationNodeID: 2, DestinationWorkerEpoch: destinationEpoch, CoordinatorEpoch: epoch},
-		artifactAck:   ResultArtifactAck{TransferID: transfer.TransferID, NodeID: 2, WorkerEpoch: destinationEpoch, Artifact: artifact, NextOffset: 2, Complete: true, CoordinatorEpoch: epoch},
+		recordChunk:   ResultRecordChunk{Transfer: recordTransfer, Record: record, Provenance: provenance, DestinationNodeID: replica.SecondaryNodeID, DestinationWorkerEpoch: replica.SecondaryEpoch, RepairID: instruction.RepairID, RepairInstructionDigest: instruction.InstructionDigest},
+		recordAck:     ResultRecordAck{TransferID: recordTransfer.TransferID, NodeID: 2, WorkerEpoch: destinationEpoch, RepairID: instruction.RepairID, RepairInstructionDigest: instruction.InstructionDigest, NextOffset: uint64(len(recordBytes)), TotalLength: uint64(len(recordBytes)), Checksum: recordTransfer.Checksum, Complete: true, CoordinatorEpoch: epoch},
+		artifactChunk: ResultArtifactChunk{Transfer: artifactTransfer, Artifact: artifact, DestinationNodeID: 2, DestinationWorkerEpoch: destinationEpoch, CoordinatorEpoch: epoch},
+		artifactAck:   ResultArtifactAck{TransferID: artifactTransfer.TransferID, NodeID: 2, WorkerEpoch: destinationEpoch, Artifact: artifact, NextOffset: uint64(len(artifactBytes)), Complete: true, CoordinatorEpoch: epoch},
 		fetch:         ResultFetchRequest{Artifact: artifact, ReplicaNodeID: 2, ReplicaWorkerEpoch: destinationEpoch, Offset: 0, CoordinatorEpoch: epoch},
-		fetchChunk:    ResultFetchChunk{Transfer: transfer, Artifact: artifact, SourceNodeID: 2, SourceWorkerEpoch: destinationEpoch, CoordinatorEpoch: epoch},
+		fetchChunk:    ResultFetchChunk{Transfer: artifactTransfer, Artifact: artifact, SourceNodeID: 2, SourceWorkerEpoch: destinationEpoch, CoordinatorEpoch: epoch},
 		workerError:   WorkerError{NodeID: 1, WorkerEpoch: workerEpoch, CoordinatorEpoch: epoch, RelatedMessage: wire.MessageCraneWorkerStatusRequest, Code: WorkerErrorStaleEpoch, Detail: []byte("stale")}, grant: grant,
 	}, nil
 }
