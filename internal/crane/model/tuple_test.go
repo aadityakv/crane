@@ -26,8 +26,8 @@ func TestTupleValidateRequiresSortedUniqueBoundedFields(t *testing.T) {
 	}
 }
 
-func TestTupleValidateRejectsValuePayloadOverBound(t *testing.T) {
-	tooLarge := make([]byte, LimitsV1().MaxTupleFieldPayloadBytes+1)
+func TestTupleValidateRejectsCompletePayloadOverBound(t *testing.T) {
+	tooLarge := make([]byte, LimitsV1().MaxTuplePayloadBytes+1)
 	tuple := Tuple{Fields: []Field{{Name: "raw", Value: Value{Type: ValueBytes, Bytes: tooLarge}}}}
 	if err := tuple.Validate(); err == nil {
 		t.Fatal("tuple accepted an oversized bytes payload")

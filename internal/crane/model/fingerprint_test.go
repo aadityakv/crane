@@ -30,12 +30,11 @@ func TestLimitsV1PinsEveryConsensusBound(t *testing.T) {
 		MaxOperatorOutputs:             16,
 		MaxDerivedDeliveries:           4096,
 		MaxTupleFields:                 64,
-		MaxTupleFieldPayloadBytes:      512,
-		MaxCanonicalTupleBytes:         37_186,
+		MaxTuplePayloadBytes:           512,
 		CustodyInboxFixedBytes:         379,
 		CustodyOutboxFixedBytes:        293,
 		ResultCopyFixedBytes:           293,
-		MaxCustodyReservationBytes:     614_445_757,
+		MaxCustodyReservationBytes:     13_542_267,
 		MaxSubmitJobBytes:              1 << 20,
 		MaxControlFrameBytes:           1 << 20,
 		MaxWorkerControlFrameBytes:     1 << 20,
@@ -73,11 +72,11 @@ func TestV1FingerprintsMatchIndependentGoldens(t *testing.T) {
 	if got := hex.EncodeToString(registry[:]); got != "56b222c3476fa78b244396eb8c12a74b1d6f4cfa1ab0b8cf7655d76cfb81d6d0" {
 		t.Fatalf("RegistryFingerprint() = %s", got)
 	}
-	if got := ConsensusFingerprintHex(); got != "10a44b7bf119aec85037e343680323c220ee02b09a627298dc8965fba4ae021b" {
+	if got := ConsensusFingerprintHex(); got != "723dc3c2dc56e81abaca4adfdd8a4a33d787e40a45c322793757876819795f0c" {
 		t.Fatalf("ConsensusFingerprintHex() = %s", got)
 	}
 	consensus := ConsensusFingerprint()
-	if got := hex.EncodeToString(consensus[:]); got != "10a44b7bf119aec85037e343680323c220ee02b09a627298dc8965fba4ae021b" {
+	if got := hex.EncodeToString(consensus[:]); got != "723dc3c2dc56e81abaca4adfdd8a4a33d787e40a45c322793757876819795f0c" {
 		t.Fatalf("ConsensusFingerprint() = %s", got)
 	}
 }

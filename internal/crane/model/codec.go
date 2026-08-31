@@ -6,12 +6,18 @@ import (
 	"fmt"
 )
 
+var errTuplePayloadTooLarge = errors.New("tuple exceeds complete payload limit")
+
 // MarshalTuple returns the sole canonical binary representation of a tuple.
 func MarshalTuple(tuple Tuple) ([]byte, error) {
 	if err := tuple.Validate(); err != nil {
 		return nil, err
 	}
-	writer := newCheckedWriter(2 + len(tuple.Fields)*(2+int(LimitsV1().MaxIdentifierBytes)+1+8))
+	size, err := canonicalTupleSize(tuple)
+	if err != nil {
+		return nil, err
+	}
+	writer := newCheckedWriter(int(size))
 	if err := writer.uint16(uint16(len(tuple.Fields))); err != nil {
 		return nil, err
 	}
@@ -42,6 +48,9 @@ func MarshalTuple(tuple Tuple) ([]byte, error) {
 
 // UnmarshalTuple decodes only complete canonical tuple bytes.
 func UnmarshalTuple(encoded []byte) (Tuple, error) {
+	if uint64(len(encoded)) > LimitsV1().MaxTuplePayloadBytes {
+		return Tuple{}, errTuplePayloadTooLarge
+	}
 	reader := checkedReader{input: encoded}
 	count, err := reader.uint16()
 	if err != nil {
@@ -72,12 +81,12 @@ func UnmarshalTuple(encoded []byte) (Tuple, error) {
 			}
 			value.Int64 = int64(encodedInt)
 		case ValueString:
-			value.String, err = reader.string(LimitsV1().MaxTupleFieldPayloadBytes)
+			value.String, err = reader.string(LimitsV1().MaxTuplePayloadBytes)
 			if err != nil {
 				return Tuple{}, fmt.Errorf("tuple field %d string: %w", index, err)
 			}
 		case ValueBytes:
-			value.Bytes, err = reader.bytes(LimitsV1().MaxTupleFieldPayloadBytes)
+			value.Bytes, err = reader.bytes(LimitsV1().MaxTuplePayloadBytes)
 			if err != nil {
 				return Tuple{}, fmt.Errorf("tuple field %d bytes: %w", index, err)
 			}
@@ -123,7 +132,16 @@ func (writer *checkedWriter) uint64(value uint64) error {
 	return nil
 }
 
-func (writer *checkedWriter) string(value string) error { return writer.bytes([]byte(value)) }
+func (writer *checkedWriter) string(value string) error {
+	if len(value) > int(^uint16(0)) {
+		return errors.New("length exceeds uint16 codec bound")
+	}
+	if err := writer.uint16(uint16(len(value))); err != nil {
+		return err
+	}
+	writer.output = append(writer.output, value...)
+	return nil
+}
 
 func (writer *checkedWriter) bytes(value []byte) error {
 	if len(value) > int(^uint16(0)) {

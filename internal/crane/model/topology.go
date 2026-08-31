@@ -646,15 +646,15 @@ func validateExpansion(order []uint16, outgoing map[uint16][]EdgeSpec, stages ma
 }
 
 func calculateCustodyReservations(order []uint16, outgoing map[uint16][]EdgeSpec, stages map[uint16]StageSpec, outputBounds map[uint16]uint64, sinkID uint16, limits ConsensusLimits) (map[uint16]uint64, error) {
-	inbox, ok := checkedAddUint64(limits.CustodyInboxFixedBytes, limits.MaxCanonicalTupleBytes)
+	inbox, ok := checkedAddUint64(limits.CustodyInboxFixedBytes, limits.MaxTuplePayloadBytes)
 	if !ok {
 		return nil, errors.New("custody inbox size overflow")
 	}
-	outbox, ok := checkedAddUint64(limits.CustodyOutboxFixedBytes, limits.MaxCanonicalTupleBytes)
+	outbox, ok := checkedAddUint64(limits.CustodyOutboxFixedBytes, limits.MaxTuplePayloadBytes)
 	if !ok {
 		return nil, errors.New("custody outbox size overflow")
 	}
-	result, ok := checkedAddUint64(limits.ResultCopyFixedBytes, limits.MaxCanonicalTupleBytes)
+	result, ok := checkedAddUint64(limits.ResultCopyFixedBytes, limits.MaxTuplePayloadBytes)
 	if !ok {
 		return nil, errors.New("result copy size overflow")
 	}

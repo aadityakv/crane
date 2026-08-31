@@ -31,8 +31,7 @@ type ConsensusLimits struct {
 	MaxOperatorOutputs             uint64
 	MaxDerivedDeliveries           uint64
 	MaxTupleFields                 uint64
-	MaxTupleFieldPayloadBytes      uint64
-	MaxCanonicalTupleBytes         uint64
+	MaxTuplePayloadBytes           uint64
 	CustodyInboxFixedBytes         uint64
 	CustodyOutboxFixedBytes        uint64
 	ResultCopyFixedBytes           uint64
@@ -96,14 +95,13 @@ func LimitsV1() ConsensusLimits {
 	const maxTasksPerStage uint64 = 256
 	const maxTupleFields uint64 = 64
 	const maxIdentifierBytes uint64 = 64
-	const maxTupleFieldPayloadBytes uint64 = 512
+	const maxTuplePayloadBytes uint64 = 512
 	const maxDerivedDeliveries uint64 = 4096
 	const maxOperatorOutputs uint64 = 16
-	maxCanonicalTupleBytes := v1Uint16Bytes + maxTupleFields*(v1Uint16Bytes+maxIdentifierBytes+1+v1Uint16Bytes+maxTupleFieldPayloadBytes)
 	assignmentSetInstallFixedBytes := v1AssignmentSetInstallBaseBytes + maxTasksPerJob*v1AssignmentTokenBytes + maxTasksPerStage*v1ResultReplicaSetBytes
-	inboxBytes := v1CustodyInboxFixedBytes + maxCanonicalTupleBytes
-	outboxBytes := v1CustodyOutboxFixedBytes + maxCanonicalTupleBytes
-	resultCopyBytes := v1ResultCopyFixedBytes + maxCanonicalTupleBytes
+	inboxBytes := v1CustodyInboxFixedBytes + maxTuplePayloadBytes
+	outboxBytes := v1CustodyOutboxFixedBytes + maxTuplePayloadBytes
+	resultCopyBytes := v1ResultCopyFixedBytes + maxTuplePayloadBytes
 	maxCustodyReservationBytes := inboxBytes + maxDerivedDeliveries*(outboxBytes+inboxBytes+2*resultCopyBytes)
 	return ConsensusLimits{
 		MaxRegisteredWorkers:           1024,
@@ -128,8 +126,7 @@ func LimitsV1() ConsensusLimits {
 		MaxOperatorOutputs:             maxOperatorOutputs,
 		MaxDerivedDeliveries:           maxDerivedDeliveries,
 		MaxTupleFields:                 maxTupleFields,
-		MaxTupleFieldPayloadBytes:      maxTupleFieldPayloadBytes,
-		MaxCanonicalTupleBytes:         maxCanonicalTupleBytes,
+		MaxTuplePayloadBytes:           maxTuplePayloadBytes,
 		CustodyInboxFixedBytes:         v1CustodyInboxFixedBytes,
 		CustodyOutboxFixedBytes:        v1CustodyOutboxFixedBytes,
 		ResultCopyFixedBytes:           v1ResultCopyFixedBytes,
@@ -157,15 +154,15 @@ func CustodyReservationUpperBoundV1(deliveries uint64) (uint64, error) {
 	if deliveries > limits.MaxDerivedDeliveries {
 		return 0, errors.New("derived delivery count exceeds custody bound")
 	}
-	inbox, ok := checkedAddUint64(limits.CustodyInboxFixedBytes, limits.MaxCanonicalTupleBytes)
+	inbox, ok := checkedAddUint64(limits.CustodyInboxFixedBytes, limits.MaxTuplePayloadBytes)
 	if !ok {
 		return 0, errors.New("custody inbox bound overflow")
 	}
-	outbox, ok := checkedAddUint64(limits.CustodyOutboxFixedBytes, limits.MaxCanonicalTupleBytes)
+	outbox, ok := checkedAddUint64(limits.CustodyOutboxFixedBytes, limits.MaxTuplePayloadBytes)
 	if !ok {
 		return 0, errors.New("custody outbox bound overflow")
 	}
-	result, ok := checkedAddUint64(limits.ResultCopyFixedBytes, limits.MaxCanonicalTupleBytes)
+	result, ok := checkedAddUint64(limits.ResultCopyFixedBytes, limits.MaxTuplePayloadBytes)
 	if !ok {
 		return 0, errors.New("result copy bound overflow")
 	}

@@ -69,7 +69,7 @@ func TestResultRecordRejectsNonCanonicalTupleBytes(t *testing.T) {
 
 func TestResultRecordRejectsOversizeBeforeCopy(t *testing.T) {
 	job := JobID{1}
-	value := make([]byte, LimitsV1().MaxCanonicalTupleBytes+1)
+	value := make([]byte, LimitsV1().MaxTuplePayloadBytes+1)
 	if _, err := NewResultRecord(DeriveSourceTupleID(job, TaskID{JobID: job, StageID: 1}, 1), TaskID{JobID: job, StageID: 3}, [32]byte{7}, value); err == nil {
 		t.Fatal("oversize result value accepted")
 	}

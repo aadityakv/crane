@@ -12,6 +12,12 @@ import (
 
 func TestConsensusLimitsMatchExistingIndependentTransportBounds(t *testing.T) {
 	limits := model.LimitsV1()
+	if limits.MaxTuplePayloadBytes != 512 {
+		t.Fatalf("tuple payload bytes = %d, want frozen 512-byte canonical tuple limit", limits.MaxTuplePayloadBytes)
+	}
+	if limits.MaxTuplePayloadBytes > uint64(wire.MaxCraneDatagramBytesV1-wire.FixedHeaderSize-wire.MACSize) {
+		t.Fatalf("tuple payload bytes = %d, wire datagram payload budget = %d", limits.MaxTuplePayloadBytes, wire.MaxCraneDatagramBytesV1-wire.FixedHeaderSize-wire.MACSize)
+	}
 	if limits.MaxSubmitJobBytes != config.MaxRaftCommandBytes {
 		t.Fatalf("SubmitJob bytes = %d, Raft command bytes = %d", limits.MaxSubmitJobBytes, config.MaxRaftCommandBytes)
 	}

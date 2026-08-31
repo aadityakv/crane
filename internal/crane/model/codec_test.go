@@ -31,6 +31,39 @@ func TestCodecTupleGoldenBigEndianTaggedValues(t *testing.T) {
 	}
 }
 
+func TestCodecTupleCompletePayloadBoundaryAndCumulativeOverhead(t *testing.T) {
+	exact := Tuple{Fields: []Field{{Name: "a", Value: Value{Type: ValueBytes, Bytes: make([]byte, 504)}}}}
+	encoded, err := MarshalTuple(exact)
+	if err != nil {
+		t.Fatalf("MarshalTuple exact 512 bytes: %v", err)
+	}
+	if uint64(len(encoded)) != LimitsV1().MaxTuplePayloadBytes {
+		t.Fatalf("exact tuple bytes = %d, want %d", len(encoded), LimitsV1().MaxTuplePayloadBytes)
+	}
+	if _, err := MarshalTuple(Tuple{Fields: []Field{{Name: "a", Value: Value{Type: ValueBytes, Bytes: make([]byte, 505)}}}}); err == nil {
+		t.Fatal("513-byte canonical tuple accepted")
+	}
+	if _, err := MarshalTuple(Tuple{Fields: []Field{
+		{Name: "a", Value: Value{Type: ValueBytes, Bytes: make([]byte, 300)}},
+		{Name: "b", Value: Value{Type: ValueBytes, Bytes: make([]byte, 200)}},
+	}}); err == nil {
+		t.Fatal("cumulative multi-field overhead over 512 bytes accepted")
+	}
+}
+
+func TestCodecTupleRejectsOversizeBeforeFieldAllocation(t *testing.T) {
+	oversize := make([]byte, LimitsV1().MaxTuplePayloadBytes+1)
+	oversize[1] = byte(LimitsV1().MaxTupleFields)
+	if allocations := testing.AllocsPerRun(100, func() {
+		_, _ = UnmarshalTuple(oversize)
+	}); allocations != 0 {
+		t.Fatalf("oversize tuple decoded with %f allocations", allocations)
+	}
+	if _, err := UnmarshalTuple(oversize); err == nil {
+		t.Fatal("oversize tuple accepted")
+	}
+}
+
 func TestCodecTupleRejectsNonCanonicalAndMalformedInputs(t *testing.T) {
 	valid, err := hex.DecodeString("000100016103000100")
 	if err != nil {
@@ -93,9 +126,26 @@ func TestCodecTupleRandomInputsNeverPanic(t *testing.T) {
 	}
 }
 
+func TestCodecTupleOversizeRandomInputsAllocateNothing(t *testing.T) {
+	random := rand.New(rand.NewPCG(3, 4))
+	for index := 0; index < 100; index++ {
+		input := make([]byte, int(LimitsV1().MaxTuplePayloadBytes)+1+random.IntN(1_536))
+		input[1] = byte(LimitsV1().MaxTupleFields)
+		for byteIndex := 2; byteIndex < len(input); byteIndex++ {
+			input[byteIndex] = byte(random.Uint64())
+		}
+		if allocations := testing.AllocsPerRun(10, func() {
+			_, _ = UnmarshalTuple(input)
+		}); allocations != 0 {
+			t.Fatalf("oversize random input %d decoded with %f allocations", index, allocations)
+		}
+	}
+}
+
 func FuzzUnmarshalTuple(f *testing.F) {
 	f.Add([]byte{0, 0})
 	f.Add([]byte{0xff, 0xff})
+	f.Add(bytes.Repeat([]byte{0}, 513))
 	f.Add([]byte{0, 1, 0, 1, 'a', byte(ValueInt64), 0, 0, 0, 0, 0, 0, 0, 1})
 	f.Fuzz(func(t *testing.T, input []byte) {
 		_, _ = UnmarshalTuple(input)

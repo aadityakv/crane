@@ -53,12 +53,13 @@ func (tuple Tuple) Validate() error {
 		}
 		previous = field.Name
 	}
-	return nil
+	_, err := canonicalTupleSize(tuple)
+	return err
 }
 
 // Validate checks that a value has a known canonical tag and bounded payload.
 func (value Value) Validate() error {
-	limit := LimitsV1().MaxTupleFieldPayloadBytes
+	limit := LimitsV1().MaxTuplePayloadBytes
 	switch value.Type {
 	case ValueInt64:
 		if value.String != "" || len(value.Bytes) != 0 {
@@ -85,6 +86,47 @@ func (value Value) Validate() error {
 		return errors.New("unknown tuple value tag")
 	}
 	return nil
+}
+
+func canonicalTupleSize(tuple Tuple) (uint64, error) {
+	size := v1Uint16Bytes
+	for _, field := range tuple.Fields {
+		fieldSize, ok := checkedAddUint64(v1Uint16Bytes, uint64(len(field.Name)))
+		if !ok {
+			return 0, errors.New("tuple field name size overflow")
+		}
+		fieldSize, ok = checkedAddUint64(fieldSize, 1)
+		if !ok {
+			return 0, errors.New("tuple value tag size overflow")
+		}
+		valueSize := uint64(0)
+		switch field.Value.Type {
+		case ValueInt64:
+			valueSize = v1Uint64Bytes
+		case ValueString:
+			valueSize, ok = checkedAddUint64(v1Uint16Bytes, uint64(len(field.Value.String)))
+			if !ok {
+				return 0, errors.New("tuple string value size overflow")
+			}
+		case ValueBytes:
+			valueSize, ok = checkedAddUint64(v1Uint16Bytes, uint64(len(field.Value.Bytes)))
+			if !ok {
+				return 0, errors.New("tuple bytes value size overflow")
+			}
+		}
+		fieldSize, ok = checkedAddUint64(fieldSize, valueSize)
+		if !ok {
+			return 0, errors.New("tuple field size overflow")
+		}
+		size, ok = checkedAddUint64(size, fieldSize)
+		if !ok {
+			return 0, errors.New("tuple size overflow")
+		}
+	}
+	if size > LimitsV1().MaxTuplePayloadBytes {
+		return 0, errors.New("tuple exceeds complete payload limit")
+	}
+	return size, nil
 }
 
 func validateFieldName(name string) error {

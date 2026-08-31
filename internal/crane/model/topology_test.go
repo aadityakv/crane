@@ -248,8 +248,8 @@ func TestTopologyCustodyReservationIsExactBoundedAndImmutable(t *testing.T) {
 	if err != nil || second != first {
 		t.Fatalf("per-task reservation mismatch: %d %d %v", first, second, err)
 	}
-	if first != 187_567 {
-		t.Fatalf("stage-2 custody bytes = %d, want independent formula 187567", first)
+	if first != 4_197 {
+		t.Fatalf("stage-2 custody bytes = %d, want independent formula 4197", first)
 	}
 	if _, err := v.WorstCaseCustodyBytes(TaskID{JobID: job, StageID: 2, Partition: 2}); err == nil {
 		t.Fatal("invalid task partition reservation accepted")
