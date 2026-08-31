@@ -134,6 +134,23 @@ func TestTCPReadFrameAcceptsExactCraneTupleFrameLimit(t *testing.T) {
 	}
 }
 
+func TestTCPWriteFrameRejectsConfiguredCraneLimitAboveCompiledMaximumBeforeWriting(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxCraneDatagramSize = 1201
+	header := testHeader()
+	header.Message = MessageCraneTupleDeliveryNack
+	header.Codec = CodecBinary
+	conn := &countingWriteConn{}
+	frame := Frame{Header: header, Payload: make([]byte, 1201-FixedHeaderSize-MACSize)}
+
+	if err := WriteTCPFrame(context.Background(), conn, frame, NewHMACAuthenticator(testKey), limits, time.Second); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("WriteTCPFrame with 1201-byte Crane limit error = %v, want ErrTooLarge", err)
+	}
+	if conn.writeCalls != 0 {
+		t.Fatalf("WriteTCPFrame performed %d writes before rejecting invalid Crane limit", conn.writeCalls)
+	}
+}
+
 func TestTCPReadFrameRejectsBodyShorterThanFixedHeaderAndMAC(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
@@ -475,6 +492,22 @@ type deadlineFailureConn struct {
 	writeError error
 	clearError error
 }
+
+type countingWriteConn struct {
+	writeCalls int
+}
+
+func (*countingWriteConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *countingWriteConn) Write(payload []byte) (int, error) {
+	c.writeCalls++
+	return len(payload), nil
+}
+func (*countingWriteConn) Close() error                     { return nil }
+func (*countingWriteConn) LocalAddr() net.Addr              { return nil }
+func (*countingWriteConn) RemoteAddr() net.Addr             { return nil }
+func (*countingWriteConn) SetDeadline(time.Time) error      { return nil }
+func (*countingWriteConn) SetReadDeadline(time.Time) error  { return nil }
+func (*countingWriteConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (*deadlineFailureConn) Read([]byte) (int, error) { return 0, io.EOF }
 

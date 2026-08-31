@@ -215,6 +215,29 @@ func TestEffectiveLimitDefaultsAndValidatesEveryLimit(t *testing.T) {
 	}
 }
 
+func TestCraneDatagramLimitCannotExceedCompiledV1Maximum(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxCraneDatagramSize = 1201
+	if _, err := EffectiveLimit(MessageCraneTupleDelivery, limits); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("EffectiveLimit with 1201-byte Crane limit error = %v, want ErrTooLarge", err)
+	}
+
+	header := testHeader()
+	header.Message = MessageCraneTupleDelivery
+	header.Codec = CodecBinary
+	payload := make([]byte, 1201-FixedHeaderSize-MACSize)
+	if _, err := Encode(header, payload, NewHMACAuthenticator(testKey), limits); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("Encode 1201-byte Crane frame error = %v, want ErrTooLarge", err)
+	}
+
+	lowerGlobalLimit := DefaultLimits()
+	lowerGlobalLimit.MaxFrameSize = 1000
+	lowerGlobalLimit.MaxCraneDatagramSize = 1100
+	if got, err := EffectiveLimit(MessageCraneTupleDelivery, lowerGlobalLimit); err != nil || got != 1000 {
+		t.Fatalf("EffectiveLimit with lower global limit = %d, %v; want 1000, nil", got, err)
+	}
+}
+
 func TestCraneTupleFramesUseComplete1200ByteLimitOnEncodeAndDecode(t *testing.T) {
 	auth := NewHMACAuthenticator(testKey)
 	limits := DefaultLimits()
@@ -239,12 +262,7 @@ func TestCraneTupleFramesUseComplete1200ByteLimitOnEncodeAndDecode(t *testing.T)
 		if _, err := Encode(header, oversizedPayload, auth, limits); !errors.Is(err, ErrTooLarge) {
 			t.Fatalf("Encode oversized message %d error = %v, want ErrTooLarge", message, err)
 		}
-		enlarged := limits
-		enlarged.MaxCraneDatagramSize++
-		oversized, err := Encode(header, oversizedPayload, auth, enlarged)
-		if err != nil {
-			t.Fatalf("Encode message %d with enlarged limit: %v", message, err)
-		}
+		oversized := makeAuthenticatedFrameForTest(header, oversizedPayload, auth)
 		if _, err := Decode(oversized, auth, limits); !errors.Is(err, ErrTooLarge) {
 			t.Fatalf("Decode oversized message %d error = %v, want ErrTooLarge", message, err)
 		}

@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	registryFingerprintDomain  = "cs425/crane/operator-registry/v1\x00"
-	consensusFingerprintDomain = "cs425/crane/consensus/v1\x00"
+	registryFingerprintDomain     = "cs425/crane/operator-registry/v1\x00"
+	consensusFingerprintDomain    = "cs425/crane/consensus/v1\x00"
+	wireContractFingerprintDomain = "cs425/crane/wire-contract/v1\x00"
 )
 
 var identityDomainsV1 = []string{
@@ -58,6 +59,7 @@ func ConsensusFingerprint() [32]byte {
 		encoded = appendString(encoded, domain)
 	}
 	encoded = append(encoded, canonicalRegistryBytes(RegistryV1())...)
+	encoded = append(encoded, canonicalWireContractBytes(WireContractV1())...)
 	return sha256.Sum256(append([]byte(consensusFingerprintDomain), encoded...))
 }
 
@@ -88,6 +90,34 @@ func canonicalRegistryBytes(registry Registry) []byte {
 		encoded = append(encoded, operator.ImplementationFingerprint[:]...)
 	}
 	return encoded
+}
+
+func canonicalWireContractBytes(contract WireContractDescriptor) []byte {
+	encoded := appendString(nil, wireContractFingerprintDomain)
+	encoded = appendUint16(encoded, contract.SchemaVersion)
+	encoded = appendUint16(encoded, contract.OwnedMessageTypeMin)
+	encoded = appendUint16(encoded, contract.OwnedMessageTypeMax)
+	encoded = append(encoded, contract.RequiredCodec)
+	encoded = appendBool(encoded, contract.RejectUnlistedOwnedMessages)
+	encoded = appendUint64(encoded, contract.MaxCraneDatagramBytes)
+	encoded = appendUint16(encoded, uint16(len(contract.Messages)))
+	for _, message := range contract.Messages {
+		encoded = appendString(encoded, message.Name)
+		encoded = appendUint16(encoded, message.MessageType)
+		encoded = appendBool(encoded, message.Datagram)
+	}
+	encoded = appendUint16(encoded, uint16(len(contract.ExplicitReservedMessageTypes)))
+	for _, messageType := range contract.ExplicitReservedMessageTypes {
+		encoded = appendUint16(encoded, messageType)
+	}
+	return encoded
+}
+
+func appendBool(destination []byte, value bool) []byte {
+	if value {
+		return append(destination, 1)
+	}
+	return append(destination, 0)
 }
 
 func appendString(destination []byte, value string) []byte {

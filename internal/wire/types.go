@@ -10,10 +10,12 @@ const (
 	FixedHeaderSize = 55
 	// MACSize is the byte length of the trailing HMAC-SHA256 authentication code.
 	MACSize = 32
+	// MaxCraneDatagramBytesV1 is the absolute complete-frame ceiling for Crane v1 tuple traffic.
+	MaxCraneDatagramBytesV1 = 1200
 
 	defaultMaxFrameSize         = 8 << 20
 	defaultMaxSWIMDatagramSize  = 1200
-	defaultMaxCraneDatagramSize = 1200
+	defaultMaxCraneDatagramSize = MaxCraneDatagramBytesV1
 )
 
 var (

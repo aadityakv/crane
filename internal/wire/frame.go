@@ -106,6 +106,9 @@ func resolveLimits(limits Limits) (Limits, error) {
 	if limits.MaxCraneDatagramSize == 0 {
 		limits.MaxCraneDatagramSize = defaults.MaxCraneDatagramSize
 	}
+	if limits.MaxCraneDatagramSize > MaxCraneDatagramBytesV1 {
+		return Limits{}, fmt.Errorf("%w: Crane datagram limit exceeds the compiled v1 maximum of %d bytes", ErrTooLarge, MaxCraneDatagramBytesV1)
+	}
 	minimum := FixedHeaderSize + MACSize
 	if limits.MaxFrameSize < minimum || limits.MaxSWIMDatagramSize < minimum || limits.MaxCraneDatagramSize < minimum {
 		return Limits{}, fmt.Errorf("%w: limits must permit the fixed header and MAC", ErrTooLarge)
