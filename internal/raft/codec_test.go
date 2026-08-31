@@ -51,7 +51,7 @@ func TestCodecRejectsHostileCountsLengthsOffsetsAndTrailingData(t *testing.T) {
 		t.Fatalf("offset overflow error = %v, want ErrRPCTooLarge", err)
 	}
 
-	message, valid, err := EncodeRPC(Handshake{SenderID: 1, VoterFingerprint: VoterFingerprint{1}}, DefaultCodecLimits())
+	message, valid, err := EncodeRPC(task5Handshake(1, VoterFingerprint{1}), DefaultCodecLimits())
 	if err != nil {
 		t.Fatalf("Encode handshake: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestCodecRejectsHostileSnapshotSemanticsBeforeVariableAllocation(t *testing
 }
 
 func TestCodecAbsoluteCeilingsCannotBeRaised(t *testing.T) {
-	rpc := Handshake{SenderID: 1, VoterFingerprint: VoterFingerprint{1}}
+	rpc := task5Handshake(1, VoterFingerprint{1})
 	tests := []struct {
 		name   string
 		limits CodecLimits
@@ -168,7 +168,7 @@ func TestCodecAbsoluteCeilingBoundariesAreAccepted(t *testing.T) {
 
 	limits := DefaultCodecLimits()
 	limits.MaxEncodedBytes = MaxRPCPayloadBytes
-	if _, _, err := EncodeRPC(Handshake{SenderID: 1, VoterFingerprint: VoterFingerprint{1}}, limits); err != nil {
+	if _, _, err := EncodeRPC(task5Handshake(1, VoterFingerprint{1}), limits); err != nil {
 		t.Fatalf("EncodeRPC encoded boundary: %v", err)
 	}
 }
@@ -225,8 +225,8 @@ func validRPCFixtures(t *testing.T) []RPC {
 
 func validRPCFixturesForFuzz() []RPC {
 	return []RPC{
-		Handshake{SenderID: 1, VoterFingerprint: VoterFingerprint{1}},
-		HandshakeAck{ResponderID: 2, VoterFingerprint: VoterFingerprint{1}},
+		task5Handshake(1, VoterFingerprint{1}),
+		task5HandshakeAck(2, VoterFingerprint{1}),
 		PreVoteRequest{CandidateID: 1, CurrentTerm: 1, ProspectiveTerm: 2},
 		PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 3, RequestCurrentTerm: 1, ProspectiveTerm: 2},
 		RequestVoteRequest{CandidateID: 1, Term: 2},

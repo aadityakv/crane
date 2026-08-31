@@ -30,6 +30,8 @@ var _ internalnode.Service = (*Service)(nil)
 type ServiceOptions struct {
 	// Config is the validated fixed-voter runtime configuration owned by the service.
 	Config config.NodeConfig
+	// ApplicationFingerprint binds every Raft peer to the same deterministic state machine rules.
+	ApplicationFingerprint [32]byte
 	// Secret is the raw cluster HMAC key; construction takes an owned copy.
 	Secret []byte
 	// Clock drives wire replay timestamps and the serialized Node timer.
@@ -76,6 +78,9 @@ type Service struct {
 // NewService validates and owns dependencies without touching storage, the application,
 // listeners, connections, timers, or goroutines.
 func NewService(options ServiceOptions) (*Service, error) {
+	if options.ApplicationFingerprint == ([32]byte{}) {
+		return nil, ErrApplicationFingerprint
+	}
 	if err := options.Config.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: invalid configuration: %v", ErrInvalidCoreState, err)
 	}
@@ -201,7 +206,8 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	codecLimits.MaxSnapshotBytes = service.options.Config.Raft.MaxSnapshotBytes
 	transport, err := service.newTransport(TCPTransportOptions{
 		LocalID: service.options.Config.NodeID, Voters: service.voters, ClusterID: service.clusterID,
-		Authenticator: service.authenticator, Clock: service.options.Clock,
+		ApplicationFingerprint: service.options.ApplicationFingerprint,
+		Authenticator:          service.authenticator, Clock: service.options.Clock,
 		ReplayWindow: time.Duration(service.options.Config.Timing.ReplayWindow),
 		RPCTimeout:   time.Duration(service.options.Config.Raft.RPCTimeout), CodecLimits: codecLimits,
 	})

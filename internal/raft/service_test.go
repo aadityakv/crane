@@ -24,7 +24,8 @@ func TestServiceConstructorIsSideEffectFreeAndRequiresLocalVoter(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33000)
 	machine := &task8StateMachine{}
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: machine,
 	})
 	if err != nil {
@@ -49,7 +50,8 @@ func TestServiceConstructorIsSideEffectFreeAndRequiresLocalVoter(t *testing.T) {
 	nonvoter.NodeID = 4
 	nonvoter.BasePort = 33030
 	if _, err := NewService(ServiceOptions{
-		Config: nonvoter, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 nonvoter, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	}); !errors.Is(err, ErrNotVoter) {
 		t.Fatalf("nonvoter constructor error = %v, want ErrNotVoter", err)
@@ -76,7 +78,8 @@ func TestServiceConstructorValidatesReplayRetentionBeforeEffects(t *testing.T) {
 			configuration.Timing.ReplayWindow = config.Duration(test.replayWindow)
 
 			service, err := NewService(ServiceOptions{
-				Config: configuration, Secret: secret, Clock: &task10PanicClock{},
+				ApplicationFingerprint: task5ApplicationFingerprint,
+				Config:                 configuration, Secret: secret, Clock: &task10PanicClock{},
 				Random: task10ConstructorPanicRandom{}, StateMachine: task10ConstructorPanicStateMachine{},
 			})
 			if test.wantErr {
@@ -128,7 +131,8 @@ func TestServiceRunOrdersRecoveryBindWorkersOwnerAndIsolatedReady(t *testing.T) 
 	serviceClock := &task10RecordingClock{Clock: manualClock, events: events}
 	machine := &task8StateMachine{events: events}
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: serviceClock,
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: serviceClock,
 		Random: task8ZeroOffsetRandom{}, StateMachine: machine,
 	})
 	if err != nil {
@@ -147,7 +151,12 @@ func TestServiceRunOrdersRecoveryBindWorkersOwnerAndIsolatedReady(t *testing.T) 
 		return listener, nil
 	}
 	fakeTransport := newTask10ServiceTransport(events)
-	service.newTransport = func(TCPTransportOptions) (serviceTransport, error) { return fakeTransport, nil }
+	service.newTransport = func(options TCPTransportOptions) (serviceTransport, error) {
+		if options.ApplicationFingerprint != task5ApplicationFingerprint {
+			t.Fatalf("transport application fingerprint = %x, want %x", options.ApplicationFingerprint, task5ApplicationFingerprint)
+		}
+		return fakeTransport, nil
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -179,7 +188,8 @@ func TestServiceRunOrdersRecoveryBindWorkersOwnerAndIsolatedReady(t *testing.T) 
 func TestServiceBindFailureOccursBeforeReadyAndReleasesStore(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33200)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	})
 	if err != nil {
@@ -224,7 +234,8 @@ func TestServiceStorageAndRestoreFailuresOccurBeforeBindAndReady(t *testing.T) {
 			configuration, secret := task10ServiceConfig(t, 1, 33400)
 			machine := &task8StateMachine{}
 			service, err := NewService(ServiceOptions{
-				Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+				ApplicationFingerprint: task5ApplicationFingerprint,
+				Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 				Random: task8ZeroOffsetRandom{}, StateMachine: machine,
 			})
 			if err != nil {
@@ -260,7 +271,8 @@ func TestServiceStorageAndRestoreFailuresOccurBeforeBindAndReady(t *testing.T) {
 func TestServiceRecoveredInvariantFailurePrecedesBindAndClosesStore(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33450)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	})
 	if err != nil {
@@ -295,7 +307,8 @@ func TestServiceRecoveredInvariantFailurePrecedesBindAndClosesStore(t *testing.T
 func TestServiceRuntimeListenerFailureIsFatalAndStopsNode(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33500)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	})
 	if err != nil {
@@ -327,7 +340,8 @@ func TestServiceReadyDoesNotBeatAlreadyReportedNodeStartupFailure(t *testing.T) 
 	defer runtime.GOMAXPROCS(previousProcs)
 	configuration, secret := task10ServiceConfig(t, 1, 33550)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: newTask10StartupFailureClock(),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: newTask10StartupFailureClock(),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	})
 	if err != nil {
@@ -357,7 +371,8 @@ func TestServiceReadyDoesNotBeatAlreadyReportedNodeStartupFailure(t *testing.T) 
 func TestServiceReportedFatalWinsConcurrentCancellation(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33570)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	})
 	if err != nil {
@@ -400,7 +415,8 @@ func TestServiceReturnsStateMachineContextCancellationAsFatalAfterReady(t *testi
 				configuration, secret := task10ServiceConfig(t, 1, uint16(33572+attempt*10))
 				machine := &task8StateMachine{applyErrAt: 1, applyErr: test.applyErr}
 				service, err := NewService(ServiceOptions{
-					Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+					ApplicationFingerprint: task5ApplicationFingerprint,
+					Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 					Random: task8ZeroOffsetRandom{}, StateMachine: machine,
 				})
 				if err != nil {
@@ -457,7 +473,8 @@ func TestServiceReturnsStateMachineContextCancellationAsFatalAfterReady(t *testi
 func TestServiceChildResultPublicationLinearizesBeforeReady(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33580)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	})
 	if err != nil {
@@ -502,7 +519,8 @@ func TestServiceReadyAndChildResultSimultaneousStressIsLinearizable(t *testing.T
 	for attempt := 0; attempt < 50; attempt++ {
 		configuration, secret := task10ServiceConfig(t, 1, uint16(33600+attempt*10))
 		service, err := NewService(ServiceOptions{
-			Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+			ApplicationFingerprint: task5ApplicationFingerprint,
+			Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 			Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 		})
 		if err != nil {
@@ -562,7 +580,8 @@ func TestServiceReadyAndChildResultSimultaneousStressIsLinearizable(t *testing.T
 func TestServiceDelegatesPublicAPIWhileReady(t *testing.T) {
 	configuration, secret := task10ServiceConfig(t, 1, 33300)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewManual(time.Unix(1000, 0)),
 		Random: task8ZeroOffsetRandom{}, StateMachine: &task8StateMachine{},
 	})
 	if err != nil {

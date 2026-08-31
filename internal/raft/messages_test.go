@@ -10,7 +10,7 @@ import (
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
-func TestMessageExactV1CanonicalLayouts(t *testing.T) {
+func TestMessageExactCanonicalLayouts(t *testing.T) {
 	fingerprint := VoterFingerprint{1}
 	transferID := TransferID{1}
 	snapshotID := SnapshotID{2}
@@ -25,8 +25,8 @@ func TestMessageExactV1CanonicalLayouts(t *testing.T) {
 		message wire.MessageType
 		wantHex string
 	}{
-		{name: "handshake", rpc: Handshake{SenderID: 1, VoterFingerprint: fingerprint}, message: wire.MessageRaftHandshake, wantHex: "000100010100000000000000000000000000000000000000000000000000000000000000"},
-		{name: "handshake_ack", rpc: HandshakeAck{ResponderID: 2, VoterFingerprint: fingerprint}, message: wire.MessageRaftHandshakeAck, wantHex: "000100020100000000000000000000000000000000000000000000000000000000000000"},
+		{name: "handshake", rpc: task5Handshake(1, fingerprint), message: wire.MessageRaftHandshake, wantHex: "00020001010000000000000000000000000000000000000000000000000000000000000010a44b7bf119aec85037e343680323c220ee02b09a627298dc8965fba4ae021b"},
+		{name: "handshake_ack", rpc: task5HandshakeAck(2, fingerprint), message: wire.MessageRaftHandshakeAck, wantHex: "00020002010000000000000000000000000000000000000000000000000000000000000010a44b7bf119aec85037e343680323c220ee02b09a627298dc8965fba4ae021b"},
 		{name: "pre_vote_request", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: 2, ProspectiveTerm: 3, LastLogIndex: 4, LastLogTerm: 2}, message: wire.MessageRaftPreVoteRequest, wantHex: "000100010000000000000002000000000000000300000000000000040000000000000002"},
 		{name: "pre_vote_response", rpc: PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 1, RequestCurrentTerm: 2, ProspectiveTerm: 3, Granted: true}, message: wire.MessageRaftPreVoteResponse, wantHex: "00010002000100000000000000010000000000000002000000000000000301"},
 		{name: "vote_request", rpc: RequestVoteRequest{CandidateID: 1, Term: 3, LastLogIndex: 4, LastLogTerm: 2}, message: wire.MessageRaftRequestVoteRequest, wantHex: "00010001000000000000000300000000000000040000000000000002"},
@@ -68,8 +68,8 @@ func TestMessageValidAndInvalidDomains(t *testing.T) {
 	snapshotID := SnapshotID{2}
 	checksum := SnapshotChecksum{3}
 	valid := []RPC{
-		Handshake{SenderID: 1, VoterFingerprint: fingerprint},
-		HandshakeAck{ResponderID: 2, VoterFingerprint: fingerprint},
+		task5Handshake(1, fingerprint),
+		task5HandshakeAck(2, fingerprint),
 		PreVoteRequest{CandidateID: 1, CurrentTerm: 0, ProspectiveTerm: 1, LastLogIndex: 0, LastLogTerm: 0},
 		PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 1, RequestCurrentTerm: 2, ProspectiveTerm: 3, Granted: true},
 		PreVoteResponse{ResponderID: 2, CandidateID: 1, Term: 4, RequestCurrentTerm: 2, ProspectiveTerm: 3},
@@ -103,9 +103,10 @@ func TestMessageValidAndInvalidDomains(t *testing.T) {
 		rpc    RPC
 		limits CodecLimits
 	}{
-		{name: "zero_handshake_id", rpc: Handshake{VoterFingerprint: fingerprint}},
-		{name: "zero_fingerprint", rpc: Handshake{SenderID: 1}},
-		{name: "same_handshake_ack_actor", rpc: HandshakeAck{ResponderID: 0, VoterFingerprint: fingerprint}},
+		{name: "zero_handshake_id", rpc: Handshake{VoterFingerprint: fingerprint, ApplicationFingerprint: task5ApplicationFingerprint}},
+		{name: "zero_fingerprint", rpc: Handshake{SenderID: 1, ApplicationFingerprint: task5ApplicationFingerprint}},
+		{name: "zero_application_fingerprint", rpc: Handshake{SenderID: 1, VoterFingerprint: fingerprint}},
+		{name: "same_handshake_ack_actor", rpc: HandshakeAck{ResponderID: 0, VoterFingerprint: fingerprint, ApplicationFingerprint: task5ApplicationFingerprint}},
 		{name: "pre_vote_prospective_not_next", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: 2, ProspectiveTerm: 4}},
 		{name: "pre_vote_term_overflow", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: ^uint64(0), ProspectiveTerm: 0}},
 		{name: "pre_vote_bad_log_pair", rpc: PreVoteRequest{CandidateID: 1, CurrentTerm: 2, ProspectiveTerm: 3, LastLogTerm: 1}},
@@ -147,12 +148,12 @@ func TestMessageValidAndInvalidDomains(t *testing.T) {
 		})
 	}
 
-	if err := ValidateRPCSender(Handshake{SenderID: 2, VoterFingerprint: fingerprint}, 1, validSet); !errors.Is(err, ErrInvalidRPC) {
+	if err := ValidateRPCSender(task5Handshake(2, fingerprint), 1, validSet); !errors.Is(err, ErrInvalidRPC) {
 		t.Fatalf("mismatched sender error = %v, want ErrInvalidRPC", err)
 	}
 	wrongFingerprint := fingerprint
 	wrongFingerprint[0] ^= 0xff
-	if err := ValidateRPCSender(Handshake{SenderID: 1, VoterFingerprint: wrongFingerprint}, 1, validSet); !errors.Is(err, ErrVoterFingerprint) {
+	if err := ValidateRPCSender(task5Handshake(1, wrongFingerprint), 1, validSet); !errors.Is(err, ErrVoterFingerprint) {
 		t.Fatalf("fingerprint error = %v, want ErrVoterFingerprint", err)
 	}
 	if err := ValidateRPCSender(RequestVoteRequest{CandidateID: 1, Term: 1}, 9, validSet); !errors.Is(err, ErrNotVoter) {
@@ -206,6 +207,9 @@ func TestMessageDecodedBytesAndClonesAreOwned(t *testing.T) {
 func TestRPCMessageTypesUseStableWireIDsAndBinaryCodec(t *testing.T) {
 	if RPCSchemaVersion != 1 {
 		t.Fatalf("RPCSchemaVersion = %d, want 1", RPCSchemaVersion)
+	}
+	if HandshakeSchemaVersion != 2 {
+		t.Fatalf("HandshakeSchemaVersion = %d, want 2", HandshakeSchemaVersion)
 	}
 	if wire.CodecBinary != 2 {
 		t.Fatalf("CodecBinary = %d, want 2", wire.CodecBinary)

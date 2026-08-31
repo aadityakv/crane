@@ -547,16 +547,17 @@ func newTask10Transport(t *testing.T, seams task10TransportOptions) *TCPTranspor
 	voters := task10Voters(t)
 	clusterID := [16]byte{1}
 	options := TCPTransportOptions{
-		LocalID:       1,
-		Voters:        voters,
-		ClusterID:     clusterID,
-		Authenticator: wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901")),
-		Clock:         seams.clock,
-		ReplayWindow:  2 * time.Minute,
-		RPCTimeout:    seams.rpcTimeout,
-		RequestIDs:    seams.requestIDs,
-		DialContext:   seams.dial,
-		Backoff:       seams.backoff,
+		LocalID:                1,
+		Voters:                 voters,
+		ClusterID:              clusterID,
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Authenticator:          wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901")),
+		Clock:                  seams.clock,
+		ReplayWindow:           2 * time.Minute,
+		RPCTimeout:             seams.rpcTimeout,
+		RequestIDs:             seams.requestIDs,
+		DialContext:            seams.dial,
+		Backoff:                seams.backoff,
 	}
 	if options.RPCTimeout == 0 {
 		options.RPCTimeout = 100 * time.Millisecond

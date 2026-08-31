@@ -28,7 +28,7 @@ func TestTCPHandshakeBindsConfiguredHeaderAndPayloadSender(t *testing.T) {
 		close(done)
 	}()
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
-	handshake := Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()}
+	handshake := task5Handshake(2, transport.voters.Fingerprint())
 	requestID := wire.RequestID{1}
 	if err := writeFrameForTest(stream, transportFrame(t, transport, 2, requestID, handshake)); err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestTCPHandshakeAckReservesCorrelatedRequestIDForOutboundReplayWindow(t *te
 		close(done)
 	}()
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
-	handshake := transportFrame(t, transport, 2, id, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+	handshake := transportFrame(t, transport, 2, id, task5Handshake(2, transport.voters.Fingerprint()))
 	if err := writeFrameForTest(stream, handshake); err != nil {
 		t.Fatal(err)
 	}
@@ -105,21 +105,21 @@ func TestTCPHandshakeAckRejectsRequestIDAlreadyUsedOutboundToPeer(t *testing.T) 
 	client, server := net.Pipe()
 	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
-	handshake := transportFrame(t, transport, 2, id, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+	handshake := transportFrame(t, transport, 2, id, task5Handshake(2, transport.voters.Fingerprint()))
 	writeRejectedFrameForTest(t, stream, handshake)
 	expectClosedStream(t, stream)
 }
 
 func TestTCPHandshakeRejectsPayloadMismatchAndReplayAcrossReconnect(t *testing.T) {
 	transport := newTask10Transport(t, task10TransportOptions{})
-	bad := Handshake{SenderID: 3, VoterFingerprint: transport.voters.Fingerprint()}
+	bad := task5Handshake(3, transport.voters.Fingerprint())
 	client, server := net.Pipe()
 	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 	stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
 	writeRejectedFrameForTest(t, stream, transportFrame(t, transport, 2, wire.RequestID{1}, bad))
 	expectClosedStream(t, stream)
 
-	valid := transportFrame(t, transport, 2, wire.RequestID{2}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+	valid := transportFrame(t, transport, 2, wire.RequestID{2}, task5Handshake(2, transport.voters.Fingerprint()))
 	for attempt := 0; attempt < 2; attempt++ {
 		client, server = net.Pipe()
 		go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
@@ -166,7 +166,7 @@ func TestTCPInvalidPayloadDoesNotConsumeAcceptedReplayCapacity(t *testing.T) {
 	client, server = net.Pipe()
 	go transport.handleInboundConnection(context.Background(), server, task10Ingress{})
 	stream = wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
-	valid := transportFrame(t, transport, 2, wire.RequestID{2}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+	valid := transportFrame(t, transport, 2, wire.RequestID{2}, task5Handshake(2, transport.voters.Fingerprint()))
 	if err := writeFrameForTest(stream, valid); err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +323,7 @@ func TestTCPBoundStreamRejectsSenderChangeAndGob(t *testing.T) {
 				close(done)
 			}()
 			stream := wire.NewTCPFrameStream(client, transport.authenticator, transport.limits, time.Second)
-			handshake := transportFrame(t, transport, 2, wire.RequestID{1}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			handshake := transportFrame(t, transport, 2, wire.RequestID{1}, task5Handshake(2, transport.voters.Fingerprint()))
 			if err := writeFrameForTest(stream, handshake); err != nil {
 				t.Fatal(err)
 			}
@@ -348,27 +348,27 @@ func TestTCPHandshakeRejectsUnauthenticatedUnboundAndInvalidPeers(t *testing.T) 
 		build func(*TCPTransport) (*wire.TCPFrameStream, wire.Frame)
 	}{
 		{name: "wrong cluster", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
-			frame := transportFrame(t, transport, 2, wire.RequestID{1}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame := transportFrame(t, transport, 2, wire.RequestID{1}, task5Handshake(2, transport.voters.Fingerprint()))
 			frame.Header.ClusterID[0]++
 			return nil, frame
 		}},
 		{name: "wrong mac", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
-			frame := transportFrame(t, transport, 2, wire.RequestID{1}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame := transportFrame(t, transport, 2, wire.RequestID{1}, task5Handshake(2, transport.voters.Fingerprint()))
 			return wire.NewTCPFrameStream(nil, wire.NewHMACAuthenticator([]byte("different-authentication-key-0000")), wire.DefaultLimits(), time.Second), frame
 		}},
 		{name: "rpc before handshake", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
 			return nil, transportFrame(t, transport, 2, wire.RequestID{1}, AppendEntriesRequest{LeaderID: 2, Term: 1, Generation: 1})
 		}},
 		{name: "self sender", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
-			return nil, transportFrame(t, transport, 1, wire.RequestID{1}, Handshake{SenderID: 1, VoterFingerprint: transport.voters.Fingerprint()})
+			return nil, transportFrame(t, transport, 1, wire.RequestID{1}, task5Handshake(1, transport.voters.Fingerprint()))
 		}},
 		{name: "nonvoter", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
-			return nil, transportFrame(t, transport, 4, wire.RequestID{1}, Handshake{SenderID: 4, VoterFingerprint: transport.voters.Fingerprint()})
+			return nil, transportFrame(t, transport, 4, wire.RequestID{1}, task5Handshake(4, transport.voters.Fingerprint()))
 		}},
 		{name: "fingerprint mismatch", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
 			fingerprint := transport.voters.Fingerprint()
 			fingerprint[0]++
-			return nil, transportFrame(t, transport, 2, wire.RequestID{1}, Handshake{SenderID: 2, VoterFingerprint: fingerprint})
+			return nil, transportFrame(t, transport, 2, wire.RequestID{1}, task5Handshake(2, fingerprint))
 		}},
 		{name: "unknown type", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
 			return nil, wire.Frame{Header: transportHeader(transport, 2, wire.RequestID{1}, wire.MessageType(999)), Payload: []byte{0, 1}}
@@ -377,12 +377,12 @@ func TestTCPHandshakeRejectsUnauthenticatedUnboundAndInvalidPeers(t *testing.T) 
 			return nil, wire.Frame{Header: transportHeader(transport, 2, wire.RequestID{1}, wire.MessageRaftHandshake), Payload: []byte{0}}
 		}},
 		{name: "future timestamp", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
-			frame := transportFrame(t, transport, 2, wire.RequestID{1}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame := transportFrame(t, transport, 2, wire.RequestID{1}, task5Handshake(2, transport.voters.Fingerprint()))
 			frame.Header.TimestampMillis = transport.clock.Now().Add(TransportFutureSkew + time.Millisecond).UnixMilli()
 			return nil, frame
 		}},
 		{name: "expired timestamp", build: func(transport *TCPTransport) (*wire.TCPFrameStream, wire.Frame) {
-			frame := transportFrame(t, transport, 2, wire.RequestID{1}, Handshake{SenderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame := transportFrame(t, transport, 2, wire.RequestID{1}, task5Handshake(2, transport.voters.Fingerprint()))
 			frame.Header.TimestampMillis = transport.clock.Now().Add(-transport.replayWindow).UnixMilli()
 			return nil, frame
 		}},
@@ -441,36 +441,41 @@ func TestTCPOutboundHandshakeRejectsEveryUncorrelatedAck(t *testing.T) {
 		build      func(*TCPTransport, wire.Frame) wire.Frame
 	}{
 		{name: "wrong sender", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
-			return transportFrame(t, transport, 3, handshake.Header.RequestID, HandshakeAck{ResponderID: 3, VoterFingerprint: transport.voters.Fingerprint()})
+			return transportFrame(t, transport, 3, handshake.Header.RequestID, task5HandshakeAck(3, transport.voters.Fingerprint()))
 		}},
 		{name: "wrong cluster header", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
-			frame := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame := transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(2, transport.voters.Fingerprint()))
 			frame.Header.ClusterID[0]++
 			return frame
 		}},
 		{name: "wrong payload responder", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
-			return transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 3, VoterFingerprint: transport.voters.Fingerprint()})
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(3, transport.voters.Fingerprint()))
 		}},
 		{name: "wrong fingerprint", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
 			fingerprint := transport.voters.Fingerprint()
 			fingerprint[0]++
-			return transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: fingerprint})
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(2, fingerprint))
+		}},
+		{name: "wrong application fingerprint", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
+			fingerprint := task5ApplicationFingerprint
+			fingerprint[0]++
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint(), ApplicationFingerprint: fingerprint})
 		}},
 		{name: "wrong request ID", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
 			requestID := handshake.Header.RequestID
 			requestID[0]++
-			return transportFrame(t, transport, 2, requestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			return transportFrame(t, transport, 2, requestID, task5HandshakeAck(2, transport.voters.Fingerprint()))
 		}},
 		{name: "wrong message", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
 			return transportFrame(t, transport, 2, handshake.Header.RequestID, AppendEntriesRequest{LeaderID: 2, Term: 1, Generation: 1})
 		}},
 		{name: "wrong codec", respond: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
-			frame := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			frame := transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(2, transport.voters.Fingerprint()))
 			frame.Header.Codec = wire.CodecGob
 			return frame
 		}},
 		{name: "replayed ack", respond: true, seedReplay: true, build: func(transport *TCPTransport, handshake wire.Frame) wire.Frame {
-			return transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+			return transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(2, transport.voters.Fingerprint()))
 		}},
 		{name: "ack timeout", respond: false},
 	} {
@@ -545,7 +550,7 @@ func TestTCPDialAndHandshakeShareOneAggregateRPCTimeout(t *testing.T) {
 				handshake, err := readFrameOrError(stream)
 				if err == nil {
 					time.Sleep(phaseDelay)
-					ack := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+					ack := transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(2, transport.voters.Fingerprint()))
 					err = writeFrameForTest(stream, ack)
 				}
 				serverDone <- err
@@ -675,7 +680,7 @@ func serveTask10OutboundPeer(t *testing.T, transport *TCPTransport, connection n
 	if err != nil {
 		return
 	}
-	ack := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+	ack := transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(2, transport.voters.Fingerprint()))
 	if err := writeFrameForTest(stream, ack); err != nil {
 		return
 	}
@@ -708,13 +713,14 @@ func TestTCPReplayRetentionRejectsDurationOverflowAtConstruction(t *testing.T) {
 	const maxDuration = time.Duration(1<<63 - 1)
 	maxReplayWindow := maxDuration - TransportFutureSkew
 	base := TCPTransportOptions{
-		LocalID:       1,
-		Voters:        task10Voters(t),
-		ClusterID:     [16]byte{1},
-		Authenticator: wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901")),
-		Clock:         &task10PanicClock{},
-		ReplayWindow:  maxReplayWindow + time.Nanosecond,
-		RPCTimeout:    time.Second,
+		LocalID:                1,
+		Voters:                 task10Voters(t),
+		ClusterID:              [16]byte{1},
+		ApplicationFingerprint: task5ApplicationFingerprint,
+		Authenticator:          wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901")),
+		Clock:                  &task10PanicClock{},
+		ReplayWindow:           maxReplayWindow + time.Nanosecond,
+		RPCTimeout:             time.Second,
 	}
 	if _, err := NewTCPTransport(base); !errors.Is(err, ErrTransportInvariant) {
 		t.Fatalf("overflowing replay retention constructor error = %v, want ErrTransportInvariant", err)
@@ -814,7 +820,7 @@ func TestTCPRequestIDRetentionUsesExactFrameTimestamp(t *testing.T) {
 					return
 				}
 				handshakeReceived <- handshake
-				ack := transportFrame(t, transport, 2, handshake.Header.RequestID, HandshakeAck{ResponderID: 2, VoterFingerprint: transport.voters.Fingerprint()})
+				ack := transportFrame(t, transport, 2, handshake.Header.RequestID, task5HandshakeAck(2, transport.voters.Fingerprint()))
 				_ = writeFrameForTest(stream, ack)
 				<-releaseServer
 			}()

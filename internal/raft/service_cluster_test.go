@@ -286,6 +286,53 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 	assertTask10IdempotencyEvidence(t, nodes, trackers, "durable conflicting retry")
 }
 
+func TestRealTCPClusterApplicationFingerprintMismatchCannotJoinQuorum(t *testing.T) {
+	configurations, secret, reservations := task10ClusterConfigurations(t)
+	trackers := []*task10KVTracker{newTask10KVTracker(), newTask10KVTracker(), newTask10KVTracker()}
+	mismatched := task5ApplicationFingerprint
+	mismatched[0] ^= 0xff
+	nodes := make([]*task10ClusterNode, 3)
+	nodes[0] = startTask10ClusterNodeWithFingerprint(t, configurations[0], secret, 1, reservations[0], trackers[0], mismatched)
+	for index := 1; index < len(nodes); index++ {
+		nodes[index] = startTask10ClusterNodeWithFingerprint(t, configurations[index], secret, int64(index+1), reservations[index], trackers[index], task5ApplicationFingerprint)
+	}
+	defer func() {
+		for _, node := range nodes {
+			node.stop(t)
+		}
+	}()
+
+	matching := nodes[1:]
+	leader := awaitTask10Leader(t, matching, 5*time.Second)
+	command := task10KVCommand{ID: "application-fenced", Key: "compatible", Value: "quorum"}
+	_ = proposeTask10Command(t, matching, command)
+	awaitTask10State(t, matching, map[string]string{"compatible": "quorum"}, 5*time.Second)
+	if got := nodes[0].machine.valuesSnapshot(); len(got) != 0 {
+		t.Fatalf("application-mismatched voter replicated state: %#v", got)
+	}
+	if status := nodes[0].service.Status(); status.Role == RoleLeader || status.LeaderID != 0 {
+		t.Fatalf("application-mismatched voter received quorum/contact credit: %#v; matching leader=%d", status, leader.configuration.NodeID)
+	}
+}
+
+func TestRealTCPClusterFiveMatchingApplicationFingerprintsReadyElectAndReplicate(t *testing.T) {
+	configurations, secret, reservations := task10ClusterConfigurationsWithVoters(t, 5)
+	nodes := make([]*task10ClusterNode, len(configurations))
+	for index := range nodes {
+		nodes[index] = startTask10ClusterNode(t, configurations[index], secret, int64(index+1), reservations[index], newTask10KVTracker())
+	}
+	defer func() {
+		for _, node := range nodes {
+			node.stop(t)
+		}
+	}()
+
+	_ = awaitTask10Leader(t, nodes, 5*time.Second)
+	command := task10KVCommand{ID: "five-voter-application-fence", Key: "matching", Value: "replicated"}
+	_ = proposeTask10Command(t, nodes, command)
+	awaitTask10State(t, nodes, map[string]string{"matching": "replicated"}, 5*time.Second)
+}
+
 type task10ClusterNode struct {
 	configuration config.NodeConfig
 	service       *Service
@@ -296,10 +343,15 @@ type task10ClusterNode struct {
 }
 
 func startTask10ClusterNode(t *testing.T, configuration config.NodeConfig, secret []byte, seed int64, reservation net.Listener, tracker *task10KVTracker) *task10ClusterNode {
+	return startTask10ClusterNodeWithFingerprint(t, configuration, secret, seed, reservation, tracker, task5ApplicationFingerprint)
+}
+
+func startTask10ClusterNodeWithFingerprint(t *testing.T, configuration config.NodeConfig, secret []byte, seed int64, reservation net.Listener, tracker *task10KVTracker, fingerprint [32]byte) *task10ClusterNode {
 	t.Helper()
 	machine := newTask10KVStateMachine(tracker)
 	service, err := NewService(ServiceOptions{
-		Config: configuration, Secret: secret, Clock: clock.NewReal(),
+		ApplicationFingerprint: fingerprint,
+		Config:                 configuration, Secret: secret, Clock: clock.NewReal(),
 		Random: internalrandom.NewLockedSource(seed), StateMachine: machine,
 	})
 	if err != nil {
@@ -346,15 +398,19 @@ func (node *task10ClusterNode) stop(t *testing.T) {
 }
 
 func task10ClusterConfigurations(t *testing.T) ([]config.NodeConfig, []byte, []net.Listener) {
+	return task10ClusterConfigurationsWithVoters(t, 3)
+}
+
+func task10ClusterConfigurationsWithVoters(t *testing.T, voterCount int) ([]config.NodeConfig, []byte, []net.Listener) {
 	t.Helper()
 	secret := []byte("task10-real-tcp-hmac-secret-key-0001")
 	secretPath := filepath.Join(t.TempDir(), "cluster.secret")
 	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	reservations := make([]net.Listener, 3)
-	voters := make([]config.RaftVoter, 3)
-	bases := make([]uint16, 3)
+	reservations := make([]net.Listener, voterCount)
+	voters := make([]config.RaftVoter, voterCount)
+	bases := make([]uint16, voterCount)
 	for index := range reservations {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -369,7 +425,7 @@ func task10ClusterConfigurations(t *testing.T) ([]config.NodeConfig, []byte, []n
 		bases[index] = uint16(port - 8)
 		voters[index] = config.RaftVoter{NodeID: uint16(index + 1), Endpoint: listener.Addr().String()}
 	}
-	configurations := make([]config.NodeConfig, 3)
+	configurations := make([]config.NodeConfig, voterCount)
 	for index := range configurations {
 		raftConfig := config.DefaultRaftConfig()
 		raftConfig.HeartbeatInterval = config.Duration(20 * time.Millisecond)

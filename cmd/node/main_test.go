@@ -186,6 +186,20 @@ func TestNewLocalRuntimeComposesOnlyConfiguredVotersWithoutSideEffects(t *testin
 	}
 }
 
+func TestNewLocalRuntimeRejectsConsensusFingerprintMismatchBeforeServiceConstruction(t *testing.T) {
+	configuration := writeNodeTestConfig(t)
+	configuration.Crane.ConsensusFingerprint = strings.Repeat("0", 64)
+	raftDirectory := filepath.Join(configuration.StorageDir, raft.RaftStorageDirectoryName)
+
+	runtime, err := newLocalRuntime(configuration)
+	if err == nil || runtime != nil {
+		t.Fatalf("newLocalRuntime accepted consensus mismatch: runtime=%#v err=%v", runtime, err)
+	}
+	if _, statErr := os.Stat(raftDirectory); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("consensus mismatch reached Raft service construction: %v", statErr)
+	}
+}
+
 func reserveConfiguredRaftEndpoint(t *testing.T, configuration *config.NodeConfig) net.Listener {
 	t.Helper()
 	for attempt := 0; attempt < 20; attempt++ {

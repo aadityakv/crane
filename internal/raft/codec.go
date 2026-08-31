@@ -55,7 +55,7 @@ func EncodeRPC(rpc RPC, limits CodecLimits) (wire.MessageType, []byte, error) {
 	}
 
 	encoder := payloadEncoder{maximum: resolved.MaxEncodedBytes}
-	if err := encoder.uint16(RPCSchemaVersion); err != nil {
+	if err := encoder.uint16(schemaVersionForRPC(rpc)); err != nil {
 		return 0, nil, err
 	}
 	switch message := rpc.(type) {
@@ -90,7 +90,7 @@ func EncodeRPC(rpc RPC, limits CodecLimits) (wire.MessageType, []byte, error) {
 	return rpc.MessageType(), encoder.bytes(), nil
 }
 
-// DecodeRPC parses exactly one bounded canonical v1 payload and rejects trailing bytes.
+// DecodeRPC parses exactly one bounded canonical payload and rejects trailing bytes.
 func DecodeRPC(messageType wire.MessageType, payload []byte, limits CodecLimits) (RPC, error) {
 	resolved, err := resolveCodecLimits(limits)
 	if err != nil {
@@ -104,7 +104,7 @@ func DecodeRPC(messageType wire.MessageType, payload []byte, limits CodecLimits)
 	if err != nil {
 		return nil, err
 	}
-	if version != RPCSchemaVersion {
+	if version != schemaVersionForMessage(messageType) {
 		return nil, fmt.Errorf("%w: version %d", ErrUnsupportedSchema, version)
 	}
 
@@ -188,12 +188,12 @@ func resolveCodecLimits(limits CodecLimits) (CodecLimits, error) {
 func validateRPC(rpc RPC, limits CodecLimits) error {
 	switch message := rpc.(type) {
 	case Handshake:
-		if message.SenderID == 0 || message.VoterFingerprint == (VoterFingerprint{}) {
-			return fmt.Errorf("%w: handshake requires sender and voter fingerprint", ErrInvalidRPC)
+		if message.SenderID == 0 || message.VoterFingerprint == (VoterFingerprint{}) || message.ApplicationFingerprint == ([32]byte{}) {
+			return fmt.Errorf("%w: handshake requires sender, voter fingerprint, and application fingerprint", ErrInvalidRPC)
 		}
 	case HandshakeAck:
-		if message.ResponderID == 0 || message.VoterFingerprint == (VoterFingerprint{}) {
-			return fmt.Errorf("%w: handshake acknowledgement requires responder and voter fingerprint", ErrInvalidRPC)
+		if message.ResponderID == 0 || message.VoterFingerprint == (VoterFingerprint{}) || message.ApplicationFingerprint == ([32]byte{}) {
+			return fmt.Errorf("%w: handshake acknowledgement requires responder, voter fingerprint, and application fingerprint", ErrInvalidRPC)
 		}
 	case PreVoteRequest:
 		if message.CandidateID == 0 || !isNextTerm(message.CurrentTerm, message.ProspectiveTerm) || !validLogPosition(message.LastLogIndex, message.LastLogTerm) || message.LastLogTerm > message.CurrentTerm {
@@ -476,14 +476,20 @@ func encodeHandshake(e *payloadEncoder, m Handshake) error {
 	if err := e.uint16(m.SenderID); err != nil {
 		return err
 	}
-	return e.add(m.VoterFingerprint[:])
+	if err := e.add(m.VoterFingerprint[:]); err != nil {
+		return err
+	}
+	return e.add(m.ApplicationFingerprint[:])
 }
 
 func encodeHandshakeAck(e *payloadEncoder, m HandshakeAck) error {
 	if err := e.uint16(m.ResponderID); err != nil {
 		return err
 	}
-	return e.add(m.VoterFingerprint[:])
+	if err := e.add(m.VoterFingerprint[:]); err != nil {
+		return err
+	}
+	return e.add(m.ApplicationFingerprint[:])
 }
 
 func encodePreVoteRequest(e *payloadEncoder, m PreVoteRequest) error {
@@ -650,6 +656,9 @@ func decodeHandshake(d *payloadDecoder) (RPC, error) {
 	if err := d.fixed(message.VoterFingerprint[:]); err != nil {
 		return nil, err
 	}
+	if err := d.fixed(message.ApplicationFingerprint[:]); err != nil {
+		return nil, err
+	}
 	return message, nil
 }
 
@@ -662,7 +671,28 @@ func decodeHandshakeAck(d *payloadDecoder) (RPC, error) {
 	if err := d.fixed(message.VoterFingerprint[:]); err != nil {
 		return nil, err
 	}
+	if err := d.fixed(message.ApplicationFingerprint[:]); err != nil {
+		return nil, err
+	}
 	return message, nil
+}
+
+func schemaVersionForRPC(rpc RPC) uint16 {
+	switch rpc.(type) {
+	case Handshake, HandshakeAck:
+		return HandshakeSchemaVersion
+	default:
+		return RPCSchemaVersion
+	}
+}
+
+func schemaVersionForMessage(messageType wire.MessageType) uint16 {
+	switch messageType {
+	case wire.MessageRaftHandshake, wire.MessageRaftHandshakeAck:
+		return HandshakeSchemaVersion
+	default:
+		return RPCSchemaVersion
+	}
 }
 
 func decodePreVoteRequest(d *payloadDecoder) (RPC, error) {

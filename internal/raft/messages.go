@@ -6,8 +6,11 @@ import (
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
-// RPCSchemaVersion is the initial canonical binary Raft payload schema.
+// RPCSchemaVersion is the initial canonical binary schema for non-handshake Raft payloads.
 const RPCSchemaVersion uint16 = 1
+
+// HandshakeSchemaVersion is the canonical application-fenced peer handshake schema.
+const HandshakeSchemaVersion uint16 = 2
 
 // SnapshotID identifies immutable snapshot content independently of transfer retries.
 type SnapshotID [16]byte
@@ -27,6 +30,8 @@ type Handshake struct {
 	SenderID uint16
 	// VoterFingerprint is the canonical fixed-voter trust boundary.
 	VoterFingerprint VoterFingerprint
+	// ApplicationFingerprint binds the complete deterministic application protocol.
+	ApplicationFingerprint [32]byte
 }
 
 // MessageType returns wire.MessageRaftHandshake.
@@ -38,6 +43,8 @@ type HandshakeAck struct {
 	ResponderID uint16
 	// VoterFingerprint is the responder's canonical fixed-voter trust boundary.
 	VoterFingerprint VoterFingerprint
+	// ApplicationFingerprint binds the complete deterministic application protocol.
+	ApplicationFingerprint [32]byte
 }
 
 // MessageType returns wire.MessageRaftHandshakeAck.

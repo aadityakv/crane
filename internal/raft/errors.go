@@ -29,10 +29,12 @@ var (
 	ErrRPCTooLarge = errors.New("raft RPC too large")
 	// ErrInvalidRPC classifies a structurally complete payload with invalid Raft semantics.
 	ErrInvalidRPC = errors.New("invalid raft RPC")
-	// ErrUnknownRPC classifies a wire message that has no v1 Raft payload schema.
+	// ErrUnknownRPC classifies a wire message that has no supported Raft payload schema.
 	ErrUnknownRPC = errors.New("unknown raft RPC")
 	// ErrVoterFingerprint classifies a handshake for another configured voter set.
 	ErrVoterFingerprint = errors.New("raft voter fingerprint mismatch")
+	// ErrApplicationFingerprint classifies a peer running incompatible application rules.
+	ErrApplicationFingerprint = errors.New("raft application fingerprint mismatch")
 	// ErrLogCompacted classifies a log index hidden by the current snapshot base.
 	ErrLogCompacted = errors.New("raft log index compacted")
 	// ErrLogUnavailable classifies a log index beyond the last available entry.

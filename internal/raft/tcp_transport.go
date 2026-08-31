@@ -58,6 +58,8 @@ type TCPTransportOptions struct {
 	Voters VoterSet
 	// ClusterID is the exact authenticated wire cluster identity.
 	ClusterID [16]byte
+	// ApplicationFingerprint binds peers to one deterministic application protocol.
+	ApplicationFingerprint [32]byte
 	// Authenticator verifies and signs canonical frames.
 	Authenticator wire.Authenticator
 	// Clock timestamps frames and drives per-remote replay validation.
@@ -78,20 +80,21 @@ type TCPTransportOptions struct {
 
 // TCPTransport owns one bounded outbound worker per remote voter and bounded inbound handlers.
 type TCPTransport struct {
-	localID         uint16
-	voters          VoterSet
-	clusterID       [16]byte
-	authenticator   wire.Authenticator
-	clock           clock.Clock
-	replayWindow    time.Duration
-	replayRetention time.Duration
-	rpcTimeout      time.Duration
-	codecLimits     CodecLimits
-	limits          wire.Limits
-	replayGuards    map[uint16]*wire.ReplayGuard
-	requestIDs      RequestIDSource
-	dialContext     TCPDialContext
-	backoff         BackoffFunc
+	localID                uint16
+	voters                 VoterSet
+	clusterID              [16]byte
+	applicationFingerprint [32]byte
+	authenticator          wire.Authenticator
+	clock                  clock.Clock
+	replayWindow           time.Duration
+	replayRetention        time.Duration
+	rpcTimeout             time.Duration
+	codecLimits            CodecLimits
+	limits                 wire.Limits
+	replayGuards           map[uint16]*wire.ReplayGuard
+	requestIDs             RequestIDSource
+	dialContext            TCPDialContext
+	backoff                BackoffFunc
 
 	state  atomic.Uint32
 	ready  chan struct{}
@@ -117,7 +120,7 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 	if err := options.Voters.ValidateLocalID(options.LocalID); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTransportInvariant, err)
 	}
-	if options.ClusterID == ([16]byte{}) || options.Authenticator == nil || options.Clock == nil || options.ReplayWindow <= 0 || options.ReplayWindow > config.MaxReplayWindow || options.RPCTimeout <= 0 {
+	if options.ClusterID == ([16]byte{}) || options.ApplicationFingerprint == ([32]byte{}) || options.Authenticator == nil || options.Clock == nil || options.ReplayWindow <= 0 || options.ReplayWindow > config.MaxReplayWindow || options.RPCTimeout <= 0 {
 		return nil, fmt.Errorf("%w: invalid TCP transport options", ErrTransportInvariant)
 	}
 	replayRetention := options.ReplayWindow + TransportFutureSkew
@@ -152,7 +155,7 @@ func NewTCPTransport(options TCPTransportOptions) (*TCPTransport, error) {
 		}
 	}
 	transport := &TCPTransport{
-		localID: options.LocalID, voters: options.Voters, clusterID: clusterID,
+		localID: options.LocalID, voters: options.Voters, clusterID: clusterID, applicationFingerprint: options.ApplicationFingerprint,
 		authenticator: options.Authenticator, clock: options.Clock, replayWindow: options.ReplayWindow, replayRetention: replayRetention,
 		rpcTimeout: options.RPCTimeout, codecLimits: resolvedCodec, limits: limits,
 		replayGuards: replayGuards,
@@ -339,7 +342,7 @@ func (transport *TCPTransport) dialPeer(ctx context.Context, voter Voter) (*wire
 		_ = stream.Close()
 		return nil, nil, err
 	}
-	messageType, payload, err := EncodeRPC(Handshake{SenderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint()}, transport.codecLimits)
+	messageType, payload, err := EncodeRPC(Handshake{SenderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint(), ApplicationFingerprint: transport.applicationFingerprint}, transport.codecLimits)
 	if err == nil {
 		err = stream.WriteFrame(attemptContext, wire.Frame{Header: transport.outboundHeaderAt(messageType, requestID, timestamp), Payload: payload})
 	}
@@ -378,6 +381,9 @@ func (transport *TCPTransport) acceptHandshakeAck(frame wire.Frame, peerID uint1
 	}
 	if err := ValidateRPCSender(rpc, peerID, transport.voters); err != nil {
 		return invalid(err)
+	}
+	if err := transport.validateApplicationFingerprint(rpc); err != nil {
+		return err
 	}
 	if err := transport.commitFrame(frame); err != nil {
 		return err
@@ -457,7 +463,7 @@ func (transport *TCPTransport) handleInboundConnection(ctx context.Context, conn
 	if err != nil {
 		return
 	}
-	messageType, payload, err := EncodeRPC(HandshakeAck{ResponderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint()}, transport.codecLimits)
+	messageType, payload, err := EncodeRPC(HandshakeAck{ResponderID: transport.localID, VoterFingerprint: transport.voters.Fingerprint(), ApplicationFingerprint: transport.applicationFingerprint}, transport.codecLimits)
 	if err != nil {
 		return
 	}
@@ -512,10 +518,27 @@ func (transport *TCPTransport) validateInboundFrame(frame wire.Frame, boundID ui
 	if err := ValidateRPCSender(rpc, frame.Header.SenderID, transport.voters); err != nil {
 		return reject()
 	}
+	if err := transport.validateApplicationFingerprint(rpc); err != nil {
+		return nil, false
+	}
 	if err := transport.commitFrame(frame); err != nil {
 		return nil, false
 	}
 	return rpc, true
+}
+
+func (transport *TCPTransport) validateApplicationFingerprint(rpc RPC) error {
+	switch message := rpc.(type) {
+	case Handshake:
+		if message.ApplicationFingerprint != transport.applicationFingerprint {
+			return ErrApplicationFingerprint
+		}
+	case HandshakeAck:
+		if message.ApplicationFingerprint != transport.applicationFingerprint {
+			return ErrApplicationFingerprint
+		}
+	}
+	return nil
 }
 
 func isNodeRPCMessage(message wire.MessageType) bool {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/aaditya/cs425mp3/internal/clock"
 	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/node"
 	"github.com/aaditya/cs425mp3/internal/raft"
 	internalrandom "github.com/aaditya/cs425mp3/internal/random"
@@ -141,11 +142,12 @@ func newLocalRuntime(configuration config.NodeConfig) (*localRuntime, error) {
 		return runtime, nil
 	}
 	raftService, err := raft.NewService(raft.ServiceOptions{
-		Config:       ownedNodeConfig(configuration),
-		Secret:       append([]byte(nil), secret...),
-		Clock:        realClock,
-		Random:       sharedRandom,
-		StateMachine: &bootstrapStateMachine{},
+		Config:                 ownedNodeConfig(configuration),
+		ApplicationFingerprint: model.ConsensusFingerprint(),
+		Secret:                 append([]byte(nil), secret...),
+		Clock:                  realClock,
+		Random:                 sharedRandom,
+		StateMachine:           &bootstrapStateMachine{},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Raft service: %w", err)
