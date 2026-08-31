@@ -17,9 +17,11 @@ const (
 )
 
 type mutationPlan struct {
-	result []byte
-	commit func()
-	reject bool
+	result     []byte
+	commit     func()
+	reject     bool
+	capacity   bool
+	stateDelta int64
 }
 
 type clientHistory struct {
@@ -50,6 +52,8 @@ type Machine struct {
 
 	coordinatorRevision uint64
 	coordinatorEpoch    model.CoordinatorEpoch
+	workers             map[uint16]WorkerRecord
+	jobs                map[model.JobID]JobRecord
 
 	estimatedSnapshotBytes uint64
 }
@@ -57,25 +61,47 @@ type Machine struct {
 func NewMachine() *Machine {
 	return &Machine{
 		clients: make(map[model.ClientID]clientHistory), subjects: make(map[SubjectKey]subjectHistory),
+		workers: make(map[uint16]WorkerRecord), jobs: make(map[model.JobID]JobRecord),
 		estimatedSnapshotBytes: estimatedSnapshotBaseBytes,
 	}
 }
 
-// Apply applies the only concrete Task 9 command. Expected business rejection
-// is returned as an encoded CommandResult with a nil error.
+// Apply decodes one concrete command and returns expected business rejection as
+// an encoded CommandResult with a nil error.
 func (machine *Machine) Apply(index, term uint64, encoded []byte) ([]byte, error) {
 	if index == 0 || term == 0 {
 		return nil, fmt.Errorf("%w: zero apply index or term", ErrMalformedCommand)
 	}
-	command, err := UnmarshalBeginCoordinatorEpoch(encoded)
+	decoded, err := UnmarshalCommand(encoded)
 	if err != nil {
 		return nil, err
 	}
-	target := beginTarget(command)
-	appliedTarget := beginAppliedTarget(term, command)
 
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
+	switch command := decoded.(type) {
+	case BeginCoordinatorEpoch:
+		return machine.applyBeginCoordinatorLocked(index, term, command)
+	case RegisterWorker:
+		return machine.applyRegisterWorkerLocked(command)
+	case DrainWorker:
+		return machine.applyDrainWorkerLocked(command)
+	case DeactivateWorker:
+		return machine.applyDeactivateWorkerLocked(command)
+	case ReplaceWorkerEpoch:
+		return machine.applyReplaceWorkerEpochLocked(command)
+	case SubmitJob:
+		return machine.applySubmitJobLocked(command)
+	case CancelJob:
+		return machine.applyCancelJobLocked(command)
+	default:
+		return nil, errors.New("impossible decoded command type")
+	}
+}
+
+func (machine *Machine) applyBeginCoordinatorLocked(index, term uint64, command BeginCoordinatorEpoch) ([]byte, error) {
+	target := beginTarget(command)
+	appliedTarget := beginAppliedTarget(term, command)
 	return machine.applyInternalResolvedLocked(command.Envelope, target, appliedTarget, func(nextRevision uint64) (mutationPlan, error) {
 		if machine.coordinatorRevision != nextRevision-1 {
 			return mutationPlan{}, errors.New("impossible coordinator revision divergence")
@@ -142,7 +168,14 @@ func (machine *Machine) applyClientLocked(request model.ClientRequestID, digest 
 	if uint64(len(plan.result)) > model.StateCommandMaxCachedResultBytesV1 {
 		plan = mutationPlan{result: mustBusinessResult(ResultResultTooLarge, SubjectKey{}, 0, model.CoordinatorEpoch{}), reject: true}
 	}
+	if plan.capacity {
+		return owned(plan.result), nil
+	}
 	newSize, ok := machine.preflightClientHistoryLength(history, exists, uint64(len(plan.result)))
+	if !ok {
+		return marshalBusinessResult(ResultCapacityExhausted, SubjectKey{}, 0, model.CoordinatorEpoch{})
+	}
+	newSize, ok = preflightMutationDelta(newSize, plan.stateDelta)
 	if !ok {
 		return marshalBusinessResult(ResultCapacityExhausted, SubjectKey{}, 0, model.CoordinatorEpoch{})
 	}
@@ -218,6 +251,9 @@ func (machine *Machine) applyInternalResolvedLocked(envelope Envelope, target, a
 	if uint64(len(plan.result)) > model.StateCommandMaxCachedResultBytesV1 {
 		plan = mutationPlan{result: mustBusinessResult(ResultResultTooLarge, internal.Subject, currentRevision, machine.epochForSubject(internal.Subject, currentRevision)), reject: true}
 	}
+	if plan.capacity {
+		return owned(plan.result), nil
+	}
 	appliedTargetLength, appliedResultLength := uint64(0), uint64(0)
 	if exists {
 		appliedTargetLength = uint64(len(history.appliedTarget))
@@ -228,6 +264,10 @@ func (machine *Machine) applyInternalResolvedLocked(envelope Envelope, target, a
 		appliedResultLength = uint64(len(plan.result))
 	}
 	newSize, ok := machine.preflightSubjectHistoryLengths(history, exists, uint64(len(target)), uint64(len(plan.result)), appliedTargetLength, appliedResultLength)
+	if !ok {
+		return marshalBusinessResult(ResultCapacityExhausted, internal.Subject, currentRevision, machine.epochForSubject(internal.Subject, currentRevision))
+	}
+	newSize, ok = preflightMutationDelta(newSize, plan.stateDelta)
 	if !ok {
 		return marshalBusinessResult(ResultCapacityExhausted, internal.Subject, currentRevision, machine.epochForSubject(internal.Subject, currentRevision))
 	}
@@ -331,6 +371,17 @@ func checkedAddMany(values ...uint64) (uint64, bool) {
 func checkedSnapshotAdd(left, right uint64) (uint64, bool) {
 	total, ok := checkedAddMany(left, right)
 	return total, ok && total <= model.StateCommandMaxSnapshotBytesV1
+}
+
+func preflightMutationDelta(current uint64, delta int64) (uint64, bool) {
+	if delta < 0 {
+		magnitude := uint64(-(delta + 1)) + 1
+		if magnitude > current {
+			return 0, false
+		}
+		return current - magnitude, true
+	}
+	return checkedSnapshotAdd(current, uint64(delta))
 }
 
 func marshalBusinessResult(code ResultCode, subject SubjectKey, revision uint64, epoch model.CoordinatorEpoch) ([]byte, error) {

@@ -24,6 +24,12 @@ type CommandKind uint16
 
 const (
 	CommandBeginCoordinatorEpoch CommandKind = 1
+	CommandRegisterWorker        CommandKind = 2
+	CommandDrainWorker           CommandKind = 3
+	CommandDeactivateWorker      CommandKind = 4
+	CommandReplaceWorkerEpoch    CommandKind = 5
+	CommandSubmitJob             CommandKind = 6
+	CommandCancelJob             CommandKind = 7
 )
 
 type InternalCommandID [32]byte
@@ -100,7 +106,7 @@ func (envelope Envelope) Validate() error {
 	if envelope.ConsensusFingerprint == ([32]byte{}) || envelope.ConsensusFingerprint != model.ConsensusFingerprint() {
 		return ErrConsensusFingerprintMismatch
 	}
-	if envelope.Kind != CommandBeginCoordinatorEpoch {
+	if envelope.Kind < CommandBeginCoordinatorEpoch || envelope.Kind > CommandCancelJob {
 		return fmt.Errorf("%w: %d", ErrUnknownCommandKind, envelope.Kind)
 	}
 	if (envelope.Client == nil) == (envelope.Internal == nil) {
@@ -185,6 +191,10 @@ const (
 	ResultRevisionMismatch  ResultCode = 6
 	ResultStaleEpoch        ResultCode = 7
 	ResultResultTooLarge    ResultCode = 8
+	// State-specific names map onto the stable v1 result categories.
+	ResultNotFound          ResultCode = ResultRevisionMismatch
+	ResultInvalidTransition ResultCode = ResultRevisionMismatch
+	ResultIdentityCollision ResultCode = ResultIdentityReuse
 )
 
 type CommandResult struct {
