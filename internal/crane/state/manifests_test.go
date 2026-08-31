@@ -13,13 +13,13 @@ import (
 func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 	machine, job, topology, assignment := task10RunningJob(t)
 	worker := machine.workers[1]
-	register, _ := NewRegisterWorker(InternalCommandID{0xd1}, 0, WorkerRecord{NodeID: worker.NodeID, Epoch: worker.Epoch, State: WorkerEligible, Revision: 1, Slots: worker.Slots, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()})
-	drain, _ := NewDrainWorker(InternalCommandID{0xd2}, 1, worker.NodeID, worker.Epoch)
-	deactivate, _ := NewDeactivateWorker(InternalCommandID{0xd3}, 1, worker.NodeID, worker.Epoch, nil)
+	register, _ := NewRegisterWorker(InternalCommandID{0xd1}, 0, WorkerRecord{NodeID: worker.NodeID, Epoch: worker.Epoch, State: WorkerEligible, Revision: 1, Slots: worker.Slots, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}, machine.coordinatorEpoch)
+	drain, _ := NewDrainWorker(InternalCommandID{0xd2}, 1, worker.NodeID, worker.Epoch, machine.coordinatorEpoch)
+	deactivate, _ := NewDeactivateWorker(InternalCommandID{0xd3}, 1, worker.NodeID, worker.Epoch, nil, machine.coordinatorEpoch)
 	replacementRecord := WorkerRecord{NodeID: worker.NodeID, Epoch: model.WorkerEpoch{0xd4}, State: WorkerEligible, Revision: 2, Slots: worker.Slots, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-	replaceWorker, _ := NewReplaceWorkerEpoch(InternalCommandID{0xd4}, 1, worker.NodeID, worker.Epoch, replacementRecord, nil)
-	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xd5}, Sequence: 1}, topology.Spec())
-	cancel, _ := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{0xd5}, Sequence: 2}, submit.JobID(), 1)
+	replaceWorker, _ := NewReplaceWorkerEpoch(InternalCommandID{0xd4}, 1, worker.NodeID, worker.Epoch, replacementRecord, nil, machine.coordinatorEpoch)
+	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xd5}, Sequence: 1}, topology.Spec(), machine.coordinatorEpoch)
+	cancel, _ := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{0xd5}, Sequence: 2}, submit.JobID(), 1, machine.coordinatorEpoch)
 	var source model.AssignmentToken
 	for _, token := range assignment.Tasks {
 		if token.Task.StageID == 1 {
@@ -28,8 +28,8 @@ func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 		}
 	}
 	eof := machine.jobs[job].SourceEOFs[source.Task].EOF
-	recordEOF, _ := NewRecordSourceEOF(InternalCommandID{0xd6}, 0, source.Task, eof)
-	install, _ := NewInstallAssignments(InternalCommandID{0xd7}, 1, assignment)
+	recordEOF, _ := NewRecordSourceEOF(InternalCommandID{0xd6}, 0, source.Task, eof, machine.coordinatorEpoch)
+	install, _ := NewInstallAssignments(InternalCommandID{0xd7}, 1, assignment, machine.coordinatorEpoch)
 	targetTokens := append([]model.AssignmentToken(nil), assignment.Tasks...)
 	for index := range targetTokens {
 		targetTokens[index].AssignmentRevision++
@@ -38,16 +38,16 @@ func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	replaceAssignments, _ := NewReplaceAssignments(InternalCommandID{0xd8}, machine.jobs[job].JobControlRevision, job, assignment.Revision, assignment.Digest, NeedsReassignmentDigest(nil), target)
+	replaceAssignments, _ := NewReplaceAssignments(InternalCommandID{0xd8}, machine.jobs[job].JobControlRevision, job, assignment.Revision, assignment.Digest, NeedsReassignmentDigest(nil), target, machine.coordinatorEpoch)
 	report := model.CompletionReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Source: source.Task, Token: source, Epoch: machine.coordinatorEpoch, ExpectedCheckpointRevision: 0, Prior: 0, New: eof, EOF: eof, WorkerTransactionID: 1}
 	report.Digest = model.CompletionReportDigest(report)
-	advance, _ := NewAdvanceCheckpoint(InternalCommandID{0xd9}, 0, report)
+	advance, _ := NewAdvanceCheckpoint(InternalCommandID{0xd9}, 0, report, machine.coordinatorEpoch)
 	replica := assignment.ResultReplicas[0]
-	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 1, TotalBytes: 7, Checksum: [32]byte{0xda}, Replicas: replica}
-	seal, _ := NewSealManifest(InternalCommandID{0xda}, 0, manifest)
-	transition, _ := NewTransitionJob(InternalCommandID{0xdb}, machine.jobs[job].JobControlRevision, job, JobRunning, JobDraining)
+	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 1, TotalBytes: model.ResultArtifactMinRecordBytesV1, Checksum: [32]byte{0xda}, Replicas: replica}
+	seal, _ := NewSealManifest(InternalCommandID{0xda}, 0, manifest, machine.coordinatorEpoch)
+	transition, _ := NewTransitionJob(InternalCommandID{0xdb}, machine.jobs[job].JobControlRevision, job, JobRunning, JobDraining, machine.coordinatorEpoch)
 	failure := model.JobFailureReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Task: source, Epoch: machine.coordinatorEpoch, TransactionID: 2, Code: model.FailureStorage, DetailDigest: [32]byte{0xdc}}
-	fail, _ := NewFailJob(InternalCommandID{0xdc}, machine.jobs[job].JobControlRevision, failure)
+	fail, _ := NewFailJob(InternalCommandID{0xdc}, machine.jobs[job].JobControlRevision, failure, machine.coordinatorEpoch)
 
 	commands := []any{register, drain, deactivate, replaceWorker, submit, cancel, recordEOF, install, replaceAssignments, advance, seal, transition, fail}
 	bundle := make([]byte, 0)
@@ -62,7 +62,7 @@ func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 		bundle = append(bundle, encoded...)
 	}
 	digest := sha256.Sum256(bundle)
-	const want = "2d6c3886ce99ce12c8e8d37196d83a154e95349bb14b28b69f5bd7121f20ace9"
+	const want = "c420f8a0fb39373dfb471c67da880347edddabf216f851f750fa3a52cdfe4dcf"
 	if got := hex.EncodeToString(digest[:]); got != want {
 		t.Fatalf("Task 10 canonical command bundle SHA-256 = %s, want %s", got, want)
 	}
@@ -80,13 +80,13 @@ func TestProgressCommandsConcreteCanonicalRoundTrip(t *testing.T) {
 	eof := machine.jobs[job].SourceEOFs[source.Task].EOF
 	report := model.CompletionReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Source: source.Task, Token: source, Epoch: machine.coordinatorEpoch, ExpectedCheckpointRevision: 0, Prior: 0, New: eof, EOF: eof, WorkerTransactionID: 1}
 	report.Digest = model.CompletionReportDigest(report)
-	advance, _ := NewAdvanceCheckpoint(InternalCommandID{0xa1}, 0, report)
+	advance, _ := NewAdvanceCheckpoint(InternalCommandID{0xa1}, 0, report, machine.coordinatorEpoch)
 	replica := assignment.ResultReplicas[0]
-	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 3, TotalBytes: 128, Checksum: [32]byte{1}, Replicas: replica}
-	seal, _ := NewSealManifest(InternalCommandID{0xa2}, 0, manifest)
-	transition, _ := NewTransitionJob(InternalCommandID{0xa3}, machine.jobs[job].JobControlRevision, job, JobRunning, JobDraining)
+	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 3, TotalBytes: 3 * model.ResultArtifactMinRecordBytesV1, Checksum: [32]byte{1}, Replicas: replica}
+	seal, _ := NewSealManifest(InternalCommandID{0xa2}, 0, manifest, machine.coordinatorEpoch)
+	transition, _ := NewTransitionJob(InternalCommandID{0xa3}, machine.jobs[job].JobControlRevision, job, JobRunning, JobDraining, machine.coordinatorEpoch)
 	failure := model.JobFailureReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Task: source, Epoch: machine.coordinatorEpoch, TransactionID: 2, Code: model.FailureOperator, DetailDigest: [32]byte{2}}
-	fail, _ := NewFailJob(InternalCommandID{0xa4}, machine.jobs[job].JobControlRevision, failure)
+	fail, _ := NewFailJob(InternalCommandID{0xa4}, machine.jobs[job].JobControlRevision, failure, machine.coordinatorEpoch)
 	for _, command := range []any{advance, seal, transition, fail} {
 		encoded, err := MarshalCommand(command)
 		if err != nil {
@@ -120,7 +120,7 @@ func TestManifestAndSucceededRequireFinalCheckpointsAndTwoCurrentCopies(t *testi
 		t.Fatalf("draining = %#v", got)
 	}
 	replica := assignment.ResultReplicas[0]
-	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 9, TotalBytes: 512, Checksum: [32]byte{3}, Replicas: replica}
+	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 9, TotalBytes: 9 * model.ResultArtifactMinRecordBytesV1, Checksum: [32]byte{3}, Replicas: replica}
 	seal, _ := NewSealManifest(InternalCommandID{0xb2}, 0, manifest)
 	jobRevision := machine.jobs[job].JobControlRevision
 	if got := applyTask10(t, machine, 81, seal); got.Code != ResultSuccess || got.Revision != 1 {
@@ -164,11 +164,11 @@ func TestLifecycleEveryNormalTransitionPairAndSpecialTerminalPath(t *testing.T) 
 					record.Checkpoints[source] = CheckpointRecord{Watermark: eof.EOF, Revision: 1}
 				}
 				for _, replica := range assignment.ResultReplicas {
-					record.Manifests[replica.SinkTask] = ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 1, TotalBytes: 1, Checksum: [32]byte{1}, Replicas: replica}
+					record.Manifests[replica.SinkTask] = ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 1, TotalBytes: model.ResultArtifactMinRecordBytesV1, Checksum: [32]byte{1}, Replicas: replica}
 				}
 				machine.jobs[job] = record
 				delete(machine.subjects, SubjectKey{Kind: SubjectJobControl, JobID: job})
-				command, err := NewTransitionJob(InternalCommandID{byte(from), byte(to), 0xee}, record.JobControlRevision, job, from, to)
+				command, err := NewTransitionJob(InternalCommandID{byte(from), byte(to), 0xee}, record.JobControlRevision, job, from, to, machine.coordinatorEpoch)
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -148,7 +148,9 @@ func (machine *Machine) applyBeginCoordinatorLocked(index, term uint64, command 
 	})
 }
 
-func (machine *Machine) applyClientLocked(request model.ClientRequestID, digest [32]byte, prepare func() (mutationPlan, error)) ([]byte, error) {
+func (machine *Machine) applyClientCommandLocked(envelope Envelope, subject SubjectKey, prepare func() (mutationPlan, error)) ([]byte, error) {
+	request := envelope.Client.Request
+	digest := envelope.Client.Digest
 	if err := request.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid client request: %w", err)
 	}
@@ -157,11 +159,16 @@ func (machine *Machine) applyClientLocked(request model.ClientRequestID, digest 
 	}
 	history, exists := machine.clients[request.ClientID]
 	if exists {
+		if request.Sequence == history.sequence && digest == history.digest {
+			return owned(history.result), nil
+		}
+	}
+	if envelope.CoordinatorEpoch != machine.coordinatorEpoch {
+		return marshalBusinessResult(ResultStaleEpoch, subject, machine.subjectRevision(subject), machine.coordinatorEpoch)
+	}
+	if exists {
 		switch {
 		case request.Sequence == history.sequence:
-			if digest == history.digest {
-				return owned(history.result), nil
-			}
 			return marshalBusinessResult(ResultIdentityReuse, SubjectKey{}, 0, model.CoordinatorEpoch{})
 		case request.Sequence < history.sequence:
 			return marshalBusinessResult(ResultStaleRequest, SubjectKey{}, 0, model.CoordinatorEpoch{})
@@ -204,6 +211,13 @@ func (machine *Machine) applyClientLocked(request model.ClientRequestID, digest 
 	return owned(newHistory.result), nil
 }
 
+// applyClientLocked retains the Task 9 generic dedup test seam. Concrete Task
+// 10 mutations use applyClientCommandLocked with their canonical subject/fence.
+func (machine *Machine) applyClientLocked(request model.ClientRequestID, digest [32]byte, prepare func() (mutationPlan, error)) ([]byte, error) {
+	envelope := Envelope{CoordinatorEpoch: machine.coordinatorEpoch, Client: &ClientEnvelope{Request: request, Digest: digest}}
+	return machine.applyClientCommandLocked(envelope, SubjectKey{}, prepare)
+}
+
 func (machine *Machine) applyInternalLocked(envelope Envelope, target []byte, prepare func(uint64) (mutationPlan, error)) ([]byte, error) {
 	return machine.applyInternalResolvedAtLocked(envelope, target, target, nil, prepare)
 }
@@ -234,6 +248,17 @@ func (machine *Machine) applyInternalResolvedAtLocked(envelope Envelope, target,
 		}
 		return marshalBusinessResult(ResultIdentityReuse, internal.Subject, history.revision, machine.epochForSubject(internal.Subject, history.revision))
 	}
+	currentRevision := uint64(0)
+	if exists {
+		currentRevision = history.revision
+	}
+	if authoritativeRevision != nil {
+		currentRevision = *authoritativeRevision
+		history.revision = currentRevision
+	}
+	if envelope.Kind != CommandBeginCoordinatorEpoch && envelope.CoordinatorEpoch != machine.coordinatorEpoch {
+		return marshalBusinessResult(ResultStaleEpoch, internal.Subject, currentRevision, machine.coordinatorEpoch)
+	}
 	if exists && history.appliedTarget != nil && bytes.Equal(history.appliedTarget, appliedTarget) && (authoritativeRevision == nil || history.revision == *authoritativeRevision) {
 		newSize, ok := machine.preflightSubjectHistoryLengths(history, true, uint64(len(target)), uint64(len(history.appliedResult)), uint64(len(history.appliedTarget)), uint64(len(history.appliedResult)))
 		if !ok {
@@ -247,14 +272,6 @@ func (machine *Machine) applyInternalResolvedAtLocked(envelope Envelope, target,
 		machine.subjects[internal.Subject] = newHistory
 		machine.estimatedSnapshotBytes = newSize
 		return owned(newHistory.result), nil
-	}
-	currentRevision := uint64(0)
-	if exists {
-		currentRevision = history.revision
-	}
-	if authoritativeRevision != nil {
-		currentRevision = *authoritativeRevision
-		history.revision = currentRevision
 	}
 	if !exists && uint64(len(machine.subjects)) >= model.StateCommandMaxSubjectHistoriesV1 {
 		return marshalBusinessResult(ResultCapacityExhausted, internal.Subject, 0, model.CoordinatorEpoch{})
@@ -343,6 +360,25 @@ func (machine *Machine) epochForSubject(subject SubjectKey, revision uint64) mod
 		return machine.coordinatorEpoch
 	}
 	return model.CoordinatorEpoch{}
+}
+
+func (machine *Machine) subjectRevision(subject SubjectKey) uint64 {
+	switch subject.Kind {
+	case SubjectCoordinator:
+		return machine.coordinatorRevision
+	case SubjectWorker:
+		return machine.workers[subject.WorkerID].Revision
+	case SubjectJobControl:
+		return machine.jobs[subject.JobID].JobControlRevision
+	case SubjectSourceEOF:
+		return machine.jobs[subject.JobID].SourceEOFs[subject.TaskID].Revision
+	case SubjectSourceCheckpoint:
+		return machine.jobs[subject.JobID].Checkpoints[subject.TaskID].Revision
+	case SubjectResultManifest:
+		return machine.jobs[subject.JobID].Manifests[subject.TaskID].ManifestRevision
+	default:
+		return 0
+	}
 }
 
 func (machine *Machine) preflightClientHistoryLength(old clientHistory, exists bool, resultLength uint64) (uint64, bool) {

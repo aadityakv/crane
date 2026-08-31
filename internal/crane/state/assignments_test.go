@@ -9,7 +9,7 @@ import (
 
 func TestAssignmentCommandsCanonicalRoundTripAndRejectPartialOrMixedRevisionSets(t *testing.T) {
 	machine, job, topology, assignment := task10AssignedJob(t, 1)
-	install, err := NewInstallAssignments(InternalCommandID{0x31}, 1, assignment)
+	install, err := NewInstallAssignments(InternalCommandID{0x31}, 1, assignment, machine.coordinatorEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +21,7 @@ func TestAssignmentCommandsCanonicalRoundTripAndRejectPartialOrMixedRevisionSets
 	if err != nil {
 		t.Fatal(err)
 	}
-	replace, err := NewReplaceAssignments(InternalCommandID{0x32}, 2, job, assignment.Revision, assignment.Digest, NeedsReassignmentDigest(nil), target)
+	replace, err := NewReplaceAssignments(InternalCommandID{0x32}, 2, job, assignment.Revision, assignment.Digest, NeedsReassignmentDigest(nil), target, machine.coordinatorEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestAssignmentCommandsCanonicalRoundTripAndRejectPartialOrMixedRevisionSets
 
 	partial := assignment
 	partial.Tasks = append([]model.AssignmentToken(nil), partial.Tasks[:len(partial.Tasks)-1]...)
-	partialCommand, err := NewInstallAssignments(InternalCommandID{0x33}, 1, partial)
+	partialCommand, err := NewInstallAssignments(InternalCommandID{0x33}, 1, partial, machine.coordinatorEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,14 +48,14 @@ func TestAssignmentCommandsCanonicalRoundTripAndRejectPartialOrMixedRevisionSets
 	mixed := assignment
 	mixed.Tasks = append([]model.AssignmentToken(nil), mixed.Tasks...)
 	mixed.Tasks[0].AssignmentRevision++
-	if _, err := NewInstallAssignments(InternalCommandID{0x34}, 1, mixed); err == nil {
+	if _, err := NewInstallAssignments(InternalCommandID{0x34}, 1, mixed, machine.coordinatorEpoch); err == nil {
 		t.Fatal("mixed token AssignmentRevision accepted")
 	}
 }
 
 func TestAssignmentInitialPlacementEOFAndLifecycleFences(t *testing.T) {
 	machine, job, _, assignment := task10AssignedJob(t, 1)
-	install, _ := NewInstallAssignments(InternalCommandID{0x41}, 1, assignment)
+	install, _ := NewInstallAssignments(InternalCommandID{0x41}, 1, assignment, machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, 20, install); got.Code != ResultSuccess || got.Revision != 2 {
 		t.Fatalf("install = %#v", got)
 	}
@@ -68,7 +68,7 @@ func TestAssignmentInitialPlacementEOFAndLifecycleFences(t *testing.T) {
 			t.Fatalf("token revision %d != set %d", token.AssignmentRevision, record.Assignment.Revision)
 		}
 	}
-	running, _ := NewTransitionJob(InternalCommandID{0x42}, 2, job, JobDeploying, JobRunning)
+	running, _ := NewTransitionJob(InternalCommandID{0x42}, 2, job, JobDeploying, JobRunning, machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, 21, running); got.Code != ResultSuccess || got.Revision != 3 {
 		t.Fatalf("begin running = %#v", got)
 	}
@@ -94,7 +94,7 @@ func TestAssignmentReplacementChangedTargetAdvancesOnlyChangedAttempt(t *testing
 
 func TestWorkerInvalidationCreatesAtomicSortedMarkersAndSecondaryOnlyReplacement(t *testing.T) {
 	machine, job, topology, assignment := task10AssignedJob(t, 4)
-	install, _ := NewInstallAssignments(InternalCommandID{0x51}, 1, assignment)
+	install, _ := NewInstallAssignments(InternalCommandID{0x51}, 1, assignment, machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, 30, install); got.Code != ResultSuccess {
 		t.Fatalf("install = %#v", got)
 	}
@@ -177,9 +177,11 @@ func TestWorkerInvalidationCreatesAtomicSortedMarkersAndSecondaryOnlyReplacement
 func task10AssignedJob(t *testing.T, workerCount int) (*Machine, model.JobID, model.ValidatedTopology, model.AssignmentSet) {
 	t.Helper()
 	machine := NewMachine()
+	begin, _ := NewBeginCoordinatorEpoch(InternalCommandID{0x70}, 0, 1, [16]byte{0x70})
+	applyTask10(t, machine, 1, begin)
 	for index := 1; index <= workerCount; index++ {
 		record := WorkerRecord{NodeID: uint16(index), Epoch: model.WorkerEpoch{byte(index)}, State: WorkerEligible, Revision: 1, Slots: 16, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-		register, err := NewRegisterWorker(InternalCommandID{byte(index), 0x10}, 0, record)
+		register, err := NewRegisterWorker(InternalCommandID{byte(index), 0x10}, 0, record, machine.coordinatorEpoch)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -191,7 +193,7 @@ func task10AssignedJob(t *testing.T, workerCount int) (*Machine, model.JobID, mo
 		// Assignment construction requires two distinct result nodes.
 		for index := workerCount + 1; index <= 2; index++ {
 			record := WorkerRecord{NodeID: uint16(index), Epoch: model.WorkerEpoch{byte(index)}, State: WorkerEligible, Revision: 1, Slots: 16, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-			register, _ := NewRegisterWorker(InternalCommandID{byte(index), 0x10}, 0, record)
+			register, _ := NewRegisterWorker(InternalCommandID{byte(index), 0x10}, 0, record, machine.coordinatorEpoch)
 			applyTask10(t, machine, uint64(index), register)
 		}
 	}
@@ -199,14 +201,14 @@ func task10AssignedJob(t *testing.T, workerCount int) (*Machine, model.JobID, mo
 	if err != nil {
 		t.Fatal(err)
 	}
-	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0x71}, Sequence: 1}, topology.Spec())
+	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0x71}, Sequence: 1}, topology.Spec(), machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, 10, submit); got.Code != ResultSuccess {
 		t.Fatalf("submit = %#v", got)
 	}
 	job := submit.JobID()
 	source := model.TaskID{JobID: job, StageID: 1, Partition: 0}
 	eof, _ := model.SourceEOF(topology, source)
-	recordEOF, _ := NewRecordSourceEOF(InternalCommandID{0x72}, 0, source, eof)
+	recordEOF, _ := NewRecordSourceEOF(InternalCommandID{0x72}, 0, source, eof, machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, 11, recordEOF); got.Code != ResultSuccess {
 		t.Fatalf("record EOF = %#v", got)
 	}

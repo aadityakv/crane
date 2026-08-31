@@ -29,11 +29,11 @@ func MarshalCommand(command any) ([]byte, error) {
 	case ReplaceWorkerEpoch:
 		return marshalConcreteCommand(value.Envelope, replaceWorkerEpochTarget(value), value.Validate())
 	case SubmitJob:
-		validated, err := model.ValidateTopology(value.Topology)
+		target, err := submitJobTargetTraced(value, nil)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrInvalidCommand, err)
 		}
-		return marshalConcreteCommand(value.Envelope, validated.CanonicalBytes(), value.Validate())
+		return marshalConcreteCommand(value.Envelope, target, value.Validate())
 	case CancelJob:
 		return marshalConcreteCommand(value.Envelope, cancelJobTarget(value), value.Validate())
 	case RecordSourceEOF:
@@ -237,179 +237,359 @@ func marshalConcreteCommand(envelope Envelope, target []byte, validation error) 
 }
 
 func marshalEnvelope(envelope Envelope) []byte {
+	return marshalEnvelopeTraced(envelope, nil)
+}
+
+func marshalEnvelopeTraced(envelope Envelope, trace *[]string) []byte {
 	encoded := make([]byte, 0, commandFixedEnvelopeBytes+internalEnvelopeBytes)
-	encoded = appendU16(encoded, envelope.SchemaVersion)
-	encoded = append(encoded, envelope.ConsensusFingerprint[:]...)
-	encoded = appendU16(encoded, uint16(envelope.Kind))
-	if envelope.Client != nil {
-		encoded = append(encoded, identityClient)
-		encoded = append(encoded, envelope.Client.Request.ClientID[:]...)
-		encoded = appendU64(encoded, envelope.Client.Request.Sequence)
-		return append(encoded, envelope.Client.Digest[:]...)
+	appendCodecField(&encoded, trace, "SchemaVersion:u16", func(out []byte) []byte { return appendU16(out, envelope.SchemaVersion) })
+	appendCodecField(&encoded, trace, "ConsensusFingerprint:sha256", func(out []byte) []byte { return append(out, envelope.ConsensusFingerprint[:]...) })
+	appendCodecField(&encoded, trace, "Kind:u16", func(out []byte) []byte { return appendU16(out, uint16(envelope.Kind)) })
+	appendCodecField(&encoded, trace, "CoordinatorEpoch:CoordinatorEpoch(zero-only-for-begin)", func(out []byte) []byte { return appendEpoch(out, envelope.CoordinatorEpoch) })
+	appendCodecField(&encoded, trace, "IdentitySelector:u8", func(out []byte) []byte {
+		if envelope.Client != nil {
+			return append(out, identityClient)
+		}
+		return append(out, identityInternal)
+	})
+	if trace != nil {
+		*trace = append(*trace, "Identity:ClientEnvelope|InternalEnvelope", "Target:concrete-command-fields")
 	}
-	encoded = append(encoded, identityInternal)
-	encoded = append(encoded, envelope.Internal.ID[:]...)
-	encoded = append(encoded, envelope.Internal.Digest[:]...)
-	encoded = appendSubject(encoded, envelope.Internal.Subject)
-	return appendU64(encoded, envelope.Internal.ExpectedRevision)
+	if envelope.Client != nil {
+		return appendClientEnvelopeTraced(encoded, *envelope.Client, nil)
+	}
+	return appendInternalEnvelopeTraced(encoded, *envelope.Internal, nil)
+}
+
+func appendClientEnvelopeTraced(encoded []byte, envelope ClientEnvelope, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "ClientID:bytes16(nonzero)", func(out []byte) []byte { return append(out, envelope.Request.ClientID[:]...) })
+	appendCodecField(&encoded, trace, "Sequence:u64(nonzero)", func(out []byte) []byte { return appendU64(out, envelope.Request.Sequence) })
+	appendCodecField(&encoded, trace, "Digest:sha256(nonzero)", func(out []byte) []byte { return append(out, envelope.Digest[:]...) })
+	return encoded
+}
+
+func appendInternalEnvelopeTraced(encoded []byte, envelope InternalEnvelope, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "ID:bytes32(nonzero)", func(out []byte) []byte { return append(out, envelope.ID[:]...) })
+	appendCodecField(&encoded, trace, "Digest:sha256(nonzero)", func(out []byte) []byte { return append(out, envelope.Digest[:]...) })
+	appendCodecField(&encoded, trace, "Subject:SubjectKey", func(out []byte) []byte { return appendSubject(out, envelope.Subject) })
+	appendCodecField(&encoded, trace, "ExpectedRevision:u64", func(out []byte) []byte { return appendU64(out, envelope.ExpectedRevision) })
+	return encoded
+}
+
+func appendCodecField(encoded *[]byte, trace *[]string, descriptor string, appendValue func([]byte) []byte) {
+	if trace != nil {
+		*trace = append(*trace, descriptor)
+	}
+	*encoded = appendValue(*encoded)
+}
+
+func recordCodecDescriptor(trace *[]string, descriptor string) {
+	if trace != nil {
+		*trace = append(*trace, descriptor)
+	}
 }
 
 func appendWorkerRecord(encoded []byte, worker WorkerRecord) []byte {
-	encoded = appendU16(encoded, worker.NodeID)
-	encoded = append(encoded, worker.Epoch[:]...)
-	encoded = append(encoded, byte(worker.State))
-	encoded = appendU64(encoded, worker.Revision)
-	encoded = appendU16(encoded, worker.Slots)
-	encoded = append(encoded, worker.ConsensusFingerprint[:]...)
-	return append(encoded, worker.RegistryFingerprint[:]...)
+	return appendWorkerRecordTraced(encoded, worker, nil)
+}
+
+func appendWorkerRecordTraced(encoded []byte, worker WorkerRecord, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "NodeID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, worker.NodeID) })
+	appendCodecField(&encoded, trace, "Epoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, worker.Epoch[:]...) })
+	appendCodecField(&encoded, trace, "State:u8", func(out []byte) []byte { return append(out, byte(worker.State)) })
+	appendCodecField(&encoded, trace, "Revision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, worker.Revision) })
+	appendCodecField(&encoded, trace, "Slots:u16", func(out []byte) []byte { return appendU16(out, worker.Slots) })
+	appendCodecField(&encoded, trace, "ConsensusFingerprint:sha256", func(out []byte) []byte { return append(out, worker.ConsensusFingerprint[:]...) })
+	appendCodecField(&encoded, trace, "RegistryFingerprint:sha256", func(out []byte) []byte { return append(out, worker.RegistryFingerprint[:]...) })
+	return encoded
 }
 
 func appendAffected(encoded []byte, affected []AffectedAssignment) []byte {
 	encoded = appendU16(encoded, uint16(len(affected)))
 	for _, item := range affected {
-		encoded = append(encoded, item.JobID[:]...)
-		encoded = appendU64(encoded, item.JobControlRevision)
-		encoded = appendU64(encoded, item.AssignmentRevision)
-		encoded = append(encoded, item.AssignmentDigest[:]...)
+		encoded = appendAffectedItemTraced(encoded, item, nil)
 	}
+	return encoded
+}
+
+func appendAffectedItemTraced(encoded []byte, item AffectedAssignment, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "JobID:bytes16(nonzero)", func(out []byte) []byte { return append(out, item.JobID[:]...) })
+	appendCodecField(&encoded, trace, "JobControlRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, item.JobControlRevision) })
+	appendCodecField(&encoded, trace, "AssignmentRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, item.AssignmentRevision) })
+	appendCodecField(&encoded, trace, "AssignmentDigest:sha256(nonzero)", func(out []byte) []byte { return append(out, item.AssignmentDigest[:]...) })
 	return encoded
 }
 
 func registerWorkerTarget(command RegisterWorker) []byte {
-	return appendWorkerRecord(nil, command.Worker)
+	return registerWorkerTargetTraced(command, nil)
+}
+func registerWorkerTargetTraced(command RegisterWorker, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-worker)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "Worker:WorkerRecord", func(out []byte) []byte { return appendWorkerRecord(out, command.Worker) })
+	return encoded
 }
 func drainWorkerTarget(command DrainWorker) []byte {
-	encoded := appendU16(nil, command.WorkerID)
-	return append(encoded, command.WorkerEpoch[:]...)
+	return drainWorkerTargetTraced(command, nil)
+}
+func drainWorkerTargetTraced(command DrainWorker, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-worker)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "WorkerID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, command.WorkerID) })
+	appendCodecField(&encoded, trace, "WorkerEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, command.WorkerEpoch[:]...) })
+	return encoded
 }
 func deactivateWorkerTarget(command DeactivateWorker) []byte {
-	encoded := drainWorkerTarget(DrainWorker{WorkerID: command.WorkerID, WorkerEpoch: command.WorkerEpoch})
-	return appendAffected(encoded, command.Affected)
+	return deactivateWorkerTargetTraced(command, nil)
+}
+func deactivateWorkerTargetTraced(command DeactivateWorker, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-worker)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "WorkerID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, command.WorkerID) })
+	appendCodecField(&encoded, trace, "WorkerEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, command.WorkerEpoch[:]...) })
+	appendCodecField(&encoded, trace, "Affected:list(AffectedAssignment)", func(out []byte) []byte { return appendAffected(out, command.Affected) })
+	return encoded
 }
 func replaceWorkerEpochTarget(command ReplaceWorkerEpoch) []byte {
-	encoded := appendU16(nil, command.WorkerID)
-	encoded = append(encoded, command.OldEpoch[:]...)
-	encoded = appendWorkerRecord(encoded, command.Target)
-	return appendAffected(encoded, command.Affected)
+	return replaceWorkerEpochTargetTraced(command, nil)
+}
+func replaceWorkerEpochTargetTraced(command ReplaceWorkerEpoch, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-worker)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "WorkerID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, command.WorkerID) })
+	appendCodecField(&encoded, trace, "OldEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, command.OldEpoch[:]...) })
+	appendCodecField(&encoded, trace, "Target:WorkerRecord", func(out []byte) []byte { return appendWorkerRecord(out, command.Target) })
+	appendCodecField(&encoded, trace, "Affected:list(AffectedAssignment)", func(out []byte) []byte { return appendAffected(out, command.Affected) })
+	return encoded
 }
 func cancelJobTarget(command CancelJob) []byte {
-	encoded := append([]byte(nil), command.Job[:]...)
-	return appendU64(encoded, command.ExpectedRevision)
+	return cancelJobTargetTraced(command, nil)
+}
+func cancelJobTargetTraced(command CancelJob, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(client)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "JobID:bytes16(nonzero)", func(out []byte) []byte { return append(out, command.Job[:]...) })
+	appendCodecField(&encoded, trace, "ExpectedRevision:u64(nonzero-successor)", func(out []byte) []byte { return appendU64(out, command.ExpectedRevision) })
+	return encoded
+}
+
+func submitJobTargetTraced(command SubmitJob, trace *[]string) ([]byte, error) {
+	recordCodecDescriptor(trace, "Envelope:Envelope(client)")
+	recordCodecDescriptor(trace, "Topology:canonical-topology-v1")
+	validated, err := model.ValidateTopology(command.Topology)
+	if err != nil {
+		return nil, err
+	}
+	return validated.CanonicalBytes(), nil
 }
 
 func appendTask(encoded []byte, task model.TaskID) []byte {
-	encoded = append(encoded, task.JobID[:]...)
-	encoded = appendU16(encoded, task.StageID)
-	return appendU16(encoded, task.Partition)
+	return appendTaskTraced(encoded, task, nil)
+}
+
+func appendTaskTraced(encoded []byte, task model.TaskID, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "JobID:bytes16(nonzero)", func(out []byte) []byte { return append(out, task.JobID[:]...) })
+	appendCodecField(&encoded, trace, "StageID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, task.StageID) })
+	appendCodecField(&encoded, trace, "Partition:u16", func(out []byte) []byte { return appendU16(out, task.Partition) })
+	return encoded
 }
 
 func appendEpoch(encoded []byte, epoch model.CoordinatorEpoch) []byte {
-	encoded = appendU64(encoded, epoch.Term)
-	encoded = appendU64(encoded, epoch.BeginIndex)
-	encoded = appendU16(encoded, epoch.Coordinator)
-	return append(encoded, epoch.Nonce[:]...)
+	return appendEpochTraced(encoded, epoch, nil)
+}
+
+func appendEpochTraced(encoded []byte, epoch model.CoordinatorEpoch, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "Term:u64(nonzero)", func(out []byte) []byte { return appendU64(out, epoch.Term) })
+	appendCodecField(&encoded, trace, "BeginIndex:u64(nonzero)", func(out []byte) []byte { return appendU64(out, epoch.BeginIndex) })
+	appendCodecField(&encoded, trace, "Coordinator:u16(nonzero)", func(out []byte) []byte { return appendU16(out, epoch.Coordinator) })
+	appendCodecField(&encoded, trace, "Nonce:bytes16(nonzero)", func(out []byte) []byte { return append(out, epoch.Nonce[:]...) })
+	return encoded
 }
 
 func appendToken(encoded []byte, token model.AssignmentToken) []byte {
-	encoded = appendTask(encoded, token.Task)
-	encoded = appendU16(encoded, token.WorkerID)
-	encoded = append(encoded, token.WorkerEpoch[:]...)
-	encoded = appendU64(encoded, token.Attempt)
-	encoded = append(encoded, token.SpecificationHash[:]...)
-	return appendU64(encoded, token.AssignmentRevision)
+	return appendTokenTraced(encoded, token, nil)
+}
+
+func appendTokenTraced(encoded []byte, token model.AssignmentToken, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "Task:TaskID", func(out []byte) []byte { return appendTask(out, token.Task) })
+	appendCodecField(&encoded, trace, "WorkerID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, token.WorkerID) })
+	appendCodecField(&encoded, trace, "WorkerEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, token.WorkerEpoch[:]...) })
+	appendCodecField(&encoded, trace, "Attempt:u64(nonzero)", func(out []byte) []byte { return appendU64(out, token.Attempt) })
+	appendCodecField(&encoded, trace, "SpecificationHash:sha256(nonzero)", func(out []byte) []byte { return append(out, token.SpecificationHash[:]...) })
+	appendCodecField(&encoded, trace, "AssignmentRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, token.AssignmentRevision) })
+	return encoded
 }
 
 func appendReplica(encoded []byte, replica model.ResultReplicaSet) []byte {
-	encoded = appendTask(encoded, replica.SinkTask)
-	encoded = appendU16(encoded, replica.PrimaryNodeID)
-	encoded = appendU16(encoded, replica.SecondaryNodeID)
-	encoded = append(encoded, replica.PrimaryEpoch[:]...)
-	return append(encoded, replica.SecondaryEpoch[:]...)
+	return appendReplicaTraced(encoded, replica, nil)
+}
+
+func appendReplicaTraced(encoded []byte, replica model.ResultReplicaSet, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "SinkTask:TaskID", func(out []byte) []byte { return appendTask(out, replica.SinkTask) })
+	appendCodecField(&encoded, trace, "PrimaryNodeID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, replica.PrimaryNodeID) })
+	appendCodecField(&encoded, trace, "SecondaryNodeID:u16(nonzero-distinct)", func(out []byte) []byte { return appendU16(out, replica.SecondaryNodeID) })
+	appendCodecField(&encoded, trace, "PrimaryEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, replica.PrimaryEpoch[:]...) })
+	appendCodecField(&encoded, trace, "SecondaryEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, replica.SecondaryEpoch[:]...) })
+	return encoded
 }
 
 func appendAssignment(encoded []byte, assignment model.AssignmentSet) []byte {
-	encoded = append(encoded, assignment.JobID[:]...)
-	encoded = appendU64(encoded, assignment.Revision)
-	encoded = append(encoded, assignment.Digest[:]...)
-	encoded = appendU16(encoded, uint16(len(assignment.Tasks)))
-	for _, token := range assignment.Tasks {
-		encoded = appendToken(encoded, token)
-	}
-	encoded = appendU16(encoded, uint16(len(assignment.ResultReplicas)))
-	for _, replica := range assignment.ResultReplicas {
-		encoded = appendReplica(encoded, replica)
-	}
+	return appendAssignmentTraced(encoded, assignment, nil)
+}
+
+func appendAssignmentTraced(encoded []byte, assignment model.AssignmentSet, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "JobID:bytes16(nonzero)", func(out []byte) []byte { return append(out, assignment.JobID[:]...) })
+	appendCodecField(&encoded, trace, "Revision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, assignment.Revision) })
+	appendCodecField(&encoded, trace, "Digest:sha256(nonzero)", func(out []byte) []byte { return append(out, assignment.Digest[:]...) })
+	appendCodecField(&encoded, trace, "Tasks:u16-count+list(AssignmentToken)", func(out []byte) []byte {
+		out = appendU16(out, uint16(len(assignment.Tasks)))
+		for _, token := range assignment.Tasks {
+			out = appendToken(out, token)
+		}
+		return out
+	})
+	appendCodecField(&encoded, trace, "ResultReplicas:u16-count+list(ResultReplicaSet)", func(out []byte) []byte {
+		out = appendU16(out, uint16(len(assignment.ResultReplicas)))
+		for _, replica := range assignment.ResultReplicas {
+			out = appendReplica(out, replica)
+		}
+		return out
+	})
 	return encoded
 }
 
 func appendMarker(encoded []byte, marker NeedsReassignment) []byte {
-	encoded = append(encoded, byte(marker.Kind))
-	encoded = appendTask(encoded, marker.Task)
-	encoded = appendTask(encoded, marker.SinkTask)
-	encoded = append(encoded, byte(marker.ReplicaRole))
-	encoded = appendU16(encoded, marker.OldWorkerID)
-	return append(encoded, marker.OldWorkerEpoch[:]...)
+	return appendMarkerTraced(encoded, marker, nil)
+}
+
+func appendMarkerTraced(encoded []byte, marker NeedsReassignment, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "Kind:ReassignmentTargetKind", func(out []byte) []byte { return append(out, byte(marker.Kind)) })
+	appendCodecField(&encoded, trace, "Task:TaskID", func(out []byte) []byte { return appendTask(out, marker.Task) })
+	appendCodecField(&encoded, trace, "SinkTask:TaskID", func(out []byte) []byte { return appendTask(out, marker.SinkTask) })
+	appendCodecField(&encoded, trace, "ReplicaRole:ResultReplicaRole", func(out []byte) []byte { return append(out, byte(marker.ReplicaRole)) })
+	appendCodecField(&encoded, trace, "OldWorkerID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, marker.OldWorkerID) })
+	appendCodecField(&encoded, trace, "OldWorkerEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, marker.OldWorkerEpoch[:]...) })
+	return encoded
 }
 
 func completionReportBytes(report model.CompletionReport) []byte {
-	encoded := append([]byte(nil), report.JobID[:]...)
-	encoded = appendU64(encoded, report.JobControlRevision)
-	encoded = appendU64(encoded, report.AssignmentRevision)
-	encoded = appendTask(encoded, report.Source)
-	encoded = appendToken(encoded, report.Token)
-	encoded = appendEpoch(encoded, report.Epoch)
-	encoded = appendU64(encoded, report.ExpectedCheckpointRevision)
-	encoded = appendU64(encoded, report.Prior)
-	encoded = appendU64(encoded, report.New)
-	encoded = appendU64(encoded, report.EOF)
-	encoded = appendU64(encoded, report.WorkerTransactionID)
-	return append(encoded, report.Digest[:]...)
+	return appendCompletionReportTraced(nil, report, nil)
+}
+
+func appendCompletionReportTraced(encoded []byte, report model.CompletionReport, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "JobID:JobID", func(out []byte) []byte { return append(out, report.JobID[:]...) })
+	appendCodecField(&encoded, trace, "JobControlRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, report.JobControlRevision) })
+	appendCodecField(&encoded, trace, "AssignmentRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, report.AssignmentRevision) })
+	appendCodecField(&encoded, trace, "Source:TaskID", func(out []byte) []byte { return appendTask(out, report.Source) })
+	appendCodecField(&encoded, trace, "Token:AssignmentToken", func(out []byte) []byte { return appendToken(out, report.Token) })
+	appendCodecField(&encoded, trace, "Epoch:CoordinatorEpoch", func(out []byte) []byte { return appendEpoch(out, report.Epoch) })
+	appendCodecField(&encoded, trace, "ExpectedCheckpointRevision:u64", func(out []byte) []byte { return appendU64(out, report.ExpectedCheckpointRevision) })
+	appendCodecField(&encoded, trace, "Prior:u64", func(out []byte) []byte { return appendU64(out, report.Prior) })
+	appendCodecField(&encoded, trace, "New:u64", func(out []byte) []byte { return appendU64(out, report.New) })
+	appendCodecField(&encoded, trace, "EOF:u64", func(out []byte) []byte { return appendU64(out, report.EOF) })
+	appendCodecField(&encoded, trace, "WorkerTransactionID:u64(nonzero)", func(out []byte) []byte { return appendU64(out, report.WorkerTransactionID) })
+	appendCodecField(&encoded, trace, "Digest:sha256(nonzero)", func(out []byte) []byte { return append(out, report.Digest[:]...) })
+	return encoded
 }
 
 func failureReportBytes(report model.JobFailureReport) []byte {
-	encoded := append([]byte(nil), report.JobID[:]...)
-	encoded = appendU64(encoded, report.JobControlRevision)
-	encoded = appendU64(encoded, report.AssignmentRevision)
-	encoded = appendToken(encoded, report.Task)
-	encoded = appendEpoch(encoded, report.Epoch)
-	encoded = appendU64(encoded, report.TransactionID)
-	encoded = appendU16(encoded, uint16(report.Code))
-	return append(encoded, report.DetailDigest[:]...)
+	return appendFailureReportTraced(nil, report, nil)
+}
+
+func appendFailureReportTraced(encoded []byte, report model.JobFailureReport, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "JobID:JobID", func(out []byte) []byte { return append(out, report.JobID[:]...) })
+	appendCodecField(&encoded, trace, "JobControlRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, report.JobControlRevision) })
+	appendCodecField(&encoded, trace, "AssignmentRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, report.AssignmentRevision) })
+	appendCodecField(&encoded, trace, "Task:AssignmentToken", func(out []byte) []byte { return appendToken(out, report.Task) })
+	appendCodecField(&encoded, trace, "Epoch:CoordinatorEpoch", func(out []byte) []byte { return appendEpoch(out, report.Epoch) })
+	appendCodecField(&encoded, trace, "TransactionID:u64(nonzero)", func(out []byte) []byte { return appendU64(out, report.TransactionID) })
+	appendCodecField(&encoded, trace, "Code:FailureCode", func(out []byte) []byte { return appendU16(out, uint16(report.Code)) })
+	appendCodecField(&encoded, trace, "DetailDigest:sha256(nonzero)", func(out []byte) []byte { return append(out, report.DetailDigest[:]...) })
+	return encoded
 }
 
 func appendManifest(encoded []byte, manifest ResultManifest) []byte {
-	encoded = append(encoded, manifest.JobID[:]...)
-	encoded = appendTask(encoded, manifest.SinkTask)
-	encoded = appendU64(encoded, manifest.ManifestRevision)
-	encoded = append(encoded, manifest.SpecificationHash[:]...)
-	encoded = appendU64(encoded, manifest.RecordCount)
-	encoded = appendU64(encoded, manifest.TotalBytes)
-	encoded = append(encoded, manifest.Checksum[:]...)
-	return appendReplica(encoded, manifest.Replicas)
+	return appendManifestTraced(encoded, manifest, nil)
+}
+
+func appendManifestTraced(encoded []byte, manifest ResultManifest, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "JobID:JobID", func(out []byte) []byte { return append(out, manifest.JobID[:]...) })
+	appendCodecField(&encoded, trace, "SinkTask:TaskID", func(out []byte) []byte { return appendTask(out, manifest.SinkTask) })
+	appendCodecField(&encoded, trace, "ManifestRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, manifest.ManifestRevision) })
+	appendCodecField(&encoded, trace, "SpecificationHash:sha256(nonzero)", func(out []byte) []byte { return append(out, manifest.SpecificationHash[:]...) })
+	appendCodecField(&encoded, trace, "RecordCount:u64", func(out []byte) []byte { return appendU64(out, manifest.RecordCount) })
+	appendCodecField(&encoded, trace, "TotalBytes:u64(bounded)", func(out []byte) []byte { return appendU64(out, manifest.TotalBytes) })
+	appendCodecField(&encoded, trace, "Checksum:sha256(nonzero)", func(out []byte) []byte { return append(out, manifest.Checksum[:]...) })
+	appendCodecField(&encoded, trace, "Replicas:ResultReplicaSet", func(out []byte) []byte { return appendReplica(out, manifest.Replicas) })
+	return encoded
 }
 
 func recordSourceEOFTarget(command RecordSourceEOF) []byte {
-	return appendU64(appendTask(nil, command.Source), command.EOF)
+	return recordSourceEOFTargetTraced(command, nil)
+}
+func recordSourceEOFTargetTraced(command RecordSourceEOF, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-source-eof)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "Source:TaskID", func(out []byte) []byte { return appendTask(out, command.Source) })
+	appendCodecField(&encoded, trace, "EOF:u64", func(out []byte) []byte { return appendU64(out, command.EOF) })
+	return encoded
 }
 func installAssignmentsTarget(command InstallAssignments) []byte {
-	return appendAssignment(nil, command.Assignment)
+	return installAssignmentsTargetTraced(command, nil)
+}
+func installAssignmentsTargetTraced(command InstallAssignments, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-job-control)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "Assignment:AssignmentSet", func(out []byte) []byte { return appendAssignment(out, command.Assignment) })
+	return encoded
 }
 func replaceAssignmentsTarget(command ReplaceAssignments) []byte {
-	encoded := append([]byte(nil), command.JobID[:]...)
-	encoded = appendU64(encoded, command.ExpectedAssignmentRevision)
-	encoded = append(encoded, command.ExpectedDigest[:]...)
-	encoded = append(encoded, command.ExpectedMarkersDigest[:]...)
-	return appendAssignment(encoded, command.Target)
+	return replaceAssignmentsTargetTraced(command, nil)
+}
+func replaceAssignmentsTargetTraced(command ReplaceAssignments, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-job-control)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "JobID:JobID", func(out []byte) []byte { return append(out, command.JobID[:]...) })
+	appendCodecField(&encoded, trace, "ExpectedAssignmentRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, command.ExpectedAssignmentRevision) })
+	appendCodecField(&encoded, trace, "ExpectedDigest:sha256(nonzero)", func(out []byte) []byte { return append(out, command.ExpectedDigest[:]...) })
+	appendCodecField(&encoded, trace, "ExpectedMarkersDigest:sha256(nonzero)", func(out []byte) []byte { return append(out, command.ExpectedMarkersDigest[:]...) })
+	appendCodecField(&encoded, trace, "Target:AssignmentSet(successor)", func(out []byte) []byte { return appendAssignment(out, command.Target) })
+	return encoded
 }
 func advanceCheckpointTarget(command AdvanceCheckpoint) []byte {
-	return completionReportBytes(command.Report)
+	return advanceCheckpointTargetTraced(command, nil)
 }
-func sealManifestTarget(command SealManifest) []byte { return appendManifest(nil, command.Manifest) }
+func advanceCheckpointTargetTraced(command AdvanceCheckpoint, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-source-checkpoint)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "Report:CompletionReport", func(out []byte) []byte { return appendCompletionReportTraced(out, command.Report, nil) })
+	return encoded
+}
+func sealManifestTarget(command SealManifest) []byte { return sealManifestTargetTraced(command, nil) }
+func sealManifestTargetTraced(command SealManifest, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-result-manifest)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "Manifest:ResultManifest", func(out []byte) []byte { return appendManifest(out, command.Manifest) })
+	return encoded
+}
 func transitionJobTarget(command TransitionJob) []byte {
-	encoded := append([]byte(nil), command.JobID[:]...)
-	return append(encoded, byte(command.From), byte(command.To))
+	return transitionJobTargetTraced(command, nil)
 }
-func failJobTarget(command FailJob) []byte { return failureReportBytes(command.Report) }
+func transitionJobTargetTraced(command TransitionJob, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-job-control)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "JobID:JobID", func(out []byte) []byte { return append(out, command.JobID[:]...) })
+	appendCodecField(&encoded, trace, "From:JobLifecycle", func(out []byte) []byte { return append(out, byte(command.From)) })
+	appendCodecField(&encoded, trace, "To:JobLifecycle", func(out []byte) []byte { return append(out, byte(command.To)) })
+	return encoded
+}
+func failJobTarget(command FailJob) []byte { return failJobTargetTraced(command, nil) }
+func failJobTargetTraced(command FailJob, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-job-control)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "Report:JobFailureReport", func(out []byte) []byte { return appendFailureReportTraced(out, command.Report, nil) })
+	return encoded
+}
 
 // MarshalBeginCoordinatorEpoch emits the sole canonical concrete Task 9 command.
 func MarshalBeginCoordinatorEpoch(command BeginCoordinatorEpoch) ([]byte, error) {
@@ -420,6 +600,7 @@ func MarshalBeginCoordinatorEpoch(command BeginCoordinatorEpoch) ([]byte, error)
 	encoded = appendU16(encoded, command.Envelope.SchemaVersion)
 	encoded = append(encoded, command.Envelope.ConsensusFingerprint[:]...)
 	encoded = appendU16(encoded, uint16(command.Envelope.Kind))
+	encoded = appendEpoch(encoded, command.Envelope.CoordinatorEpoch)
 	encoded = append(encoded, identityInternal)
 	internal := command.Envelope.Internal
 	encoded = append(encoded, internal.ID[:]...)
@@ -445,6 +626,10 @@ func UnmarshalBeginCoordinatorEpoch(encoded []byte) (BeginCoordinatorEpoch, erro
 		return BeginCoordinatorEpoch{}, err
 	}
 	kind, err := decoder.u16()
+	if err != nil {
+		return BeginCoordinatorEpoch{}, err
+	}
+	epoch, err := decoder.epoch()
 	if err != nil {
 		return BeginCoordinatorEpoch{}, err
 	}
@@ -483,7 +668,7 @@ func UnmarshalBeginCoordinatorEpoch(encoded []byte) (BeginCoordinatorEpoch, erro
 		return BeginCoordinatorEpoch{}, fmt.Errorf("%w: trailing bytes", ErrMalformedCommand)
 	}
 	command := BeginCoordinatorEpoch{
-		Envelope:    Envelope{SchemaVersion: version, ConsensusFingerprint: fingerprint, Kind: CommandKind(kind), Internal: &InternalEnvelope{ID: InternalCommandID(idBytes), Digest: digest, Subject: subject, ExpectedRevision: expectedRevision}},
+		Envelope:    Envelope{SchemaVersion: version, ConsensusFingerprint: fingerprint, Kind: CommandKind(kind), CoordinatorEpoch: epoch, Internal: &InternalEnvelope{ID: InternalCommandID(idBytes), Digest: digest, Subject: subject, ExpectedRevision: expectedRevision}},
 		Coordinator: coordinator, Nonce: nonce,
 	}
 	if err := command.Validate(); err != nil {
@@ -550,6 +735,7 @@ func internalDigest(envelope Envelope, target []byte) [32]byte {
 	encoded = appendU16(encoded, envelope.SchemaVersion)
 	encoded = append(encoded, envelope.ConsensusFingerprint[:]...)
 	encoded = appendU16(encoded, uint16(envelope.Kind))
+	encoded = appendEpoch(encoded, envelope.CoordinatorEpoch)
 	encoded = append(encoded, identityInternal)
 	if envelope.Internal == nil {
 		return sha256.Sum256(encoded)
@@ -566,9 +752,15 @@ func internalDigest(envelope Envelope, target []byte) [32]byte {
 }
 
 func beginTarget(command BeginCoordinatorEpoch) []byte {
+	return beginTargetTraced(command, nil)
+}
+
+func beginTargetTraced(command BeginCoordinatorEpoch, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal)")
 	target := make([]byte, 0, beginTargetBytes)
-	target = appendU16(target, command.Coordinator)
-	return append(target, command.Nonce[:]...)
+	appendCodecField(&target, trace, "Coordinator:u16(nonzero)", func(out []byte) []byte { return appendU16(out, command.Coordinator) })
+	appendCodecField(&target, trace, "Nonce:bytes16(nonzero)", func(out []byte) []byte { return append(out, command.Nonce[:]...) })
+	return target
 }
 
 func beginAppliedTarget(term uint64, command BeginCoordinatorEpoch) []byte {
@@ -578,12 +770,15 @@ func beginAppliedTarget(term uint64, command BeginCoordinatorEpoch) []byte {
 }
 
 func appendSubject(encoded []byte, subject SubjectKey) []byte {
-	encoded = append(encoded, byte(subject.Kind))
-	encoded = append(encoded, subject.JobID[:]...)
-	encoded = append(encoded, subject.TaskID.JobID[:]...)
-	encoded = appendU16(encoded, subject.TaskID.StageID)
-	encoded = appendU16(encoded, subject.TaskID.Partition)
-	return appendU16(encoded, subject.WorkerID)
+	return appendSubjectTraced(encoded, subject, nil)
+}
+
+func appendSubjectTraced(encoded []byte, subject SubjectKey, trace *[]string) []byte {
+	appendCodecField(&encoded, trace, "Kind:u8", func(out []byte) []byte { return append(out, byte(subject.Kind)) })
+	appendCodecField(&encoded, trace, "JobID:JobID", func(out []byte) []byte { return append(out, subject.JobID[:]...) })
+	appendCodecField(&encoded, trace, "TaskID:TaskID", func(out []byte) []byte { return appendTask(out, subject.TaskID) })
+	appendCodecField(&encoded, trace, "WorkerID:u16", func(out []byte) []byte { return appendU16(out, subject.WorkerID) })
+	return encoded
 }
 
 func appendU16(encoded []byte, value uint16) []byte {
@@ -695,11 +890,15 @@ func (decoder *commandDecoder) envelope() (Envelope, error) {
 	if err != nil {
 		return Envelope{}, err
 	}
+	epoch, err := decoder.epoch()
+	if err != nil {
+		return Envelope{}, err
+	}
 	selector, err := decoder.byte()
 	if err != nil {
 		return Envelope{}, err
 	}
-	envelope := Envelope{SchemaVersion: version, ConsensusFingerprint: fingerprint, Kind: CommandKind(kind)}
+	envelope := Envelope{SchemaVersion: version, ConsensusFingerprint: fingerprint, Kind: CommandKind(kind), CoordinatorEpoch: epoch}
 	switch selector {
 	case identityClient:
 		client, err := decoder.array16()

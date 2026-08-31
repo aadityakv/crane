@@ -6,6 +6,18 @@ import (
 	"errors"
 )
 
+const (
+	// ResultArtifactMinRecordBytesV1 is the smallest complete length-prefixed
+	// canonical result record stored in a sealed artifact.
+	ResultArtifactMinRecordBytesV1 = PublicControlMinEncodedResultRecordBytesV1
+	// ResultArtifactMaxRecordBytesV1 is the largest complete length-prefixed
+	// canonical result record stored in a sealed artifact.
+	ResultArtifactMaxRecordBytesV1 = PublicControlMaxEncodedResultRecordBytesV1
+	// ResultArtifactMaxRecordCountV1 is the maximum minimum-size records that
+	// fit the v1 64-MiB per-job artifact budget.
+	ResultArtifactMaxRecordCountV1 uint64 = (64 << 20) / ResultArtifactMinRecordBytesV1
+)
+
 // ResultReplicaRole selects one destination from a committed replica set.
 type ResultReplicaRole uint8
 

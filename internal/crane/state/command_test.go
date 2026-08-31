@@ -19,7 +19,7 @@ func TestCommandBeginCoordinatorEpochCanonicalGoldenAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBeginCoordinatorEpoch: %v", err)
 	}
-	const wantHex = "00019da3b0fb713e401da1770cc147ec298ee81e028b016920ff35075ac62a49cdb200010211000000000000000000000000000000000000000000000000000000000000003db1bb7d2c882b6f72f6f5bd1620a3e12c3d67b5da87a3e3c0a035e3d6960db30100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
+	const wantHex = "0001ade79cdd8b02c7d55f75358fd6693682667984627ce923b6bf7c5cdb57e244f9000100000000000000000000000000000000000000000000000000000000000000000000021100000000000000000000000000000000000000000000000000000000000000d821feaa1790ff04a14fdbfa2878fe389e43e7d3787b9ce774de02903df5044e0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("golden = %s, want %s", got, wantHex)
 	}
@@ -143,7 +143,7 @@ func TestCommandValidationPreservesTopLevelAndUnderlyingSentinels(t *testing.T) 
 		t.Fatal(err)
 	}
 	// These offsets are independently pinned by the command golden: schema 0,
-	// fingerprint 2, kind 34, digest 69, and subject kind 101.
+	// fingerprint 2, kind 34, coordinator epoch 36, digest 103, and subject 135.
 	unmarshalCases := []struct {
 		name     string
 		offset   int
@@ -153,8 +153,8 @@ func TestCommandValidationPreservesTopLevelAndUnderlyingSentinels(t *testing.T) 
 		{name: "schema", offset: 1, value: 2, sentinel: ErrUnsupportedCommandSchema},
 		{name: "fingerprint", offset: 2, value: encoded[2] ^ 1, sentinel: ErrConsensusFingerprintMismatch},
 		{name: "kind", offset: 35, value: 99, sentinel: ErrUnknownCommandKind},
-		{name: "digest", offset: 69, value: encoded[69] ^ 1, sentinel: ErrCommandDigestMismatch},
-		{name: "subject", offset: 101, value: 0, sentinel: ErrInvalidCommandSubject},
+		{name: "digest", offset: 103, value: encoded[103] ^ 1, sentinel: ErrCommandDigestMismatch},
+		{name: "subject", offset: 135, value: 0, sentinel: ErrInvalidCommandSubject},
 	}
 	for _, test := range unmarshalCases {
 		t.Run("unmarshal/"+test.name, func(t *testing.T) {
@@ -291,7 +291,10 @@ func TestCommandResultExhaustiveLegalMatrixAndCorrelationFields(t *testing.T) {
 			SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
 			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
 		},
-		ResultStaleEpoch: {SubjectCoordinator: true},
+		ResultStaleEpoch: {
+			SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
+			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
+		},
 		ResultResultTooLarge: {
 			SubjectNone: true, SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
 			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
@@ -320,7 +323,7 @@ func TestCommandResultExhaustiveLegalMatrixAndCorrelationFields(t *testing.T) {
 
 	for code, subjects := range legal {
 		for subject := range subjects {
-			if code == ResultSuccess || code == ResultStaleEpoch {
+			if code == ResultSuccess || code == ResultStaleEpoch && subject == SubjectCoordinator {
 				candidate := validResultForMatrix(code, subject, 1)
 				candidate.Revision = 0
 				candidate.Epoch = model.CoordinatorEpoch{}
@@ -340,7 +343,7 @@ func TestCommandResultExhaustiveLegalMatrixAndCorrelationFields(t *testing.T) {
 				}
 				return 0
 			}())
-			mutations := invalidCorrelationMutations(subject, valid.Revision)
+			mutations := invalidCorrelationMutations(code, subject, valid.Revision)
 			for name, mutate := range mutations {
 				candidate := valid
 				mutate(&candidate)
@@ -359,6 +362,9 @@ func TestCommandContractDescriptorMechanicallyMatchesCodecConstantsAndEnums(t *t
 	}
 	if estimatedSnapshotBaseBytes != contract.SnapshotBaseBytes || clientHistoryFixedBytes != contract.ClientHistoryFixedBytes || subjectHistoryFixedBytes != contract.SubjectHistoryFixedBytes {
 		t.Fatalf("state preflight constants drifted from fingerprinted contract: %#v", contract)
+	}
+	if uint64(workerRecordEstimatedBytes) != contract.WorkerRecordBytes || uint64(jobRecordFixedEstimatedBytes) != contract.JobRecordFixedBytes || assignmentTokenEstimatedBytes != contract.AssignmentTokenBytes || resultReplicaEstimatedBytes != contract.ResultReplicaBytes || reassignmentMarkerEstimatedBytes != contract.ReassignmentBytes || sourceEOFEntryEstimatedBytes != contract.SourceEOFEntryBytes || checkpointEntryEstimatedBytes != contract.CheckpointEntryBytes || resultManifestEntryEstimatedBytes != contract.ManifestEntryBytes || jobFailureEstimatedBytes != contract.FailureBytes || workerEventEntryEstimatedBytes != contract.WorkerEventBytes {
+		t.Fatalf("state retained-record estimates drifted from fingerprinted contract: %#v", contract)
 	}
 	if CommandBeginCoordinatorEpoch != 1 || CommandFailJob != 14 || SubjectNone != 0 || SubjectCoordinator != 1 || SubjectResultManifest != 6 || ResultSuccess != 1 || ResultResultTooLarge != 8 {
 		t.Fatal("state enums drifted from fingerprinted contract")
@@ -437,10 +443,13 @@ func validResultForMatrix(code ResultCode, subject SubjectKind, revision uint64)
 	case SubjectJobControl, SubjectSourceEOF, SubjectSourceCheckpoint, SubjectResultManifest:
 		result.JobID = model.JobID{1}
 	}
+	if code == ResultStaleEpoch && subject != SubjectCoordinator {
+		result.Epoch = model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
+	}
 	return result
 }
 
-func invalidCorrelationMutations(subject SubjectKind, revision uint64) map[string]func(*CommandResult) {
+func invalidCorrelationMutations(code ResultCode, subject SubjectKind, revision uint64) map[string]func(*CommandResult) {
 	validEpoch := model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
 	switch subject {
 	case SubjectNone:
@@ -462,16 +471,24 @@ func invalidCorrelationMutations(subject SubjectKind, revision uint64) map[strin
 		}
 		return mutations
 	case SubjectWorker:
+		epochMutation := func(result *CommandResult) { result.Epoch = validEpoch }
+		if code == ResultStaleEpoch {
+			epochMutation = func(result *CommandResult) { result.Epoch = model.CoordinatorEpoch{Term: 1} }
+		}
 		return map[string]func(*CommandResult){
 			"zero_worker": func(result *CommandResult) { result.WorkerID = 0 },
 			"job":         func(result *CommandResult) { result.JobID = model.JobID{1} },
-			"epoch":       func(result *CommandResult) { result.Epoch = validEpoch },
+			"epoch":       epochMutation,
 		}
 	default:
+		epochMutation := func(result *CommandResult) { result.Epoch = validEpoch }
+		if code == ResultStaleEpoch {
+			epochMutation = func(result *CommandResult) { result.Epoch = model.CoordinatorEpoch{Term: 1} }
+		}
 		return map[string]func(*CommandResult){
 			"zero_job": func(result *CommandResult) { result.JobID = model.JobID{} },
 			"worker":   func(result *CommandResult) { result.WorkerID = 1 },
-			"epoch":    func(result *CommandResult) { result.Epoch = validEpoch },
+			"epoch":    epochMutation,
 		}
 	}
 }
@@ -514,6 +531,13 @@ func independentInternalDigest(envelope Envelope, target []byte) [32]byte {
 	var fixed [8]byte
 	binary.BigEndian.PutUint16(fixed[:2], uint16(envelope.Kind))
 	encoded = append(encoded, fixed[:2]...)
+	binary.BigEndian.PutUint64(fixed[:], envelope.CoordinatorEpoch.Term)
+	encoded = append(encoded, fixed[:]...)
+	binary.BigEndian.PutUint64(fixed[:], envelope.CoordinatorEpoch.BeginIndex)
+	encoded = append(encoded, fixed[:]...)
+	binary.BigEndian.PutUint16(fixed[:2], envelope.CoordinatorEpoch.Coordinator)
+	encoded = append(encoded, fixed[:2]...)
+	encoded = append(encoded, envelope.CoordinatorEpoch.Nonce[:]...)
 	encoded = append(encoded, 2)
 	internal := envelope.Internal
 	encoded = append(encoded, internal.ID[:]...)

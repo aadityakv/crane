@@ -67,7 +67,7 @@ const (
 	v1SubmitRequestFixedBytes = v1AuthenticatedFrameBytes + 2*v1Uint16Bytes + (16 + v1Uint64Bytes) + v1DigestBytes
 	// SubmitJob: schema + consensus fingerprint + kind + envelope selector +
 	// ClientRequestID + complete client-command digest.
-	v1SubmitJobFixedBytes = v1Uint16Bytes + v1DigestBytes + v1Uint16Bytes + 1 + (16 + v1Uint64Bytes) + v1DigestBytes
+	v1SubmitJobFixedBytes = v1Uint16Bytes + v1DigestBytes + v1Uint16Bytes + (2*v1Uint64Bytes + v1Uint16Bytes + 16) + 1 + (16 + v1Uint64Bytes) + v1DigestBytes
 	// One AssignmentSetInstall excluding canonical topology bytes: authenticated
 	// frame, message schema and message type, complete maximum AssignmentSet, specification digest,
 	// JobControlRevision, SchedulingState, and CoordinatorEpoch.

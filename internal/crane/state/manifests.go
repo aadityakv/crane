@@ -3,19 +3,21 @@ package state
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 )
 
+// ResultManifest seals one sink artifact and its two current durable replicas.
 type ResultManifest struct {
-	JobID             model.JobID
-	SinkTask          model.TaskID
-	ManifestRevision  uint64
-	SpecificationHash [32]byte
-	RecordCount       uint64
-	TotalBytes        uint64
-	Checksum          [32]byte
-	Replicas          model.ResultReplicaSet
+	JobID             model.JobID            // JobID identifies the producing job.
+	SinkTask          model.TaskID           // SinkTask identifies the collecting task.
+	ManifestRevision  uint64                 // ManifestRevision is the independent sink revision.
+	SpecificationHash [32]byte               // SpecificationHash binds the immutable topology.
+	RecordCount       uint64                 // RecordCount is bounded by canonical record sizes.
+	TotalBytes        uint64                 // TotalBytes is the complete artifact byte count.
+	Checksum          [32]byte               // Checksum authenticates the artifact stream.
+	Replicas          model.ResultReplicaSet // Replicas are the exact two current copies.
 }
 
 func (manifest ResultManifest) Validate() error {
@@ -28,43 +30,61 @@ func (manifest ResultManifest) Validate() error {
 	if err := manifest.Replicas.Validate(); err != nil || manifest.Replicas.SinkTask != manifest.SinkTask {
 		return errors.New("manifest replica set mismatch")
 	}
+	if manifest.RecordCount == 0 {
+		if manifest.TotalBytes != 0 {
+			return errors.New("empty result manifest has nonzero artifact bytes")
+		}
+		return nil
+	}
+	if manifest.RecordCount > model.ResultArtifactMaxRecordCountV1 || manifest.TotalBytes == 0 {
+		return errors.New("result manifest record count outside artifact bounds")
+	}
+	if manifest.RecordCount > math.MaxUint64/model.ResultArtifactMinRecordBytesV1 || manifest.RecordCount*model.ResultArtifactMinRecordBytesV1 > manifest.TotalBytes {
+		return errors.New("result manifest bytes cannot contain the declared records")
+	}
+	if manifest.RecordCount <= math.MaxUint64/model.ResultArtifactMaxRecordBytesV1 && manifest.TotalBytes > manifest.RecordCount*model.ResultArtifactMaxRecordBytesV1 {
+		return errors.New("result manifest bytes exceed the declared records")
+	}
 	return nil
 }
 
+// SealManifest commits one complete current result artifact description.
 type SealManifest struct {
-	Envelope Envelope
-	Manifest ResultManifest
+	Envelope Envelope       // Envelope carries manifest and coordinator fences.
+	Manifest ResultManifest // Manifest is the complete successor record.
 }
 
+// TransitionJob conditionally applies one legal nonterminal lifecycle edge.
 type TransitionJob struct {
-	Envelope Envelope
-	JobID    model.JobID
-	From     JobLifecycle
-	To       JobLifecycle
+	Envelope Envelope     // Envelope carries job-control and coordinator fences.
+	JobID    model.JobID  // JobID selects the retained job.
+	From     JobLifecycle // From is the required current lifecycle.
+	To       JobLifecycle // To is the legal successor lifecycle.
 }
 
+// FailJob commits one current-token failure and terminal Failed state atomically.
 type FailJob struct {
-	Envelope Envelope
-	Report   model.JobFailureReport
+	Envelope Envelope               // Envelope carries job-control and coordinator fences.
+	Report   model.JobFailureReport // Report binds the worker cursor and current token.
 }
 
-func NewSealManifest(id InternalCommandID, expectedRevision uint64, manifest ResultManifest) (SealManifest, error) {
+func NewSealManifest(id InternalCommandID, expectedRevision uint64, manifest ResultManifest, fence ...model.CoordinatorEpoch) (SealManifest, error) {
 	command := SealManifest{Manifest: manifest}
-	command.Envelope = newInternalEnvelope(CommandSealManifest, SubjectKey{Kind: SubjectResultManifest, JobID: manifest.JobID, TaskID: manifest.SinkTask}, id, expectedRevision)
+	command.Envelope = newInternalEnvelope(CommandSealManifest, SubjectKey{Kind: SubjectResultManifest, JobID: manifest.JobID, TaskID: manifest.SinkTask}, id, expectedRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, sealManifestTarget(command))
 	return command, command.Validate()
 }
 
-func NewTransitionJob(id InternalCommandID, expectedRevision uint64, job model.JobID, from, to JobLifecycle) (TransitionJob, error) {
+func NewTransitionJob(id InternalCommandID, expectedRevision uint64, job model.JobID, from, to JobLifecycle, fence ...model.CoordinatorEpoch) (TransitionJob, error) {
 	command := TransitionJob{JobID: job, From: from, To: to}
-	command.Envelope = newInternalEnvelope(CommandTransitionJob, SubjectKey{Kind: SubjectJobControl, JobID: job}, id, expectedRevision)
+	command.Envelope = newInternalEnvelope(CommandTransitionJob, SubjectKey{Kind: SubjectJobControl, JobID: job}, id, expectedRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, transitionJobTarget(command))
 	return command, command.Validate()
 }
 
-func NewFailJob(id InternalCommandID, expectedRevision uint64, report model.JobFailureReport) (FailJob, error) {
+func NewFailJob(id InternalCommandID, expectedRevision uint64, report model.JobFailureReport, fence ...model.CoordinatorEpoch) (FailJob, error) {
 	command := FailJob{Report: report}
-	command.Envelope = newInternalEnvelope(CommandFailJob, SubjectKey{Kind: SubjectJobControl, JobID: report.JobID}, id, expectedRevision)
+	command.Envelope = newInternalEnvelope(CommandFailJob, SubjectKey{Kind: SubjectJobControl, JobID: report.JobID}, id, expectedRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, failJobTarget(command))
 	return command, command.Validate()
 }
@@ -142,7 +162,7 @@ func (machine *Machine) applySealManifestLocked(command SealManifest) ([]byte, e
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
 		delta := int64(0)
 		if !manifestExists {
-			delta = 200
+			delta = int64(resultManifestEntryEstimatedBytes)
 		}
 		return mutationPlan{result: result, stateDelta: delta, commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
 	})
@@ -217,9 +237,9 @@ func (machine *Machine) applyFailJobLocked(command FailJob) ([]byte, error) {
 		candidate.Lifecycle = JobFailed
 		candidate.JobControlRevision = nextRevision
 		_, cursorExists := machine.workerEvents[cursorKey]
-		delta := int64(194)
+		delta := int64(jobFailureEstimatedBytes)
 		if !cursorExists {
-			delta += 58
+			delta += int64(workerEventEntryEstimatedBytes)
 		}
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
 		return mutationPlan{result: result, stateDelta: delta, commit: func() {

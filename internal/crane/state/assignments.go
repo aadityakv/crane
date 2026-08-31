@@ -13,20 +13,22 @@ import (
 
 const needsReassignmentDigestDomain = "cs425/crane/needs-reassignment/v1\x00"
 
+// ReassignmentTargetKind selects a task token or one result-replica role.
 type ReassignmentTargetKind uint8
 
 const (
-	TaskTarget ReassignmentTargetKind = iota + 1
-	ResultReplicaTarget
+	TaskTarget          ReassignmentTargetKind = iota + 1 // TaskTarget invalidates one task token.
+	ResultReplicaTarget                                   // ResultReplicaTarget invalidates one replica role.
 )
 
+// NeedsReassignment identifies one exact target invalidated by a worker change.
 type NeedsReassignment struct {
-	Kind           ReassignmentTargetKind
-	Task           model.TaskID
-	SinkTask       model.TaskID
-	ReplicaRole    model.ResultReplicaRole
-	OldWorkerID    uint16
-	OldWorkerEpoch model.WorkerEpoch
+	Kind           ReassignmentTargetKind  // Kind selects the marker union member.
+	Task           model.TaskID            // Task identifies a task-token target.
+	SinkTask       model.TaskID            // SinkTask identifies a replica target.
+	ReplicaRole    model.ResultReplicaRole // ReplicaRole selects primary or secondary.
+	OldWorkerID    uint16                  // OldWorkerID binds the invalidated node.
+	OldWorkerEpoch model.WorkerEpoch       // OldWorkerEpoch binds its exact incarnation.
 }
 
 func (marker NeedsReassignment) Validate() error {
@@ -101,30 +103,32 @@ func NeedsReassignmentDigest(markers []NeedsReassignment) [32]byte {
 	return sha256.Sum256(encoded)
 }
 
+// InstallAssignments commits the first complete assignment set for a pending job.
 type InstallAssignments struct {
-	Envelope   Envelope
-	Assignment model.AssignmentSet
+	Envelope   Envelope            // Envelope carries job-control and coordinator fences.
+	Assignment model.AssignmentSet // Assignment is the complete revision-one set.
 }
 
+// ReplaceAssignments conditionally replaces exactly the marked targets.
 type ReplaceAssignments struct {
-	Envelope                   Envelope
-	JobID                      model.JobID
-	ExpectedAssignmentRevision uint64
-	ExpectedDigest             [32]byte
-	ExpectedMarkersDigest      [32]byte
-	Target                     model.AssignmentSet
+	Envelope                   Envelope            // Envelope carries job-control and coordinator fences.
+	JobID                      model.JobID         // JobID selects the assigned job.
+	ExpectedAssignmentRevision uint64              // ExpectedAssignmentRevision fences the old set.
+	ExpectedDigest             [32]byte            // ExpectedDigest binds the old complete set.
+	ExpectedMarkersDigest      [32]byte            // ExpectedMarkersDigest binds all invalid targets.
+	Target                     model.AssignmentSet // Target is the complete successor set.
 }
 
-func NewInstallAssignments(id InternalCommandID, expectedJobRevision uint64, assignment model.AssignmentSet) (InstallAssignments, error) {
+func NewInstallAssignments(id InternalCommandID, expectedJobRevision uint64, assignment model.AssignmentSet, fence ...model.CoordinatorEpoch) (InstallAssignments, error) {
 	command := InstallAssignments{Assignment: cloneAssignment(assignment)}
-	command.Envelope = newInternalEnvelope(CommandInstallAssignments, SubjectKey{Kind: SubjectJobControl, JobID: assignment.JobID}, id, expectedJobRevision)
+	command.Envelope = newInternalEnvelope(CommandInstallAssignments, SubjectKey{Kind: SubjectJobControl, JobID: assignment.JobID}, id, expectedJobRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, installAssignmentsTarget(command))
 	return command, command.Validate()
 }
 
-func NewReplaceAssignments(id InternalCommandID, expectedJobRevision uint64, job model.JobID, expectedAssignmentRevision uint64, expectedDigest, expectedMarkersDigest [32]byte, target model.AssignmentSet) (ReplaceAssignments, error) {
+func NewReplaceAssignments(id InternalCommandID, expectedJobRevision uint64, job model.JobID, expectedAssignmentRevision uint64, expectedDigest, expectedMarkersDigest [32]byte, target model.AssignmentSet, fence ...model.CoordinatorEpoch) (ReplaceAssignments, error) {
 	command := ReplaceAssignments{JobID: job, ExpectedAssignmentRevision: expectedAssignmentRevision, ExpectedDigest: expectedDigest, ExpectedMarkersDigest: expectedMarkersDigest, Target: cloneAssignment(target)}
-	command.Envelope = newInternalEnvelope(CommandReplaceAssignments, SubjectKey{Kind: SubjectJobControl, JobID: job}, id, expectedJobRevision)
+	command.Envelope = newInternalEnvelope(CommandReplaceAssignments, SubjectKey{Kind: SubjectJobControl, JobID: job}, id, expectedJobRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, replaceAssignmentsTarget(command))
 	return command, command.Validate()
 }
@@ -244,7 +248,7 @@ func (machine *Machine) applyInstallAssignmentsLocked(command InstallAssignments
 			result, resultErr := marshalBusinessResult(ResultInvalidTarget, key, currentRevision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, resultErr
 		}
-		want, err := model.BuildAssignmentSet(candidate.JobID, candidate.TopologyDigest, 1, topology, machine.eligiblePlacements())
+		want, err := model.BuildAssignmentSet(candidate.JobID, candidate.TopologyDigest, 1, topology, machine.residualEligiblePlacements(candidate.JobID))
 		if err != nil || !reflect.DeepEqual(want, command.Assignment) {
 			result, resultErr := marshalBusinessResult(ResultInvalidTarget, key, currentRevision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, resultErr
@@ -278,12 +282,12 @@ func (machine *Machine) applyReplaceAssignmentsLocked(command ReplaceAssignments
 		if err != nil {
 			return mutationPlan{}, fmt.Errorf("impossible retained topology: %w", err)
 		}
-		if err := command.Target.Validate(topology); err != nil || !machine.assignmentUsesCurrentEligibleWorkers(command.Target) || validateReplacement(*record.Assignment, command.Target, record.NeedsReassignment) != nil {
+		if err := command.Target.Validate(topology); err != nil || !machine.assignmentUsesCurrentEligibleWorkers(command.Target, command.JobID) || validateReplacement(*record.Assignment, command.Target, record.NeedsReassignment) != nil {
 			result, resultErr := marshalBusinessResult(ResultInvalidTarget, key, currentRevision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, resultErr
 		}
 		candidate := cloneJobRecord(record)
-		oldBytes := assignmentEncodedBytes(*candidate.Assignment) + uint64(len(candidate.NeedsReassignment))*60
+		oldBytes := assignmentEncodedBytes(*candidate.Assignment) + uint64(len(candidate.NeedsReassignment))*reassignmentMarkerEstimatedBytes
 		newBytes := assignmentEncodedBytes(command.Target)
 		candidate.Assignment = assignmentPointer(command.Target)
 		candidate.NeedsReassignment = nil
@@ -298,10 +302,6 @@ func assignmentPointer(set model.AssignmentSet) *model.AssignmentSet {
 	return &clone
 }
 
-func assignmentEncodedBytes(set model.AssignmentSet) uint64 {
-	return uint64(16 + 8 + 32 + 2 + len(set.Tasks)*86 + 2 + len(set.ResultReplicas)*56)
-}
-
 func signedSizeDelta(next, current uint64) int64 {
 	if next >= current {
 		return int64(next - current)
@@ -310,6 +310,22 @@ func signedSizeDelta(next, current uint64) int64 {
 }
 
 func (machine *Machine) eligiblePlacements() []model.WorkerPlacement {
+	return machine.residualEligiblePlacements(model.JobID{})
+}
+
+// residualEligiblePlacements returns task-execution capacity after subtracting
+// every token in every other nonterminal job. Result replicas consume durable
+// storage capacity, not logical worker execution slots, and are not subtracted.
+func (machine *Machine) residualEligiblePlacements(excludeJob model.JobID) []model.WorkerPlacement {
+	used := make(map[uint16]uint64)
+	for jobID, job := range machine.jobs {
+		if jobID == excludeJob || job.Lifecycle.terminal() || job.Assignment == nil {
+			continue
+		}
+		for _, token := range job.Assignment.Tasks {
+			used[token.WorkerID]++
+		}
+	}
 	workers := make([]WorkerRecord, 0, len(machine.workers))
 	for _, worker := range machine.workers {
 		if worker.State == WorkerEligible {
@@ -317,14 +333,21 @@ func (machine *Machine) eligiblePlacements() []model.WorkerPlacement {
 		}
 	}
 	sort.Slice(workers, func(i, j int) bool { return workers[i].NodeID < workers[j].NodeID })
-	placements := make([]model.WorkerPlacement, len(workers))
-	for index, worker := range workers {
-		placements[index] = model.WorkerPlacement{NodeID: worker.NodeID, WorkerEpoch: worker.Epoch, SlotCapacity: worker.Slots}
+	placements := make([]model.WorkerPlacement, 0, len(workers))
+	for _, worker := range workers {
+		if used[worker.NodeID] >= uint64(worker.Slots) {
+			continue
+		}
+		placements = append(placements, model.WorkerPlacement{NodeID: worker.NodeID, WorkerEpoch: worker.Epoch, SlotCapacity: worker.Slots - uint16(used[worker.NodeID])})
 	}
 	return placements
 }
 
-func (machine *Machine) assignmentUsesCurrentEligibleWorkers(set model.AssignmentSet) bool {
+func (machine *Machine) assignmentUsesCurrentEligibleWorkers(set model.AssignmentSet, excludeJob model.JobID) bool {
+	available := make(map[uint16]uint64)
+	for _, placement := range machine.residualEligiblePlacements(excludeJob) {
+		available[placement.NodeID] = uint64(placement.SlotCapacity)
+	}
 	used := make(map[uint16]uint64)
 	for _, token := range set.Tasks {
 		worker, ok := machine.workers[token.WorkerID]
@@ -332,7 +355,7 @@ func (machine *Machine) assignmentUsesCurrentEligibleWorkers(set model.Assignmen
 			return false
 		}
 		used[token.WorkerID]++
-		if used[token.WorkerID] > uint64(worker.Slots) {
+		if used[token.WorkerID] > available[token.WorkerID] {
 			return false
 		}
 	}

@@ -161,33 +161,33 @@ func TestWorkerEventCursorResetsForNewEpochWhileOldTokenStaysFenced(t *testing.T
 func task10RunningJob(t *testing.T) (*Machine, model.JobID, model.ValidatedTopology, model.AssignmentSet) {
 	t.Helper()
 	machine := NewMachine()
+	epochCommand, _ := NewBeginCoordinatorEpoch(InternalCommandID{0x60}, 0, 1, [16]byte{0x60})
+	applyTask10(t, machine, 1, epochCommand)
 	for index := 1; index <= 2; index++ {
 		record := WorkerRecord{NodeID: uint16(index), Epoch: model.WorkerEpoch{byte(index), 0x44}, State: WorkerEligible, Revision: 1, Slots: 16, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-		register, _ := NewRegisterWorker(InternalCommandID{byte(index), 0x44}, 0, record)
+		register, _ := NewRegisterWorker(InternalCommandID{byte(index), 0x44}, 0, record, machine.coordinatorEpoch)
 		applyTask10(t, machine, uint64(index), register)
 	}
-	epochCommand, _ := NewBeginCoordinatorEpoch(InternalCommandID{0x60}, 0, 1, [16]byte{0x60})
-	applyTask10(t, machine, 3, epochCommand)
 	topology, err := model.ValidateTopology(task10ProgressTopology())
 	if err != nil {
 		t.Fatal(err)
 	}
-	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0x61}, Sequence: 1}, topology.Spec())
+	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0x61}, Sequence: 1}, topology.Spec(), machine.coordinatorEpoch)
 	applyTask10(t, machine, 4, submit)
 	job := submit.JobID()
 	for partition := uint16(0); partition < 3; partition++ {
 		source := model.TaskID{JobID: job, StageID: 1, Partition: partition}
 		eof, _ := model.SourceEOF(topology, source)
-		command, _ := NewRecordSourceEOF(InternalCommandID{0x62, byte(partition)}, 0, source, eof)
+		command, _ := NewRecordSourceEOF(InternalCommandID{0x62, byte(partition)}, 0, source, eof, machine.coordinatorEpoch)
 		applyTask10(t, machine, uint64(5+partition), command)
 	}
 	assignment, err := model.BuildAssignmentSet(job, topology.Digest(), 1, topology, task10EligiblePlacements(machine))
 	if err != nil {
 		t.Fatal(err)
 	}
-	install, _ := NewInstallAssignments(InternalCommandID{0x63}, 1, assignment)
+	install, _ := NewInstallAssignments(InternalCommandID{0x63}, 1, assignment, machine.coordinatorEpoch)
 	applyTask10(t, machine, 10, install)
-	running, _ := NewTransitionJob(InternalCommandID{0x64}, 2, job, JobDeploying, JobRunning)
+	running, _ := NewTransitionJob(InternalCommandID{0x64}, 2, job, JobDeploying, JobRunning, machine.coordinatorEpoch)
 	applyTask10(t, machine, 11, running)
 	return machine, job, topology, assignment
 }

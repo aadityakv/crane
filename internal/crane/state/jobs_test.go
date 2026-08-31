@@ -14,11 +14,12 @@ import (
 func TestJobCommandsCanonicalRoundTripAndSubmitSizeAgreement(t *testing.T) {
 	topology := task10Topology(0)
 	request := model.ClientRequestID{ClientID: model.ClientID{1}, Sequence: 1}
-	submit, err := NewSubmitJob(request, topology)
+	fence := model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
+	submit, err := NewSubmitJob(request, topology, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cancel, err := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{1}, Sequence: 2}, submit.JobID(), 1)
+	cancel, err := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{1}, Sequence: 2}, submit.JobID(), 1, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +50,8 @@ func TestJobCommandsCanonicalRoundTripAndSubmitSizeAgreement(t *testing.T) {
 	over[36] = identityClient
 	copy(over[37:53], request.ClientID[:])
 	binary.BigEndian.PutUint64(over[53:61], request.Sequence)
-	binary.BigEndian.PutUint64(over[93:101], model.LimitsV1().MaxTopologyBytes-8+1)
+	topologyOffset := model.LimitsV1().SubmitJobFixedBytes
+	binary.BigEndian.PutUint64(over[topologyOffset:topologyOffset+8], model.LimitsV1().MaxTopologyBytes-8+1)
 	if _, err := UnmarshalCommand(over); err == nil {
 		t.Fatal("SubmitJob decoder accepted declared topology maximum + 1")
 	}
@@ -65,7 +67,8 @@ func TestMaximallyStructuredSubmitJobFitsRaftCommandBudget(t *testing.T) {
 	if uint64(len(topology.Stages)) != limits.MaxStages || uint64(len(topology.Edges)) != limits.MaxEdges {
 		t.Fatal("maximum fixture misses structural maxima")
 	}
-	command, err := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xef}, Sequence: 1}, topology)
+	fence := model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
+	command, err := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xef}, Sequence: 1}, topology, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +204,7 @@ func FuzzUnmarshalStateCommand(f *testing.F) {
 	report := model.CompletionReport{JobID: job, JobControlRevision: 3, AssignmentRevision: 1, Source: source.Task, Token: source, Epoch: epoch, Prior: 0, New: eof, EOF: eof, WorkerTransactionID: 1}
 	report.Digest = model.CompletionReportDigest(report)
 	replica := assignment.ResultReplicas[0]
-	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: validated.Digest(), RecordCount: 1, TotalBytes: 1, Checksum: [32]byte{1}, Replicas: replica}
+	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: validated.Digest(), RecordCount: 1, TotalBytes: model.ResultArtifactMinRecordBytesV1, Checksum: [32]byte{1}, Replicas: replica}
 	failure := model.JobFailureReport{JobID: job, JobControlRevision: 3, AssignmentRevision: 1, Task: source, Epoch: epoch, TransactionID: 2, Code: model.FailureOperator, DetailDigest: [32]byte{2}}
 	drain, _ := NewDrainWorker(InternalCommandID{2}, 1, 1, model.WorkerEpoch{1})
 	deactivate, _ := NewDeactivateWorker(InternalCommandID{3}, 1, 1, model.WorkerEpoch{1}, nil)

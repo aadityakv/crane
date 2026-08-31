@@ -12,13 +12,13 @@ import (
 type JobLifecycle uint8
 
 const (
-	JobPending JobLifecycle = iota + 1
-	JobDeploying
-	JobRunning
-	JobDraining
-	JobSucceeded
-	JobFailed
-	JobCanceled
+	JobPending   JobLifecycle = iota + 1 // JobPending awaits a complete assignment set.
+	JobDeploying                         // JobDeploying has assignments awaiting activation.
+	JobRunning                           // JobRunning accepts worker progress.
+	JobDraining                          // JobDraining has observed all source EOFs.
+	JobSucceeded                         // JobSucceeded is terminal successful retention.
+	JobFailed                            // JobFailed is terminal failure retention.
+	JobCanceled                          // JobCanceled is terminal client cancellation.
 )
 
 func (state JobLifecycle) terminal() bool {
@@ -27,38 +27,44 @@ func (state JobLifecycle) terminal() bool {
 
 // JobRecord is one retained immutable definition and its replicated control fence.
 type JobRecord struct {
-	JobID              model.JobID
-	DefiningRequest    model.ClientRequestID
-	TopologyDigest     [32]byte
-	TopologyBytes      []byte
-	Lifecycle          JobLifecycle
-	JobControlRevision uint64
-	Assignment         *model.AssignmentSet
-	NeedsReassignment  []NeedsReassignment
-	SourceEOFs         map[model.TaskID]SourceEOFRecord
-	Checkpoints        map[model.TaskID]CheckpointRecord
-	Manifests          map[model.TaskID]ResultManifest
-	Failure            *model.JobFailureReport
+	JobID              model.JobID                       // JobID is derived from request and topology.
+	DefiningRequest    model.ClientRequestID             // DefiningRequest defends ID collisions.
+	TopologyDigest     [32]byte                          // TopologyDigest binds the immutable plan.
+	TopologyBytes      []byte                            // TopologyBytes owns the canonical plan bytes.
+	Lifecycle          JobLifecycle                      // Lifecycle is the finite control state.
+	JobControlRevision uint64                            // JobControlRevision fences job-wide changes.
+	Assignment         *model.AssignmentSet              // Assignment is the complete current set.
+	NeedsReassignment  []NeedsReassignment               // NeedsReassignment is sorted and complete.
+	SourceEOFs         map[model.TaskID]SourceEOFRecord  // SourceEOFs retain immutable source bounds.
+	Checkpoints        map[model.TaskID]CheckpointRecord // Checkpoints advance independently by source.
+	Manifests          map[model.TaskID]ResultManifest   // Manifests seal independently by sink.
+	Failure            *model.JobFailureReport           // Failure retains the terminal failure event.
 }
 
+// SubmitJob creates an immutable job definition under a client identity.
 type SubmitJob struct {
-	Envelope Envelope
-	Topology model.TopologySpec
+	Envelope Envelope           // Envelope carries client identity and coordinator fence.
+	Topology model.TopologySpec // Topology is the validated immutable logical plan.
 }
 
+// CancelJob conditionally moves a nonterminal job to Canceled.
 type CancelJob struct {
-	Envelope         Envelope
-	Job              model.JobID
-	ExpectedRevision uint64
+	Envelope         Envelope    // Envelope carries client identity and coordinator fence.
+	Job              model.JobID // Job selects the retained job.
+	ExpectedRevision uint64      // ExpectedRevision fences job control.
 }
 
-func NewSubmitJob(request model.ClientRequestID, topology model.TopologySpec) (SubmitJob, error) {
+func NewSubmitJob(request model.ClientRequestID, topology model.TopologySpec, fences ...model.CoordinatorEpoch) (SubmitJob, error) {
 	validated, err := model.ValidateTopology(topology)
 	if err != nil {
 		return SubmitJob{}, err
 	}
 	command := SubmitJob{Topology: validated.Spec()}
-	command.Envelope = Envelope{SchemaVersion: CommandSchemaVersion, ConsensusFingerprint: model.ConsensusFingerprint(), Kind: CommandSubmitJob, Client: &ClientEnvelope{Request: request}}
+	var fence model.CoordinatorEpoch
+	if len(fences) == 1 {
+		fence = fences[0]
+	}
+	command.Envelope = Envelope{SchemaVersion: CommandSchemaVersion, ConsensusFingerprint: model.ConsensusFingerprint(), Kind: CommandSubmitJob, CoordinatorEpoch: fence, Client: &ClientEnvelope{Request: request}}
 	command.Envelope.Client.Digest = model.PublicSubmitCommandDigest(request, validated.CanonicalBytes())
 	return command, command.Validate()
 }
@@ -71,9 +77,13 @@ func (command SubmitJob) JobID() model.JobID {
 	return model.DeriveJobID(command.Envelope.Client.Request, validated.Digest())
 }
 
-func NewCancelJob(request model.ClientRequestID, job model.JobID, expectedRevision uint64) (CancelJob, error) {
+func NewCancelJob(request model.ClientRequestID, job model.JobID, expectedRevision uint64, fences ...model.CoordinatorEpoch) (CancelJob, error) {
 	command := CancelJob{Job: job, ExpectedRevision: expectedRevision}
-	command.Envelope = Envelope{SchemaVersion: CommandSchemaVersion, ConsensusFingerprint: model.ConsensusFingerprint(), Kind: CommandCancelJob, Client: &ClientEnvelope{Request: request}}
+	var fence model.CoordinatorEpoch
+	if len(fences) == 1 {
+		fence = fences[0]
+	}
+	command.Envelope = Envelope{SchemaVersion: CommandSchemaVersion, ConsensusFingerprint: model.ConsensusFingerprint(), Kind: CommandCancelJob, CoordinatorEpoch: fence, Client: &ClientEnvelope{Request: request}}
 	command.Envelope.Client.Digest = model.PublicCancelCommandDigest(request, job, expectedRevision)
 	return command, command.Validate()
 }
@@ -126,8 +136,6 @@ func sameJobDefinition(record JobRecord, request model.ClientRequestID, digest [
 	return record.DefiningRequest == request && record.TopologyDigest == digest && bytes.Equal(record.TopologyBytes, canonical)
 }
 
-const jobRecordFixedEstimatedBytes int64 = 16 + 24 + 32 + 1 + 8 + 8
-
 func (machine *Machine) applySubmitJobLocked(command SubmitJob) ([]byte, error) {
 	validated, err := model.ValidateTopology(command.Topology)
 	if err != nil {
@@ -136,8 +144,8 @@ func (machine *Machine) applySubmitJobLocked(command SubmitJob) ([]byte, error) 
 	canonical := validated.CanonicalBytes()
 	jobID := command.JobID()
 	request := command.Envelope.Client.Request
-	return machine.applyClientLocked(request, command.Envelope.Client.Digest, func() (mutationPlan, error) {
-		key := SubjectKey{Kind: SubjectJobControl, JobID: jobID}
+	key := SubjectKey{Kind: SubjectJobControl, JobID: jobID}
+	return machine.applyClientCommandLocked(command.Envelope, key, func() (mutationPlan, error) {
 		if existing, ok := machine.jobs[jobID]; ok {
 			if !sameJobDefinition(existing, request, validated.Digest(), canonical) {
 				result, resultErr := marshalBusinessResult(ResultIdentityCollision, key, existing.JobControlRevision, model.CoordinatorEpoch{})
@@ -161,9 +169,8 @@ func (machine *Machine) applySubmitJobLocked(command SubmitJob) ([]byte, error) 
 }
 
 func (machine *Machine) applyCancelJobLocked(command CancelJob) ([]byte, error) {
-	request := command.Envelope.Client.Request
-	return machine.applyClientLocked(request, command.Envelope.Client.Digest, func() (mutationPlan, error) {
-		key := SubjectKey{Kind: SubjectJobControl, JobID: command.Job}
+	key := SubjectKey{Kind: SubjectJobControl, JobID: command.Job}
+	return machine.applyClientCommandLocked(command.Envelope, key, func() (mutationPlan, error) {
 		record, exists := machine.jobs[command.Job]
 		if !exists {
 			result, err := marshalBusinessResult(ResultNotFound, key, 0, model.CoordinatorEpoch{})

@@ -11,25 +11,26 @@ import (
 func TestWorkerCommandsCanonicalRoundTripAndOwnedCollections(t *testing.T) {
 	epoch1 := model.WorkerEpoch{1}
 	epoch2 := model.WorkerEpoch{2}
+	fence := model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
 	register, err := NewRegisterWorker(InternalCommandID{1}, 0, WorkerRecord{
 		NodeID: 7, Epoch: epoch1, State: WorkerEligible, Revision: 1, Slots: 4,
 		ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint(),
-	})
+	}, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	drain, err := NewDrainWorker(InternalCommandID{2}, 1, 7, epoch1)
+	drain, err := NewDrainWorker(InternalCommandID{2}, 1, 7, epoch1, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	deactivate, err := NewDeactivateWorker(InternalCommandID{3}, 2, 7, epoch1, nil)
+	deactivate, err := NewDeactivateWorker(InternalCommandID{3}, 2, 7, epoch1, nil, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
 	replace, err := NewReplaceWorkerEpoch(InternalCommandID{4}, 3, 7, epoch1, WorkerRecord{
 		NodeID: 7, Epoch: epoch2, State: WorkerEligible, Revision: 4, Slots: 8,
 		ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint(),
-	}, nil)
+	}, nil, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,13 +102,15 @@ func TestWorkerLifecycleOfflineReregistrationAndDrainingFence(t *testing.T) {
 
 func TestWorkerCapacityIsExactAndDoesNotEvict(t *testing.T) {
 	machine := NewMachine()
+	begin, _ := NewBeginCoordinatorEpoch(InternalCommandID{0xfa}, 0, 1, [16]byte{0xfa})
+	applyTask10(t, machine, 1, begin)
 	limit := int(model.LimitsV1().MaxRegisteredWorkers)
 	for index := 1; index <= limit; index++ {
 		nodeID := uint16(index)
 		command, err := NewRegisterWorker(InternalCommandID{byte(index), byte(index >> 8), 1}, 0, WorkerRecord{
 			NodeID: nodeID, Epoch: model.WorkerEpoch{byte(index), byte(index >> 8), 1}, State: WorkerEligible, Revision: 1, Slots: 1,
 			ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint(),
-		})
+		}, machine.coordinatorEpoch)
 		if err != nil {
 			t.Fatalf("constructor %d: %v", index, err)
 		}
@@ -118,7 +121,7 @@ func TestWorkerCapacityIsExactAndDoesNotEvict(t *testing.T) {
 	extra, _ := NewRegisterWorker(InternalCommandID{0xff, 0xff, 2}, 0, WorkerRecord{
 		NodeID: uint16(limit + 1), Epoch: model.WorkerEpoch{0xff, 0xff, 2}, State: WorkerEligible, Revision: 1, Slots: 1,
 		ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint(),
-	})
+	}, machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, uint64(limit+1), extra); got.Code != ResultCapacityExhausted {
 		t.Fatalf("worker capacity = %#v", got)
 	}
@@ -129,6 +132,22 @@ func TestWorkerCapacityIsExactAndDoesNotEvict(t *testing.T) {
 
 func applyTask10(t *testing.T, machine *Machine, index uint64, command any) CommandResult {
 	t.Helper()
+	if _, begin := command.(BeginCoordinatorEpoch); !begin {
+		if machine.coordinatorEpoch == (model.CoordinatorEpoch{}) {
+			beginCommand, err := NewBeginCoordinatorEpoch(InternalCommandID{0xfe, 0xce}, machine.coordinatorRevision, 1, [16]byte{0xfe})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encodedBegin, err := MarshalCommand(beginCommand)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := machine.Apply(1, 1, encodedBegin); err != nil {
+				t.Fatal(err)
+			}
+		}
+		command = bindTask10CommandFenceForTest(command, machine.coordinatorEpoch)
+	}
 	encoded, err := MarshalCommand(command)
 	if err != nil {
 		t.Fatalf("MarshalCommand(%T): %v", command, err)
@@ -138,4 +157,56 @@ func applyTask10(t *testing.T, machine *Machine, index uint64, command any) Comm
 		t.Fatalf("Apply(%T): %v", command, err)
 	}
 	return mustResult(t, result)
+}
+
+func bindTask10CommandFenceForTest(command any, fence model.CoordinatorEpoch) any {
+	rebind := func(envelope *Envelope, target []byte) {
+		envelope.CoordinatorEpoch = fence
+		if envelope.Internal != nil {
+			envelope.Internal.Digest = internalDigest(*envelope, target)
+		}
+	}
+	switch value := command.(type) {
+	case RegisterWorker:
+		rebind(&value.Envelope, registerWorkerTarget(value))
+		return value
+	case DrainWorker:
+		rebind(&value.Envelope, drainWorkerTarget(value))
+		return value
+	case DeactivateWorker:
+		rebind(&value.Envelope, deactivateWorkerTarget(value))
+		return value
+	case ReplaceWorkerEpoch:
+		rebind(&value.Envelope, replaceWorkerEpochTarget(value))
+		return value
+	case SubmitJob:
+		value.Envelope.CoordinatorEpoch = fence
+		return value
+	case CancelJob:
+		value.Envelope.CoordinatorEpoch = fence
+		return value
+	case RecordSourceEOF:
+		rebind(&value.Envelope, recordSourceEOFTarget(value))
+		return value
+	case InstallAssignments:
+		rebind(&value.Envelope, installAssignmentsTarget(value))
+		return value
+	case ReplaceAssignments:
+		rebind(&value.Envelope, replaceAssignmentsTarget(value))
+		return value
+	case AdvanceCheckpoint:
+		rebind(&value.Envelope, advanceCheckpointTarget(value))
+		return value
+	case SealManifest:
+		rebind(&value.Envelope, sealManifestTarget(value))
+		return value
+	case TransitionJob:
+		rebind(&value.Envelope, transitionJobTarget(value))
+		return value
+	case FailJob:
+		rebind(&value.Envelope, failJobTarget(value))
+		return value
+	default:
+		return command
+	}
 }

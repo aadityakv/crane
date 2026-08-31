@@ -11,14 +11,16 @@ import (
 
 const failureEventDigestDomain = "cs425/crane/job-failure-event/v1\x00"
 
+// SourceEOFRecord retains one immutable source bound and its subject revision.
 type SourceEOFRecord struct {
-	EOF      uint64
-	Revision uint64
+	EOF      uint64 // EOF is the immutable exclusive sequence bound.
+	Revision uint64 // Revision is the independent source-EOF revision.
 }
 
+// CheckpointRecord retains monotonic source progress and its subject revision.
 type CheckpointRecord struct {
-	Watermark uint64
-	Revision  uint64
+	Watermark uint64 // Watermark is the highest durably completed source sequence.
+	Revision  uint64 // Revision is the independent checkpoint revision.
 }
 
 type workerEventKey struct {
@@ -31,27 +33,29 @@ type workerEventCursor struct {
 	Digest        [32]byte
 }
 
+// RecordSourceEOF commits the topology-derived source bound exactly once.
 type RecordSourceEOF struct {
-	Envelope Envelope
-	Source   model.TaskID
-	EOF      uint64
+	Envelope Envelope     // Envelope carries source-EOF and coordinator fences.
+	Source   model.TaskID // Source selects an immutable topology source task.
+	EOF      uint64       // EOF is the topology-derived exclusive bound.
 }
 
+// AdvanceCheckpoint applies one globally ordered, current-token completion event.
 type AdvanceCheckpoint struct {
-	Envelope Envelope
-	Report   model.CompletionReport
+	Envelope Envelope               // Envelope carries checkpoint and coordinator fences.
+	Report   model.CompletionReport // Report binds token, cursor, prior, and new progress.
 }
 
-func NewRecordSourceEOF(id InternalCommandID, expectedRevision uint64, source model.TaskID, eof uint64) (RecordSourceEOF, error) {
+func NewRecordSourceEOF(id InternalCommandID, expectedRevision uint64, source model.TaskID, eof uint64, fence ...model.CoordinatorEpoch) (RecordSourceEOF, error) {
 	command := RecordSourceEOF{Source: source, EOF: eof}
-	command.Envelope = newInternalEnvelope(CommandRecordSourceEOF, SubjectKey{Kind: SubjectSourceEOF, JobID: source.JobID, TaskID: source}, id, expectedRevision)
+	command.Envelope = newInternalEnvelope(CommandRecordSourceEOF, SubjectKey{Kind: SubjectSourceEOF, JobID: source.JobID, TaskID: source}, id, expectedRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, recordSourceEOFTarget(command))
 	return command, command.Validate()
 }
 
-func NewAdvanceCheckpoint(id InternalCommandID, expectedRevision uint64, report model.CompletionReport) (AdvanceCheckpoint, error) {
+func NewAdvanceCheckpoint(id InternalCommandID, expectedRevision uint64, report model.CompletionReport, fence ...model.CoordinatorEpoch) (AdvanceCheckpoint, error) {
 	command := AdvanceCheckpoint{Report: report}
-	command.Envelope = newInternalEnvelope(CommandAdvanceCheckpoint, SubjectKey{Kind: SubjectSourceCheckpoint, JobID: report.JobID, TaskID: report.Source}, id, expectedRevision)
+	command.Envelope = newInternalEnvelope(CommandAdvanceCheckpoint, SubjectKey{Kind: SubjectSourceCheckpoint, JobID: report.JobID, TaskID: report.Source}, id, expectedRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, advanceCheckpointTarget(command))
 	return command, command.Validate()
 }
@@ -134,7 +138,7 @@ func (machine *Machine) applyRecordSourceEOFLocked(command RecordSourceEOF) ([]b
 		candidate := cloneJobRecord(record)
 		candidate.SourceEOFs[command.Source] = SourceEOFRecord{EOF: command.EOF, Revision: nextRevision}
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
-		return mutationPlan{result: result, stateDelta: 36, commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
+		return mutationPlan{result: result, stateDelta: int64(sourceEOFEntryEstimatedBytes), commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
 	})
 }
 
@@ -174,10 +178,10 @@ func (machine *Machine) applyAdvanceCheckpointLocked(command AdvanceCheckpoint) 
 		_, cursorExists := machine.workerEvents[cursorKey]
 		delta := int64(0)
 		if !checkpointExists {
-			delta += 36
+			delta += int64(checkpointEntryEstimatedBytes)
 		}
 		if !cursorExists {
-			delta += 58
+			delta += int64(workerEventEntryEstimatedBytes)
 		}
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
 		return mutationPlan{result: result, stateDelta: delta, commit: func() {

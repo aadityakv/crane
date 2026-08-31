@@ -7,6 +7,7 @@ import (
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 )
 
+// CommandSchemaVersion is the only accepted canonical state-command schema.
 const CommandSchemaVersion = model.StateCommandSchemaVersionV1
 
 const (
@@ -20,44 +21,48 @@ const (
 
 const internalCommandDigestDomain = "cs425/crane/internal-command/v1\x00"
 
+// CommandKind selects one concrete, non-opaque replicated transition.
 type CommandKind uint16
 
 const (
-	CommandBeginCoordinatorEpoch CommandKind = 1
-	CommandRegisterWorker        CommandKind = 2
-	CommandDrainWorker           CommandKind = 3
-	CommandDeactivateWorker      CommandKind = 4
-	CommandReplaceWorkerEpoch    CommandKind = 5
-	CommandSubmitJob             CommandKind = 6
-	CommandCancelJob             CommandKind = 7
-	CommandRecordSourceEOF       CommandKind = 8
-	CommandInstallAssignments    CommandKind = 9
-	CommandReplaceAssignments    CommandKind = 10
-	CommandAdvanceCheckpoint     CommandKind = 11
-	CommandSealManifest          CommandKind = 12
-	CommandTransitionJob         CommandKind = 13
-	CommandFailJob               CommandKind = 14
+	CommandBeginCoordinatorEpoch CommandKind = 1  // CommandBeginCoordinatorEpoch creates a leadership fence.
+	CommandRegisterWorker        CommandKind = 2  // CommandRegisterWorker creates or revives a worker.
+	CommandDrainWorker           CommandKind = 3  // CommandDrainWorker disables new placement.
+	CommandDeactivateWorker      CommandKind = 4  // CommandDeactivateWorker invalidates an incarnation.
+	CommandReplaceWorkerEpoch    CommandKind = 5  // CommandReplaceWorkerEpoch changes an incarnation.
+	CommandSubmitJob             CommandKind = 6  // CommandSubmitJob creates an immutable job.
+	CommandCancelJob             CommandKind = 7  // CommandCancelJob terminally cancels a job.
+	CommandRecordSourceEOF       CommandKind = 8  // CommandRecordSourceEOF commits one source bound.
+	CommandInstallAssignments    CommandKind = 9  // CommandInstallAssignments commits initial placement.
+	CommandReplaceAssignments    CommandKind = 10 // CommandReplaceAssignments resolves invalidated targets.
+	CommandAdvanceCheckpoint     CommandKind = 11 // CommandAdvanceCheckpoint commits worker progress.
+	CommandSealManifest          CommandKind = 12 // CommandSealManifest commits one result artifact.
+	CommandTransitionJob         CommandKind = 13 // CommandTransitionJob advances normal lifecycle.
+	CommandFailJob               CommandKind = 14 // CommandFailJob commits terminal failure.
 )
 
+// InternalCommandID is the stable deduplication identity of one coordinator command.
 type InternalCommandID [32]byte
 
+// SubjectKind selects the independently revisioned replicated subject.
 type SubjectKind uint8
 
 const (
-	SubjectNone             SubjectKind = 0
-	SubjectCoordinator      SubjectKind = 1
-	SubjectWorker           SubjectKind = 2
-	SubjectJobControl       SubjectKind = 3
-	SubjectSourceEOF        SubjectKind = 4
-	SubjectSourceCheckpoint SubjectKind = 5
-	SubjectResultManifest   SubjectKind = 6
+	SubjectNone             SubjectKind = 0 // SubjectNone is reserved for unbound results.
+	SubjectCoordinator      SubjectKind = 1 // SubjectCoordinator revisions leadership fences.
+	SubjectWorker           SubjectKind = 2 // SubjectWorker revisions one node record.
+	SubjectJobControl       SubjectKind = 3 // SubjectJobControl revisions job-wide control.
+	SubjectSourceEOF        SubjectKind = 4 // SubjectSourceEOF revisions one source bound.
+	SubjectSourceCheckpoint SubjectKind = 5 // SubjectSourceCheckpoint revisions source progress.
+	SubjectResultManifest   SubjectKind = 6 // SubjectResultManifest revisions one sink artifact.
 )
 
+// SubjectKey is the canonical tagged union identifying one revision history.
 type SubjectKey struct {
-	Kind     SubjectKind
-	JobID    model.JobID
-	TaskID   model.TaskID
-	WorkerID uint16
+	Kind     SubjectKind  // Kind selects the active union member.
+	JobID    model.JobID  // JobID identifies job-scoped subjects.
+	TaskID   model.TaskID // TaskID identifies source or sink scoped subjects.
+	WorkerID uint16       // WorkerID identifies worker-scoped subjects.
 }
 
 func (key SubjectKey) Validate() error {
@@ -86,24 +91,28 @@ func (key SubjectKey) Validate() error {
 	return nil
 }
 
+// ClientEnvelope carries public request identity and its logical digest.
 type ClientEnvelope struct {
-	Request model.ClientRequestID
-	Digest  [32]byte
+	Request model.ClientRequestID // Request provides client/session deduplication identity.
+	Digest  [32]byte              // Digest binds the logical public operation.
 }
 
+// InternalEnvelope carries exact coordinator identity and subject fencing.
 type InternalEnvelope struct {
-	ID               InternalCommandID
-	Digest           [32]byte
-	Subject          SubjectKey
-	ExpectedRevision uint64
+	ID               InternalCommandID // ID uniquely identifies the coordinator operation.
+	Digest           [32]byte          // Digest binds the fence, subject, revision, and target.
+	Subject          SubjectKey        // Subject selects the independent history.
+	ExpectedRevision uint64            // ExpectedRevision conditionally fences the transition.
 }
 
+// Envelope is the common schema, compatibility, coordinator, and identity fence.
 type Envelope struct {
-	SchemaVersion        uint16
-	ConsensusFingerprint [32]byte
-	Kind                 CommandKind
-	Client               *ClientEnvelope
-	Internal             *InternalEnvelope
+	SchemaVersion        uint16                 // SchemaVersion rejects unknown encodings.
+	ConsensusFingerprint [32]byte               // ConsensusFingerprint rejects mixed contracts.
+	Kind                 CommandKind            // Kind selects the concrete target layout.
+	CoordinatorEpoch     model.CoordinatorEpoch // CoordinatorEpoch fences every non-begin mutation.
+	Client               *ClientEnvelope        // Client is set only for public operations.
+	Internal             *InternalEnvelope      // Internal is set only for coordinator operations.
 }
 
 func (envelope Envelope) Validate() error {
@@ -115,6 +124,13 @@ func (envelope Envelope) Validate() error {
 	}
 	if envelope.Kind < CommandBeginCoordinatorEpoch || envelope.Kind > CommandFailJob {
 		return fmt.Errorf("%w: %d", ErrUnknownCommandKind, envelope.Kind)
+	}
+	if envelope.Kind == CommandBeginCoordinatorEpoch {
+		if envelope.CoordinatorEpoch != (model.CoordinatorEpoch{}) {
+			return errors.New("begin coordinator epoch carries a preexisting fence")
+		}
+	} else if err := envelope.CoordinatorEpoch.Validate(); err != nil {
+		return fmt.Errorf("command coordinator fence: %w", err)
 	}
 	if (envelope.Client == nil) == (envelope.Internal == nil) {
 		return errors.New("command must have exactly one identity")
@@ -141,10 +157,11 @@ func (envelope Envelope) Validate() error {
 	return nil
 }
 
+// BeginCoordinatorEpoch commits the sole constructor of a coordinator fence.
 type BeginCoordinatorEpoch struct {
-	Envelope    Envelope
-	Coordinator uint16
-	Nonce       [16]byte
+	Envelope    Envelope // Envelope carries the coordinator singleton subject.
+	Coordinator uint16   // Coordinator is the elected node ID.
+	Nonce       [16]byte // Nonce distinguishes leadership at the same node.
 }
 
 func (command BeginCoordinatorEpoch) Validate() error {
@@ -187,17 +204,18 @@ func NewBeginCoordinatorEpoch(id InternalCommandID, expectedRevision uint64, coo
 	return command, nil
 }
 
+// ResultCode is the stable replicated business-result category.
 type ResultCode uint16
 
 const (
-	ResultSuccess           ResultCode = 1
-	ResultIdentityReuse     ResultCode = 2
-	ResultStaleRequest      ResultCode = 3
-	ResultSkippedRequest    ResultCode = 4
-	ResultCapacityExhausted ResultCode = 5
-	ResultRevisionMismatch  ResultCode = 6
-	ResultStaleEpoch        ResultCode = 7
-	ResultResultTooLarge    ResultCode = 8
+	ResultSuccess           ResultCode = 1 // ResultSuccess reports a committed or exact replayed success.
+	ResultIdentityReuse     ResultCode = 2 // ResultIdentityReuse reports changed bytes under one identity.
+	ResultStaleRequest      ResultCode = 3 // ResultStaleRequest reports an older client sequence.
+	ResultSkippedRequest    ResultCode = 4 // ResultSkippedRequest reports a client sequence gap.
+	ResultCapacityExhausted ResultCode = 5 // ResultCapacityExhausted is stateless and retryable.
+	ResultRevisionMismatch  ResultCode = 6 // ResultRevisionMismatch reports a failed condition.
+	ResultStaleEpoch        ResultCode = 7 // ResultStaleEpoch reports the current coordinator fence.
+	ResultResultTooLarge    ResultCode = 8 // ResultResultTooLarge reports an uncacheable outcome.
 	// State-specific names map onto the stable v1 result categories.
 	ResultNotFound          ResultCode = ResultRevisionMismatch
 	ResultInvalidTransition ResultCode = ResultRevisionMismatch
@@ -206,13 +224,14 @@ const (
 	ResultStaleWorkerEvent  ResultCode = ResultRevisionMismatch
 )
 
+// CommandResult is the canonical cached outcome of one accepted operation.
 type CommandResult struct {
-	Code     ResultCode
-	Subject  SubjectKind
-	Revision uint64
-	JobID    model.JobID
-	WorkerID uint16
-	Epoch    model.CoordinatorEpoch
+	Code     ResultCode             // Code reports success or deterministic rejection.
+	Subject  SubjectKind            // Subject identifies the affected revision domain.
+	Revision uint64                 // Revision reports the authoritative subject revision.
+	JobID    model.JobID            // JobID correlates job-scoped results.
+	WorkerID uint16                 // WorkerID correlates worker-scoped results.
+	Epoch    model.CoordinatorEpoch // Epoch reports coordinator success or the current stale fence.
 }
 
 func (result CommandResult) Validate() error {
@@ -266,6 +285,12 @@ func (result CommandResult) Validate() error {
 			}
 		} else if err := result.Epoch.Validate(); err != nil {
 			return fmt.Errorf("%w: coordinator result epoch: %v", ErrInvalidCommandSubject, err)
+		}
+	case model.StateCommandEpochCurrentFence:
+		if result.Epoch != zeroEpoch {
+			if err := result.Epoch.Validate(); err != nil {
+				return fmt.Errorf("%w: stale result coordinator epoch: %v", ErrInvalidCommandSubject, err)
+			}
 		}
 	default:
 		return errors.New("impossible result epoch policy")

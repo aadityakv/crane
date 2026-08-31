@@ -9,27 +9,44 @@ import (
 
 const rendezvousDomain = "cs425/crane/rendezvous/v1\x00"
 
+// AssignmentSetDigestDomainV1 is the immutable domain separator for complete
+// assignment-set identity.
+const AssignmentSetDigestDomainV1 = "cs425/crane/assignment-set/v1"
+
+var assignmentSetDigestLayoutV1 = []string{
+	"Domain:cs425/crane/assignment-set/v1+zero",
+	"JobID:bytes16(nonzero)",
+	"Revision:u64(nonzero)",
+	"Tasks:u16-count+list(TaskID,WorkerID,WorkerEpoch,Attempt,SpecificationHash,AssignmentRevision)",
+	"ResultReplicas:u16-count+list(SinkTask,PrimaryNodeID,SecondaryNodeID,PrimaryEpoch,SecondaryEpoch)",
+}
+
+// AssignmentSetDigestLayoutV1 returns the exact owned canonical hash layout.
+func AssignmentSetDigestLayoutV1() []string {
+	return append([]string(nil), assignmentSetDigestLayoutV1...)
+}
+
 // WorkerPlacement is one current eligible worker and its committed executor capacity.
 type WorkerPlacement struct {
-	NodeID       uint16
-	WorkerEpoch  WorkerEpoch
-	SlotCapacity uint16
+	NodeID       uint16      // NodeID is the stable eligible worker ID.
+	WorkerEpoch  WorkerEpoch // WorkerEpoch binds the exact current incarnation.
+	SlotCapacity uint16      // SlotCapacity is residual task-token capacity.
 }
 
 // ResultReplicaSet assigns one collect partition to two current worker epochs.
 type ResultReplicaSet struct {
-	SinkTask                       TaskID
-	PrimaryNodeID, SecondaryNodeID uint16
-	PrimaryEpoch, SecondaryEpoch   WorkerEpoch
+	SinkTask                       TaskID      // SinkTask identifies one collect partition.
+	PrimaryNodeID, SecondaryNodeID uint16      // Node IDs identify two distinct durable copies.
+	PrimaryEpoch, SecondaryEpoch   WorkerEpoch // Epochs bind each exact worker incarnation.
 }
 
 // AssignmentSet is the complete canonical placement for one job revision.
 type AssignmentSet struct {
-	JobID          JobID
-	Revision       uint64
-	Digest         [32]byte
-	Tasks          []AssignmentToken
-	ResultReplicas []ResultReplicaSet
+	JobID          JobID              // JobID identifies the complete placement owner.
+	Revision       uint64             // Revision monotonically identifies the set.
+	Digest         [32]byte           // Digest binds all canonical set fields.
+	Tasks          []AssignmentToken  // Tasks is the sorted complete task-token list.
+	ResultReplicas []ResultReplicaSet // ResultReplicas is the sorted complete sink-copy list.
 }
 
 // NewAssignmentSet owns one explicit complete placement, calculates its
@@ -286,7 +303,7 @@ func preferRendezvous(candidate [32]byte, candidateNode uint16, current [32]byte
 }
 
 func assignmentDigest(set AssignmentSet) [32]byte {
-	encoded := append([]byte("cs425/crane/assignment-set/v1\x00"), set.JobID[:]...)
+	encoded := append([]byte(AssignmentSetDigestDomainV1+"\x00"), set.JobID[:]...)
 	encoded = appendUint64(encoded, set.Revision)
 	encoded = appendUint16(encoded, uint16(len(set.Tasks)))
 	for _, token := range set.Tasks {
