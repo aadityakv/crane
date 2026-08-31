@@ -174,6 +174,50 @@ func TestDatagramSendFromUsesSelectedBoundEndpoint(t *testing.T) {
 	}
 }
 
+func TestDatagramTruncationSignalUsesBoundedReadMsgUDP(t *testing.T) {
+	endpoint := freeUDPEndpoint(t)
+	datagram, err := ListenUDPBounded(1200, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = datagram.Close() })
+
+	sender, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sender.Close() })
+	destination, _ := net.ResolveUDPAddr("udp", endpoint.String())
+	if _, err := sender.WriteToUDP(make([]byte, 1201), destination); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	packet, err := datagram.Receive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !packet.Truncated || len(packet.Data) != 1200 {
+		t.Fatalf("oversized packet truncated=%t bytes=%d, want true/1200", packet.Truncated, len(packet.Data))
+	}
+
+	// Existing SWIM construction keeps the complete UDP payload behavior.
+	unboundedEndpoint := freeUDPEndpoint(t)
+	unbounded, err := ListenUDP(unboundedEndpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unbounded.Close() })
+	unboundedDestination, _ := net.ResolveUDPAddr("udp", unboundedEndpoint.String())
+	if _, err := sender.WriteToUDP(make([]byte, 1201), unboundedDestination); err != nil {
+		t.Fatal(err)
+	}
+	full, err := unbounded.Receive(ctx)
+	if err != nil || full.Truncated || len(full.Data) != 1201 {
+		t.Fatalf("legacy receive truncated=%t bytes=%d err=%v", full.Truncated, len(full.Data), err)
+	}
+}
+
 func freeUDPEndpoint(t *testing.T) config.Endpoint {
 	t.Helper()
 	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})

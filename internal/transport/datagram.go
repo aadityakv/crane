@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/config"
@@ -28,8 +29,9 @@ var (
 
 // Packet is an independently owned datagram and its source address.
 type Packet struct {
-	From config.Endpoint
-	Data []byte
+	From      config.Endpoint
+	Data      []byte
+	Truncated bool // Truncated reports that bytes beyond the receive bound were discarded.
 }
 
 // Datagram is the packet transport used by the SWIM service.
@@ -65,18 +67,34 @@ type UDPDatagram struct {
 	readers     sync.WaitGroup
 	writeMu     sync.Mutex
 	resolver    IPResolver
+	receiveSize int
 }
 
 // ListenUDP binds every endpoint and returns one aggregate datagram transport.
 func ListenUDP(endpoints ...config.Endpoint) (*UDPDatagram, error) {
-	return ListenUDPWithResolver(nil, endpoints...)
+	return ListenUDPBoundedWithResolver(nil, maxUDPDatagramSize, endpoints...)
 }
 
 // ListenUDPWithResolver binds every endpoint and uses resolver for
 // context-aware outbound DNS resolution.
 func ListenUDPWithResolver(resolver IPResolver, endpoints ...config.Endpoint) (*UDPDatagram, error) {
+	return ListenUDPBoundedWithResolver(resolver, maxUDPDatagramSize, endpoints...)
+}
+
+// ListenUDPBounded binds every endpoint and reports datagrams larger than
+// maxReceiveBytes as truncated instead of silently treating their prefix as a
+// complete protocol frame.
+func ListenUDPBounded(maxReceiveBytes int, endpoints ...config.Endpoint) (*UDPDatagram, error) {
+	return ListenUDPBoundedWithResolver(nil, maxReceiveBytes, endpoints...)
+}
+
+// ListenUDPBoundedWithResolver is ListenUDPBounded with an injected resolver.
+func ListenUDPBoundedWithResolver(resolver IPResolver, maxReceiveBytes int, endpoints ...config.Endpoint) (*UDPDatagram, error) {
 	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("%w: no bind endpoints", ErrInvalidDatagramEndpoint)
+	}
+	if maxReceiveBytes <= 0 || maxReceiveBytes > maxUDPDatagramSize {
+		return nil, fmt.Errorf("%w: receive bound %d", ErrInvalidDatagramEndpoint, maxReceiveBytes)
 	}
 	if resolver == nil {
 		resolver = net.DefaultResolver
@@ -105,6 +123,7 @@ func ListenUDPWithResolver(resolver IPResolver, endpoints ...config.Endpoint) (*
 		errors:      make(chan error, len(connections)),
 		done:        make(chan struct{}),
 		resolver:    resolver,
+		receiveSize: maxReceiveBytes,
 	}
 	for _, connection := range connections {
 		datagram.readers.Add(1)
@@ -224,9 +243,9 @@ func (d *UDPDatagram) Close() error {
 
 func (d *UDPDatagram) read(connection *net.UDPConn) {
 	defer d.readers.Done()
-	buffer := make([]byte, maxUDPDatagramSize)
+	buffer := make([]byte, d.receiveSize)
 	for {
-		count, source, err := connection.ReadFromUDP(buffer)
+		count, _, flags, source, err := connection.ReadMsgUDP(buffer, nil)
 		if err != nil {
 			select {
 			case <-d.done:
@@ -243,8 +262,9 @@ func (d *UDPDatagram) read(connection *net.UDPConn) {
 			continue
 		}
 		packet := Packet{
-			From: config.Endpoint{Host: source.IP.String(), Port: uint16(source.Port)},
-			Data: append([]byte(nil), buffer[:count]...),
+			From:      config.Endpoint{Host: source.IP.String(), Port: uint16(source.Port)},
+			Data:      append([]byte(nil), buffer[:count]...),
+			Truncated: flags&syscall.MSG_TRUNC != 0,
 		}
 		select {
 		case d.packets <- packet:

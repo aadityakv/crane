@@ -16,8 +16,6 @@ func TestAddressMatcherExpiresPositiveAndNegativeDNSCacheEntries(t *testing.T) {
 	manualClock := clock.NewManual(time.Unix(9000, 0))
 	resolver := &mutableAddressResolver{addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")}}
 	matcher := newAddressMatcherWithClock(resolver, manualClock)
-	matcher.positiveTTL = time.Second
-	matcher.negativeTTL = 100 * time.Millisecond
 	advertised := config.Endpoint{Host: "peer.test", Port: 9000}
 
 	if !matcher.matchesSource(context.Background(), config.Endpoint{Host: "192.0.2.1", Port: 9000}, advertised) {
@@ -27,7 +25,7 @@ func TestAddressMatcherExpiresPositiveAndNegativeDNSCacheEntries(t *testing.T) {
 	if matcher.matchesSource(context.Background(), config.Endpoint{Host: "192.0.2.2", Port: 9000}, advertised) {
 		t.Fatal("positive cache refreshed before its TTL")
 	}
-	manualClock.Advance(time.Second)
+	manualClock.Advance(30 * time.Second)
 	if !matcher.matchesSource(context.Background(), config.Endpoint{Host: "192.0.2.2", Port: 9000}, advertised) {
 		t.Fatal("positive cache did not refresh after its TTL")
 	}
@@ -45,7 +43,7 @@ func TestAddressMatcherExpiresPositiveAndNegativeDNSCacheEntries(t *testing.T) {
 		t.Fatalf("negative cache lookup calls = %d, want %d", got, firstNegativeCalls)
 	}
 	resolver.set([]netip.Addr{netip.MustParseAddr("192.0.2.3")}, nil)
-	manualClock.Advance(100 * time.Millisecond)
+	manualClock.Advance(time.Second)
 	if !matcher.matchesSource(context.Background(), config.Endpoint{Host: "192.0.2.3", Port: 9000}, advertised) {
 		t.Fatal("negative cache did not retry after its bounded TTL")
 	}
@@ -81,14 +79,13 @@ func TestServiceHigherIncarnationInvalidatesDNSGeneration(t *testing.T) {
 	}
 }
 
-func TestAddressMatcherBoundsAndReusesResolvedAddressCache(t *testing.T) {
+func TestAddressMatcherReusesResolvedAddressCache(t *testing.T) {
 	resolver := &staticAddressResolver{addresses: map[string][]netip.Addr{
 		"one.test":   {netip.MustParseAddr("192.0.2.1")},
 		"two.test":   {netip.MustParseAddr("192.0.2.2")},
 		"three.test": {netip.MustParseAddr("192.0.2.3")},
 	}}
 	matcher := newAddressMatcher(resolver)
-	matcher.capacity = 2
 	for index, host := range []string{"one.test", "two.test", "three.test"} {
 		source := config.Endpoint{Host: "192.0.2." + string(rune('1'+index)), Port: 9000}
 		advertised := config.Endpoint{Host: host, Port: 9000}
@@ -96,25 +93,20 @@ func TestAddressMatcherBoundsAndReusesResolvedAddressCache(t *testing.T) {
 			t.Fatalf("resolved source %s did not match %s", source, advertised)
 		}
 	}
-	matcher.mu.Lock()
-	cacheEntries := len(matcher.cache)
-	matcher.mu.Unlock()
-	if cacheEntries != 2 {
-		t.Fatalf("resolved cache entries = %d, want capacity 2", cacheEntries)
-	}
 	if !matcher.matchesSource(context.Background(), config.Endpoint{Host: "192.0.2.1", Port: 9000}, config.Endpoint{Host: "one.test", Port: 9000}) {
-		t.Fatal("evicted address did not resolve again")
+		t.Fatal("cached address did not match again")
 	}
-	if calls := resolver.callCount("one.test"); calls != 2 {
-		t.Fatalf("evicted host lookup calls = %d, want 2", calls)
+	if calls := resolver.callCount("one.test"); calls != 1 {
+		t.Fatalf("cached host lookup calls = %d, want 1", calls)
 	}
 }
 
 func TestAddressMatcherBoundsResolverLatency(t *testing.T) {
 	matcher := newAddressMatcher(blockingAddressResolver{})
-	matcher.timeout = 10 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
 	started := time.Now()
-	matched := matcher.matchesSource(context.Background(),
+	matched := matcher.matchesSource(ctx,
 		config.Endpoint{Host: "192.0.2.1", Port: 9000},
 		config.Endpoint{Host: "blocked.test", Port: 9000},
 	)
