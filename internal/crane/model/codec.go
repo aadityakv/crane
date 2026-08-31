@@ -47,7 +47,7 @@ func UnmarshalTuple(encoded []byte) (Tuple, error) {
 	if err != nil {
 		return Tuple{}, err
 	}
-	if count > maxTupleFields {
+	if uint64(count) > LimitsV1().MaxTupleFields {
 		return Tuple{}, errors.New("tuple field count exceeds limit")
 	}
 	if int(count) > reader.remaining()/3 {

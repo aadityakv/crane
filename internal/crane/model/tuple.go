@@ -6,8 +6,6 @@ import (
 	"unicode/utf8"
 )
 
-const maxTupleFields = 64
-
 // ValueType is the stable tag for one tuple scalar value.
 type ValueType uint8
 
@@ -38,8 +36,9 @@ type Tuple struct {
 
 // Validate checks canonical field ordering, bounds, and scalar representation.
 func (tuple Tuple) Validate() error {
-	if len(tuple.Fields) > maxTupleFields {
-		return fmt.Errorf("tuple has %d fields, maximum is %d", len(tuple.Fields), maxTupleFields)
+	maxFields := LimitsV1().MaxTupleFields
+	if uint64(len(tuple.Fields)) > maxFields {
+		return fmt.Errorf("tuple has %d fields, maximum is %d", len(tuple.Fields), maxFields)
 	}
 	previous := ""
 	for index, field := range tuple.Fields {

@@ -26,6 +26,7 @@ type ConsensusLimits struct {
 	MaxSourceSequences          uint64
 	MaxOperatorOutputs          uint64
 	MaxDerivedDeliveries        uint64
+	MaxTupleFields              uint64
 	MaxTupleFieldPayloadBytes   uint64
 	MaxSubmitJobBytes           uint64
 	SubmitJobOverheadBytes      uint64
@@ -63,6 +64,7 @@ func LimitsV1() ConsensusLimits {
 		MaxSourceSequences:          1_000_000,
 		MaxOperatorOutputs:          16,
 		MaxDerivedDeliveries:        4096,
+		MaxTupleFields:              64,
 		MaxTupleFieldPayloadBytes:   512,
 		MaxSubmitJobBytes:           maxSubmitJobBytes,
 		SubmitJobOverheadBytes:      submitJobOverheadBytes,

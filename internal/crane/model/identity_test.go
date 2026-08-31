@@ -86,6 +86,38 @@ func TestIdentityValidationDistinguishesReuseFromExactRetry(t *testing.T) {
 	}
 }
 
+func TestDeriveChildTupleIDRejectsForeignJobProducer(t *testing.T) {
+	job := jobIDFixture()
+	parent := DeriveSourceTupleID(job, TaskID{JobID: job, StageID: 1}, 1)
+	foreign := JobID{0xff}
+	got := DeriveChildTupleID(parent, TaskID{JobID: foreign, StageID: 2}, 1, 0)
+	if got != (TupleID{}) {
+		t.Fatalf("DeriveChildTupleID accepted foreign producer job: %#v", got)
+	}
+}
+
+func TestDeriveSourceTupleIDRejectsForeignJobSource(t *testing.T) {
+	job := jobIDFixture()
+	got := DeriveSourceTupleID(job, TaskID{JobID: JobID{0xff}, StageID: 1}, 1)
+	if got != (TupleID{}) {
+		t.Fatalf("DeriveSourceTupleID accepted foreign source job: %#v", got)
+	}
+}
+
+func TestValidateIdentityReuseAcceptsExactRetryAndRejectsCollision(t *testing.T) {
+	identity := jobIDFixture()
+	stored := []byte{0, 1, 2, 3}
+	if err := ValidateIdentityReuse(identity, identity, stored, []byte{0, 1, 2, 3}); err != nil {
+		t.Fatalf("exact identity retry rejected: %v", err)
+	}
+	if err := ValidateIdentityReuse(identity, identity, stored, []byte{0, 1, 2, 4}); err == nil {
+		t.Fatal("same identity with different defining bytes accepted")
+	}
+	if err := ValidateIdentityReuse(identity, JobID{0xff}, stored, []byte{0, 1, 2, 4}); err != nil {
+		t.Fatalf("distinct identity rejected: %v", err)
+	}
+}
+
 func jobIDFixture() JobID {
 	return JobID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 }

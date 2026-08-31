@@ -1,10 +1,15 @@
 package model
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 )
+
+// ErrIdentityReuse reports one existing identity presented with different
+// canonical defining bytes.
+var ErrIdentityReuse = errors.New("identity reuse with different defining bytes")
 
 const (
 	jobIDDomain         = "cs425/crane/job/v1\x00"
@@ -193,6 +198,9 @@ func DeriveJobID(request ClientRequestID, topologyDigest [32]byte) JobID {
 
 // DeriveSourceTupleID derives the path digest of one source emission.
 func DeriveSourceTupleID(job JobID, source TaskID, sequence uint64) TupleID {
+	if job.Validate() != nil || source.Validate() != nil || source.JobID != job || sequence == 0 {
+		return TupleID{}
+	}
 	encoded := make([]byte, 0, len(sourceTupleIDDomain)+16+20+8)
 	encoded = append(encoded, sourceTupleIDDomain...)
 	encoded = append(encoded, job[:]...)
@@ -203,6 +211,9 @@ func DeriveSourceTupleID(job JobID, source TaskID, sequence uint64) TupleID {
 
 // DeriveChildTupleID preserves the source identity and derives a distinct path.
 func DeriveChildTupleID(parent TupleID, producer TaskID, edgeID, outputOrdinal uint16) TupleID {
+	if parent.Validate() != nil || producer.Validate() != nil || producer.JobID != parent.JobID || edgeID == 0 {
+		return TupleID{}
+	}
 	encoded := make([]byte, 0, len(childTupleIDDomain)+76+20+2+2)
 	encoded = append(encoded, childTupleIDDomain...)
 	encoded = appendTupleID(encoded, parent)
@@ -210,6 +221,16 @@ func DeriveChildTupleID(parent TupleID, producer TaskID, edgeID, outputOrdinal u
 	encoded = appendUint16(encoded, edgeID)
 	encoded = appendUint16(encoded, outputOrdinal)
 	return TupleID{JobID: parent.JobID, SourceTask: parent.SourceTask, SourceSequence: parent.SourceSequence, PathDigest: sha256.Sum256(encoded)}
+}
+
+// ValidateIdentityReuse accepts an exact retry and rejects a collision where
+// the same comparable identity is paired with different defining bytes.
+// Distinct identities are independent records and are accepted.
+func ValidateIdentityReuse[T comparable](storedID, presentedID T, storedDefinition, presentedDefinition []byte) error {
+	if storedID == presentedID && !bytes.Equal(storedDefinition, presentedDefinition) {
+		return ErrIdentityReuse
+	}
+	return nil
 }
 
 func appendTaskID(destination []byte, task TaskID) []byte {

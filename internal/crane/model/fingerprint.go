@@ -39,7 +39,8 @@ func ConsensusFingerprint() [32]byte {
 		limits.MaxEdges, limits.MaxTasksPerStage, limits.MaxTasksPerJob,
 		limits.MaxSettingsPerStage, limits.MaxSettingKeyBytes, limits.MaxSettingValueBytes,
 		limits.MaxTotalSettingsBytes, limits.MaxSourceSequences, limits.MaxOperatorOutputs,
-		limits.MaxDerivedDeliveries, limits.MaxTupleFieldPayloadBytes, limits.MaxSubmitJobBytes,
+		limits.MaxDerivedDeliveries, limits.MaxTupleFields, limits.MaxTupleFieldPayloadBytes,
+		limits.MaxSubmitJobBytes,
 		limits.SubmitJobOverheadBytes, limits.SubmitRequestOverheadBytes,
 		limits.AssignmentSetOverheadBytes, limits.MaxTopologyBytes,
 	} {
