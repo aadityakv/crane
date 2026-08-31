@@ -2153,6 +2153,826 @@ func newTupleDecoder(input []byte, schema uint16, message wire.MessageType) (tup
 	return decoder, nil
 }
 
+// MarshalControlMessage validates and emits the sole canonical payload for IDs 240-249.
+func MarshalControlMessage(message ControlMessage) ([]byte, error) {
+	if message == nil || message.MessageType() < wire.MessageCraneSubmitRequest || message.MessageType() > wire.MessageCraneControlError {
+		return nil, ErrUnexpectedControlMessage
+	}
+	if err := validateControlMessage(message); err != nil {
+		return nil, invalidControl(message, err)
+	}
+	encoder := controlEncoder{}
+	encoder.u16(ControlSchemaVersion)
+	encoder.u16(uint16(message.MessageType()))
+	if err := encoder.message(message); err != nil {
+		return nil, err
+	}
+	return encoder.owned(), nil
+}
+
+// UnmarshalControlMessage decodes one complete canonical payload for IDs 240-249.
+func UnmarshalControlMessage(messageType wire.MessageType, encoded []byte) (ControlMessage, error) {
+	return unmarshalControlMessageWith(messageType, encoded, model.DecodeTopology)
+}
+
+// ControlEncodingLayout returns the top-level order exercised by the actual encoder.
+func ControlEncodingLayout(message ControlMessage) ([]model.PublicControlFieldDescriptor, error) {
+	if message == nil || message.MessageType() < wire.MessageCraneSubmitRequest || message.MessageType() > wire.MessageCraneControlError {
+		return nil, ErrUnexpectedControlMessage
+	}
+	if err := validateControlMessage(message); err != nil {
+		return nil, invalidControl(message, err)
+	}
+	encoder := controlEncoder{trace: true}
+	if err := encoder.message(message); err != nil {
+		return nil, err
+	}
+	return append([]model.PublicControlFieldDescriptor(nil), encoder.layout...), nil
+}
+
+// MarshalSubmitRequest emits a canonical submit request.
+func MarshalSubmitRequest(value SubmitRequest) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalSubmitRequest decodes a canonical submit request.
+func UnmarshalSubmitRequest(encoded []byte) (SubmitRequest, error) {
+	return unmarshalSubmitRequestWith(encoded, model.DecodeTopology)
+}
+
+// MarshalSubmitResponse emits a canonical submit response.
+func MarshalSubmitResponse(value SubmitResponse) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalSubmitResponse decodes a canonical submit response.
+func UnmarshalSubmitResponse(encoded []byte) (SubmitResponse, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneSubmitResponse, encoded)
+	if err != nil {
+		return SubmitResponse{}, err
+	}
+	return value.(SubmitResponse), nil
+}
+
+// MarshalCancelRequest emits a canonical cancel request.
+func MarshalCancelRequest(value CancelRequest) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalCancelRequest decodes a canonical cancel request.
+func UnmarshalCancelRequest(encoded []byte) (CancelRequest, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneCancelRequest, encoded)
+	if err != nil {
+		return CancelRequest{}, err
+	}
+	return value.(CancelRequest), nil
+}
+
+// MarshalCancelResponse emits a canonical cancel response.
+func MarshalCancelResponse(value CancelResponse) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalCancelResponse decodes a canonical cancel response.
+func UnmarshalCancelResponse(encoded []byte) (CancelResponse, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneCancelResponse, encoded)
+	if err != nil {
+		return CancelResponse{}, err
+	}
+	return value.(CancelResponse), nil
+}
+
+// MarshalStatusRequest emits a canonical status request.
+func MarshalStatusRequest(value StatusRequest) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalStatusRequest decodes a canonical status request.
+func UnmarshalStatusRequest(encoded []byte) (StatusRequest, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneStatusRequest, encoded)
+	if err != nil {
+		return StatusRequest{}, err
+	}
+	return value.(StatusRequest), nil
+}
+
+// MarshalStatusResponse emits a canonical status response.
+func MarshalStatusResponse(value StatusResponse) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalStatusResponse decodes a canonical status response.
+func UnmarshalStatusResponse(encoded []byte) (StatusResponse, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneStatusResponse, encoded)
+	if err != nil {
+		return StatusResponse{}, err
+	}
+	return value.(StatusResponse), nil
+}
+
+// MarshalResultPageRequest emits a canonical result-page request.
+func MarshalResultPageRequest(value ResultPageRequest) ([]byte, error) {
+	return MarshalControlMessage(value)
+}
+
+// UnmarshalResultPageRequest decodes a canonical result-page request.
+func UnmarshalResultPageRequest(encoded []byte) (ResultPageRequest, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneResultPageRequest, encoded)
+	if err != nil {
+		return ResultPageRequest{}, err
+	}
+	return value.(ResultPageRequest), nil
+}
+
+// MarshalResultPageResponse emits a canonical result-page response.
+func MarshalResultPageResponse(value ResultPageResponse) ([]byte, error) {
+	return MarshalControlMessage(value)
+}
+
+// UnmarshalResultPageResponse decodes a canonical result-page response.
+func UnmarshalResultPageResponse(encoded []byte) (ResultPageResponse, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneResultPageResponse, encoded)
+	if err != nil {
+		return ResultPageResponse{}, err
+	}
+	return value.(ResultPageResponse), nil
+}
+
+// MarshalLeaderRedirect emits a canonical leader redirect.
+func MarshalLeaderRedirect(value LeaderRedirect) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalLeaderRedirect decodes a canonical leader redirect.
+func UnmarshalLeaderRedirect(encoded []byte) (LeaderRedirect, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneLeaderRedirect, encoded)
+	if err != nil {
+		return LeaderRedirect{}, err
+	}
+	return value.(LeaderRedirect), nil
+}
+
+// MarshalControlError emits a canonical public-control error.
+func MarshalControlError(value ControlError) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalControlError decodes a canonical public-control error.
+func UnmarshalControlError(encoded []byte) (ControlError, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneControlError, encoded)
+	if err != nil {
+		return ControlError{}, err
+	}
+	return value.(ControlError), nil
+}
+
+func unmarshalSubmitRequestWith(encoded []byte, decode topologyDecodeFunc) (SubmitRequest, error) {
+	value, err := unmarshalControlMessageWith(wire.MessageCraneSubmitRequest, encoded, decode)
+	if err != nil {
+		return SubmitRequest{}, err
+	}
+	return value.(SubmitRequest), nil
+}
+
+func unmarshalControlMessageWith(messageType wire.MessageType, encoded []byte, decode topologyDecodeFunc) (ControlMessage, error) {
+	if messageType < wire.MessageCraneSubmitRequest || messageType > wire.MessageCraneControlError {
+		return nil, ErrUnexpectedControlMessage
+	}
+	if len(encoded) > MaxControlPayloadBytes {
+		return nil, fmt.Errorf("%w: %d", ErrControlMessageTooLarge, len(encoded))
+	}
+	decoder := controlDecoder{input: encoded, decodeTopology: decode}
+	version, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	if version != ControlSchemaVersion {
+		return nil, fmt.Errorf("%w: %d", ErrUnsupportedControlSchema, version)
+	}
+	gotType, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	if wire.MessageType(gotType) != messageType {
+		return nil, fmt.Errorf("%w: got %d want %d", ErrUnexpectedControlMessage, gotType, messageType)
+	}
+	message, err := decoder.message(messageType)
+	if err != nil {
+		return nil, err
+	}
+	if err := decoder.finish(); err != nil {
+		return nil, err
+	}
+	if err := validateControlMessage(message); err != nil {
+		return nil, invalidControl(message, err)
+	}
+	canonical, err := MarshalControlMessage(message)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return nil, fmt.Errorf("%w: non-canonical payload", ErrMalformedControlMessage)
+	}
+	return message, nil
+}
+
+type controlEncoder struct {
+	output []byte
+	err    error
+	trace  bool
+	layout []model.PublicControlFieldDescriptor
+}
+
+func (encoder *controlEncoder) owned() []byte { return append([]byte(nil), encoder.output...) }
+
+func (encoder *controlEncoder) add(value []byte) {
+	if encoder.err != nil {
+		return
+	}
+	if len(value) > MaxControlPayloadBytes-len(encoder.output) {
+		encoder.err = ErrControlMessageTooLarge
+		return
+	}
+	encoder.output = append(encoder.output, value...)
+}
+
+func (encoder *controlEncoder) field(name, encoding string, appendValue func()) {
+	if encoder.trace {
+		encoder.layout = append(encoder.layout, model.PublicControlFieldDescriptor{Name: name, Encoding: encoding})
+	}
+	appendValue()
+}
+
+func (encoder *controlEncoder) u8(value byte) { encoder.add([]byte{value}) }
+func (encoder *controlEncoder) bool(value bool) {
+	if value {
+		encoder.u8(1)
+	} else {
+		encoder.u8(0)
+	}
+}
+func (encoder *controlEncoder) u16(value uint16) {
+	var encoded [2]byte
+	binary.BigEndian.PutUint16(encoded[:], value)
+	encoder.add(encoded[:])
+}
+func (encoder *controlEncoder) u32(value uint32) {
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], value)
+	encoder.add(encoded[:])
+}
+func (encoder *controlEncoder) u64(value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	encoder.add(encoded[:])
+}
+func (encoder *controlEncoder) bytes16(value []byte) {
+	if len(value) > math.MaxUint16 {
+		encoder.err = ErrControlMessageTooLarge
+		return
+	}
+	encoder.u16(uint16(len(value)))
+	encoder.add(value)
+}
+func (encoder *controlEncoder) request(value model.ClientRequestID) {
+	encoder.add(value.ClientID[:])
+	encoder.u64(value.Sequence)
+}
+func (encoder *controlEncoder) task(value model.TaskID) {
+	encoder.add(value.JobID[:])
+	encoder.u16(value.StageID)
+	encoder.u16(value.Partition)
+}
+func (encoder *controlEncoder) tuple(value model.TupleID) {
+	encoder.add(value.JobID[:])
+	encoder.task(value.SourceTask)
+	encoder.u64(value.SourceSequence)
+	encoder.add(value.PathDigest[:])
+}
+func (encoder *controlEncoder) pageBinding(value ResultPageRequest) {
+	encoder.add(value.JobID[:])
+	encoder.add(value.ManifestDigest[:])
+	encoder.bool(value.HasLastTuple)
+	encoder.tuple(value.Last)
+	encoder.u32(value.PageBytes)
+}
+
+func (encoder *controlEncoder) message(message ControlMessage) error {
+	switch value := message.(type) {
+	case SubmitRequest:
+		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
+		encoder.field("Topology", "TopologySpec", func() {
+			validated, _ := model.ValidateTopology(value.Topology)
+			encoder.add(validated.CanonicalBytes())
+		})
+		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
+	case SubmitResponse:
+		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
+		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobControlRevision", "u64", func() { encoder.u64(value.JobControlRevision) })
+		encoder.field("State", "u8", func() { encoder.u8(byte(value.State)) })
+	case CancelRequest:
+		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
+		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("ExpectedJobControlRevision", "u64", func() { encoder.u64(value.ExpectedJobControlRevision) })
+		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
+	case CancelResponse:
+		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
+		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobControlRevision", "u64", func() { encoder.u64(value.JobControlRevision) })
+		encoder.field("State", "u8", func() { encoder.u8(byte(value.State)) })
+	case StatusRequest:
+		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+	case StatusResponse:
+		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("AppliedIndex", "u64", func() { encoder.u64(value.AppliedIndex) })
+		encoder.field("TopologyDigest", "sha256", func() { encoder.add(value.TopologyDigest[:]) })
+		encoder.field("JobControlRevision", "u64", func() { encoder.u64(value.JobControlRevision) })
+		encoder.field("State", "u8", func() { encoder.u8(byte(value.State)) })
+		encoder.field("HasAssignment", "bool", func() { encoder.bool(value.HasAssignment) })
+		encoder.field("AssignmentRevision", "u64", func() { encoder.u64(value.AssignmentRevision) })
+		encoder.field("AssignmentDigest", "sha256", func() { encoder.add(value.AssignmentDigest[:]) })
+		encoder.field("SourceTaskCount", "u16", func() { encoder.u16(value.SourceTaskCount) })
+		encoder.field("CompletedSourceTasks", "u16", func() { encoder.u16(value.CompletedSourceTasks) })
+		encoder.field("ManifestCount", "u16", func() { encoder.u16(value.ManifestCount) })
+		encoder.field("HasManifestSet", "bool", func() { encoder.bool(value.HasManifestSet) })
+		encoder.field("ManifestSetDigest", "sha256", func() { encoder.add(value.ManifestSetDigest[:]) })
+		encoder.field("HasFailure", "bool", func() { encoder.bool(value.HasFailure) })
+		encoder.field("FailureCode", "u16", func() { encoder.u16(uint16(value.FailureCode)) })
+		encoder.field("FailureDetailDigest", "sha256", func() { encoder.add(value.FailureDetailDigest[:]) })
+	case ResultPageRequest:
+		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("ManifestDigest", "sha256", func() { encoder.add(value.ManifestDigest[:]) })
+		encoder.field("HasLastTuple", "bool", func() { encoder.bool(value.HasLastTuple) })
+		encoder.field("Last", "TupleID", func() { encoder.tuple(value.Last) })
+		encoder.field("PageBytes", "u32", func() { encoder.u32(value.PageBytes) })
+	case ResultPageResponse:
+		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("ManifestDigest", "sha256", func() { encoder.add(value.ManifestDigest[:]) })
+		encoder.field("RequestHasLastTuple", "bool", func() { encoder.bool(value.RequestHasLastTuple) })
+		encoder.field("RequestLast", "TupleID", func() { encoder.tuple(value.RequestLast) })
+		encoder.field("PageBytes", "u32", func() { encoder.u32(value.PageBytes) })
+		encoder.field("Records", "list(ResultRecordEntry)", func() {
+			encoder.u16(uint16(len(value.Records)))
+			for _, record := range value.Records {
+				stream, _ := model.MarshalResultRecord(record)
+				encoder.u32(uint32(len(stream)))
+				encoder.add(stream)
+			}
+		})
+		encoder.field("NextHasLastTuple", "bool", func() { encoder.bool(value.NextHasLastTuple) })
+		encoder.field("NextLast", "TupleID", func() { encoder.tuple(value.NextLast) })
+		encoder.field("End", "bool", func() { encoder.bool(value.End) })
+	case LeaderRedirect:
+		encoder.field("Endpoints", "list(string16)", func() {
+			encoder.u16(uint16(len(value.Endpoints)))
+			for _, endpoint := range value.Endpoints {
+				encoder.bytes16([]byte(endpoint))
+			}
+		})
+	case ControlError:
+		encoder.field("RelatedMessage", "u16", func() { encoder.u16(uint16(value.RelatedMessage)) })
+		encoder.field("Code", "u16", func() { encoder.u16(uint16(value.Code)) })
+		encoder.field("Retryable", "bool", func() { encoder.bool(value.Retryable) })
+		encoder.field("HasClientRequest", "bool", func() { encoder.bool(value.HasClientRequest) })
+		encoder.field("ClientRequest", "ClientRequestID", func() { encoder.request(value.ClientRequest) })
+		encoder.field("ClientDigest", "sha256", func() { encoder.add(value.ClientDigest[:]) })
+		encoder.field("HasResultPage", "bool", func() { encoder.bool(value.HasResultPage) })
+		encoder.field("ResultPage", "ResultPageBinding", func() { encoder.pageBinding(value.ResultPage) })
+		encoder.field("RequiredBytes", "u32", func() { encoder.u32(value.RequiredBytes) })
+		encoder.field("Detail", "bytes16", func() { encoder.bytes16(value.Detail) })
+	default:
+		return ErrUnexpectedControlMessage
+	}
+	return encoder.err
+}
+
+type controlDecoder struct {
+	input          []byte
+	offset         int
+	decodeTopology topologyDecodeFunc
+}
+
+func (decoder *controlDecoder) remaining() int { return len(decoder.input) - decoder.offset }
+func (decoder *controlDecoder) take(length int) ([]byte, error) {
+	if length < 0 || length > decoder.remaining() {
+		return nil, fmt.Errorf("%w: truncated field", ErrMalformedControlMessage)
+	}
+	value := decoder.input[decoder.offset : decoder.offset+length]
+	decoder.offset += length
+	return value, nil
+}
+func (decoder *controlDecoder) finish() error {
+	if decoder.remaining() != 0 {
+		return fmt.Errorf("%w: %d trailing bytes", ErrMalformedControlMessage, decoder.remaining())
+	}
+	return nil
+}
+func (decoder *controlDecoder) u8() (byte, error) {
+	value, err := decoder.take(1)
+	if err != nil {
+		return 0, err
+	}
+	return value[0], nil
+}
+func (decoder *controlDecoder) bool() (bool, error) {
+	value, err := decoder.u8()
+	if err != nil {
+		return false, err
+	}
+	if value > 1 {
+		return false, ErrMalformedControlMessage
+	}
+	return value == 1, nil
+}
+func (decoder *controlDecoder) u16() (uint16, error) {
+	value, err := decoder.take(2)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(value), nil
+}
+func (decoder *controlDecoder) u32() (uint32, error) {
+	value, err := decoder.take(4)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(value), nil
+}
+func (decoder *controlDecoder) u64() (uint64, error) {
+	value, err := decoder.take(8)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(value), nil
+}
+func (decoder *controlDecoder) bytes16(limit int) ([]byte, error) {
+	length, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	if int(length) > limit || int(length) > decoder.remaining() {
+		return nil, ErrMalformedControlMessage
+	}
+	value, err := decoder.take(int(length))
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), value...), nil
+}
+func (decoder *controlDecoder) digest() ([32]byte, error) {
+	value, err := decoder.take(32)
+	var digest [32]byte
+	if err == nil {
+		copy(digest[:], value)
+	}
+	return digest, err
+}
+func (decoder *controlDecoder) job() (model.JobID, error) {
+	value, err := decoder.take(16)
+	var job model.JobID
+	if err == nil {
+		copy(job[:], value)
+	}
+	return job, err
+}
+func (decoder *controlDecoder) request() (model.ClientRequestID, error) {
+	clientBytes, err := decoder.take(16)
+	if err != nil {
+		return model.ClientRequestID{}, err
+	}
+	sequence, err := decoder.u64()
+	var client model.ClientID
+	copy(client[:], clientBytes)
+	return model.ClientRequestID{ClientID: client, Sequence: sequence}, err
+}
+func (decoder *controlDecoder) task() (model.TaskID, error) {
+	job, err := decoder.job()
+	if err != nil {
+		return model.TaskID{}, err
+	}
+	stage, err := decoder.u16()
+	if err != nil {
+		return model.TaskID{}, err
+	}
+	partition, err := decoder.u16()
+	return model.TaskID{JobID: job, StageID: stage, Partition: partition}, err
+}
+func (decoder *controlDecoder) tuple() (model.TupleID, error) {
+	job, err := decoder.job()
+	if err != nil {
+		return model.TupleID{}, err
+	}
+	source, err := decoder.task()
+	if err != nil {
+		return model.TupleID{}, err
+	}
+	sequence, err := decoder.u64()
+	if err != nil {
+		return model.TupleID{}, err
+	}
+	digest, err := decoder.digest()
+	return model.TupleID{JobID: job, SourceTask: source, SourceSequence: sequence, PathDigest: digest}, err
+}
+func (decoder *controlDecoder) pageBinding() (ResultPageRequest, error) {
+	job, err := decoder.job()
+	if err != nil {
+		return ResultPageRequest{}, err
+	}
+	manifest, err := decoder.digest()
+	if err != nil {
+		return ResultPageRequest{}, err
+	}
+	hasLast, err := decoder.bool()
+	if err != nil {
+		return ResultPageRequest{}, err
+	}
+	last, err := decoder.tuple()
+	if err != nil {
+		return ResultPageRequest{}, err
+	}
+	pageBytes, err := decoder.u32()
+	return ResultPageRequest{JobID: job, ManifestDigest: manifest, HasLastTuple: hasLast, Last: last, PageBytes: pageBytes}, err
+}
+func (decoder *controlDecoder) topology() (model.ValidatedTopology, error) {
+	if decoder.remaining() < 8 {
+		return model.ValidatedTopology{}, ErrMalformedControlMessage
+	}
+	declared := binary.BigEndian.Uint64(decoder.input[decoder.offset : decoder.offset+8])
+	maximumBody := model.LimitsV1().MaxTopologyBytes - 8
+	if declared > maximumBody {
+		return model.ValidatedTopology{}, fmt.Errorf("%w: declared topology %d", ErrControlMessageTooLarge, declared)
+	}
+	total := declared + 8
+	if total > uint64(decoder.remaining()) {
+		return model.ValidatedTopology{}, ErrMalformedControlMessage
+	}
+	encoded := decoder.input[decoder.offset : decoder.offset+int(total)]
+	validated, err := decoder.decodeTopology(encoded)
+	if err != nil {
+		return model.ValidatedTopology{}, fmt.Errorf("%w: topology: %v", ErrInvalidControlMessage, err)
+	}
+	decoder.offset += int(total)
+	return validated, nil
+}
+func (decoder *controlDecoder) resultRecords() ([]model.ResultRecord, error) {
+	count, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	if int(count) > MaxResultPageRecords || int(count) > decoder.remaining()/int(MinEncodedResultRecordBytes) {
+		return nil, ErrMalformedControlMessage
+	}
+	records := make([]model.ResultRecord, int(count))
+	for index := range records {
+		length, err := decoder.u32()
+		if err != nil {
+			return nil, err
+		}
+		if length+4 > MaxEncodedResultRecordBytes || int(length) > decoder.remaining() {
+			return nil, ErrMalformedControlMessage
+		}
+		encoded, err := decoder.take(int(length))
+		if err != nil {
+			return nil, err
+		}
+		records[index], err = model.UnmarshalResultRecord(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("%w: result record %d: %v", ErrInvalidControlMessage, index, err)
+		}
+	}
+	return records, nil
+}
+
+func (decoder *controlDecoder) message(messageType wire.MessageType) (ControlMessage, error) {
+	switch messageType {
+	case wire.MessageCraneSubmitRequest:
+		request, err := decoder.request()
+		if err != nil {
+			return nil, err
+		}
+		topology, err := decoder.topology()
+		if err != nil {
+			return nil, err
+		}
+		digest, err := decoder.digest()
+		return SubmitRequest{Request: request, Topology: topology.Spec(), Digest: digest}, err
+	case wire.MessageCraneSubmitResponse:
+		request, err := decoder.request()
+		if err != nil {
+			return nil, err
+		}
+		digest, err := decoder.digest()
+		if err != nil {
+			return nil, err
+		}
+		job, err := decoder.job()
+		if err != nil {
+			return nil, err
+		}
+		revision, err := decoder.u64()
+		if err != nil {
+			return nil, err
+		}
+		state, err := decoder.u8()
+		return SubmitResponse{Request: request, Digest: digest, JobID: job, JobControlRevision: revision, State: JobState(state)}, err
+	case wire.MessageCraneCancelRequest:
+		request, err := decoder.request()
+		if err != nil {
+			return nil, err
+		}
+		job, err := decoder.job()
+		if err != nil {
+			return nil, err
+		}
+		revision, err := decoder.u64()
+		if err != nil {
+			return nil, err
+		}
+		digest, err := decoder.digest()
+		return CancelRequest{Request: request, JobID: job, ExpectedJobControlRevision: revision, Digest: digest}, err
+	case wire.MessageCraneCancelResponse:
+		request, err := decoder.request()
+		if err != nil {
+			return nil, err
+		}
+		digest, err := decoder.digest()
+		if err != nil {
+			return nil, err
+		}
+		job, err := decoder.job()
+		if err != nil {
+			return nil, err
+		}
+		revision, err := decoder.u64()
+		if err != nil {
+			return nil, err
+		}
+		state, err := decoder.u8()
+		return CancelResponse{Request: request, Digest: digest, JobID: job, JobControlRevision: revision, State: JobState(state)}, err
+	case wire.MessageCraneStatusRequest:
+		job, err := decoder.job()
+		return StatusRequest{JobID: job}, err
+	case wire.MessageCraneStatusResponse:
+		return decoder.statusResponse()
+	case wire.MessageCraneResultPageRequest:
+		return decoder.pageBinding()
+	case wire.MessageCraneResultPageResponse:
+		return decoder.resultPageResponse()
+	case wire.MessageCraneLeaderRedirect:
+		return decoder.leaderRedirect()
+	case wire.MessageCraneControlError:
+		return decoder.controlError()
+	default:
+		return nil, ErrUnexpectedControlMessage
+	}
+}
+
+func (decoder *controlDecoder) statusResponse() (ControlMessage, error) {
+	job, err := decoder.job()
+	if err != nil {
+		return nil, err
+	}
+	applied, err := decoder.u64()
+	if err != nil {
+		return nil, err
+	}
+	topology, err := decoder.digest()
+	if err != nil {
+		return nil, err
+	}
+	jobRevision, err := decoder.u64()
+	if err != nil {
+		return nil, err
+	}
+	state, err := decoder.u8()
+	if err != nil {
+		return nil, err
+	}
+	hasAssignment, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	assignmentRevision, err := decoder.u64()
+	if err != nil {
+		return nil, err
+	}
+	assignmentDigest, err := decoder.digest()
+	if err != nil {
+		return nil, err
+	}
+	sources, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	completed, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	manifests, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	hasManifest, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	manifestDigest, err := decoder.digest()
+	if err != nil {
+		return nil, err
+	}
+	hasFailure, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	failureCode, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	failureDigest, err := decoder.digest()
+	return StatusResponse{JobID: job, AppliedIndex: applied, TopologyDigest: topology, JobControlRevision: jobRevision, State: JobState(state), HasAssignment: hasAssignment, AssignmentRevision: assignmentRevision, AssignmentDigest: assignmentDigest, SourceTaskCount: sources, CompletedSourceTasks: completed, ManifestCount: manifests, HasManifestSet: hasManifest, ManifestSetDigest: manifestDigest, HasFailure: hasFailure, FailureCode: model.FailureCode(failureCode), FailureDetailDigest: failureDigest}, err
+}
+
+func (decoder *controlDecoder) resultPageResponse() (ControlMessage, error) {
+	job, err := decoder.job()
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := decoder.digest()
+	if err != nil {
+		return nil, err
+	}
+	hasRequest, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	requestLast, err := decoder.tuple()
+	if err != nil {
+		return nil, err
+	}
+	pageBytes, err := decoder.u32()
+	if err != nil {
+		return nil, err
+	}
+	records, err := decoder.resultRecords()
+	if err != nil {
+		return nil, err
+	}
+	hasNext, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	nextLast, err := decoder.tuple()
+	if err != nil {
+		return nil, err
+	}
+	end, err := decoder.bool()
+	return ResultPageResponse{JobID: job, ManifestDigest: manifest, RequestHasLastTuple: hasRequest, RequestLast: requestLast, PageBytes: pageBytes, Records: records, NextHasLastTuple: hasNext, NextLast: nextLast, End: end}, err
+}
+
+func (decoder *controlDecoder) leaderRedirect() (ControlMessage, error) {
+	count, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	if int(count) > MaxLeaderRedirectEndpoints || int(count) > decoder.remaining()/2 {
+		return nil, ErrMalformedControlMessage
+	}
+	endpoints := make([]string, int(count))
+	for index := range endpoints {
+		encoded, err := decoder.bytes16(MaxControlEndpointBytes)
+		if err != nil {
+			return nil, err
+		}
+		endpoints[index] = string(encoded)
+	}
+	return LeaderRedirect{Endpoints: endpoints}, nil
+}
+
+func (decoder *controlDecoder) controlError() (ControlMessage, error) {
+	related, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	code, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	retryable, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	hasClient, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	client, err := decoder.request()
+	if err != nil {
+		return nil, err
+	}
+	clientDigest, err := decoder.digest()
+	if err != nil {
+		return nil, err
+	}
+	hasPage, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	page, err := decoder.pageBinding()
+	if err != nil {
+		return nil, err
+	}
+	required, err := decoder.u32()
+	if err != nil {
+		return nil, err
+	}
+	detail, err := decoder.bytes16(MaxControlErrorDetailBytes)
+	return ControlError{RelatedMessage: wire.MessageType(related), Code: ControlErrorCode(code), Retryable: retryable, HasClientRequest: hasClient, ClientRequest: client, ClientDigest: clientDigest, HasResultPage: hasPage, ResultPage: page, RequiredBytes: required, Detail: detail}, err
+}
+
 func preflightTupleDelivery(input []byte) error {
 	maximum := TupleDeliveryMaxPayloadBytes()
 	if len(input) < TupleDeliveryMinPayloadBytes {

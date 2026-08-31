@@ -1,0 +1,136 @@
+package model
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestPublicControlResultEntryBoundsAreMechanicallyDerived(t *testing.T) {
+	emptyTuple, err := MarshalTuple(Tuple{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyTuple) != 2 {
+		t.Fatalf("canonical empty tuple bytes = %d, want 2", len(emptyTuple))
+	}
+	minimum, err := PublicControlResultRecordEntryBytesV1(uint64(len(emptyTuple)))
+	if err != nil || minimum != 170 {
+		t.Fatalf("minimum result entry bytes = %d, %v; want 170", minimum, err)
+	}
+	if minimum != PublicControlContractV1().MinEncodedResultRecordBytes {
+		t.Fatalf("derived minimum = %d, fingerprinted contract = %d", minimum, PublicControlContractV1().MinEncodedResultRecordBytes)
+	}
+	maximum, err := PublicControlResultRecordEntryBytesV1(LimitsV1().MaxTuplePayloadBytes)
+	if err != nil || maximum != PublicControlMaxEncodedResultRecordBytesV1 {
+		t.Fatalf("maximum result entry bytes = %d, %v; contract = %d", maximum, err, PublicControlMaxEncodedResultRecordBytesV1)
+	}
+	if got := PublicControlMaxResultPageBytesV1 / minimum; got != PublicControlMaxResultPageRecordsV1 {
+		t.Fatalf("minimum entries fitting page = %d, contract = %d", got, PublicControlMaxResultPageRecordsV1)
+	}
+	if PublicControlMaxResultPageRecordsV1*minimum > PublicControlMaxResultPageBytesV1 {
+		t.Fatal("3,084 minimum entries do not fit the page budget")
+	}
+	if (PublicControlMaxResultPageRecordsV1+1)*minimum <= PublicControlMaxResultPageBytesV1 {
+		t.Fatal("3,085 minimum entries unexpectedly fit the page budget")
+	}
+}
+
+func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *testing.T) {
+	want := PublicControlContract{
+		SchemaVersion:               1,
+		MessageTypeMin:              240,
+		MessageTypeMax:              249,
+		MaxControlFrameBytes:        1 << 20,
+		MaxResultPageBytes:          512 << 10,
+		MaxResultPageRecords:        3084,
+		MinEncodedResultRecordBytes: 170,
+		MaxEncodedResultRecordBytes: 680,
+		MaxRedirectEndpoints:        5,
+		MaxEndpointBytes:            259,
+		MaxErrorDetailBytes:         256,
+		Messages: []PublicControlMessageDescriptor{
+			{Name: "SubmitRequest", MessageType: 240, SchemaVersion: 1, Fields: fields("Request:ClientRequestID", "Topology:TopologySpec", "Digest:sha256")},
+			{Name: "SubmitResponse", MessageType: 241, SchemaVersion: 1, Fields: fields("Request:ClientRequestID", "Digest:sha256", "JobID:JobID", "JobControlRevision:u64", "State:u8")},
+			{Name: "CancelRequest", MessageType: 242, SchemaVersion: 1, Fields: fields("Request:ClientRequestID", "JobID:JobID", "ExpectedJobControlRevision:u64", "Digest:sha256")},
+			{Name: "CancelResponse", MessageType: 243, SchemaVersion: 1, Fields: fields("Request:ClientRequestID", "Digest:sha256", "JobID:JobID", "JobControlRevision:u64", "State:u8")},
+			{Name: "StatusRequest", MessageType: 244, SchemaVersion: 1, Fields: fields("JobID:JobID")},
+			{Name: "StatusResponse", MessageType: 245, SchemaVersion: 1, Fields: fields("JobID:JobID", "AppliedIndex:u64", "TopologyDigest:sha256", "JobControlRevision:u64", "State:u8", "HasAssignment:bool", "AssignmentRevision:u64", "AssignmentDigest:sha256", "SourceTaskCount:u16", "CompletedSourceTasks:u16", "ManifestCount:u16", "HasManifestSet:bool", "ManifestSetDigest:sha256", "HasFailure:bool", "FailureCode:u16", "FailureDetailDigest:sha256")},
+			{Name: "ResultPageRequest", MessageType: 246, SchemaVersion: 1, Fields: fields("JobID:JobID", "ManifestDigest:sha256", "HasLastTuple:bool", "Last:TupleID", "PageBytes:u32")},
+			{Name: "ResultPageResponse", MessageType: 247, SchemaVersion: 1, Fields: fields("JobID:JobID", "ManifestDigest:sha256", "RequestHasLastTuple:bool", "RequestLast:TupleID", "PageBytes:u32", "Records:list(ResultRecordEntry)", "NextHasLastTuple:bool", "NextLast:TupleID", "End:bool")},
+			{Name: "LeaderRedirect", MessageType: 248, SchemaVersion: 1, Fields: fields("Endpoints:list(string16)")},
+			{Name: "ControlError", MessageType: 249, SchemaVersion: 1, Fields: fields("RelatedMessage:u16", "Code:u16", "Retryable:bool", "HasClientRequest:bool", "ClientRequest:ClientRequestID", "ClientDigest:sha256", "HasResultPage:bool", "ResultPage:ResultPageBinding", "RequiredBytes:u32", "Detail:bytes16")},
+		},
+		NestedLayouts: []PublicControlNestedDescriptor{
+			{Name: "ClientRequestID", Fields: fields("ClientID:bytes16(nonzero)", "Sequence:u64(nonzero)")},
+			{Name: "JobID", Fields: fields("Value:bytes16(nonzero)")},
+			{Name: "TaskID", Fields: fields("JobID:JobID", "StageID:u16(nonzero)", "Partition:u16")},
+			{Name: "TupleID", Fields: fields("JobID:JobID", "SourceTask:TaskID", "SourceSequence:u64(nonzero)", "PathDigest:sha256(nonzero)")},
+			{Name: "TopologySpec", Fields: fields("CanonicalTopology:bytes64")},
+			{Name: "ResultRecordEntry", Fields: fields("Length:u32", "Record:canonical-result-record-v1")},
+			{Name: "ResultPageBinding", Fields: fields("JobID:JobID", "ManifestDigest:sha256", "HasLastTuple:bool", "Last:TupleID", "PageBytes:u32")},
+		},
+		EnumDomains: []PublicControlEnumDescriptor{
+			{Name: "JobState", Values: []string{"Pending=1", "Deploying=2", "Running=3", "Draining=4", "Succeeded=5", "Failed=6", "Canceled=7"}},
+			{Name: "ControlErrorCode", Values: []string{"Malformed=1", "UnsupportedSchema=2", "InvalidRequest=3", "Starting=4", "NotLeader=5", "StaleRequest=6", "SkippedRequest=7", "IdentityReuse=8", "NotFound=9", "RevisionMismatch=10", "CapacityExhausted=11", "PageLimitTooSmall=12", "ResultUnavailable=13", "CorruptResult=14"}},
+			{Name: "FailureCode", Values: []string{"Operator=1", "TupleInvalid=2", "Storage=3"}},
+		},
+		IdentityDomains: []string{
+			"cs425/crane/submit-control-command/v1",
+			"cs425/crane/cancel-control-command/v1",
+		},
+		Rules: []string{
+			"payload-prefix-is-schema-version-then-message-type",
+			"submit-digest-binds-client-request-and-canonical-topology",
+			"cancel-digest-binds-client-request-job-and-expected-revision",
+			"mutation-response-echoes-request-digest-job-revision-and-terminal-command-state",
+			"status-binds-applied-index-topology-assignment-manifest-and-failure-identities",
+			"result-page-cursor-is-global-stateless-and-bound-to-job-manifest-and-page-limit",
+			"result-record-entries-are-complete-canonical-streams-and-never-split",
+			"result-records-are-strictly-globally-increasing-and-cross-job-records-are-rejected",
+			"nonempty-page-next-cursor-equals-last-record",
+			"empty-terminal-page-preserves-request-cursor",
+			"page-limit-too-small-repeats-request-binding-required-bytes-and-does-not-advance",
+			"redirect-endpoints-are-exactly-one-or-three-or-five-canonical-sorted-unique-control-endpoints",
+			"control-error-binding-selectors-are-exclusive-and-match-related-request-type",
+			"mutation-control-errors-echo-client-request-and-candidate-command-digest",
+			"unbound-control-errors-are-limited-to-predecode-starting-or-not-leader-codes",
+			"decoded-variable-values-are-owned",
+			"bounds-and-declared-lengths-are-checked-before-allocation",
+			"unknown-enums-trailing-bytes-type-mismatches-and-noncanonical-bytes-are-rejected",
+		},
+	}
+
+	got := PublicControlContractV1()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PublicControlContractV1()\n got: %#v\nwant: %#v", got, want)
+	}
+
+	got.Messages[0].Name = "mutated"
+	got.Messages[0].Fields[0].Name = "mutated"
+	got.NestedLayouts[0].Fields[0].Encoding = "mutated"
+	got.EnumDomains[0].Values[0] = "mutated"
+	got.IdentityDomains[0] = "mutated"
+	got.Rules[0] = "mutated"
+	again := PublicControlContractV1()
+	if again.Messages[0].Name != "SubmitRequest" || again.Messages[0].Fields[0].Name != "Request" || again.NestedLayouts[0].Fields[0].Encoding != "bytes16(nonzero)" || again.EnumDomains[0].Values[0] != "Pending=1" || again.IdentityDomains[0] != "cs425/crane/submit-control-command/v1" || again.Rules[0] != "payload-prefix-is-schema-version-then-message-type" {
+		t.Fatalf("PublicControlContractV1 shares mutable storage: %#v", again)
+	}
+}
+
+func fields(values ...string) []PublicControlFieldDescriptor {
+	result := make([]PublicControlFieldDescriptor, len(values))
+	for index, value := range values {
+		separator := -1
+		for i := range value {
+			if value[i] == ':' {
+				separator = i
+				break
+			}
+		}
+		if separator < 1 {
+			panic("invalid test field descriptor")
+		}
+		result[index] = PublicControlFieldDescriptor{Name: value[:separator], Encoding: value[separator+1:]}
+	}
+	return result
+}
