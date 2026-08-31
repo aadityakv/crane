@@ -54,6 +54,7 @@ type Machine struct {
 	coordinatorEpoch    model.CoordinatorEpoch
 	workers             map[uint16]WorkerRecord
 	jobs                map[model.JobID]JobRecord
+	workerEvents        map[workerEventKey]workerEventCursor
 
 	estimatedSnapshotBytes uint64
 }
@@ -62,6 +63,7 @@ func NewMachine() *Machine {
 	return &Machine{
 		clients: make(map[model.ClientID]clientHistory), subjects: make(map[SubjectKey]subjectHistory),
 		workers: make(map[uint16]WorkerRecord), jobs: make(map[model.JobID]JobRecord),
+		workerEvents:           make(map[workerEventKey]workerEventCursor),
 		estimatedSnapshotBytes: estimatedSnapshotBaseBytes,
 	}
 }
@@ -94,6 +96,20 @@ func (machine *Machine) Apply(index, term uint64, encoded []byte) ([]byte, error
 		return machine.applySubmitJobLocked(command)
 	case CancelJob:
 		return machine.applyCancelJobLocked(command)
+	case RecordSourceEOF:
+		return machine.applyRecordSourceEOFLocked(command)
+	case InstallAssignments:
+		return machine.applyInstallAssignmentsLocked(command)
+	case ReplaceAssignments:
+		return machine.applyReplaceAssignmentsLocked(command)
+	case AdvanceCheckpoint:
+		return machine.applyAdvanceCheckpointLocked(command)
+	case SealManifest:
+		return machine.applySealManifestLocked(command)
+	case TransitionJob:
+		return machine.applyTransitionJobLocked(command)
+	case FailJob:
+		return machine.applyFailJobLocked(command)
 	default:
 		return nil, errors.New("impossible decoded command type")
 	}
@@ -189,10 +205,18 @@ func (machine *Machine) applyClientLocked(request model.ClientRequestID, digest 
 }
 
 func (machine *Machine) applyInternalLocked(envelope Envelope, target []byte, prepare func(uint64) (mutationPlan, error)) ([]byte, error) {
-	return machine.applyInternalResolvedLocked(envelope, target, target, prepare)
+	return machine.applyInternalResolvedAtLocked(envelope, target, target, nil, prepare)
 }
 
 func (machine *Machine) applyInternalResolvedLocked(envelope Envelope, target, appliedTarget []byte, prepare func(uint64) (mutationPlan, error)) ([]byte, error) {
+	return machine.applyInternalResolvedAtLocked(envelope, target, appliedTarget, nil, prepare)
+}
+
+func (machine *Machine) applyInternalAtRevisionLocked(envelope Envelope, target []byte, authoritativeRevision uint64, prepare func(uint64) (mutationPlan, error)) ([]byte, error) {
+	return machine.applyInternalResolvedAtLocked(envelope, target, target, &authoritativeRevision, prepare)
+}
+
+func (machine *Machine) applyInternalResolvedAtLocked(envelope Envelope, target, appliedTarget []byte, authoritativeRevision *uint64, prepare func(uint64) (mutationPlan, error)) ([]byte, error) {
 	if err := envelope.Validate(); err != nil {
 		return nil, err
 	}
@@ -210,7 +234,7 @@ func (machine *Machine) applyInternalResolvedLocked(envelope Envelope, target, a
 		}
 		return marshalBusinessResult(ResultIdentityReuse, internal.Subject, history.revision, machine.epochForSubject(internal.Subject, history.revision))
 	}
-	if exists && history.appliedTarget != nil && bytes.Equal(history.appliedTarget, appliedTarget) {
+	if exists && history.appliedTarget != nil && bytes.Equal(history.appliedTarget, appliedTarget) && (authoritativeRevision == nil || history.revision == *authoritativeRevision) {
 		newSize, ok := machine.preflightSubjectHistoryLengths(history, true, uint64(len(target)), uint64(len(history.appliedResult)), uint64(len(history.appliedTarget)), uint64(len(history.appliedResult)))
 		if !ok {
 			return marshalBusinessResult(ResultCapacityExhausted, internal.Subject, history.revision, machine.epochForSubject(internal.Subject, history.revision))
@@ -227,6 +251,10 @@ func (machine *Machine) applyInternalResolvedLocked(envelope Envelope, target, a
 	currentRevision := uint64(0)
 	if exists {
 		currentRevision = history.revision
+	}
+	if authoritativeRevision != nil {
+		currentRevision = *authoritativeRevision
+		history.revision = currentRevision
 	}
 	if !exists && uint64(len(machine.subjects)) >= model.StateCommandMaxSubjectHistoriesV1 {
 		return marshalBusinessResult(ResultCapacityExhausted, internal.Subject, 0, model.CoordinatorEpoch{})

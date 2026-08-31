@@ -32,6 +32,20 @@ type AssignmentSet struct {
 	ResultReplicas []ResultReplicaSet
 }
 
+// NewAssignmentSet owns one explicit complete placement, calculates its
+// canonical digest, and validates it against the immutable topology.
+func NewAssignmentSet(job JobID, revision uint64, tasks []AssignmentToken, replicas []ResultReplicaSet, topology ValidatedTopology) (AssignmentSet, error) {
+	if uint64(len(tasks)) > LimitsV1().MaxTasksPerJob || uint64(len(replicas)) > LimitsV1().MaxResultManifestsPerJob {
+		return AssignmentSet{}, errors.New("assignment collection exceeds bound before copy")
+	}
+	set := AssignmentSet{JobID: job, Revision: revision, Tasks: append([]AssignmentToken(nil), tasks...), ResultReplicas: append([]ResultReplicaSet(nil), replicas...)}
+	set.Digest = assignmentDigest(set)
+	if err := set.Validate(topology); err != nil {
+		return AssignmentSet{}, err
+	}
+	return set, nil
+}
+
 // PlaceTasks assigns all explicit tasks by deterministic rendezvous score and slots.
 func PlaceTasks(job JobID, specificationHash [32]byte, assignmentRevision uint64, tasks []TaskID, workers []WorkerPlacement) ([]AssignmentToken, error) {
 	if err := job.Validate(); err != nil {

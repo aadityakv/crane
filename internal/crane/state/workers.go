@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -288,13 +289,23 @@ func (machine *Machine) applyDeactivateWorkerLocked(command DeactivateWorker) ([
 			result, err := marshalBusinessResult(ResultNotFound, key, 0, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
 		}
-		if current.Epoch != command.WorkerEpoch || current.State != WorkerEligible || len(command.Affected) != 0 {
+		if current.Epoch != command.WorkerEpoch || current.State != WorkerEligible {
 			result, err := marshalBusinessResult(ResultInvalidTransition, key, current.Revision, model.CoordinatorEpoch{})
+			return mutationPlan{result: result, reject: true}, err
+		}
+		jobs, delta, ok := machine.prepareWorkerInvalidation(command.WorkerID, command.WorkerEpoch, command.Affected)
+		if !ok {
+			result, err := marshalBusinessResult(ResultRevisionMismatch, key, current.Revision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
 		}
 		current.State, current.Revision = WorkerOffline, nextRevision
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
-		return mutationPlan{result: result, commit: func() { machine.workers[command.WorkerID] = current }}, err
+		return mutationPlan{result: result, stateDelta: delta, commit: func() {
+			machine.workers[command.WorkerID] = current
+			for job, record := range jobs {
+				machine.jobs[job] = record
+			}
+		}}, err
 	})
 }
 
@@ -307,11 +318,75 @@ func (machine *Machine) applyReplaceWorkerEpochLocked(command ReplaceWorkerEpoch
 			result, err := marshalBusinessResult(ResultNotFound, key, 0, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
 		}
-		if current.Epoch != command.OldEpoch || command.Target.Revision != nextRevision || len(command.Affected) != 0 {
+		if current.Epoch != command.OldEpoch || command.Target.Revision != nextRevision {
 			result, err := marshalBusinessResult(ResultInvalidTransition, key, current.Revision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
 		}
+		jobs, delta, ok := machine.prepareWorkerInvalidation(command.WorkerID, command.OldEpoch, command.Affected)
+		if !ok {
+			result, err := marshalBusinessResult(ResultRevisionMismatch, key, current.Revision, model.CoordinatorEpoch{})
+			return mutationPlan{result: result, reject: true}, err
+		}
+		oldCursor := workerEventKey{WorkerID: command.WorkerID, WorkerEpoch: command.OldEpoch}
+		if _, exists := machine.workerEvents[oldCursor]; exists {
+			delta -= 58
+		}
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
-		return mutationPlan{result: result, commit: func() { machine.workers[command.WorkerID] = command.Target }}, err
+		return mutationPlan{result: result, stateDelta: delta, commit: func() {
+			machine.workers[command.WorkerID] = command.Target
+			delete(machine.workerEvents, oldCursor)
+			for job, record := range jobs {
+				machine.jobs[job] = record
+			}
+		}}, err
 	})
+}
+
+func (machine *Machine) prepareWorkerInvalidation(workerID uint16, epoch model.WorkerEpoch, presented []AffectedAssignment) (map[model.JobID]JobRecord, int64, bool) {
+	jobs := make(map[model.JobID]JobRecord)
+	var actual []AffectedAssignment
+	var delta int64
+	for jobID, record := range machine.jobs {
+		if record.Assignment == nil || record.Lifecycle.terminal() {
+			continue
+		}
+		markers := markersForWorker(*record.Assignment, workerID, epoch)
+		if len(markers) == 0 {
+			continue
+		}
+		actual = append(actual, AffectedAssignment{JobID: jobID, JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision, AssignmentDigest: record.Assignment.Digest})
+		candidate := cloneJobRecord(record)
+		before := len(candidate.NeedsReassignment)
+		candidate.NeedsReassignment = sortedMarkerUnion(candidate.NeedsReassignment, markers)
+		if err := validateMarkers(candidate.NeedsReassignment, jobID); err != nil || candidate.JobControlRevision == ^uint64(0) {
+			return nil, 0, false
+		}
+		candidate.JobControlRevision++
+		delta += int64(len(candidate.NeedsReassignment)-before) * 60
+		jobs[jobID] = candidate
+	}
+	sort.Slice(actual, func(i, j int) bool { return bytes.Compare(actual[i].JobID[:], actual[j].JobID[:]) < 0 })
+	if !reflect.DeepEqual(actual, presented) {
+		return nil, 0, false
+	}
+	return jobs, delta, true
+}
+
+func markersForWorker(set model.AssignmentSet, workerID uint16, epoch model.WorkerEpoch) []NeedsReassignment {
+	markers := make([]NeedsReassignment, 0)
+	for _, token := range set.Tasks {
+		if token.WorkerID == workerID && token.WorkerEpoch == epoch {
+			markers = append(markers, NeedsReassignment{Kind: TaskTarget, Task: token.Task, OldWorkerID: workerID, OldWorkerEpoch: epoch})
+		}
+	}
+	for _, replica := range set.ResultReplicas {
+		if replica.PrimaryNodeID == workerID && replica.PrimaryEpoch == epoch {
+			markers = append(markers, NeedsReassignment{Kind: ResultReplicaTarget, SinkTask: replica.SinkTask, ReplicaRole: model.PrimaryReplica, OldWorkerID: workerID, OldWorkerEpoch: epoch})
+		}
+		if replica.SecondaryNodeID == workerID && replica.SecondaryEpoch == epoch {
+			markers = append(markers, NeedsReassignment{Kind: ResultReplicaTarget, SinkTask: replica.SinkTask, ReplicaRole: model.SecondaryReplica, OldWorkerID: workerID, OldWorkerEpoch: epoch})
+		}
+	}
+	sort.Slice(markers, func(i, j int) bool { return markerLess(markers[i], markers[j]) })
+	return markers
 }

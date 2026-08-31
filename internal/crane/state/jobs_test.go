@@ -3,7 +3,9 @@ package state
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -50,6 +52,30 @@ func TestJobCommandsCanonicalRoundTripAndSubmitSizeAgreement(t *testing.T) {
 	binary.BigEndian.PutUint64(over[93:101], model.LimitsV1().MaxTopologyBytes-8+1)
 	if _, err := UnmarshalCommand(over); err == nil {
 		t.Fatal("SubmitJob decoder accepted declared topology maximum + 1")
+	}
+}
+
+func TestMaximallyStructuredSubmitJobFitsRaftCommandBudget(t *testing.T) {
+	topology := task10MaximumTopology()
+	validated, err := model.ValidateTopology(topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := model.LimitsV1()
+	if uint64(len(topology.Stages)) != limits.MaxStages || uint64(len(topology.Edges)) != limits.MaxEdges {
+		t.Fatal("maximum fixture misses structural maxima")
+	}
+	command, err := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xef}, Sequence: 1}, topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := MarshalCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := model.CompleteSubmitJobBytes(uint64(len(validated.CanonicalBytes())))
+	if err != nil || uint64(len(encoded)) != want || uint64(len(encoded)) > limits.MaxSubmitJobBytes {
+		t.Fatalf("maximum structured SubmitJob = %d, model=%d, max=%d, err=%v", len(encoded), want, limits.MaxSubmitJobBytes, err)
 	}
 }
 
@@ -160,7 +186,35 @@ func TestJobCapacityRefusalIsUnacceptedAndCanSucceedAfterCapacityChanges(t *test
 func FuzzUnmarshalStateCommand(f *testing.F) {
 	register, _ := NewRegisterWorker(InternalCommandID{1}, 0, WorkerRecord{NodeID: 1, Epoch: model.WorkerEpoch{1}, State: WorkerEligible, Revision: 1, Slots: 1, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()})
 	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{1}, Sequence: 1}, task10Topology(0))
-	for _, command := range []any{register, submit} {
+	validated, _ := model.ValidateTopology(task10Topology(0))
+	job := submit.JobID()
+	placements := []model.WorkerPlacement{{NodeID: 1, WorkerEpoch: model.WorkerEpoch{1}, SlotCapacity: 2}, {NodeID: 2, WorkerEpoch: model.WorkerEpoch{2}, SlotCapacity: 2}}
+	assignment, _ := model.BuildAssignmentSet(job, validated.Digest(), 1, validated, placements)
+	targetTokens := append([]model.AssignmentToken(nil), assignment.Tasks...)
+	for index := range targetTokens {
+		targetTokens[index].AssignmentRevision = 2
+	}
+	target, _ := model.NewAssignmentSet(job, 2, targetTokens, assignment.ResultReplicas, validated)
+	source := assignment.Tasks[0]
+	eof, _ := model.SourceEOF(validated, source.Task)
+	epoch := model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
+	report := model.CompletionReport{JobID: job, JobControlRevision: 3, AssignmentRevision: 1, Source: source.Task, Token: source, Epoch: epoch, Prior: 0, New: eof, EOF: eof, WorkerTransactionID: 1}
+	report.Digest = model.CompletionReportDigest(report)
+	replica := assignment.ResultReplicas[0]
+	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: validated.Digest(), RecordCount: 1, TotalBytes: 1, Checksum: [32]byte{1}, Replicas: replica}
+	failure := model.JobFailureReport{JobID: job, JobControlRevision: 3, AssignmentRevision: 1, Task: source, Epoch: epoch, TransactionID: 2, Code: model.FailureOperator, DetailDigest: [32]byte{2}}
+	drain, _ := NewDrainWorker(InternalCommandID{2}, 1, 1, model.WorkerEpoch{1})
+	deactivate, _ := NewDeactivateWorker(InternalCommandID{3}, 1, 1, model.WorkerEpoch{1}, nil)
+	replacement, _ := NewReplaceWorkerEpoch(InternalCommandID{4}, 1, 1, model.WorkerEpoch{1}, WorkerRecord{NodeID: 1, Epoch: model.WorkerEpoch{3}, State: WorkerEligible, Revision: 2, Slots: 1, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}, nil)
+	cancel, _ := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{1}, Sequence: 2}, job, 1)
+	recordEOF, _ := NewRecordSourceEOF(InternalCommandID{5}, 0, source.Task, eof)
+	install, _ := NewInstallAssignments(InternalCommandID{6}, 1, assignment)
+	replaceAssignments, _ := NewReplaceAssignments(InternalCommandID{7}, 3, job, 1, assignment.Digest, NeedsReassignmentDigest(nil), target)
+	advance, _ := NewAdvanceCheckpoint(InternalCommandID{8}, 0, report)
+	seal, _ := NewSealManifest(InternalCommandID{9}, 0, manifest)
+	transition, _ := NewTransitionJob(InternalCommandID{10}, 3, job, JobRunning, JobDraining)
+	fail, _ := NewFailJob(InternalCommandID{11}, 3, failure)
+	for _, command := range []any{register, drain, deactivate, replacement, submit, cancel, recordEOF, install, replaceAssignments, advance, seal, transition, fail} {
 		encoded, _ := MarshalCommand(command)
 		f.Add(encoded)
 	}
@@ -170,6 +224,38 @@ func FuzzUnmarshalStateCommand(f *testing.F) {
 		}
 		_, _ = UnmarshalCommand(encoded)
 	})
+}
+
+func task10MaximumTopology() model.TopologySpec {
+	limits := model.LimitsV1()
+	spec := model.TopologySpec{SchemaVersion: 1, Name: strings.Repeat("j", int(limits.MaxIdentifierBytes)), RegistryFingerprint: model.RegistryFingerprint()}
+	for id := uint16(1); id <= uint16(limits.MaxStages); id++ {
+		role, parallelism := model.Transform, uint16(1)
+		operator := model.OperatorSpec{Name: "even", Version: 1}
+		switch id {
+		case 1:
+			role, parallelism = model.Source, 256
+			operator = model.OperatorSpec{Name: "range", Version: 1, Settings: []model.Setting{{Key: "end_exclusive", Value: "256000000"}, {Key: "start", Value: "0"}}}
+		case 2:
+			parallelism = 256
+		case 3:
+			parallelism = 196
+		case uint16(limits.MaxStages):
+			role, parallelism = model.Sink, 256
+			operator = model.OperatorSpec{Name: "collect", Version: 1}
+		}
+		name := fmt.Sprintf("stage-%03d", id)
+		name += strings.Repeat("x", int(limits.MaxIdentifierBytes)-len(name))
+		spec.Stages = append(spec.Stages, model.StageSpec{StageID: id, Name: name, Role: role, Parallelism: parallelism, Operator: operator})
+	}
+	for id := uint16(1); id < uint16(limits.MaxStages); id++ {
+		spec.Edges = append(spec.Edges, model.EdgeSpec{EdgeID: id, SourceStageID: id, DestinationStageID: id + 1, Routing: model.Shuffle})
+	}
+	for uint64(len(spec.Edges)) < limits.MaxEdges {
+		id := uint16(len(spec.Edges) + 1)
+		spec.Edges = append(spec.Edges, model.EdgeSpec{EdgeID: id, SourceStageID: 1, DestinationStageID: uint16(limits.MaxStages), Routing: model.Shuffle})
+	}
+	return spec
 }
 
 func task10Topology(start int64) model.TopologySpec {

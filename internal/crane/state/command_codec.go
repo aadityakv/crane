@@ -36,6 +36,20 @@ func MarshalCommand(command any) ([]byte, error) {
 		return marshalConcreteCommand(value.Envelope, validated.CanonicalBytes(), value.Validate())
 	case CancelJob:
 		return marshalConcreteCommand(value.Envelope, cancelJobTarget(value), value.Validate())
+	case RecordSourceEOF:
+		return marshalConcreteCommand(value.Envelope, recordSourceEOFTarget(value), value.Validate())
+	case InstallAssignments:
+		return marshalConcreteCommand(value.Envelope, installAssignmentsTarget(value), value.Validate())
+	case ReplaceAssignments:
+		return marshalConcreteCommand(value.Envelope, replaceAssignmentsTarget(value), value.Validate())
+	case AdvanceCheckpoint:
+		return marshalConcreteCommand(value.Envelope, advanceCheckpointTarget(value), value.Validate())
+	case SealManifest:
+		return marshalConcreteCommand(value.Envelope, sealManifestTarget(value), value.Validate())
+	case TransitionJob:
+		return marshalConcreteCommand(value.Envelope, transitionJobTarget(value), value.Validate())
+	case FailJob:
+		return marshalConcreteCommand(value.Envelope, failJobTarget(value), value.Validate())
 	default:
 		return nil, fmt.Errorf("%w: unsupported concrete command %T", ErrInvalidCommand, command)
 	}
@@ -124,6 +138,76 @@ func UnmarshalCommand(encoded []byte) (any, error) {
 			return nil, err
 		}
 		command = CancelJob{Envelope: envelope, Job: job, ExpectedRevision: expected}
+	case CommandRecordSourceEOF:
+		source, err := decoder.taskID()
+		if err != nil {
+			return nil, err
+		}
+		eof, err := decoder.u64()
+		if err != nil {
+			return nil, err
+		}
+		command = RecordSourceEOF{Envelope: envelope, Source: source, EOF: eof}
+	case CommandInstallAssignments:
+		assignment, err := decoder.assignment()
+		if err != nil {
+			return nil, err
+		}
+		command = InstallAssignments{Envelope: envelope, Assignment: assignment}
+	case CommandReplaceAssignments:
+		job, err := decoder.jobID()
+		if err != nil {
+			return nil, err
+		}
+		revision, err := decoder.u64()
+		if err != nil {
+			return nil, err
+		}
+		digest, err := decoder.array32()
+		if err != nil {
+			return nil, err
+		}
+		markers, err := decoder.array32()
+		if err != nil {
+			return nil, err
+		}
+		target, err := decoder.assignment()
+		if err != nil {
+			return nil, err
+		}
+		command = ReplaceAssignments{Envelope: envelope, JobID: job, ExpectedAssignmentRevision: revision, ExpectedDigest: digest, ExpectedMarkersDigest: markers, Target: target}
+	case CommandAdvanceCheckpoint:
+		report, err := decoder.completionReport()
+		if err != nil {
+			return nil, err
+		}
+		command = AdvanceCheckpoint{Envelope: envelope, Report: report}
+	case CommandSealManifest:
+		manifest, err := decoder.manifest()
+		if err != nil {
+			return nil, err
+		}
+		command = SealManifest{Envelope: envelope, Manifest: manifest}
+	case CommandTransitionJob:
+		job, err := decoder.jobID()
+		if err != nil {
+			return nil, err
+		}
+		from, err := decoder.byte()
+		if err != nil {
+			return nil, err
+		}
+		to, err := decoder.byte()
+		if err != nil {
+			return nil, err
+		}
+		command = TransitionJob{Envelope: envelope, JobID: job, From: JobLifecycle(from), To: JobLifecycle(to)}
+	case CommandFailJob:
+		report, err := decoder.failureReport()
+		if err != nil {
+			return nil, err
+		}
+		command = FailJob{Envelope: envelope, Report: report}
 	default:
 		return nil, fmt.Errorf("%w: %d", ErrUnknownCommandKind, kind)
 	}
@@ -212,6 +296,120 @@ func cancelJobTarget(command CancelJob) []byte {
 	encoded := append([]byte(nil), command.Job[:]...)
 	return appendU64(encoded, command.ExpectedRevision)
 }
+
+func appendTask(encoded []byte, task model.TaskID) []byte {
+	encoded = append(encoded, task.JobID[:]...)
+	encoded = appendU16(encoded, task.StageID)
+	return appendU16(encoded, task.Partition)
+}
+
+func appendEpoch(encoded []byte, epoch model.CoordinatorEpoch) []byte {
+	encoded = appendU64(encoded, epoch.Term)
+	encoded = appendU64(encoded, epoch.BeginIndex)
+	encoded = appendU16(encoded, epoch.Coordinator)
+	return append(encoded, epoch.Nonce[:]...)
+}
+
+func appendToken(encoded []byte, token model.AssignmentToken) []byte {
+	encoded = appendTask(encoded, token.Task)
+	encoded = appendU16(encoded, token.WorkerID)
+	encoded = append(encoded, token.WorkerEpoch[:]...)
+	encoded = appendU64(encoded, token.Attempt)
+	encoded = append(encoded, token.SpecificationHash[:]...)
+	return appendU64(encoded, token.AssignmentRevision)
+}
+
+func appendReplica(encoded []byte, replica model.ResultReplicaSet) []byte {
+	encoded = appendTask(encoded, replica.SinkTask)
+	encoded = appendU16(encoded, replica.PrimaryNodeID)
+	encoded = appendU16(encoded, replica.SecondaryNodeID)
+	encoded = append(encoded, replica.PrimaryEpoch[:]...)
+	return append(encoded, replica.SecondaryEpoch[:]...)
+}
+
+func appendAssignment(encoded []byte, assignment model.AssignmentSet) []byte {
+	encoded = append(encoded, assignment.JobID[:]...)
+	encoded = appendU64(encoded, assignment.Revision)
+	encoded = append(encoded, assignment.Digest[:]...)
+	encoded = appendU16(encoded, uint16(len(assignment.Tasks)))
+	for _, token := range assignment.Tasks {
+		encoded = appendToken(encoded, token)
+	}
+	encoded = appendU16(encoded, uint16(len(assignment.ResultReplicas)))
+	for _, replica := range assignment.ResultReplicas {
+		encoded = appendReplica(encoded, replica)
+	}
+	return encoded
+}
+
+func appendMarker(encoded []byte, marker NeedsReassignment) []byte {
+	encoded = append(encoded, byte(marker.Kind))
+	encoded = appendTask(encoded, marker.Task)
+	encoded = appendTask(encoded, marker.SinkTask)
+	encoded = append(encoded, byte(marker.ReplicaRole))
+	encoded = appendU16(encoded, marker.OldWorkerID)
+	return append(encoded, marker.OldWorkerEpoch[:]...)
+}
+
+func completionReportBytes(report model.CompletionReport) []byte {
+	encoded := append([]byte(nil), report.JobID[:]...)
+	encoded = appendU64(encoded, report.JobControlRevision)
+	encoded = appendU64(encoded, report.AssignmentRevision)
+	encoded = appendTask(encoded, report.Source)
+	encoded = appendToken(encoded, report.Token)
+	encoded = appendEpoch(encoded, report.Epoch)
+	encoded = appendU64(encoded, report.ExpectedCheckpointRevision)
+	encoded = appendU64(encoded, report.Prior)
+	encoded = appendU64(encoded, report.New)
+	encoded = appendU64(encoded, report.EOF)
+	encoded = appendU64(encoded, report.WorkerTransactionID)
+	return append(encoded, report.Digest[:]...)
+}
+
+func failureReportBytes(report model.JobFailureReport) []byte {
+	encoded := append([]byte(nil), report.JobID[:]...)
+	encoded = appendU64(encoded, report.JobControlRevision)
+	encoded = appendU64(encoded, report.AssignmentRevision)
+	encoded = appendToken(encoded, report.Task)
+	encoded = appendEpoch(encoded, report.Epoch)
+	encoded = appendU64(encoded, report.TransactionID)
+	encoded = appendU16(encoded, uint16(report.Code))
+	return append(encoded, report.DetailDigest[:]...)
+}
+
+func appendManifest(encoded []byte, manifest ResultManifest) []byte {
+	encoded = append(encoded, manifest.JobID[:]...)
+	encoded = appendTask(encoded, manifest.SinkTask)
+	encoded = appendU64(encoded, manifest.ManifestRevision)
+	encoded = append(encoded, manifest.SpecificationHash[:]...)
+	encoded = appendU64(encoded, manifest.RecordCount)
+	encoded = appendU64(encoded, manifest.TotalBytes)
+	encoded = append(encoded, manifest.Checksum[:]...)
+	return appendReplica(encoded, manifest.Replicas)
+}
+
+func recordSourceEOFTarget(command RecordSourceEOF) []byte {
+	return appendU64(appendTask(nil, command.Source), command.EOF)
+}
+func installAssignmentsTarget(command InstallAssignments) []byte {
+	return appendAssignment(nil, command.Assignment)
+}
+func replaceAssignmentsTarget(command ReplaceAssignments) []byte {
+	encoded := append([]byte(nil), command.JobID[:]...)
+	encoded = appendU64(encoded, command.ExpectedAssignmentRevision)
+	encoded = append(encoded, command.ExpectedDigest[:]...)
+	encoded = append(encoded, command.ExpectedMarkersDigest[:]...)
+	return appendAssignment(encoded, command.Target)
+}
+func advanceCheckpointTarget(command AdvanceCheckpoint) []byte {
+	return completionReportBytes(command.Report)
+}
+func sealManifestTarget(command SealManifest) []byte { return appendManifest(nil, command.Manifest) }
+func transitionJobTarget(command TransitionJob) []byte {
+	encoded := append([]byte(nil), command.JobID[:]...)
+	return append(encoded, byte(command.From), byte(command.To))
+}
+func failJobTarget(command FailJob) []byte { return failureReportBytes(command.Report) }
 
 // MarshalBeginCoordinatorEpoch emits the sole canonical concrete Task 9 command.
 func MarshalBeginCoordinatorEpoch(command BeginCoordinatorEpoch) ([]byte, error) {
@@ -639,4 +837,241 @@ func (decoder *commandDecoder) topology() (model.ValidatedTopology, error) {
 		return model.ValidatedTopology{}, fmt.Errorf("%w: topology: %v", ErrInvalidCommand, err)
 	}
 	return validated, nil
+}
+
+func (decoder *commandDecoder) taskID() (model.TaskID, error) {
+	job, err := decoder.jobID()
+	if err != nil {
+		return model.TaskID{}, err
+	}
+	stage, err := decoder.u16()
+	if err != nil {
+		return model.TaskID{}, err
+	}
+	partition, err := decoder.u16()
+	return model.TaskID{JobID: job, StageID: stage, Partition: partition}, err
+}
+
+func (decoder *commandDecoder) epoch() (model.CoordinatorEpoch, error) {
+	term, err := decoder.u64()
+	if err != nil {
+		return model.CoordinatorEpoch{}, err
+	}
+	index, err := decoder.u64()
+	if err != nil {
+		return model.CoordinatorEpoch{}, err
+	}
+	coordinator, err := decoder.u16()
+	if err != nil {
+		return model.CoordinatorEpoch{}, err
+	}
+	nonce, err := decoder.array16()
+	return model.CoordinatorEpoch{Term: term, BeginIndex: index, Coordinator: coordinator, Nonce: nonce}, err
+}
+
+func (decoder *commandDecoder) token() (model.AssignmentToken, error) {
+	task, err := decoder.taskID()
+	if err != nil {
+		return model.AssignmentToken{}, err
+	}
+	workerID, err := decoder.u16()
+	if err != nil {
+		return model.AssignmentToken{}, err
+	}
+	epoch, err := decoder.workerEpoch()
+	if err != nil {
+		return model.AssignmentToken{}, err
+	}
+	attempt, err := decoder.u64()
+	if err != nil {
+		return model.AssignmentToken{}, err
+	}
+	specification, err := decoder.array32()
+	if err != nil {
+		return model.AssignmentToken{}, err
+	}
+	revision, err := decoder.u64()
+	return model.AssignmentToken{Task: task, WorkerID: workerID, WorkerEpoch: epoch, Attempt: attempt, SpecificationHash: specification, AssignmentRevision: revision}, err
+}
+
+func (decoder *commandDecoder) replica() (model.ResultReplicaSet, error) {
+	sink, err := decoder.taskID()
+	if err != nil {
+		return model.ResultReplicaSet{}, err
+	}
+	primary, err := decoder.u16()
+	if err != nil {
+		return model.ResultReplicaSet{}, err
+	}
+	secondary, err := decoder.u16()
+	if err != nil {
+		return model.ResultReplicaSet{}, err
+	}
+	primaryEpoch, err := decoder.workerEpoch()
+	if err != nil {
+		return model.ResultReplicaSet{}, err
+	}
+	secondaryEpoch, err := decoder.workerEpoch()
+	return model.ResultReplicaSet{SinkTask: sink, PrimaryNodeID: primary, SecondaryNodeID: secondary, PrimaryEpoch: primaryEpoch, SecondaryEpoch: secondaryEpoch}, err
+}
+
+func (decoder *commandDecoder) assignment() (model.AssignmentSet, error) {
+	job, err := decoder.jobID()
+	if err != nil {
+		return model.AssignmentSet{}, err
+	}
+	revision, err := decoder.u64()
+	if err != nil {
+		return model.AssignmentSet{}, err
+	}
+	digest, err := decoder.array32()
+	if err != nil {
+		return model.AssignmentSet{}, err
+	}
+	count, err := decoder.u16()
+	if err != nil {
+		return model.AssignmentSet{}, err
+	}
+	const tokenBytes = 86
+	if count == 0 || uint64(count) > model.LimitsV1().MaxTasksPerJob || int(count) > decoder.remaining()/tokenBytes {
+		return model.AssignmentSet{}, fmt.Errorf("%w: assignment task count", ErrMalformedCommand)
+	}
+	tasks := make([]model.AssignmentToken, int(count))
+	for index := range tasks {
+		tasks[index], err = decoder.token()
+		if err != nil {
+			return model.AssignmentSet{}, err
+		}
+	}
+	replicaCount, err := decoder.u16()
+	if err != nil {
+		return model.AssignmentSet{}, err
+	}
+	const replicaBytes = 56
+	if uint64(replicaCount) > model.LimitsV1().MaxResultManifestsPerJob || int(replicaCount) > decoder.remaining()/replicaBytes {
+		return model.AssignmentSet{}, fmt.Errorf("%w: assignment replica count", ErrMalformedCommand)
+	}
+	replicas := make([]model.ResultReplicaSet, int(replicaCount))
+	for index := range replicas {
+		replicas[index], err = decoder.replica()
+		if err != nil {
+			return model.AssignmentSet{}, err
+		}
+	}
+	return model.AssignmentSet{JobID: job, Revision: revision, Digest: digest, Tasks: tasks, ResultReplicas: replicas}, nil
+}
+
+func (decoder *commandDecoder) completionReport() (model.CompletionReport, error) {
+	job, err := decoder.jobID()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	jobRevision, err := decoder.u64()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	assignmentRevision, err := decoder.u64()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	source, err := decoder.taskID()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	token, err := decoder.token()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	epoch, err := decoder.epoch()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	expected, err := decoder.u64()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	prior, err := decoder.u64()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	newWatermark, err := decoder.u64()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	eof, err := decoder.u64()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	transaction, err := decoder.u64()
+	if err != nil {
+		return model.CompletionReport{}, err
+	}
+	digest, err := decoder.array32()
+	return model.CompletionReport{JobID: job, JobControlRevision: jobRevision, AssignmentRevision: assignmentRevision, Source: source, Token: token, Epoch: epoch, ExpectedCheckpointRevision: expected, Prior: prior, New: newWatermark, EOF: eof, WorkerTransactionID: transaction, Digest: digest}, err
+}
+
+func (decoder *commandDecoder) failureReport() (model.JobFailureReport, error) {
+	job, err := decoder.jobID()
+	if err != nil {
+		return model.JobFailureReport{}, err
+	}
+	jobRevision, err := decoder.u64()
+	if err != nil {
+		return model.JobFailureReport{}, err
+	}
+	assignmentRevision, err := decoder.u64()
+	if err != nil {
+		return model.JobFailureReport{}, err
+	}
+	token, err := decoder.token()
+	if err != nil {
+		return model.JobFailureReport{}, err
+	}
+	epoch, err := decoder.epoch()
+	if err != nil {
+		return model.JobFailureReport{}, err
+	}
+	transaction, err := decoder.u64()
+	if err != nil {
+		return model.JobFailureReport{}, err
+	}
+	code, err := decoder.u16()
+	if err != nil {
+		return model.JobFailureReport{}, err
+	}
+	detail, err := decoder.array32()
+	return model.JobFailureReport{JobID: job, JobControlRevision: jobRevision, AssignmentRevision: assignmentRevision, Task: token, Epoch: epoch, TransactionID: transaction, Code: model.FailureCode(code), DetailDigest: detail}, err
+}
+
+func (decoder *commandDecoder) manifest() (ResultManifest, error) {
+	job, err := decoder.jobID()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	sink, err := decoder.taskID()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	revision, err := decoder.u64()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	specification, err := decoder.array32()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	records, err := decoder.u64()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	total, err := decoder.u64()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	checksum, err := decoder.array32()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	replica, err := decoder.replica()
+	return ResultManifest{JobID: job, SinkTask: sink, ManifestRevision: revision, SpecificationHash: specification, RecordCount: records, TotalBytes: total, Checksum: checksum, Replicas: replica}, err
 }

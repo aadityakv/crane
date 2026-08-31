@@ -19,7 +19,7 @@ func TestCommandBeginCoordinatorEpochCanonicalGoldenAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBeginCoordinatorEpoch: %v", err)
 	}
-	const wantHex = "0001a0a7b224d7c6b8f351c1b5274a7908104b828a6a54a86ae842502f3f27d6e23a0001021100000000000000000000000000000000000000000000000000000000000000206aedeed5b65ee76c96435f96185754bd5c8b8ebfc11d819bfca2903211994b0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
+	const wantHex = "00019da3b0fb713e401da1770cc147ec298ee81e028b016920ff35075ac62a49cdb200010211000000000000000000000000000000000000000000000000000000000000003db1bb7d2c882b6f72f6f5bd1620a3e12c3d67b5da87a3e3c0a035e3d6960db30100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("golden = %s, want %s", got, wantHex)
 	}
@@ -360,18 +360,43 @@ func TestCommandContractDescriptorMechanicallyMatchesCodecConstantsAndEnums(t *t
 	if estimatedSnapshotBaseBytes != contract.SnapshotBaseBytes || clientHistoryFixedBytes != contract.ClientHistoryFixedBytes || subjectHistoryFixedBytes != contract.SubjectHistoryFixedBytes {
 		t.Fatalf("state preflight constants drifted from fingerprinted contract: %#v", contract)
 	}
-	if CommandBeginCoordinatorEpoch != 1 || SubjectNone != 0 || SubjectCoordinator != 1 || SubjectResultManifest != 6 || ResultSuccess != 1 || ResultResultTooLarge != 8 {
+	if CommandBeginCoordinatorEpoch != 1 || CommandFailJob != 14 || SubjectNone != 0 || SubjectCoordinator != 1 || SubjectResultManifest != 6 || ResultSuccess != 1 || ResultResultTooLarge != 8 {
 		t.Fatal("state enums drifted from fingerprinted contract")
 	}
-	var subjectValues []string
-	var resultValues []string
+	var commandValues, subjectValues, resultValues, targetValues []string
 	for _, domain := range contract.EnumDomains {
 		switch domain.Name {
+		case "CommandKind":
+			commandValues = domain.Values
 		case "SubjectKind":
 			subjectValues = domain.Values
 		case "ResultCode":
 			resultValues = domain.Values
+		case "ReassignmentTargetKind":
+			targetValues = domain.Values
 		}
+	}
+	wantCommandValues := []string{
+		fmt.Sprintf("BeginCoordinatorEpoch=%d", CommandBeginCoordinatorEpoch),
+		fmt.Sprintf("RegisterWorker=%d", CommandRegisterWorker),
+		fmt.Sprintf("DrainWorker=%d", CommandDrainWorker),
+		fmt.Sprintf("DeactivateWorker=%d", CommandDeactivateWorker),
+		fmt.Sprintf("ReplaceWorkerEpoch=%d", CommandReplaceWorkerEpoch),
+		fmt.Sprintf("SubmitJob=%d", CommandSubmitJob),
+		fmt.Sprintf("CancelJob=%d", CommandCancelJob),
+		fmt.Sprintf("RecordSourceEOF=%d", CommandRecordSourceEOF),
+		fmt.Sprintf("InstallAssignments=%d", CommandInstallAssignments),
+		fmt.Sprintf("ReplaceAssignments=%d", CommandReplaceAssignments),
+		fmt.Sprintf("AdvanceCheckpoint=%d", CommandAdvanceCheckpoint),
+		fmt.Sprintf("SealManifest=%d", CommandSealManifest),
+		fmt.Sprintf("TransitionJob=%d", CommandTransitionJob),
+		fmt.Sprintf("FailJob=%d", CommandFailJob),
+	}
+	if !reflect.DeepEqual(commandValues, wantCommandValues) {
+		t.Fatalf("fingerprinted CommandKind domain = %v, want actual complete domain %v", commandValues, wantCommandValues)
+	}
+	if want := []string{fmt.Sprintf("Task=%d", TaskTarget), fmt.Sprintf("ResultReplica=%d", ResultReplicaTarget)}; !reflect.DeepEqual(targetValues, want) {
+		t.Fatalf("fingerprinted reassignment domain = %v, want %v", targetValues, want)
 	}
 	wantSubjectValues := []string{
 		fmt.Sprintf("None=%d", SubjectNone),

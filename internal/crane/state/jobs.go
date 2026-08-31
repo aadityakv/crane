@@ -33,6 +33,12 @@ type JobRecord struct {
 	TopologyBytes      []byte
 	Lifecycle          JobLifecycle
 	JobControlRevision uint64
+	Assignment         *model.AssignmentSet
+	NeedsReassignment  []NeedsReassignment
+	SourceEOFs         map[model.TaskID]SourceEOFRecord
+	Checkpoints        map[model.TaskID]CheckpointRecord
+	Manifests          map[model.TaskID]ResultManifest
+	Failure            *model.JobFailureReport
 }
 
 type SubmitJob struct {
@@ -186,4 +192,31 @@ func (machine *Machine) activeJobCount() uint64 {
 		}
 	}
 	return count
+}
+
+func cloneJobRecord(record JobRecord) JobRecord {
+	clone := record
+	clone.TopologyBytes = append([]byte(nil), record.TopologyBytes...)
+	clone.NeedsReassignment = append([]NeedsReassignment(nil), record.NeedsReassignment...)
+	if record.Assignment != nil {
+		assignment := cloneAssignment(*record.Assignment)
+		clone.Assignment = &assignment
+	}
+	clone.SourceEOFs = make(map[model.TaskID]SourceEOFRecord, len(record.SourceEOFs))
+	for key, value := range record.SourceEOFs {
+		clone.SourceEOFs[key] = value
+	}
+	clone.Checkpoints = make(map[model.TaskID]CheckpointRecord, len(record.Checkpoints))
+	for key, value := range record.Checkpoints {
+		clone.Checkpoints[key] = value
+	}
+	clone.Manifests = make(map[model.TaskID]ResultManifest, len(record.Manifests))
+	for key, value := range record.Manifests {
+		clone.Manifests[key] = value
+	}
+	if record.Failure != nil {
+		failure := *record.Failure
+		clone.Failure = &failure
+	}
+	return clone
 }

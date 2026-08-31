@@ -30,6 +30,13 @@ const (
 	CommandReplaceWorkerEpoch    CommandKind = 5
 	CommandSubmitJob             CommandKind = 6
 	CommandCancelJob             CommandKind = 7
+	CommandRecordSourceEOF       CommandKind = 8
+	CommandInstallAssignments    CommandKind = 9
+	CommandReplaceAssignments    CommandKind = 10
+	CommandAdvanceCheckpoint     CommandKind = 11
+	CommandSealManifest          CommandKind = 12
+	CommandTransitionJob         CommandKind = 13
+	CommandFailJob               CommandKind = 14
 )
 
 type InternalCommandID [32]byte
@@ -106,7 +113,7 @@ func (envelope Envelope) Validate() error {
 	if envelope.ConsensusFingerprint == ([32]byte{}) || envelope.ConsensusFingerprint != model.ConsensusFingerprint() {
 		return ErrConsensusFingerprintMismatch
 	}
-	if envelope.Kind < CommandBeginCoordinatorEpoch || envelope.Kind > CommandCancelJob {
+	if envelope.Kind < CommandBeginCoordinatorEpoch || envelope.Kind > CommandFailJob {
 		return fmt.Errorf("%w: %d", ErrUnknownCommandKind, envelope.Kind)
 	}
 	if (envelope.Client == nil) == (envelope.Internal == nil) {
@@ -195,6 +202,8 @@ const (
 	ResultNotFound          ResultCode = ResultRevisionMismatch
 	ResultInvalidTransition ResultCode = ResultRevisionMismatch
 	ResultIdentityCollision ResultCode = ResultIdentityReuse
+	ResultInvalidTarget     ResultCode = ResultRevisionMismatch
+	ResultStaleWorkerEvent  ResultCode = ResultRevisionMismatch
 )
 
 type CommandResult struct {

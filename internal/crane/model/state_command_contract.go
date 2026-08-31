@@ -84,6 +84,13 @@ type StateCommandContract struct {
 	MaxWorkers           uint64
 	MaxActiveJobs        uint64
 	MaxRetainedJobs      uint64
+	MaxTasksPerJob       uint64
+	MaxManifestsPerJob   uint64
+	MaxReassignmentMarks uint64
+	MaxWorkerSlots       uint64
+	MaxCommandBytes      uint64
+	MaxTopologyBytes     uint64
+	MaxResultBytes       uint64
 
 	FixedEnvelopeBytes       uint64
 	ClientEnvelopeBytes      uint64
@@ -110,18 +117,41 @@ var stateCommandLayoutsV1 = []StateCommandLayoutDescriptor{
 	{Name: "ReplaceWorkerEpoch", Fields: []string{"Envelope:Envelope(internal-worker)", "WorkerID:u16(nonzero)", "OldEpoch:bytes16(nonzero)", "Target:WorkerRecord", "Affected:list(AffectedAssignment)"}},
 	{Name: "SubmitJob", Fields: []string{"Envelope:Envelope(client)", "Topology:canonical-topology-v1"}},
 	{Name: "CancelJob", Fields: []string{"Envelope:Envelope(client)", "JobID:bytes16(nonzero)", "ExpectedRevision:u64(nonzero-successor)"}},
+	{Name: "RecordSourceEOF", Fields: []string{"Envelope:Envelope(internal-source-eof)", "Source:TaskID", "EOF:u64"}},
+	{Name: "InstallAssignments", Fields: []string{"Envelope:Envelope(internal-job-control)", "Assignment:AssignmentSet"}},
+	{Name: "ReplaceAssignments", Fields: []string{"Envelope:Envelope(internal-job-control)", "JobID:JobID", "ExpectedAssignmentRevision:u64(nonzero)", "ExpectedDigest:sha256(nonzero)", "ExpectedMarkersDigest:sha256(nonzero)", "Target:AssignmentSet(successor)"}},
+	{Name: "AdvanceCheckpoint", Fields: []string{"Envelope:Envelope(internal-source-checkpoint)", "Report:CompletionReport"}},
+	{Name: "SealManifest", Fields: []string{"Envelope:Envelope(internal-result-manifest)", "Manifest:ResultManifest"}},
+	{Name: "TransitionJob", Fields: []string{"Envelope:Envelope(internal-job-control)", "JobID:JobID", "From:JobLifecycle", "To:JobLifecycle"}},
+	{Name: "FailJob", Fields: []string{"Envelope:Envelope(internal-job-control)", "Report:JobFailureReport"}},
 	{Name: "WorkerRecord", Fields: []string{"NodeID:u16(nonzero)", "Epoch:bytes16(nonzero)", "State:u8", "Revision:u64(nonzero)", "Slots:u16", "ConsensusFingerprint:sha256", "RegistryFingerprint:sha256"}},
 	{Name: "AffectedAssignment", Fields: []string{"JobID:bytes16(nonzero)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)"}},
+	{Name: "TaskID", Fields: []string{"JobID:bytes16(nonzero)", "StageID:u16(nonzero)", "Partition:u16"}},
+	{Name: "CoordinatorEpoch", Fields: []string{"Term:u64(nonzero)", "BeginIndex:u64(nonzero)", "Coordinator:u16(nonzero)", "Nonce:bytes16(nonzero)"}},
+	{Name: "AssignmentToken", Fields: []string{"Task:TaskID", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "Attempt:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "AssignmentRevision:u64(nonzero)"}},
+	{Name: "ResultReplicaSet", Fields: []string{"SinkTask:TaskID", "PrimaryNodeID:u16(nonzero)", "SecondaryNodeID:u16(nonzero-distinct)", "PrimaryEpoch:bytes16(nonzero)", "SecondaryEpoch:bytes16(nonzero)"}},
+	{Name: "AssignmentSet", Fields: []string{"JobID:bytes16(nonzero)", "Revision:u64(nonzero)", "Digest:sha256(nonzero)", "Tasks:u16-count+list(AssignmentToken)", "ResultReplicas:u16-count+list(ResultReplicaSet)"}},
+	{Name: "NeedsReassignment", Fields: []string{"Kind:ReassignmentTargetKind", "Task:TaskID", "SinkTask:TaskID", "ReplicaRole:ResultReplicaRole", "OldWorkerID:u16(nonzero)", "OldWorkerEpoch:bytes16(nonzero)"}},
+	{Name: "CompletionReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Source:TaskID", "Token:AssignmentToken", "Epoch:CoordinatorEpoch", "ExpectedCheckpointRevision:u64", "Prior:u64", "New:u64", "EOF:u64", "WorkerTransactionID:u64(nonzero)", "Digest:sha256(nonzero)"}},
+	{Name: "JobFailureReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Task:AssignmentToken", "Epoch:CoordinatorEpoch", "TransactionID:u64(nonzero)", "Code:FailureCode", "DetailDigest:sha256(nonzero)"}},
+	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet"}},
+	{Name: "SourceEOFRecord", Fields: []string{"EOF:u64", "Revision:u64(exactly-one)"}},
+	{Name: "CheckpointRecord", Fields: []string{"Watermark:u64", "Revision:u64(nonzero)"}},
+	{Name: "WorkerEventCursor", Fields: []string{"WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "TransactionID:u64(nonzero)", "Digest:sha256(nonzero)"}},
+	{Name: "JobRecord", Fields: []string{"JobID:JobID", "DefiningRequest:ClientRequestID", "TopologyDigest:sha256", "TopologyBytes:owned-canonical-topology", "Lifecycle:JobLifecycle", "JobControlRevision:u64", "Assignment:optional(AssignmentSet)", "NeedsReassignment:sorted-list(NeedsReassignment)", "SourceEOFs:task-keyed(SourceEOFRecord)", "Checkpoints:task-keyed(CheckpointRecord)", "Manifests:task-keyed(ResultManifest)", "Failure:optional(JobFailureReport)"}},
 	{Name: "CommandResult", Fields: []string{"SchemaVersion:u16", "Code:u16", "Subject:u8", "Revision:u64", "JobID:JobID", "WorkerID:u16", "Epoch:CoordinatorEpoch"}},
 }
 
 var stateCommandEnumsV1 = []StateCommandEnumDescriptor{
 	{Name: "IdentitySelector", Values: []string{"Client=1", "Internal=2"}},
-	{Name: "CommandKind", Values: []string{"BeginCoordinatorEpoch=1", "RegisterWorker=2", "DrainWorker=3", "DeactivateWorker=4", "ReplaceWorkerEpoch=5", "SubmitJob=6", "CancelJob=7"}},
+	{Name: "CommandKind", Values: []string{"BeginCoordinatorEpoch=1", "RegisterWorker=2", "DrainWorker=3", "DeactivateWorker=4", "ReplaceWorkerEpoch=5", "SubmitJob=6", "CancelJob=7", "RecordSourceEOF=8", "InstallAssignments=9", "ReplaceAssignments=10", "AdvanceCheckpoint=11", "SealManifest=12", "TransitionJob=13", "FailJob=14"}},
 	{Name: "WorkerState", Values: []string{"Eligible=1", "Draining=2", "Offline=3"}},
 	{Name: "JobLifecycle", Values: []string{"Pending=1", "Deploying=2", "Running=3", "Draining=4", "Succeeded=5", "Failed=6", "Canceled=7"}},
 	{Name: "SubjectKind", Values: []string{"None=0", "Coordinator=1", "Worker=2", "JobControl=3", "SourceEOF=4", "SourceCheckpoint=5", "ResultManifest=6"}},
 	{Name: "ResultCode", Values: []string{"Success=1", "IdentityReuse=2", "StaleRequest=3", "SkippedRequest=4", "CapacityExhausted=5", "RevisionMismatch=6", "StaleEpoch=7", "ResultTooLarge=8"}},
+	{Name: "ReassignmentTargetKind", Values: []string{"Task=1", "ResultReplica=2"}},
+	{Name: "ResultReplicaRole", Values: []string{"Primary=1", "Secondary=2"}},
+	{Name: "FailureCode", Values: []string{"Operator=1", "TupleInvalid=2", "Storage=3"}},
 }
 
 var stateCommandResultMatrixV1 = []StateCommandResultRule{
@@ -190,6 +220,19 @@ var stateCommandRulesV1 = []string{
 	"offline-same-epoch-registration-may-return-eligible-but-never-revives-draining",
 	"jobs-retain-defining-client-request-topology-digest-and-owned-canonical-bytes-for-collision-defense",
 	"active-and-retained-job-capacities-preflight-before-client-mutation",
+	"source-eof-is-derived-from-immutable-topology-recorded-once-before-assignment-and-has-an-independent-revision",
+	"assignment-install-is-one-complete-canonical-set-and-every-token-revision-equals-the-enclosing-set-revision",
+	"assignment-replacement-requires-the-exact-old-set-revision-digest-and-reassignment-marker-digest",
+	"assignment-replacement-changes-only-marked-targets-advances-only-their-attempts-and-replaces-result-replicas-by-marked-role",
+	"worker-deactivation-and-epoch-replacement-require-the-sorted-complete-affected-job-list-and-atomically-union-sorted-reassignment-markers",
+	"checkpoint-manifest-and-job-control-subject-revisions-advance-independently",
+	"worker-event-transactions-use-one-strictly-increasing-digest-bound-cursor-per-exact-worker-id-and-worker-epoch-across-all-jobs-and-sources",
+	"worker-epoch-replacement-discards-the-old-epoch-event-cursor-before-the-new-epoch-starts-at-zero",
+	"completion-and-failure-events-bind-the-current-coordinator-epoch-job-control-revision-assignment-revision-and-exact-current-token",
+	"checkpoints-never-exceed-immutable-source-eof-and-job-draining-requires-every-source-at-eof",
+	"sealed-manifests-bind-the-current-two-node-result-replica-set-and-succeeded-requires-every-current-manifest-and-final-checkpoint",
+	"only-deploying-to-running-running-to-draining-and-draining-to-succeeded-are-normal-internal-lifecycle-transitions",
+	"all-declared-collection-counts-and-command-sizes-are-bounded-before-allocation-or-mutation",
 }
 
 // StateCommandContractV1 returns deep-owned consensus descriptor slices.
@@ -199,7 +242,7 @@ func StateCommandContractV1() StateCommandContract {
 		EnvelopeLayouts:          cloneStateCommandLayouts(stateCommandLayoutsV1),
 		EnumDomains:              cloneStateCommandEnums(stateCommandEnumsV1),
 		ResultMatrix:             append([]StateCommandResultRule(nil), stateCommandResultMatrixV1...),
-		DigestDomains:            []string{"cs425/crane/internal-command/v1"},
+		DigestDomains:            []string{"cs425/crane/internal-command/v1", "cs425/crane/needs-reassignment/v1", "cs425/crane/completion-report/v1", "cs425/crane/job-failure-event/v1"},
 		MaxClientSessions:        StateCommandMaxClientSessionsV1,
 		MaxSubjectHistories:      StateCommandMaxSubjectHistoriesV1,
 		MaxCachedResultBytes:     StateCommandMaxCachedResultBytesV1,
@@ -207,6 +250,13 @@ func StateCommandContractV1() StateCommandContract {
 		MaxWorkers:               LimitsV1().MaxRegisteredWorkers,
 		MaxActiveJobs:            LimitsV1().MaxActiveJobs,
 		MaxRetainedJobs:          LimitsV1().MaxRetainedJobs,
+		MaxTasksPerJob:           LimitsV1().MaxTasksPerJob,
+		MaxManifestsPerJob:       LimitsV1().MaxResultManifestsPerJob,
+		MaxReassignmentMarks:     LimitsV1().MaxTasksPerJob + 2*LimitsV1().MaxResultManifestsPerJob,
+		MaxWorkerSlots:           LimitsV1().MaxWorkerSlots,
+		MaxCommandBytes:          LimitsV1().MaxSubmitJobBytes,
+		MaxTopologyBytes:         LimitsV1().MaxTopologyBytes,
+		MaxResultBytes:           LimitsV1().MaxResultRecordsBytesPerJob,
 		FixedEnvelopeBytes:       StateCommandFixedEnvelopeBytesV1,
 		ClientEnvelopeBytes:      StateCommandClientEnvelopeBytesV1,
 		InternalEnvelopeBytes:    StateCommandInternalEnvelopeBytesV1,
@@ -243,6 +293,9 @@ func canonicalStateCommandContractBytes(contract StateCommandContract) []byte {
 		contract.MaxClientSessions, contract.MaxSubjectHistories,
 		contract.MaxCachedResultBytes, contract.MaxSnapshotBytes,
 		contract.MaxWorkers, contract.MaxActiveJobs, contract.MaxRetainedJobs,
+		contract.MaxTasksPerJob, contract.MaxManifestsPerJob,
+		contract.MaxReassignmentMarks, contract.MaxWorkerSlots,
+		contract.MaxCommandBytes, contract.MaxTopologyBytes, contract.MaxResultBytes,
 		contract.FixedEnvelopeBytes, contract.ClientEnvelopeBytes,
 		contract.InternalEnvelopeBytes, contract.SubjectKeyBytes,
 		contract.BeginTargetBytes, contract.CommandResultBytes,
