@@ -47,13 +47,14 @@ func StateCommandEncodingLayouts() []model.StateCommandLayoutDescriptor {
 		tracedStateLayout("AssignmentSet", func(trace *[]string) { appendAssignmentTraced(nil, model.AssignmentSet{}, trace) }),
 		stateLayout("AssignmentSetDigest", model.AssignmentSetDigestLayoutV1()...),
 		tracedStateLayout("NeedsReassignment", func(trace *[]string) { appendMarkerTraced(nil, NeedsReassignment{}, trace) }),
+		stateLayout("InvalidationProvenance", "Kind:WorkerInvalidationKind", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "WorkerRevision:u64(nonzero)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)", "Markers:u16-count+sorted(NeedsReassignment)", "RepairJobControlRevision:u64(zero-or-nonzero)", "RepairAssignmentRevision:u64(zero-or-successor)", "RepairAssignmentDigest:sha256(zero-iff-active)", "RepairMarkersDigest:sha256(zero-iff-active)"),
 		tracedStateLayout("CompletionReport", func(trace *[]string) { appendCompletionReportTraced(nil, model.CompletionReport{}, trace) }),
 		tracedStateLayout("JobFailureReport", func(trace *[]string) { appendFailureReportTraced(nil, model.JobFailureReport{}, trace) }),
 		tracedStateLayout("ResultManifest", func(trace *[]string) { appendManifestTraced(nil, ResultManifest{}, trace) }),
 		stateLayout("SourceEOFRecord", "EOF:u64", "Revision:u64(exactly-one)"),
 		stateLayout("CheckpointRecord", "Watermark:u64", "Revision:u64(nonzero)"),
 		stateLayout("WorkerEventCursor", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "TransactionID:u64(nonzero)", "Digest:sha256(nonzero)"),
-		stateLayout("JobRecord", "JobID:JobID", "DefiningRequest:ClientRequestID", "TopologyDigest:sha256", "TopologyBytes:owned-canonical-topology", "Lifecycle:JobLifecycle", "JobControlRevision:u64", "Assignment:optional(AssignmentSet)", "NeedsReassignment:sorted-list(NeedsReassignment)", "SourceEOFs:task-keyed(SourceEOFRecord)", "Checkpoints:task-keyed(CheckpointRecord)", "Manifests:task-keyed(ResultManifest)", "Failure:optional(JobFailureReport)"),
+		stateLayout("JobRecord", "JobID:JobID", "DefiningRequest:ClientRequestID", "TopologyDigest:sha256", "TopologyBytes:owned-canonical-topology", "Lifecycle:JobLifecycle", "JobControlRevision:u64", "Assignment:optional(AssignmentSet)", "NeedsReassignment:sorted-list(NeedsReassignment)", "InvalidationHistory:u16-count+chronological(InvalidationProvenance)", "SourceEOFs:task-keyed(SourceEOFRecord)", "Checkpoints:task-keyed(CheckpointRecord)", "Manifests:task-keyed(ResultManifest)", "Failure:optional(JobFailureReport)"),
 		stateLayout("SubjectHistory", "Revision:u64", "ID:bytes32", "Digest:sha256", "Target:u32-bytes(owned)", "Result:u32-bytes(owned)", "Applied:u8", "AppliedRevision:u64", "AppliedTarget:u32-bytes(owned)", "AppliedResult:u32-bytes(owned)"),
 		stateLayout("CommandResult", "SchemaVersion:u16", "Code:u16", "Subject:u8", "Revision:u64", "JobID:JobID", "WorkerID:u16", "Epoch:CoordinatorEpoch"),
 	}
@@ -70,6 +71,7 @@ func StateCommandEnumDomains() []model.StateCommandEnumDescriptor {
 		{Name: "SubjectKind", Values: []string{fmt.Sprintf("None=%d", SubjectNone), fmt.Sprintf("Coordinator=%d", SubjectCoordinator), fmt.Sprintf("Worker=%d", SubjectWorker), fmt.Sprintf("JobControl=%d", SubjectJobControl), fmt.Sprintf("SourceEOF=%d", SubjectSourceEOF), fmt.Sprintf("SourceCheckpoint=%d", SubjectSourceCheckpoint), fmt.Sprintf("ResultManifest=%d", SubjectResultManifest)}},
 		{Name: "ResultCode", Values: []string{fmt.Sprintf("Success=%d", ResultSuccess), fmt.Sprintf("IdentityReuse=%d", ResultIdentityReuse), fmt.Sprintf("StaleRequest=%d", ResultStaleRequest), fmt.Sprintf("SkippedRequest=%d", ResultSkippedRequest), fmt.Sprintf("CapacityExhausted=%d", ResultCapacityExhausted), fmt.Sprintf("RevisionMismatch=%d", ResultRevisionMismatch), fmt.Sprintf("StaleEpoch=%d", ResultStaleEpoch), fmt.Sprintf("ResultTooLarge=%d", ResultResultTooLarge)}},
 		{Name: "ReassignmentTargetKind", Values: []string{fmt.Sprintf("Task=%d", TaskTarget), fmt.Sprintf("ResultReplica=%d", ResultReplicaTarget)}},
+		{Name: "WorkerInvalidationKind", Values: []string{fmt.Sprintf("Deactivate=%d", workerInvalidationDeactivate), fmt.Sprintf("ReplaceEpoch=%d", workerInvalidationReplaceEpoch)}},
 		{Name: "ResultReplicaRole", Values: []string{fmt.Sprintf("Primary=%d", model.PrimaryReplica), fmt.Sprintf("Secondary=%d", model.SecondaryReplica)}},
 		{Name: "FailureCode", Values: []string{fmt.Sprintf("Operator=%d", model.FailureOperator), fmt.Sprintf("TupleInvalid=%d", model.FailureTupleInvalid), fmt.Sprintf("Storage=%d", model.FailureStorage)}},
 	}

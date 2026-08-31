@@ -54,6 +54,37 @@ type AffectedAssignment struct {
 	AssignmentDigest   [32]byte    // AssignmentDigest fences the exact current set bytes.
 }
 
+type workerInvalidationKind uint8
+
+const (
+	workerInvalidationDeactivate workerInvalidationKind = iota + 1
+	workerInvalidationReplaceEpoch
+)
+
+type invalidationProvenance struct {
+	Kind                     workerInvalidationKind
+	WorkerID                 uint16
+	WorkerEpoch              model.WorkerEpoch
+	WorkerRevision           uint64
+	JobControlRevision       uint64
+	AssignmentRevision       uint64
+	AssignmentDigest         [32]byte
+	Markers                  []NeedsReassignment
+	RepairJobControlRevision uint64
+	RepairAssignmentRevision uint64
+	RepairAssignmentDigest   [32]byte
+	RepairMarkersDigest      [32]byte
+}
+
+func cloneInvalidationProvenance(input []invalidationProvenance) []invalidationProvenance {
+	result := make([]invalidationProvenance, len(input))
+	for index, provenance := range input {
+		result[index] = provenance
+		result[index].Markers = append([]NeedsReassignment(nil), provenance.Markers...)
+	}
+	return result
+}
+
 func (affected AffectedAssignment) validate() error {
 	if err := affected.JobID.Validate(); err != nil {
 		return err
@@ -259,6 +290,10 @@ func (machine *Machine) applyRegisterWorkerLocked(command RegisterWorker) ([]byt
 		if command.Worker.Revision != nextRevision {
 			return mutationPlan{}, errors.New("impossible worker target revision divergence")
 		}
+		jobs, pruneDelta, ok := machine.prepareConsumedInvalidationPrune(command.Worker.NodeID)
+		if !ok {
+			return mutationPlan{}, errors.New("impossible invalidation provenance accounting")
+		}
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
 		if err != nil {
 			return mutationPlan{}, err
@@ -267,7 +302,13 @@ func (machine *Machine) applyRegisterWorkerLocked(command RegisterWorker) ([]byt
 		if !exists {
 			delta = workerRecordEstimatedBytes
 		}
-		return mutationPlan{result: result, stateDelta: delta, commit: func() { machine.workers[command.Worker.NodeID] = command.Worker }}, nil
+		delta += pruneDelta
+		return mutationPlan{result: result, stateDelta: delta, commit: func() {
+			machine.workers[command.Worker.NodeID] = command.Worker
+			for jobID, record := range jobs {
+				machine.jobs[jobID] = record
+			}
+		}}, nil
 	})
 }
 
@@ -284,9 +325,18 @@ func (machine *Machine) applyDrainWorkerLocked(command DrainWorker) ([]byte, err
 			result, err := marshalBusinessResult(ResultInvalidTransition, key, current.Revision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
 		}
+		jobs, delta, ok := machine.prepareConsumedInvalidationPrune(command.WorkerID)
+		if !ok {
+			return mutationPlan{}, errors.New("impossible invalidation provenance accounting")
+		}
 		current.State, current.Revision = WorkerDraining, nextRevision
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
-		return mutationPlan{result: result, commit: func() { machine.workers[command.WorkerID] = current }}, err
+		return mutationPlan{result: result, stateDelta: delta, commit: func() {
+			machine.workers[command.WorkerID] = current
+			for jobID, record := range jobs {
+				machine.jobs[jobID] = record
+			}
+		}}, err
 	})
 }
 
@@ -303,7 +353,7 @@ func (machine *Machine) applyDeactivateWorkerLocked(command DeactivateWorker) ([
 			result, err := marshalBusinessResult(ResultInvalidTransition, key, current.Revision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
 		}
-		jobs, delta, ok := machine.prepareWorkerInvalidation(command.WorkerID, command.WorkerEpoch, command.Affected)
+		jobs, delta, ok := machine.prepareWorkerInvalidation(workerInvalidationDeactivate, nextRevision, command.WorkerID, command.WorkerEpoch, command.Affected)
 		if !ok {
 			result, err := marshalBusinessResult(ResultRevisionMismatch, key, current.Revision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
@@ -332,7 +382,7 @@ func (machine *Machine) applyReplaceWorkerEpochLocked(command ReplaceWorkerEpoch
 			result, err := marshalBusinessResult(ResultInvalidTransition, key, current.Revision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
 		}
-		jobs, delta, ok := machine.prepareWorkerInvalidation(command.WorkerID, command.OldEpoch, command.Affected)
+		jobs, delta, ok := machine.prepareWorkerInvalidation(workerInvalidationReplaceEpoch, nextRevision, command.WorkerID, command.OldEpoch, command.Affected)
 		if !ok {
 			result, err := marshalBusinessResult(ResultRevisionMismatch, key, current.Revision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
@@ -352,34 +402,122 @@ func (machine *Machine) applyReplaceWorkerEpochLocked(command ReplaceWorkerEpoch
 	})
 }
 
-func (machine *Machine) prepareWorkerInvalidation(workerID uint16, epoch model.WorkerEpoch, presented []AffectedAssignment) (map[model.JobID]JobRecord, int64, bool) {
+func (machine *Machine) prepareWorkerInvalidation(kind workerInvalidationKind, workerRevision uint64, workerID uint16, epoch model.WorkerEpoch, presented []AffectedAssignment) (map[model.JobID]JobRecord, int64, bool) {
 	jobs := make(map[model.JobID]JobRecord)
 	var actual []AffectedAssignment
 	var delta int64
 	for jobID, record := range machine.jobs {
-		if record.Assignment == nil || record.Lifecycle.terminal() {
-			continue
-		}
-		markers := markersForWorker(*record.Assignment, workerID, epoch)
-		if len(markers) == 0 {
-			continue
-		}
-		actual = append(actual, AffectedAssignment{JobID: jobID, JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision, AssignmentDigest: record.Assignment.Digest})
 		candidate := cloneJobRecord(record)
-		before := len(candidate.NeedsReassignment)
-		candidate.NeedsReassignment = sortedMarkerUnion(candidate.NeedsReassignment, markers)
-		if err := validateMarkers(candidate.NeedsReassignment, jobID); err != nil || candidate.JobControlRevision == ^uint64(0) {
-			return nil, 0, false
+		candidate.invalidationHistory = machine.pruneConsumedInvalidationHistory(jobID, candidate.invalidationHistory, workerID)
+		if record.Assignment != nil && !record.Lifecycle.terminal() {
+			markers := markersForWorker(*record.Assignment, workerID, epoch)
+			union := sortedMarkerUnion(record.NeedsReassignment, markers)
+			if len(union) != len(record.NeedsReassignment) {
+				actual = append(actual, AffectedAssignment{JobID: jobID, JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision, AssignmentDigest: record.Assignment.Digest})
+				candidate.NeedsReassignment = union
+				if err := validateMarkers(candidate.NeedsReassignment, jobID); err != nil || candidate.JobControlRevision == ^uint64(0) || len(candidate.invalidationHistory) == int(model.StateCommandMaxInvalidationProvenanceV1) {
+					return nil, 0, false
+				}
+				candidate.invalidationHistory = append(candidate.invalidationHistory, invalidationProvenance{
+					Kind: kind, WorkerID: workerID, WorkerEpoch: epoch, WorkerRevision: workerRevision,
+					JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision,
+					AssignmentDigest: record.Assignment.Digest, Markers: append([]NeedsReassignment(nil), markers...),
+				})
+				candidate.JobControlRevision++
+			}
 		}
-		candidate.JobControlRevision++
-		delta += int64(len(candidate.NeedsReassignment)-before) * int64(reassignmentMarkerEstimatedBytes)
-		jobs[jobID] = candidate
+		if !reflect.DeepEqual(candidate, record) {
+			before, beforeOK := estimateJobRecordBytes(record)
+			after, afterOK := estimateJobRecordBytes(candidate)
+			if !beforeOK || !afterOK {
+				return nil, 0, false
+			}
+			delta += signedSizeDelta(after, before)
+			jobs[jobID] = candidate
+		}
 	}
 	sort.Slice(actual, func(i, j int) bool { return bytes.Compare(actual[i].JobID[:], actual[j].JobID[:]) < 0 })
 	if !reflect.DeepEqual(actual, presented) {
 		return nil, 0, false
 	}
 	return jobs, delta, true
+}
+
+func (machine *Machine) prepareConsumedInvalidationPrune(workerID uint16) (map[model.JobID]JobRecord, int64, bool) {
+	jobs := make(map[model.JobID]JobRecord)
+	var delta int64
+	for jobID, record := range machine.jobs {
+		candidate := cloneJobRecord(record)
+		candidate.invalidationHistory = machine.pruneConsumedInvalidationHistory(jobID, candidate.invalidationHistory, workerID)
+		if reflect.DeepEqual(candidate.invalidationHistory, record.invalidationHistory) {
+			continue
+		}
+		before, beforeOK := estimateJobRecordBytes(record)
+		after, afterOK := estimateJobRecordBytes(candidate)
+		if !beforeOK || !afterOK {
+			return nil, 0, false
+		}
+		delta += signedSizeDelta(after, before)
+		jobs[jobID] = candidate
+	}
+	return jobs, delta, true
+}
+
+func (machine *Machine) pruneConsumedInvalidationHistory(jobID model.JobID, history []invalidationProvenance, overwrittenWorker uint16) []invalidationProvenance {
+	neededRepairs := make(map[uint64]bool)
+	for _, provenance := range history {
+		if provenance.RepairJobControlRevision == 0 || provenance.WorkerID == overwrittenWorker {
+			continue
+		}
+		if machine.subjectRetainsInvalidation(jobID, provenance) {
+			neededRepairs[provenance.RepairJobControlRevision] = true
+		}
+	}
+	result := make([]invalidationProvenance, 0, len(history))
+	for _, provenance := range history {
+		if provenance.RepairJobControlRevision == 0 || neededRepairs[provenance.RepairJobControlRevision] {
+			clone := provenance
+			clone.Markers = append([]NeedsReassignment(nil), provenance.Markers...)
+			result = append(result, clone)
+		}
+	}
+	return result
+}
+
+func (machine *Machine) subjectRetainsInvalidation(jobID model.JobID, provenance invalidationProvenance) bool {
+	history, exists := machine.subjects[SubjectKey{Kind: SubjectWorker, WorkerID: provenance.WorkerID}]
+	if !exists || history.appliedRevision != provenance.WorkerRevision {
+		return false
+	}
+	kind, workerID, epoch, _, affected, ok := decodeWorkerInvalidationTarget(history.appliedTarget)
+	if !ok || kind != provenance.Kind || workerID != provenance.WorkerID || epoch != provenance.WorkerEpoch {
+		return false
+	}
+	want := AffectedAssignment{JobID: jobID, JobControlRevision: provenance.JobControlRevision, AssignmentRevision: provenance.AssignmentRevision, AssignmentDigest: provenance.AssignmentDigest}
+	for _, item := range affected {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeWorkerInvalidationTarget(target []byte) (workerInvalidationKind, uint16, model.WorkerEpoch, WorkerRecord, []AffectedAssignment, bool) {
+	decoder := commandDecoder{input: target}
+	if len(target) >= 20 && (len(target)-20)%64 == 0 {
+		workerID, workerErr := decoder.u16()
+		epoch, epochErr := decoder.workerEpoch()
+		affected, affectedErr := decoder.affected()
+		return workerInvalidationDeactivate, workerID, epoch, WorkerRecord{}, affected, workerErr == nil && epochErr == nil && affectedErr == nil && decoder.done()
+	}
+	if len(target) >= 113 && (len(target)-113)%64 == 0 {
+		workerID, workerErr := decoder.u16()
+		epoch, epochErr := decoder.workerEpoch()
+		record, recordErr := decoder.workerRecord()
+		affected, affectedErr := decoder.affected()
+		return workerInvalidationReplaceEpoch, workerID, epoch, record, affected, workerErr == nil && epochErr == nil && recordErr == nil && affectedErr == nil && decoder.done()
+	}
+	return 0, 0, model.WorkerEpoch{}, WorkerRecord{}, nil, false
 }
 
 func markersForWorker(set model.AssignmentSet, workerID uint16, epoch model.WorkerEpoch) []NeedsReassignment {

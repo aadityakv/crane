@@ -472,6 +472,9 @@ func TestSnapshotComparatorsFollowEveryFingerprintedSortRule(t *testing.T) {
 	if compareSnapshotMarker(leftMarker, rightMarker) >= 0 {
 		t.Fatal("marker comparator is not the fingerprinted union order")
 	}
+	if compareSnapshotInvalidation(invalidationProvenance{JobControlRevision: 255}, invalidationProvenance{JobControlRevision: 256}) >= 0 {
+		t.Fatal("invalidation comparator is not unsigned JobControlRevision order")
+	}
 }
 
 func TestTask11ExportedSnapshotAPIHasDocumentation(t *testing.T) {

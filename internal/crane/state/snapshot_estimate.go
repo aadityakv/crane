@@ -8,6 +8,7 @@ const (
 	assignmentTokenEstimatedBytes     uint64 = model.StateCommandAssignmentTokenBytesV1
 	resultReplicaEstimatedBytes       uint64 = model.StateCommandResultReplicaBytesV1
 	reassignmentMarkerEstimatedBytes  uint64 = model.StateCommandReassignmentBytesV1
+	invalidationProvenanceFixedBytes  uint64 = model.StateCommandInvalidationProvenanceFixedBytesV1
 	sourceEOFEntryEstimatedBytes      uint64 = model.StateCommandSourceEOFEntryBytesV1
 	checkpointEntryEstimatedBytes     uint64 = model.StateCommandCheckpointEntryBytesV1
 	resultManifestEntryEstimatedBytes uint64 = model.StateCommandManifestEntryBytesV1
@@ -65,9 +66,14 @@ func estimateJobRecordBytes(job JobRecord) (uint64, bool) {
 			return 0, false
 		}
 	}
+	provenanceBytes, ok := invalidationProvenanceEstimatedBytes(job.invalidationHistory)
+	if !ok {
+		return 0, false
+	}
 	return checkedAddMany(
 		total,
 		uint64(len(job.NeedsReassignment))*reassignmentMarkerEstimatedBytes,
+		provenanceBytes,
 		uint64(len(job.SourceEOFs))*sourceEOFEntryEstimatedBytes,
 		uint64(len(job.Checkpoints))*checkpointEntryEstimatedBytes,
 		uint64(len(job.Manifests))*resultManifestEntryEstimatedBytes,
@@ -78,6 +84,21 @@ func estimateJobRecordBytes(job JobRecord) (uint64, bool) {
 			return 0
 		}(),
 	)
+}
+
+func invalidationProvenanceEstimatedBytes(history []invalidationProvenance) (uint64, bool) {
+	var total uint64
+	for _, provenance := range history {
+		entry, ok := checkedAddMany(invalidationProvenanceFixedBytes, uint64(len(provenance.Markers))*reassignmentMarkerEstimatedBytes)
+		if !ok {
+			return 0, false
+		}
+		total, ok = checkedSnapshotAdd(total, entry)
+		if !ok {
+			return 0, false
+		}
+	}
+	return total, true
 }
 
 func assignmentEncodedBytes(set model.AssignmentSet) uint64 {
@@ -96,6 +117,8 @@ func SnapshotEstimatorConstants() []model.StateCommandConstantDescriptor {
 		{Name: "AssignmentTokenFixed", Value: model.StateCommandAssignmentTokenBytesV1},
 		{Name: "ResultReplicaFixed", Value: model.StateCommandResultReplicaBytesV1},
 		{Name: "ReassignmentMarkerFixed", Value: model.StateCommandReassignmentBytesV1},
+		{Name: "InvalidationProvenanceFixed", Value: model.StateCommandInvalidationProvenanceFixedBytesV1},
+		{Name: "InvalidationProvenanceMaxCount", Value: model.StateCommandMaxInvalidationProvenanceV1},
 		{Name: "SourceEOFEntryFixed", Value: model.StateCommandSourceEOFEntryBytesV1},
 		{Name: "CheckpointEntryFixed", Value: model.StateCommandCheckpointEntryBytesV1},
 		{Name: "ManifestEntryFixed", Value: model.StateCommandManifestEntryBytesV1},

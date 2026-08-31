@@ -290,13 +290,27 @@ func (machine *Machine) applyReplaceAssignmentsLocked(command ReplaceAssignments
 			return mutationPlan{result: result, reject: true}, resultErr
 		}
 		candidate := cloneJobRecord(record)
-		oldBytes := assignmentEncodedBytes(*candidate.Assignment) + uint64(len(candidate.NeedsReassignment))*reassignmentMarkerEstimatedBytes
-		newBytes := assignmentEncodedBytes(command.Target)
+		for index := range candidate.invalidationHistory {
+			provenance := &candidate.invalidationHistory[index]
+			if provenance.RepairJobControlRevision != 0 {
+				continue
+			}
+			provenance.RepairJobControlRevision = nextRevision
+			provenance.RepairAssignmentRevision = command.Target.Revision
+			provenance.RepairAssignmentDigest = command.Target.Digest
+			provenance.RepairMarkersDigest = command.ExpectedMarkersDigest
+		}
 		candidate.Assignment = assignmentPointer(command.Target)
 		candidate.NeedsReassignment = nil
 		candidate.JobControlRevision = nextRevision
+		candidate.invalidationHistory = machine.pruneConsumedInvalidationHistory(candidate.JobID, candidate.invalidationHistory, 0)
+		beforeBytes, beforeOK := estimateJobRecordBytes(record)
+		afterBytes, afterOK := estimateJobRecordBytes(candidate)
+		if !beforeOK || !afterOK {
+			return mutationPlan{}, errors.New("impossible assignment provenance accounting")
+		}
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
-		return mutationPlan{result: result, stateDelta: signedSizeDelta(newBytes, oldBytes), commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
+		return mutationPlan{result: result, stateDelta: signedSizeDelta(afterBytes, beforeBytes), commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
 	})
 }
 

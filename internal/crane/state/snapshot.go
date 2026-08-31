@@ -136,7 +136,8 @@ func SnapshotValidationRules() []string {
 		"errors:every-failure-wraps-ErrInvalidSnapshot-and-preserves-nested-sentinel",
 		"cached-results:canonical-command-result-and-subject-identity-revision-epoch-correlated",
 		"retained-targets:canonical-complete-semantic-correlation-with-authoritative-state",
-		"job-control-lag:exact-distinct-worker-invalidations-plus-optional-client-cancellation",
+		"job-control-lag:exact-active-provenance-count-plus-optional-client-cancellation",
+		"worker-invalidations:bounded-causal-provenance-exact-retained-affected-target-and-repair-predecessor-fences",
 		"job-definitions:DefiningRequest-unique-across-all-retained-jobs",
 		"assigned-jobs:complete-immutable-source-eofs-including-terminal",
 		"reverse-references:coordinator-worker-job-control-eof-checkpoint-manifest",
@@ -153,6 +154,7 @@ func SnapshotSortRules() []string {
 		"Jobs:JobID:unsigned-lexicographic-bytes16",
 		"WorkerEvents:WorkerID-unsigned-u16,WorkerEpoch-unsigned-lexicographic-bytes16",
 		"NeedsReassignment:Kind,active-TaskID,ReplicaRole,OldWorkerID,OldWorkerEpoch",
+		"InvalidationHistory:JobControlRevision-strictly-increasing",
 		"SourceEOFs:TaskID:unsigned-lexicographic-canonical-bytes20",
 		"Checkpoints:TaskID:unsigned-lexicographic-canonical-bytes20",
 		"Manifests:TaskID:unsigned-lexicographic-canonical-bytes20",
@@ -195,6 +197,7 @@ func SnapshotEncodingLayouts() []model.StateCommandLayoutDescriptor {
 		traceSnapshotLayout("AssignmentToken", func(trace *[]string) { appendTokenTraced(nil, model.AssignmentToken{}, trace) }),
 		traceSnapshotLayout("ResultReplicaSet", func(trace *[]string) { appendReplicaTraced(nil, model.ResultReplicaSet{}, trace) }),
 		traceSnapshotLayout("NeedsReassignment", func(trace *[]string) { appendMarkerTraced(nil, NeedsReassignment{}, trace) }),
+		traceSnapshotLayout("InvalidationProvenance", func(trace *[]string) { appendInvalidationProvenance(nil, invalidationProvenance{}, trace) }),
 		traceSnapshotLayout("ResultManifest", func(trace *[]string) { appendManifestTraced(nil, ResultManifest{}, trace) }),
 		traceSnapshotLayout("JobFailureReport", func(trace *[]string) { appendFailureReportTraced(nil, model.JobFailureReport{}, trace) }),
 	}
@@ -309,6 +312,13 @@ func appendJobEntry(encoded []byte, key model.JobID, job JobRecord, trace *[]str
 		}
 		return out
 	})
+	snapshotField(&encoded, trace, "InvalidationHistory:u16-count+chronological(InvalidationProvenance)", func(out []byte) []byte {
+		out = appendU16(out, uint16(len(job.invalidationHistory)))
+		for _, provenance := range job.invalidationHistory {
+			out = appendInvalidationProvenance(out, provenance, nil)
+		}
+		return out
+	})
 	snapshotField(&encoded, trace, "SourceEOFs:u16-count+sorted(SourceEOFEntry)", func(out []byte) []byte {
 		keys := sortedTaskKeysEOF(job.SourceEOFs)
 		out = appendU16(out, uint16(len(keys)))
@@ -339,6 +349,28 @@ func appendJobEntry(encoded []byte, key model.JobID, job JobRecord, trace *[]str
 		}
 		return appendFailureReportTraced(append(out, 1), *job.Failure, nil)
 	})
+	return encoded
+}
+
+func appendInvalidationProvenance(encoded []byte, provenance invalidationProvenance, trace *[]string) []byte {
+	snapshotField(&encoded, trace, "Kind:WorkerInvalidationKind", func(out []byte) []byte { return append(out, byte(provenance.Kind)) })
+	snapshotField(&encoded, trace, "WorkerID:u16(nonzero)", func(out []byte) []byte { return appendU16(out, provenance.WorkerID) })
+	snapshotField(&encoded, trace, "WorkerEpoch:bytes16(nonzero)", func(out []byte) []byte { return append(out, provenance.WorkerEpoch[:]...) })
+	snapshotField(&encoded, trace, "WorkerRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, provenance.WorkerRevision) })
+	snapshotField(&encoded, trace, "JobControlRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, provenance.JobControlRevision) })
+	snapshotField(&encoded, trace, "AssignmentRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, provenance.AssignmentRevision) })
+	snapshotField(&encoded, trace, "AssignmentDigest:sha256(nonzero)", func(out []byte) []byte { return append(out, provenance.AssignmentDigest[:]...) })
+	snapshotField(&encoded, trace, "Markers:u16-count+sorted(NeedsReassignment)", func(out []byte) []byte {
+		out = appendU16(out, uint16(len(provenance.Markers)))
+		for _, marker := range provenance.Markers {
+			out = appendMarker(out, marker)
+		}
+		return out
+	})
+	snapshotField(&encoded, trace, "RepairJobControlRevision:u64(zero-or-nonzero)", func(out []byte) []byte { return appendU64(out, provenance.RepairJobControlRevision) })
+	snapshotField(&encoded, trace, "RepairAssignmentRevision:u64(zero-or-successor)", func(out []byte) []byte { return appendU64(out, provenance.RepairAssignmentRevision) })
+	snapshotField(&encoded, trace, "RepairAssignmentDigest:sha256(zero-iff-active)", func(out []byte) []byte { return append(out, provenance.RepairAssignmentDigest[:]...) })
+	snapshotField(&encoded, trace, "RepairMarkersDigest:sha256(zero-iff-active)", func(out []byte) []byte { return append(out, provenance.RepairMarkersDigest[:]...) })
 	return encoded
 }
 
@@ -468,6 +500,15 @@ func compareSnapshotMarker(left, right NeedsReassignment) int {
 		return -1
 	}
 	if markerLess(right, left) {
+		return 1
+	}
+	return 0
+}
+func compareSnapshotInvalidation(left, right invalidationProvenance) int {
+	if left.JobControlRevision < right.JobControlRevision {
+		return -1
+	}
+	if left.JobControlRevision > right.JobControlRevision {
 		return 1
 	}
 	return 0
@@ -791,6 +832,23 @@ func (decoder *snapshotDecoder) jobRecord() (JobRecord, error) {
 			record.NeedsReassignment[index] = marker
 		}
 	}
+	provenanceCount, err := decoder.u16()
+	if err != nil {
+		return JobRecord{}, snapshotDecodeError("invalidation provenance count", err)
+	}
+	if uint64(provenanceCount) > model.StateCommandMaxInvalidationProvenanceV1 || int(provenanceCount) > decoder.remaining()/int(model.StateCommandInvalidationProvenanceFixedBytesV1) {
+		return JobRecord{}, fmt.Errorf("%w: invalidation provenance count", ErrInvalidSnapshot)
+	}
+	if provenanceCount != 0 {
+		record.invalidationHistory = make([]invalidationProvenance, int(provenanceCount))
+		for index := range record.invalidationHistory {
+			provenance, provenanceErr := decoder.invalidationProvenance()
+			if provenanceErr != nil {
+				return JobRecord{}, provenanceErr
+			}
+			record.invalidationHistory[index] = provenance
+		}
+	}
 	record.SourceEOFs, err = decoder.sourceEOFs(jobID)
 	if err != nil {
 		return JobRecord{}, err
@@ -815,6 +873,75 @@ func (decoder *snapshotDecoder) jobRecord() (JobRecord, error) {
 		record.Failure = &failure
 	}
 	return record, nil
+}
+
+func (decoder *snapshotDecoder) invalidationProvenance() (invalidationProvenance, error) {
+	kind, err := decoder.byte()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation kind", err)
+	}
+	workerID, err := decoder.u16()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation worker", err)
+	}
+	epoch, err := decoder.workerEpoch()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation epoch", err)
+	}
+	workerRevision, err := decoder.u64()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation worker revision", err)
+	}
+	jobRevision, err := decoder.u64()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation job revision", err)
+	}
+	assignmentRevision, err := decoder.u64()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation assignment revision", err)
+	}
+	assignmentDigest, err := decoder.array32()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation assignment digest", err)
+	}
+	markerCount, err := decoder.u16()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("invalidation marker count", err)
+	}
+	maxMarkers := model.LimitsV1().MaxTasksPerJob + 2*model.LimitsV1().MaxResultManifestsPerJob
+	if markerCount == 0 || uint64(markerCount) > maxMarkers || int(markerCount) > decoder.remaining()/int(model.StateCommandReassignmentBytesV1) {
+		return invalidationProvenance{}, fmt.Errorf("%w: invalidation marker count", ErrInvalidSnapshot)
+	}
+	markers := make([]NeedsReassignment, int(markerCount))
+	for index := range markers {
+		marker, markerErr := decoder.marker()
+		if markerErr != nil {
+			return invalidationProvenance{}, markerErr
+		}
+		markers[index] = marker
+	}
+	repairJobRevision, err := decoder.u64()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("repair job revision", err)
+	}
+	repairAssignmentRevision, err := decoder.u64()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("repair assignment revision", err)
+	}
+	repairAssignmentDigest, err := decoder.array32()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("repair assignment digest", err)
+	}
+	repairMarkersDigest, err := decoder.array32()
+	if err != nil {
+		return invalidationProvenance{}, snapshotDecodeError("repair markers digest", err)
+	}
+	return invalidationProvenance{
+		Kind: workerInvalidationKind(kind), WorkerID: workerID, WorkerEpoch: epoch, WorkerRevision: workerRevision,
+		JobControlRevision: jobRevision, AssignmentRevision: assignmentRevision, AssignmentDigest: assignmentDigest, Markers: markers,
+		RepairJobControlRevision: repairJobRevision, RepairAssignmentRevision: repairAssignmentRevision,
+		RepairAssignmentDigest: repairAssignmentDigest, RepairMarkersDigest: repairMarkersDigest,
+	}, nil
 }
 
 func (decoder *snapshotDecoder) marker() (NeedsReassignment, error) {
@@ -1307,7 +1434,7 @@ func validateWorkerSnapshotTarget(machine *Machine, subject SubjectKey, target [
 			if worker.Revision != revision || worker.Epoch != epoch || worker.State != WorkerOffline {
 				return errors.New("worker deactivation applied target mismatch")
 			}
-			if err := validateAppliedWorkerAffected(machine, workerID, epoch, affected); err != nil {
+			if err := validateAppliedWorkerAffected(machine, workerInvalidationDeactivate, revision, workerID, epoch, affected); err != nil {
 				return err
 			}
 		}
@@ -1335,7 +1462,7 @@ func validateWorkerSnapshotTarget(machine *Machine, subject SubjectKey, target [
 			if record.Revision != revision || machine.workers[subject.WorkerID] != record {
 				return errors.New("worker replacement applied target mismatch")
 			}
-			if err := validateAppliedWorkerAffected(machine, workerID, oldEpoch, affected); err != nil {
+			if err := validateAppliedWorkerAffected(machine, workerInvalidationReplaceEpoch, revision, workerID, oldEpoch, affected); err != nil {
 				return err
 			}
 		}
@@ -1344,43 +1471,41 @@ func validateWorkerSnapshotTarget(machine *Machine, subject SubjectKey, target [
 	return fmt.Errorf("%w: unknown worker target layout", ErrMalformedCommand)
 }
 
-func validateAppliedWorkerAffected(machine *Machine, workerID uint16, epoch model.WorkerEpoch, affected []AffectedAssignment) error {
+func validateAppliedWorkerAffected(machine *Machine, kind workerInvalidationKind, workerRevision uint64, workerID uint16, epoch model.WorkerEpoch, affected []AffectedAssignment) error {
 	presented := make(map[model.JobID]AffectedAssignment, len(affected))
 	for _, item := range affected {
 		job, exists := machine.jobs[item.JobID]
-		if !exists || job.Assignment == nil || job.JobControlRevision <= item.JobControlRevision || job.Assignment.Revision < item.AssignmentRevision {
-			return fmt.Errorf("%w: affected job fence is not reachable", ErrSnapshotCrossReference)
-		}
-		if job.Assignment.Revision == item.AssignmentRevision {
-			if job.Assignment.Digest != item.AssignmentDigest || !snapshotHasWorkerInvalidationMarker(job.NeedsReassignment, workerID, epoch) {
-				return fmt.Errorf("%w: affected job assignment mismatch", ErrSnapshotCrossReference)
-			}
-			external := explainedExternalJobControlRevisions(job)
-			cancelRevision := uint64(0)
-			if job.Lifecycle == JobCanceled {
-				cancelRevision = 1
-			}
-			if external <= cancelRevision || item.JobControlRevision < job.JobControlRevision-external || item.JobControlRevision >= job.JobControlRevision-cancelRevision {
-				return fmt.Errorf("%w: affected job revision is outside the retained invalidation interval", ErrSnapshotCrossReference)
-			}
+		if !exists || !jobHasInvalidationProvenance(job, kind, workerRevision, workerID, epoch, item) {
+			return fmt.Errorf("%w: affected job fence lacks exact invalidation provenance", ErrSnapshotCrossReference)
 		}
 		presented[item.JobID] = item
 	}
 	for jobID, job := range machine.jobs {
-		if job.Assignment == nil || !snapshotHasWorkerInvalidationMarker(job.NeedsReassignment, workerID, epoch) {
-			continue
-		}
-		item, exists := presented[jobID]
-		if !exists || item.AssignmentRevision != job.Assignment.Revision || item.AssignmentDigest != job.Assignment.Digest || item.JobControlRevision >= job.JobControlRevision {
-			return fmt.Errorf("%w: affected list omits a materialized invalidation", ErrSnapshotCrossReference)
+		for _, provenance := range job.invalidationHistory {
+			if provenance.Kind != kind || provenance.WorkerRevision != workerRevision || provenance.WorkerID != workerID || provenance.WorkerEpoch != epoch {
+				continue
+			}
+			want := provenanceAffected(jobID, provenance)
+			if got, exists := presented[jobID]; !exists || got != want {
+				return fmt.Errorf("%w: affected list omits exact retained invalidation provenance", ErrSnapshotCrossReference)
+			}
 		}
 	}
 	return nil
 }
 
-func snapshotHasWorkerInvalidationMarker(markers []NeedsReassignment, workerID uint16, epoch model.WorkerEpoch) bool {
-	for _, marker := range markers {
-		if marker.OldWorkerID == workerID && marker.OldWorkerEpoch == epoch {
+func provenanceAffected(jobID model.JobID, provenance invalidationProvenance) AffectedAssignment {
+	return AffectedAssignment{
+		JobID:              jobID,
+		JobControlRevision: provenance.JobControlRevision,
+		AssignmentRevision: provenance.AssignmentRevision,
+		AssignmentDigest:   provenance.AssignmentDigest,
+	}
+}
+
+func jobHasInvalidationProvenance(job JobRecord, kind workerInvalidationKind, workerRevision uint64, workerID uint16, epoch model.WorkerEpoch, affected AffectedAssignment) bool {
+	for _, provenance := range job.invalidationHistory {
+		if provenance.Kind == kind && provenance.WorkerRevision == workerRevision && provenance.WorkerID == workerID && provenance.WorkerEpoch == epoch && provenanceAffected(job.JobID, provenance) == affected {
 			return true
 		}
 	}
@@ -1518,6 +1643,10 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 	if err := validateMarkers(job.NeedsReassignment, job.JobID); err != nil {
 		return err
 	}
+	activeInvalidations, err := validateInvalidationHistory(machine, job)
+	if err != nil {
+		return err
+	}
 	client, ok := machine.clients[job.DefiningRequest.ClientID]
 	if !ok || client.sequence < job.DefiningRequest.Sequence {
 		return errors.New("job defining request has no retained client history")
@@ -1527,7 +1656,11 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 	}
 	if job.Assignment != nil || job.Lifecycle == JobDeploying || job.Lifecycle == JobRunning || job.Lifecycle == JobDraining || job.Lifecycle == JobSucceeded || job.Lifecycle == JobFailed {
 		history, exists := machine.subjects[SubjectKey{Kind: SubjectJobControl, JobID: job.JobID}]
-		if !exists || history.appliedRevision == 0 || history.appliedRevision > job.JobControlRevision || job.JobControlRevision-history.appliedRevision != explainedExternalJobControlRevisions(job) {
+		external := activeInvalidations
+		if job.Lifecycle == JobCanceled {
+			external++
+		}
+		if !exists || history.appliedRevision == 0 || history.appliedRevision > job.JobControlRevision || job.JobControlRevision-history.appliedRevision != external {
 			return errors.New("job state lacks required applied job-control history")
 		}
 	}
@@ -1629,20 +1762,145 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 	return nil
 }
 
-func explainedExternalJobControlRevisions(job JobRecord) uint64 {
-	type workerIncarnation struct {
-		workerID uint16
-		epoch    model.WorkerEpoch
+func validateInvalidationHistory(machine *Machine, job JobRecord) (uint64, error) {
+	if uint64(len(job.invalidationHistory)) > model.StateCommandMaxInvalidationProvenanceV1 {
+		return 0, fmt.Errorf("%w: invalidation provenance count exceeds bound", ErrSnapshotCrossReference)
 	}
-	invalidations := make(map[workerIncarnation]struct{}, len(job.NeedsReassignment))
-	for _, marker := range job.NeedsReassignment {
-		invalidations[workerIncarnation{workerID: marker.OldWorkerID, epoch: marker.OldWorkerEpoch}] = struct{}{}
+	type repairGroup struct {
+		provenance []invalidationProvenance
+		retained   bool
 	}
-	count := uint64(len(invalidations))
-	if job.Lifecycle == JobCanceled {
-		count++
+	repairs := make(map[uint64]*repairGroup)
+	active := make([]invalidationProvenance, 0)
+	seenEvent := make(map[[27]byte]struct{}, len(job.invalidationHistory))
+	var priorJobRevision uint64
+	var currentRepairRevision uint64
+	var completedRepairRevision uint64
+	seenActive := false
+	for _, provenance := range job.invalidationHistory {
+		if provenance.Kind < workerInvalidationDeactivate || provenance.Kind > workerInvalidationReplaceEpoch || provenance.WorkerID == 0 || provenance.WorkerEpoch.Validate() != nil || provenance.WorkerRevision == 0 || provenance.JobControlRevision == 0 || provenance.AssignmentRevision == 0 || provenance.AssignmentDigest == ([32]byte{}) || len(provenance.Markers) == 0 {
+			return 0, fmt.Errorf("%w: invalid invalidation provenance identity or fence", ErrSnapshotCrossReference)
+		}
+		if priorJobRevision != 0 && compareSnapshotInvalidation(invalidationProvenance{JobControlRevision: priorJobRevision}, provenance) >= 0 {
+			return 0, fmt.Errorf("%w: invalidation provenance is not chronological", ErrSnapshotCrossReference)
+		}
+		priorJobRevision = provenance.JobControlRevision
+		if err := validateMarkers(provenance.Markers, job.JobID); err != nil {
+			return 0, fmt.Errorf("%w: invalidation provenance markers: %w", ErrSnapshotCrossReference, err)
+		}
+		for _, marker := range provenance.Markers {
+			if marker.OldWorkerID != provenance.WorkerID || marker.OldWorkerEpoch != provenance.WorkerEpoch {
+				return 0, fmt.Errorf("%w: invalidation marker does not identify its worker incarnation", ErrSnapshotCrossReference)
+			}
+		}
+		worker, exists := machine.workers[provenance.WorkerID]
+		if !exists || worker.Revision < provenance.WorkerRevision {
+			return 0, fmt.Errorf("%w: invalidation provenance has no reachable worker revision", ErrSnapshotCrossReference)
+		}
+		var event [27]byte
+		event[0] = byte(provenance.Kind)
+		copy(event[1:17], provenance.WorkerEpoch[:])
+		event[17] = byte(provenance.WorkerID >> 8)
+		event[18] = byte(provenance.WorkerID)
+		for index := 0; index < 8; index++ {
+			event[19+index] = byte(provenance.WorkerRevision >> (56 - 8*index))
+		}
+		if _, duplicate := seenEvent[event]; duplicate {
+			return 0, fmt.Errorf("%w: duplicate invalidation provenance event", ErrSnapshotCrossReference)
+		}
+		seenEvent[event] = struct{}{}
+		retained := machine.subjectRetainsInvalidation(job.JobID, provenance)
+		if worker.Revision == provenance.WorkerRevision {
+			if !retained || (provenance.Kind == workerInvalidationDeactivate && (worker.Epoch != provenance.WorkerEpoch || worker.State != WorkerOffline)) || (provenance.Kind == workerInvalidationReplaceEpoch && worker.Epoch == provenance.WorkerEpoch) {
+				return 0, fmt.Errorf("%w: current worker does not prove invalidation outcome", ErrSnapshotCrossReference)
+			}
+		} else if provenance.Kind == workerInvalidationReplaceEpoch && worker.Epoch == provenance.WorkerEpoch {
+			return 0, fmt.Errorf("%w: replaced worker epoch became current again", ErrSnapshotCrossReference)
+		}
+		activeRepair := provenance.RepairJobControlRevision == 0 && provenance.RepairAssignmentRevision == 0 && provenance.RepairAssignmentDigest == ([32]byte{}) && provenance.RepairMarkersDigest == ([32]byte{})
+		completeRepair := provenance.RepairJobControlRevision != 0 && provenance.RepairAssignmentRevision != 0 && provenance.RepairAssignmentDigest != ([32]byte{}) && provenance.RepairMarkersDigest != ([32]byte{})
+		if !activeRepair && !completeRepair {
+			return 0, fmt.Errorf("%w: partial invalidation repair provenance", ErrSnapshotCrossReference)
+		}
+		if currentRepairRevision != 0 && provenance.RepairJobControlRevision != currentRepairRevision {
+			completedRepairRevision = currentRepairRevision
+			currentRepairRevision = 0
+		}
+		if provenance.JobControlRevision < completedRepairRevision || seenActive && completeRepair {
+			return 0, fmt.Errorf("%w: invalidation repair generations are not chronological", ErrSnapshotCrossReference)
+		}
+		if activeRepair {
+			if job.Assignment == nil || provenance.AssignmentRevision != job.Assignment.Revision || provenance.AssignmentDigest != job.Assignment.Digest {
+				return 0, fmt.Errorf("%w: active invalidation does not fence current assignment", ErrSnapshotCrossReference)
+			}
+			active = append(active, provenance)
+			seenActive = true
+			continue
+		}
+		if currentRepairRevision == 0 {
+			currentRepairRevision = provenance.RepairJobControlRevision
+		}
+		if provenance.RepairAssignmentRevision != provenance.AssignmentRevision+1 || provenance.RepairJobControlRevision <= provenance.JobControlRevision+1 || provenance.RepairJobControlRevision > job.JobControlRevision || job.Assignment == nil || job.Assignment.Revision < provenance.RepairAssignmentRevision || job.Assignment.Revision == provenance.RepairAssignmentRevision && job.Assignment.Digest != provenance.RepairAssignmentDigest {
+			return 0, fmt.Errorf("%w: invalidation repair fence is unreachable", ErrSnapshotCrossReference)
+		}
+		group := repairs[provenance.RepairJobControlRevision]
+		if group == nil {
+			group = &repairGroup{}
+			repairs[provenance.RepairJobControlRevision] = group
+		}
+		group.provenance = append(group.provenance, provenance)
+		group.retained = group.retained || retained
 	}
-	return count
+
+	for repairRevision, group := range repairs {
+		first := group.provenance[0]
+		markers := make([]NeedsReassignment, 0)
+		for index, provenance := range group.provenance {
+			if provenance.AssignmentRevision != first.AssignmentRevision || provenance.AssignmentDigest != first.AssignmentDigest || provenance.RepairAssignmentRevision != first.RepairAssignmentRevision || provenance.RepairAssignmentDigest != first.RepairAssignmentDigest || provenance.RepairMarkersDigest != first.RepairMarkersDigest || provenance.JobControlRevision != first.JobControlRevision+uint64(index) {
+				return 0, fmt.Errorf("%w: inconsistent invalidation repair group", ErrSnapshotCrossReference)
+			}
+			markers = sortedMarkerUnion(markers, provenance.Markers)
+		}
+		if !group.retained || repairRevision != first.JobControlRevision+uint64(len(group.provenance))+1 || NeedsReassignmentDigest(markers) != first.RepairMarkersDigest {
+			return 0, fmt.Errorf("%w: invalidation repair group lacks retained causal proof", ErrSnapshotCrossReference)
+		}
+		if history, exists := machine.subjects[SubjectKey{Kind: SubjectJobControl, JobID: job.JobID}]; exists && history.appliedRevision == repairRevision {
+			replacement, ok := decodeSnapshotReplacementTarget(history.appliedTarget)
+			if !ok || replacement.ExpectedRevision != first.AssignmentRevision || replacement.ExpectedDigest != first.AssignmentDigest || replacement.ExpectedMarkersDigest != first.RepairMarkersDigest || replacement.Target.Revision != first.RepairAssignmentRevision || replacement.Target.Digest != first.RepairAssignmentDigest {
+				return 0, fmt.Errorf("%w: retained repair target does not match provenance", ErrSnapshotCrossReference)
+			}
+		}
+	}
+
+	markers := make([]NeedsReassignment, 0)
+	for index, provenance := range active {
+		if index > 0 && provenance.JobControlRevision != active[index-1].JobControlRevision+1 {
+			return 0, fmt.Errorf("%w: active invalidations are not contiguous", ErrSnapshotCrossReference)
+		}
+		markers = sortedMarkerUnion(markers, provenance.Markers)
+	}
+	if len(active) != 0 {
+		history, exists := machine.subjects[SubjectKey{Kind: SubjectJobControl, JobID: job.JobID}]
+		if !exists || history.appliedRevision != active[0].JobControlRevision {
+			return 0, fmt.Errorf("%w: active invalidation does not follow retained job-control authority", ErrSnapshotCrossReference)
+		}
+	}
+	if !sameReassignmentMarkers(markers, job.NeedsReassignment) {
+		return 0, fmt.Errorf("%w: active invalidation provenance does not exactly explain markers", ErrSnapshotCrossReference)
+	}
+	return uint64(len(active)), nil
+}
+
+func sameReassignmentMarkers(left, right []NeedsReassignment) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func snapshotTaskTargetMarked(markers []NeedsReassignment, token model.AssignmentToken) bool {

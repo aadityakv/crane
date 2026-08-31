@@ -27,18 +27,19 @@ func (state JobLifecycle) terminal() bool {
 
 // JobRecord is one retained immutable definition and its replicated control fence.
 type JobRecord struct {
-	JobID              model.JobID                       // JobID is derived from request and topology.
-	DefiningRequest    model.ClientRequestID             // DefiningRequest defends ID collisions.
-	TopologyDigest     [32]byte                          // TopologyDigest binds the immutable plan.
-	TopologyBytes      []byte                            // TopologyBytes owns the canonical plan bytes.
-	Lifecycle          JobLifecycle                      // Lifecycle is the finite control state.
-	JobControlRevision uint64                            // JobControlRevision fences job-wide changes.
-	Assignment         *model.AssignmentSet              // Assignment is the complete current set.
-	NeedsReassignment  []NeedsReassignment               // NeedsReassignment is sorted and complete.
-	SourceEOFs         map[model.TaskID]SourceEOFRecord  // SourceEOFs retain immutable source bounds.
-	Checkpoints        map[model.TaskID]CheckpointRecord // Checkpoints advance independently by source.
-	Manifests          map[model.TaskID]ResultManifest   // Manifests seal independently by sink.
-	Failure            *model.JobFailureReport           // Failure retains the terminal failure event.
+	JobID               model.JobID                       // JobID is derived from request and topology.
+	DefiningRequest     model.ClientRequestID             // DefiningRequest defends ID collisions.
+	TopologyDigest      [32]byte                          // TopologyDigest binds the immutable plan.
+	TopologyBytes       []byte                            // TopologyBytes owns the canonical plan bytes.
+	Lifecycle           JobLifecycle                      // Lifecycle is the finite control state.
+	JobControlRevision  uint64                            // JobControlRevision fences job-wide changes.
+	Assignment          *model.AssignmentSet              // Assignment is the complete current set.
+	NeedsReassignment   []NeedsReassignment               // NeedsReassignment is sorted and complete.
+	invalidationHistory []invalidationProvenance          // invalidationHistory proves retained worker-driven revision changes.
+	SourceEOFs          map[model.TaskID]SourceEOFRecord  // SourceEOFs retain immutable source bounds.
+	Checkpoints         map[model.TaskID]CheckpointRecord // Checkpoints advance independently by source.
+	Manifests           map[model.TaskID]ResultManifest   // Manifests seal independently by sink.
+	Failure             *model.JobFailureReport           // Failure retains the terminal failure event.
 }
 
 // SubmitJob creates an immutable job definition under a client identity.
@@ -207,6 +208,7 @@ func cloneJobRecord(record JobRecord) JobRecord {
 	clone := record
 	clone.TopologyBytes = append([]byte(nil), record.TopologyBytes...)
 	clone.NeedsReassignment = append([]NeedsReassignment(nil), record.NeedsReassignment...)
+	clone.invalidationHistory = cloneInvalidationProvenance(record.invalidationHistory)
 	if record.Assignment != nil {
 		assignment := cloneAssignment(*record.Assignment)
 		clone.Assignment = &assignment
