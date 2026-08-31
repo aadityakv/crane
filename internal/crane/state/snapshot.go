@@ -135,7 +135,10 @@ func SnapshotValidationRules() []string {
 		"ordering:all-declared-sorted-collections-are-strictly-increasing-and-duplicate-free",
 		"errors:every-failure-wraps-ErrInvalidSnapshot-and-preserves-nested-sentinel",
 		"cached-results:canonical-command-result-and-subject-identity-revision-epoch-correlated",
-		"retained-targets:canonical-structural-and-current-authoritative-revision-semantics",
+		"retained-targets:canonical-complete-semantic-correlation-with-authoritative-state",
+		"job-control-lag:exact-distinct-worker-invalidations-plus-optional-client-cancellation",
+		"job-definitions:DefiningRequest-unique-across-all-retained-jobs",
+		"assigned-jobs:complete-immutable-source-eofs-including-terminal",
 		"reverse-references:coordinator-worker-job-control-eof-checkpoint-manifest",
 		"artifacts:checked-per-job-aggregate-at-most-MaxResultBytes",
 	}
@@ -1000,7 +1003,12 @@ func validateSnapshotState(machine *Machine) error {
 		}
 	}
 	usedSlots := make(map[uint16]uint64)
+	definingRequests := make(map[model.ClientRequestID]model.JobID, len(machine.jobs))
 	for id, job := range machine.jobs {
+		if prior, exists := definingRequests[job.DefiningRequest]; exists && prior != id {
+			return fmt.Errorf("%w: defining request identifies jobs %x and %x", ErrSnapshotCrossReference, prior, id)
+		}
+		definingRequests[job.DefiningRequest] = id
 		if err := validateSnapshotJob(machine, id, job, usedSlots); err != nil {
 			return err
 		}
@@ -1299,6 +1307,9 @@ func validateWorkerSnapshotTarget(machine *Machine, subject SubjectKey, target [
 			if worker.Revision != revision || worker.Epoch != epoch || worker.State != WorkerOffline {
 				return errors.New("worker deactivation applied target mismatch")
 			}
+			if err := validateAppliedWorkerAffected(machine, workerID, epoch, affected); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -1320,12 +1331,60 @@ func validateWorkerSnapshotTarget(machine *Machine, subject SubjectKey, target [
 		if err != nil || !decoder.done() || validateAffected(affected) != nil || workerID != subject.WorkerID || oldEpoch.Validate() != nil || record.Validate() != nil || record.NodeID != workerID || record.Epoch == oldEpoch {
 			return fmt.Errorf("%w: malformed worker replacement target", ErrMalformedCommand)
 		}
-		if applied && (record.Revision != revision || machine.workers[subject.WorkerID] != record) {
-			return errors.New("worker replacement applied target mismatch")
+		if applied {
+			if record.Revision != revision || machine.workers[subject.WorkerID] != record {
+				return errors.New("worker replacement applied target mismatch")
+			}
+			if err := validateAppliedWorkerAffected(machine, workerID, oldEpoch, affected); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 	return fmt.Errorf("%w: unknown worker target layout", ErrMalformedCommand)
+}
+
+func validateAppliedWorkerAffected(machine *Machine, workerID uint16, epoch model.WorkerEpoch, affected []AffectedAssignment) error {
+	presented := make(map[model.JobID]AffectedAssignment, len(affected))
+	for _, item := range affected {
+		job, exists := machine.jobs[item.JobID]
+		if !exists || job.Assignment == nil || job.JobControlRevision <= item.JobControlRevision || job.Assignment.Revision < item.AssignmentRevision {
+			return fmt.Errorf("%w: affected job fence is not reachable", ErrSnapshotCrossReference)
+		}
+		if job.Assignment.Revision == item.AssignmentRevision {
+			if job.Assignment.Digest != item.AssignmentDigest || !snapshotHasWorkerInvalidationMarker(job.NeedsReassignment, workerID, epoch) {
+				return fmt.Errorf("%w: affected job assignment mismatch", ErrSnapshotCrossReference)
+			}
+			external := explainedExternalJobControlRevisions(job)
+			cancelRevision := uint64(0)
+			if job.Lifecycle == JobCanceled {
+				cancelRevision = 1
+			}
+			if external <= cancelRevision || item.JobControlRevision < job.JobControlRevision-external || item.JobControlRevision >= job.JobControlRevision-cancelRevision {
+				return fmt.Errorf("%w: affected job revision is outside the retained invalidation interval", ErrSnapshotCrossReference)
+			}
+		}
+		presented[item.JobID] = item
+	}
+	for jobID, job := range machine.jobs {
+		if job.Assignment == nil || !snapshotHasWorkerInvalidationMarker(job.NeedsReassignment, workerID, epoch) {
+			continue
+		}
+		item, exists := presented[jobID]
+		if !exists || item.AssignmentRevision != job.Assignment.Revision || item.AssignmentDigest != job.Assignment.Digest || item.JobControlRevision >= job.JobControlRevision {
+			return fmt.Errorf("%w: affected list omits a materialized invalidation", ErrSnapshotCrossReference)
+		}
+	}
+	return nil
+}
+
+func snapshotHasWorkerInvalidationMarker(markers []NeedsReassignment, workerID uint16, epoch model.WorkerEpoch) bool {
+	for _, marker := range markers {
+		if marker.OldWorkerID == workerID && marker.OldWorkerEpoch == epoch {
+			return true
+		}
+	}
+	return false
 }
 
 func validateJobControlSnapshotTarget(machine *Machine, subject SubjectKey, target []byte, revision uint64, applied bool) error {
@@ -1343,8 +1402,13 @@ func validateJobControlSnapshotTarget(machine *Machine, subject SubjectKey, targ
 		if err != nil || !decoder.done() || job != subject.JobID || JobLifecycle(from) < JobPending || JobLifecycle(from) > JobCanceled || JobLifecycle(to) < JobPending || JobLifecycle(to) > JobCanceled || from == to {
 			return fmt.Errorf("%w: malformed job transition target", ErrMalformedCommand)
 		}
-		if record, exists := machine.jobs[subject.JobID]; applied && exists && record.JobControlRevision == revision && record.Lifecycle != JobLifecycle(to) {
-			return errors.New("job transition applied target mismatch")
+		if applied {
+			legal := JobLifecycle(from) == JobDeploying && JobLifecycle(to) == JobRunning || JobLifecycle(from) == JobRunning && JobLifecycle(to) == JobDraining || JobLifecycle(from) == JobDraining && JobLifecycle(to) == JobSucceeded
+			record, exists := machine.jobs[subject.JobID]
+			canceledSuccess := record.Lifecycle == JobCanceled && JobLifecycle(to) != JobSucceeded
+			if !legal || !exists || record.JobControlRevision < revision || record.Lifecycle != JobLifecycle(to) && !canceledSuccess {
+				return errors.New("job transition applied target mismatch")
+			}
 		}
 		return nil
 	}
@@ -1354,8 +1418,11 @@ func validateJobControlSnapshotTarget(machine *Machine, subject SubjectKey, targ
 		if err != nil || !decoder.done() || report.Validate() != nil || report.JobID != subject.JobID {
 			return fmt.Errorf("%w: malformed failure target", ErrMalformedCommand)
 		}
-		if record, exists := machine.jobs[subject.JobID]; applied && exists && record.JobControlRevision == revision && (record.Failure == nil || *record.Failure != report) {
-			return errors.New("job failure applied target mismatch")
+		if applied {
+			record, exists := machine.jobs[subject.JobID]
+			if report.JobControlRevision == ^uint64(0) || report.JobControlRevision+1 != revision || !exists || record.JobControlRevision != revision || record.Failure == nil || *record.Failure != report {
+				return errors.New("job failure applied target mismatch")
+			}
 		}
 		return nil
 	}
@@ -1371,14 +1438,14 @@ func validateJobControlSnapshotTarget(machine *Machine, subject SubjectKey, targ
 			if err := assignment.Validate(topology); err != nil {
 				return fmt.Errorf("%w: assignment target: %w", ErrInvalidCommandSubject, err)
 			}
-			if applied && job.JobControlRevision == revision && (job.Assignment == nil || !bytes.Equal(appendAssignment(nil, assignment), appendAssignment(nil, *job.Assignment))) {
+			if applied && (assignment.Revision != 1 || job.Assignment == nil || !bytes.Equal(appendAssignment(nil, assignment), appendAssignment(nil, *job.Assignment))) {
 				return errors.New("assignment applied target mismatch")
 			}
 		}
 		return nil
 	}
 	if replacement, ok := decodeSnapshotReplacementTarget(target); ok {
-		if replacement.JobID != subject.JobID || replacement.ExpectedRevision == 0 || replacement.ExpectedDigest == ([32]byte{}) || replacement.ExpectedMarkersDigest == ([32]byte{}) || replacement.Target.JobID != subject.JobID {
+		if replacement.JobID != subject.JobID || replacement.ExpectedRevision == 0 || replacement.ExpectedRevision == ^uint64(0) || replacement.ExpectedDigest == ([32]byte{}) || replacement.ExpectedMarkersDigest == ([32]byte{}) || replacement.Target.JobID != subject.JobID || replacement.Target.Revision != replacement.ExpectedRevision+1 {
 			return errors.New("replacement assignment target mismatch")
 		}
 		if job, exists := machine.jobs[subject.JobID]; exists {
@@ -1389,7 +1456,7 @@ func validateJobControlSnapshotTarget(machine *Machine, subject SubjectKey, targ
 			if err := replacement.Target.Validate(topology); err != nil {
 				return fmt.Errorf("%w: replacement target: %w", ErrInvalidCommandSubject, err)
 			}
-			if applied && job.JobControlRevision == revision && (job.Assignment == nil || !bytes.Equal(appendAssignment(nil, replacement.Target), appendAssignment(nil, *job.Assignment))) {
+			if applied && (replacement.ExpectedDigest == replacement.Target.Digest || replacement.ExpectedMarkersDigest == NeedsReassignmentDigest(nil) || job.Assignment == nil || !bytes.Equal(appendAssignment(nil, replacement.Target), appendAssignment(nil, *job.Assignment))) {
 				return errors.New("replacement applied target mismatch")
 			}
 		}
@@ -1460,7 +1527,7 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 	}
 	if job.Assignment != nil || job.Lifecycle == JobDeploying || job.Lifecycle == JobRunning || job.Lifecycle == JobDraining || job.Lifecycle == JobSucceeded || job.Lifecycle == JobFailed {
 		history, exists := machine.subjects[SubjectKey{Kind: SubjectJobControl, JobID: job.JobID}]
-		if !exists || history.appliedRevision == 0 || history.appliedRevision > job.JobControlRevision {
+		if !exists || history.appliedRevision == 0 || history.appliedRevision > job.JobControlRevision || job.JobControlRevision-history.appliedRevision != explainedExternalJobControlRevisions(job) {
 			return errors.New("job state lacks required applied job-control history")
 		}
 	}
@@ -1515,7 +1582,7 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 	} else if job.Lifecycle == JobFailed {
 		return errors.New("failed job has no failure report")
 	}
-	if job.Lifecycle == JobDeploying || job.Lifecycle == JobRunning || job.Lifecycle == JobDraining || job.Lifecycle == JobSucceeded {
+	if job.Assignment != nil {
 		if !machine.allSourceEOFsPresent(job) {
 			return errors.New("assigned job lacks complete source EOF state")
 		}
@@ -1560,6 +1627,22 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 		}
 	}
 	return nil
+}
+
+func explainedExternalJobControlRevisions(job JobRecord) uint64 {
+	type workerIncarnation struct {
+		workerID uint16
+		epoch    model.WorkerEpoch
+	}
+	invalidations := make(map[workerIncarnation]struct{}, len(job.NeedsReassignment))
+	for _, marker := range job.NeedsReassignment {
+		invalidations[workerIncarnation{workerID: marker.OldWorkerID, epoch: marker.OldWorkerEpoch}] = struct{}{}
+	}
+	count := uint64(len(invalidations))
+	if job.Lifecycle == JobCanceled {
+		count++
+	}
+	return count
 }
 
 func snapshotTaskTargetMarked(markers []NeedsReassignment, token model.AssignmentToken) bool {

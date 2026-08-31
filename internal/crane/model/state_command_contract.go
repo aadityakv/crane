@@ -279,7 +279,10 @@ var stateSnapshotValidationRulesV2 = []string{
 	"ordering:all-declared-sorted-collections-are-strictly-increasing-and-duplicate-free",
 	"errors:every-failure-wraps-ErrInvalidSnapshot-and-preserves-nested-sentinel",
 	"cached-results:canonical-command-result-and-subject-identity-revision-epoch-correlated",
-	"retained-targets:canonical-structural-and-current-authoritative-revision-semantics",
+	"retained-targets:canonical-complete-semantic-correlation-with-authoritative-state",
+	"job-control-lag:exact-distinct-worker-invalidations-plus-optional-client-cancellation",
+	"job-definitions:DefiningRequest-unique-across-all-retained-jobs",
+	"assigned-jobs:complete-immutable-source-eofs-including-terminal",
 	"reverse-references:coordinator-worker-job-control-eof-checkpoint-manifest",
 	"artifacts:checked-per-job-aggregate-at-most-MaxResultBytes",
 }
