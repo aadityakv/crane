@@ -62,6 +62,7 @@ func ConsensusFingerprint() [32]byte {
 	encoded = append(encoded, canonicalWireContractBytes(WireContractV1())...)
 	encoded = append(encoded, canonicalWorkerControlContractBytes(WorkerControlContractV1())...)
 	encoded = append(encoded, canonicalPublicControlContractBytes(PublicControlContractV1())...)
+	encoded = append(encoded, canonicalStateCommandContractBytes(StateCommandContractV1())...)
 	return sha256.Sum256(append([]byte(consensusFingerprintDomain), encoded...))
 }
 
