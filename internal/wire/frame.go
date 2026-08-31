@@ -32,7 +32,7 @@ func Encode(header Header, payload []byte, auth Authenticator, limits Limits) ([
 		return nil, ErrAuthentication
 	}
 
-	limit := effectiveLimit(header.Message, resolved)
+	limit := effectiveResolvedLimit(header.Message, resolved)
 	overhead := FixedHeaderSize + MACSize
 	if len(payload) > limit-overhead {
 		return nil, fmt.Errorf("%w: encoded body exceeds %d bytes", ErrTooLarge, limit)
@@ -75,7 +75,7 @@ func Decode(encoded []byte, auth Authenticator, limits Limits) (Frame, error) {
 
 	payloadLength := binary.BigEndian.Uint32(encoded[payloadLengthOffset:FixedHeaderSize])
 	declaredLength := uint64(FixedHeaderSize) + uint64(payloadLength) + uint64(MACSize)
-	limit := effectiveLimit(header.Message, resolved)
+	limit := effectiveResolvedLimit(header.Message, resolved)
 	if declaredLength > uint64(limit) {
 		return Frame{}, fmt.Errorf("%w: declared body is %d bytes, maximum is %d", ErrTooLarge, declaredLength, limit)
 	}
@@ -103,20 +103,52 @@ func resolveLimits(limits Limits) (Limits, error) {
 	if limits.MaxSWIMDatagramSize == 0 {
 		limits.MaxSWIMDatagramSize = defaults.MaxSWIMDatagramSize
 	}
+	if limits.MaxCraneDatagramSize == 0 {
+		limits.MaxCraneDatagramSize = defaults.MaxCraneDatagramSize
+	}
 	minimum := FixedHeaderSize + MACSize
-	if limits.MaxFrameSize < minimum || limits.MaxSWIMDatagramSize < minimum {
+	if limits.MaxFrameSize < minimum || limits.MaxSWIMDatagramSize < minimum || limits.MaxCraneDatagramSize < minimum {
 		return Limits{}, fmt.Errorf("%w: limits must permit the fixed header and MAC", ErrTooLarge)
 	}
-	if uint64(limits.MaxFrameSize) > uint64(math.MaxUint32) {
-		return Limits{}, fmt.Errorf("%w: frame limit exceeds the canonical uint32 length domain", ErrTooLarge)
+	if err := validateLimitDomain("frame", limits.MaxFrameSize); err != nil {
+		return Limits{}, err
+	}
+	if err := validateLimitDomain("SWIM datagram", limits.MaxSWIMDatagramSize); err != nil {
+		return Limits{}, err
+	}
+	if err := validateLimitDomain("Crane datagram", limits.MaxCraneDatagramSize); err != nil {
+		return Limits{}, err
 	}
 	return limits, nil
 }
 
-func effectiveLimit(message MessageType, limits Limits) int {
+func validateLimitDomain(name string, limit int) error {
+	if uint64(limit) > uint64(math.MaxUint32) {
+		return fmt.Errorf("%w: %s limit exceeds the canonical uint32 length domain", ErrTooLarge, name)
+	}
+	return nil
+}
+
+// EffectiveLimit returns the maximum complete authenticated frame size for a
+// message after applying defaults and validating every configured limit.
+func EffectiveLimit(message MessageType, limits Limits) (int, error) {
+	resolved, err := resolveLimits(limits)
+	if err != nil {
+		return 0, err
+	}
+	if isReservedCraneMessage(message) {
+		return 0, fmt.Errorf("%w: %d", ErrUnsupportedMessage, message)
+	}
+	return effectiveResolvedLimit(message, resolved), nil
+}
+
+func effectiveResolvedLimit(message MessageType, limits Limits) int {
 	limit := limits.MaxFrameSize
 	if isSWIMDatagramMessage(message) && limits.MaxSWIMDatagramSize < limit {
 		limit = limits.MaxSWIMDatagramSize
+	}
+	if isCraneDatagramMessage(message) && limits.MaxCraneDatagramSize < limit {
+		limit = limits.MaxCraneDatagramSize
 	}
 	return limit
 }
@@ -130,12 +162,32 @@ func isSWIMDatagramMessage(message MessageType) bool {
 	}
 }
 
+func isCraneDatagramMessage(message MessageType) bool {
+	return message == MessageCraneTupleDelivery || message == MessageCraneTupleDeliveryAck || message == MessageCraneTupleDeliveryNack
+}
+
+func isActiveCraneMessage(message MessageType) bool {
+	return (message >= MessageCraneWorkerHandshake && message <= MessageCraneWorkerError) ||
+		(message >= MessageCraneSubmitRequest && message <= MessageCraneControlError) ||
+		isCraneDatagramMessage(message)
+}
+
+func isReservedCraneMessage(message MessageType) bool {
+	return message >= MessageCraneWorkerHandshake && message <= 299 && !isActiveCraneMessage(message)
+}
+
 func validateHeader(header Header, limits Limits) error {
 	if header.Version != Version1 {
 		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, header.Version)
 	}
+	if isReservedCraneMessage(header.Message) {
+		return fmt.Errorf("%w: %d", ErrUnsupportedMessage, header.Message)
+	}
 	if header.Codec != CodecGob && header.Codec != CodecBinary {
 		return fmt.Errorf("%w: %d", ErrUnsupportedCodec, header.Codec)
+	}
+	if isActiveCraneMessage(header.Message) && header.Codec != CodecBinary {
+		return fmt.Errorf("%w: Crane message %d requires binary codec", ErrUnsupportedCodec, header.Message)
 	}
 	if limits.ExpectedClusterID != nil && header.ClusterID != *limits.ExpectedClusterID {
 		return ErrAuthentication

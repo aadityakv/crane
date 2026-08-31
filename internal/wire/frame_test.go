@@ -76,6 +76,181 @@ func TestFrameAcceptsAuthenticatedBinaryCodec(t *testing.T) {
 	}
 }
 
+func TestCraneFramesRequireBinaryCodec(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	for _, message := range activeCraneMessageTypesForTest() {
+		t.Run(fmt.Sprint(message), func(t *testing.T) {
+			header := testHeader()
+			header.Message = message
+			header.Codec = CodecGob
+			if _, err := Encode(header, nil, auth, DefaultLimits()); !errors.Is(err, ErrUnsupportedCodec) {
+				t.Fatalf("Encode Gob Crane message error = %v, want ErrUnsupportedCodec", err)
+			}
+
+			encoded := makeAuthenticatedFrameForTest(header, nil, auth)
+			if _, err := Decode(encoded, auth, DefaultLimits()); !errors.Is(err, ErrUnsupportedCodec) {
+				t.Fatalf("Decode Gob Crane message error = %v, want ErrUnsupportedCodec", err)
+			}
+		})
+	}
+}
+
+func TestCraneBinaryFramesRoundTrip(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	for _, message := range activeCraneMessageTypesForTest() {
+		t.Run(fmt.Sprint(message), func(t *testing.T) {
+			header := testHeader()
+			header.Message = message
+			header.Codec = CodecBinary
+			encoded, err := Encode(header, []byte{1, 2, 3}, auth, DefaultLimits())
+			if err != nil {
+				t.Fatalf("Encode binary Crane message: %v", err)
+			}
+			frame, err := Decode(encoded, auth, DefaultLimits())
+			if err != nil {
+				t.Fatalf("Decode binary Crane message: %v", err)
+			}
+			if frame.Header != header || !bytes.Equal(frame.Payload, []byte{1, 2, 3}) {
+				t.Fatalf("decoded Crane frame = %#v", frame)
+			}
+		})
+	}
+}
+
+func TestCraneReservedAndUnknownRegionMessagesAreRejected(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	for _, message := range []MessageType{MessageCraneWorkerReserved, 220, 239, 250, 279, 283, 299} {
+		t.Run(fmt.Sprint(message), func(t *testing.T) {
+			header := testHeader()
+			header.Message = message
+			header.Codec = CodecBinary
+			if _, err := Encode(header, nil, auth, DefaultLimits()); !errors.Is(err, ErrUnsupportedMessage) {
+				t.Fatalf("Encode reserved Crane message error = %v, want ErrUnsupportedMessage", err)
+			}
+			encoded := makeAuthenticatedFrameForTest(header, nil, auth)
+			if _, err := Decode(encoded, auth, DefaultLimits()); !errors.Is(err, ErrUnsupportedMessage) {
+				t.Fatalf("Decode reserved Crane message error = %v, want ErrUnsupportedMessage", err)
+			}
+		})
+	}
+}
+
+func TestCraneRegistryDoesNotRestrictGenericNonCraneMessages(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	for _, message := range []MessageType{199, 300, 999} {
+		header := testHeader()
+		header.Message = message
+		encoded, err := Encode(header, []byte("legacy"), auth, DefaultLimits())
+		if err != nil {
+			t.Fatalf("Encode generic message %d: %v", message, err)
+		}
+		if _, err := Decode(encoded, auth, DefaultLimits()); err != nil {
+			t.Fatalf("Decode generic message %d: %v", message, err)
+		}
+	}
+}
+
+func TestEffectiveLimitUsesServiceSpecificCompleteFrameBounds(t *testing.T) {
+	limits := Limits{MaxFrameSize: 4096, MaxSWIMDatagramSize: 1100, MaxCraneDatagramSize: 900}
+	tests := []struct {
+		name    string
+		message MessageType
+		want    int
+	}{
+		{name: "ordinary_tcp", message: MessageRaftHandshake, want: 4096},
+		{name: "swim_datagram", message: MessageSWIMPing, want: 1100},
+		{name: "swim_tcp", message: MessageSWIMJoinRequest, want: 4096},
+		{name: "crane_worker_tcp", message: MessageCraneWorkerHandshake, want: 4096},
+		{name: "crane_tuple_delivery", message: MessageCraneTupleDelivery, want: 900},
+		{name: "crane_tuple_ack", message: MessageCraneTupleDeliveryAck, want: 900},
+		{name: "crane_tuple_nack", message: MessageCraneTupleDeliveryNack, want: 900},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := EffectiveLimit(tt.message, limits)
+			if err != nil {
+				t.Fatalf("EffectiveLimit: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("EffectiveLimit = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveLimitDefaultsAndValidatesEveryLimit(t *testing.T) {
+	if got, err := EffectiveLimit(MessageCraneTupleDelivery, Limits{}); err != nil || got != 1200 {
+		t.Fatalf("default Crane EffectiveLimit = %d, %v; want 1200, nil", got, err)
+	}
+	minimum := FixedHeaderSize + MACSize
+	for _, test := range []struct {
+		name   string
+		limits Limits
+	}{
+		{name: "frame_below_minimum", limits: Limits{MaxFrameSize: minimum - 1}},
+		{name: "swim_below_minimum", limits: Limits{MaxSWIMDatagramSize: minimum - 1}},
+		{name: "crane_below_minimum", limits: Limits{MaxCraneDatagramSize: minimum - 1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := EffectiveLimit(MessageSWIMPing, test.limits); !errors.Is(err, ErrTooLarge) {
+				t.Fatalf("EffectiveLimit error = %v, want ErrTooLarge", err)
+			}
+		})
+	}
+	if uint64(math.MaxInt) > uint64(math.MaxUint32) {
+		for _, test := range []struct {
+			name   string
+			limits Limits
+		}{
+			{name: "frame_above_uint32", limits: Limits{MaxFrameSize: math.MaxInt}},
+			{name: "swim_above_uint32", limits: Limits{MaxSWIMDatagramSize: math.MaxInt}},
+			{name: "crane_above_uint32", limits: Limits{MaxCraneDatagramSize: math.MaxInt}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				if _, err := EffectiveLimit(MessageSWIMPing, test.limits); !errors.Is(err, ErrTooLarge) {
+					t.Fatalf("EffectiveLimit error = %v, want ErrTooLarge", err)
+				}
+			})
+		}
+	}
+}
+
+func TestCraneTupleFramesUseComplete1200ByteLimitOnEncodeAndDecode(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	limits := DefaultLimits()
+	overhead := FixedHeaderSize + MACSize
+	for _, message := range []MessageType{MessageCraneTupleDelivery, MessageCraneTupleDeliveryAck, MessageCraneTupleDeliveryNack} {
+		header := testHeader()
+		header.Message = message
+		header.Codec = CodecBinary
+		payload := make([]byte, limits.MaxCraneDatagramSize-overhead)
+		encoded, err := Encode(header, payload, auth, limits)
+		if err != nil {
+			t.Fatalf("Encode exact-limit message %d: %v", message, err)
+		}
+		if len(encoded) != 1200 {
+			t.Fatalf("encoded message %d length = %d, want 1200", message, len(encoded))
+		}
+		if _, err := Decode(encoded, auth, limits); err != nil {
+			t.Fatalf("Decode exact-limit message %d: %v", message, err)
+		}
+
+		oversizedPayload := append(payload, 0)
+		if _, err := Encode(header, oversizedPayload, auth, limits); !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("Encode oversized message %d error = %v, want ErrTooLarge", message, err)
+		}
+		enlarged := limits
+		enlarged.MaxCraneDatagramSize++
+		oversized, err := Encode(header, oversizedPayload, auth, enlarged)
+		if err != nil {
+			t.Fatalf("Encode message %d with enlarged limit: %v", message, err)
+		}
+		if _, err := Decode(oversized, auth, limits); !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("Decode oversized message %d error = %v, want ErrTooLarge", message, err)
+		}
+	}
+}
+
 func TestFrameRejectsMalformedAndUnsupportedHeaders(t *testing.T) {
 	auth := NewHMACAuthenticator(testKey)
 	valid, err := Encode(testHeader(), []byte("payload"), auth, DefaultLimits())
@@ -248,6 +423,36 @@ func FuzzDecodeNeverPanics(f *testing.F) {
 
 type recordingAuthenticator struct {
 	verifyCalls int
+}
+
+func activeCraneMessageTypesForTest() []MessageType {
+	return []MessageType{
+		MessageCraneWorkerHandshake, MessageCraneWorkerHandshakeAck,
+		MessageCraneWorkerFenceRequest, MessageCraneWorkerFenceResponse,
+		MessageCraneWorkerRegisterRequest, MessageCraneWorkerRegisterResponse,
+		MessageCraneAssignmentSetInstall, MessageCraneAssignmentSetInstallAck,
+		MessageCraneWorkerStatusRequest, MessageCraneWorkerStatusReport,
+		MessageCraneCheckpointNotice, MessageCraneCheckpointAck,
+		MessageCraneResultRecordChunk, MessageCraneResultRecordAck,
+		MessageCraneResultArtifactChunk, MessageCraneResultArtifactAck,
+		MessageCraneResultFetchRequest, MessageCraneResultFetchChunk,
+		MessageCraneWorkerError,
+		MessageCraneSubmitRequest, MessageCraneSubmitResponse,
+		MessageCraneCancelRequest, MessageCraneCancelResponse,
+		MessageCraneStatusRequest, MessageCraneStatusResponse,
+		MessageCraneResultPageRequest, MessageCraneResultPageResponse,
+		MessageCraneLeaderRedirect, MessageCraneControlError,
+		MessageCraneTupleDelivery, MessageCraneTupleDeliveryAck, MessageCraneTupleDeliveryNack,
+	}
+}
+
+func makeAuthenticatedFrameForTest(header Header, payload []byte, auth Authenticator) []byte {
+	encoded := make([]byte, FixedHeaderSize+len(payload)+MACSize)
+	encodeHeader(encoded[:FixedHeaderSize], header, uint32(len(payload)))
+	copy(encoded[FixedHeaderSize:], payload)
+	signedLength := FixedHeaderSize + len(payload)
+	copy(encoded[signedLength:], auth.Sign(encoded[:signedLength]))
+	return encoded
 }
 
 func (*recordingAuthenticator) Sign([]byte) []byte {

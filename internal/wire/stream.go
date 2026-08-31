@@ -110,7 +110,7 @@ func ReadTCPFrame(ctx context.Context, conn net.Conn, auth Authenticator, limits
 
 	payloadLength := binary.BigEndian.Uint32(fixedHeader[payloadLengthOffset:FixedHeaderSize])
 	declaredLength := uint64(FixedHeaderSize) + uint64(payloadLength) + uint64(MACSize)
-	limit := effectiveLimit(header.Message, resolved)
+	limit := effectiveResolvedLimit(header.Message, resolved)
 	if declaredLength > uint64(limit) {
 		return Frame{}, fmt.Errorf("%w: declared body is %d bytes, maximum is %d", ErrTooLarge, declaredLength, limit)
 	}

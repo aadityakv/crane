@@ -92,6 +92,48 @@ func TestTCPReadFrameRejectsDeclaredBodyAboveLimit(t *testing.T) {
 	}
 }
 
+func TestTCPReadFrameRejectsOversizedCraneTupleAfterOnlyPrefixAndFixedHeader(t *testing.T) {
+	const bodyLength = 1201
+	header := testHeader()
+	header.Message = MessageCraneTupleDelivery
+	header.Codec = CodecBinary
+	fixedHeader := make([]byte, FixedHeaderSize)
+	encodeHeader(fixedHeader, header, bodyLength-FixedHeaderSize-MACSize)
+	prefix := make([]byte, tcpLengthPrefixSize)
+	binary.BigEndian.PutUint32(prefix, bodyLength)
+	conn := newReadOnlyConn(append(prefix, fixedHeader...))
+
+	if _, err := ReadTCPFrame(context.Background(), conn, NewHMACAuthenticator(testKey), DefaultLimits(), time.Second); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("oversized Crane TCP frame error = %v, want ErrTooLarge", err)
+	}
+	if conn.maximumReadRequest > FixedHeaderSize {
+		t.Fatalf("largest body read request = %d bytes, want at most fixed header size %d", conn.maximumReadRequest, FixedHeaderSize)
+	}
+	if conn.Len() != 0 {
+		t.Fatalf("unread prefix/header bytes = %d, want 0", conn.Len())
+	}
+}
+
+func TestTCPReadFrameAcceptsExactCraneTupleFrameLimit(t *testing.T) {
+	auth := NewHMACAuthenticator(testKey)
+	header := testHeader()
+	header.Message = MessageCraneTupleDeliveryAck
+	header.Codec = CodecBinary
+	payload := make([]byte, 1200-FixedHeaderSize-MACSize)
+	body, err := Encode(header, payload, auth, DefaultLimits())
+	if err != nil {
+		t.Fatalf("Encode exact Crane TCP frame: %v", err)
+	}
+	input := append(tcpPrefix(body), body...)
+	frame, err := ReadTCPFrame(context.Background(), newReadOnlyConn(input), auth, DefaultLimits(), time.Second)
+	if err != nil {
+		t.Fatalf("ReadTCPFrame exact Crane frame: %v", err)
+	}
+	if frame.Header != header || !bytes.Equal(frame.Payload, payload) {
+		t.Fatalf("decoded exact Crane frame = %#v", frame)
+	}
+}
+
 func TestTCPReadFrameRejectsBodyShorterThanFixedHeaderAndMAC(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

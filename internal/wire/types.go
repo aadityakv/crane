@@ -11,8 +11,9 @@ const (
 	// MACSize is the byte length of the trailing HMAC-SHA256 authentication code.
 	MACSize = 32
 
-	defaultMaxFrameSize        = 8 << 20
-	defaultMaxSWIMDatagramSize = 1200
+	defaultMaxFrameSize         = 8 << 20
+	defaultMaxSWIMDatagramSize  = 1200
+	defaultMaxCraneDatagramSize = 1200
 )
 
 var (
@@ -24,6 +25,8 @@ var (
 	ErrUnsupportedVersion = errors.New("unsupported wire version")
 	// ErrUnsupportedCodec classifies frames using an unknown payload codec.
 	ErrUnsupportedCodec = errors.New("unsupported wire codec")
+	// ErrUnsupportedMessage classifies reserved or unknown messages in an owned protocol range.
+	ErrUnsupportedMessage = errors.New("unsupported wire message")
 	// ErrAuthentication classifies frames that fail authentication or target another cluster.
 	ErrAuthentication = errors.New("wire authentication failed")
 )
@@ -82,6 +85,72 @@ const (
 	MessageRaftInstallSnapshotResponse MessageType = 109
 	// MessageRaftError carries a typed authentication-safe protocol failure.
 	MessageRaftError MessageType = 110
+	// MessageCraneWorkerHandshake binds a worker-control stream to its sender.
+	MessageCraneWorkerHandshake MessageType = 200
+	// MessageCraneWorkerHandshakeAck acknowledges a worker-control stream handshake.
+	MessageCraneWorkerHandshakeAck MessageType = 201
+	// MessageCraneWorkerFenceRequest asks a worker to adopt a coordinator epoch.
+	MessageCraneWorkerFenceRequest MessageType = 202
+	// MessageCraneWorkerFenceResponse reports worker fencing progress.
+	MessageCraneWorkerFenceResponse MessageType = 203
+	// MessageCraneWorkerRegisterRequest registers a fenced worker epoch.
+	MessageCraneWorkerRegisterRequest MessageType = 204
+	// MessageCraneWorkerRegisterResponse reports worker registration results.
+	MessageCraneWorkerRegisterResponse MessageType = 205
+	// MessageCraneAssignmentSetInstall replaces one job's complete worker assignment set.
+	MessageCraneAssignmentSetInstall MessageType = 206
+	// MessageCraneAssignmentSetInstallAck acknowledges an assignment-set installation.
+	MessageCraneAssignmentSetInstallAck MessageType = 207
+	// MessageCraneWorkerStatusRequest requests a bounded worker inventory.
+	MessageCraneWorkerStatusRequest MessageType = 208
+	// MessageCraneWorkerStatusReport returns a bounded worker inventory.
+	MessageCraneWorkerStatusReport MessageType = 209
+	// MessageCraneCheckpointNotice reports checkpoint progress.
+	MessageCraneCheckpointNotice MessageType = 210
+	// MessageCraneCheckpointAck acknowledges committed checkpoint progress.
+	MessageCraneCheckpointAck MessageType = 211
+	// MessageCraneResultRecordChunk transfers bounded result-record data.
+	MessageCraneResultRecordChunk MessageType = 212
+	// MessageCraneResultRecordAck acknowledges result-record transfer progress.
+	MessageCraneResultRecordAck MessageType = 213
+	// MessageCraneResultArtifactChunk transfers bounded result-artifact data.
+	MessageCraneResultArtifactChunk MessageType = 214
+	// MessageCraneResultArtifactAck acknowledges result-artifact transfer progress.
+	MessageCraneResultArtifactAck MessageType = 215
+	// MessageCraneResultFetchRequest requests a committed result artifact.
+	MessageCraneResultFetchRequest MessageType = 216
+	// MessageCraneResultFetchChunk returns bounded result-artifact data.
+	MessageCraneResultFetchChunk MessageType = 217
+	// MessageCraneWorkerError carries a typed worker-control protocol failure.
+	MessageCraneWorkerError MessageType = 218
+	// MessageCraneWorkerReserved pins the intentionally unusable worker-control ID 219.
+	MessageCraneWorkerReserved MessageType = 219
+	// MessageCraneSubmitRequest submits a validated job specification.
+	MessageCraneSubmitRequest MessageType = 240
+	// MessageCraneSubmitResponse reports the result of job submission.
+	MessageCraneSubmitResponse MessageType = 241
+	// MessageCraneCancelRequest requests cancellation of one job.
+	MessageCraneCancelRequest MessageType = 242
+	// MessageCraneCancelResponse reports the result of job cancellation.
+	MessageCraneCancelResponse MessageType = 243
+	// MessageCraneStatusRequest requests one linearizable job status.
+	MessageCraneStatusRequest MessageType = 244
+	// MessageCraneStatusResponse returns one linearizable job status.
+	MessageCraneStatusResponse MessageType = 245
+	// MessageCraneResultPageRequest requests one bounded result page.
+	MessageCraneResultPageRequest MessageType = 246
+	// MessageCraneResultPageResponse returns one bounded result page.
+	MessageCraneResultPageResponse MessageType = 247
+	// MessageCraneLeaderRedirect identifies the current control-plane leader.
+	MessageCraneLeaderRedirect MessageType = 248
+	// MessageCraneControlError carries a typed client-control protocol failure.
+	MessageCraneControlError MessageType = 249
+	// MessageCraneTupleDelivery carries one attempt-fenced tuple delivery.
+	MessageCraneTupleDelivery MessageType = 280
+	// MessageCraneTupleDeliveryAck acknowledges durable tuple acceptance.
+	MessageCraneTupleDeliveryAck MessageType = 281
+	// MessageCraneTupleDeliveryNack rejects a tuple delivery with a typed reason.
+	MessageCraneTupleDeliveryNack MessageType = 282
 
 	// MessageSWIMACK preserves the conventional all-caps ACK spelling.
 	MessageSWIMACK = MessageSWIMAck
@@ -119,18 +188,21 @@ type Frame struct {
 	Payload []byte
 }
 
-// Limits bounds complete frame bodies and SWIM UDP datagrams. ExpectedClusterID,
-// when non-nil, rejects otherwise authenticated frames for another cluster.
+// Limits bounds complete frame bodies and service-specific UDP datagrams.
+// ExpectedClusterID, when non-nil, rejects otherwise authenticated frames for
+// another cluster.
 type Limits struct {
-	MaxFrameSize        int
-	MaxSWIMDatagramSize int
-	ExpectedClusterID   *[16]byte
+	MaxFrameSize         int
+	MaxSWIMDatagramSize  int
+	MaxCraneDatagramSize int
+	ExpectedClusterID    *[16]byte
 }
 
-// DefaultLimits returns the initial 8 MiB frame and 1200-byte SWIM datagram bounds.
+// DefaultLimits returns the initial 8 MiB frame and 1200-byte SWIM and Crane datagram bounds.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxFrameSize:        defaultMaxFrameSize,
-		MaxSWIMDatagramSize: defaultMaxSWIMDatagramSize,
+		MaxFrameSize:         defaultMaxFrameSize,
+		MaxSWIMDatagramSize:  defaultMaxSWIMDatagramSize,
+		MaxCraneDatagramSize: defaultMaxCraneDatagramSize,
 	}
 }
