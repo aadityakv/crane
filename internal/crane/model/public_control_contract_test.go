@@ -1,9 +1,33 @@
 package model
 
 import (
+	"crypto/sha256"
 	"reflect"
 	"testing"
 )
+
+func TestPublicControlContractFingerprintSensitiveToEveryCategory(t *testing.T) {
+	baseline := PublicControlContractV1()
+	want := sha256.Sum256(canonicalPublicControlContractBytes(baseline))
+	tests := map[string]func(*PublicControlContract){
+		"message": func(v *PublicControlContract) { v.Messages[0].Fields[0].Name += "x" },
+		"nested":  func(v *PublicControlContract) { v.NestedLayouts[0].Fields[0].Encoding += "x" },
+		"enum":    func(v *PublicControlContract) { v.EnumDomains[0].Values[0] += "x" },
+		"bound":   func(v *PublicControlContract) { v.MaxResultPageBytes++ },
+		"domain":  func(v *PublicControlContract) { v.IdentityDomains[0] += "x" },
+		"matrix":  func(v *PublicControlContract) { v.ErrorCodeMatrix[0] += "x" },
+		"rule":    func(v *PublicControlContract) { v.Rules[0] += "x" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			changed := PublicControlContractV1()
+			mutate(&changed)
+			if got := sha256.Sum256(canonicalPublicControlContractBytes(changed)); got == want {
+				t.Fatal("contract mutation did not change canonical hash")
+			}
+		})
+	}
+}
 
 func TestPublicControlResultEntryBoundsAreMechanicallyDerived(t *testing.T) {
 	emptyTuple, err := MarshalTuple(Tuple{})
@@ -54,11 +78,11 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 			{Name: "CancelRequest", MessageType: 242, SchemaVersion: 1, Fields: fields("Request:ClientRequestID", "JobID:JobID", "ExpectedJobControlRevision:u64", "Digest:sha256")},
 			{Name: "CancelResponse", MessageType: 243, SchemaVersion: 1, Fields: fields("Request:ClientRequestID", "Digest:sha256", "JobID:JobID", "JobControlRevision:u64", "State:u8")},
 			{Name: "StatusRequest", MessageType: 244, SchemaVersion: 1, Fields: fields("JobID:JobID")},
-			{Name: "StatusResponse", MessageType: 245, SchemaVersion: 1, Fields: fields("JobID:JobID", "AppliedIndex:u64", "TopologyDigest:sha256", "JobControlRevision:u64", "State:u8", "HasAssignment:bool", "AssignmentRevision:u64", "AssignmentDigest:sha256", "SourceTaskCount:u16", "CompletedSourceTasks:u16", "ManifestCount:u16", "HasManifestSet:bool", "ManifestSetDigest:sha256", "HasFailure:bool", "FailureCode:u16", "FailureDetailDigest:sha256")},
+			{Name: "StatusResponse", MessageType: 245, SchemaVersion: 1, Fields: fields("JobID:JobID", "AppliedIndex:u64", "TopologyDigest:sha256", "JobControlRevision:u64", "State:u8", "HasAssignment:bool", "AssignmentRevision:u64", "AssignmentDigest:sha256", "SourceTaskCount:u16", "ResultPartitionCount:u16", "CompletedSourceTasks:u16", "ManifestCount:u16", "HasManifestSet:bool", "ManifestSetDigest:sha256", "HasFailure:bool", "FailureCode:u16", "FailureDetailDigest:sha256")},
 			{Name: "ResultPageRequest", MessageType: 246, SchemaVersion: 1, Fields: fields("JobID:JobID", "ManifestDigest:sha256", "HasLastTuple:bool", "Last:TupleID", "PageBytes:u32")},
 			{Name: "ResultPageResponse", MessageType: 247, SchemaVersion: 1, Fields: fields("JobID:JobID", "ManifestDigest:sha256", "RequestHasLastTuple:bool", "RequestLast:TupleID", "PageBytes:u32", "Records:list(ResultRecordEntry)", "NextHasLastTuple:bool", "NextLast:TupleID", "End:bool")},
 			{Name: "LeaderRedirect", MessageType: 248, SchemaVersion: 1, Fields: fields("Endpoints:list(string16)")},
-			{Name: "ControlError", MessageType: 249, SchemaVersion: 1, Fields: fields("RelatedMessage:u16", "Code:u16", "Retryable:bool", "HasClientRequest:bool", "ClientRequest:ClientRequestID", "ClientDigest:sha256", "HasResultPage:bool", "ResultPage:ResultPageBinding", "RequiredBytes:u32", "Detail:bytes16")},
+			{Name: "ControlError", MessageType: 249, SchemaVersion: 1, Fields: fields("RelatedMessage:u16", "Code:u16", "Retryable:bool", "HasClientRequest:bool", "ClientRequest:ClientRequestID", "ClientDigest:sha256", "HasStatusRequest:bool", "StatusJobID:JobID", "HasResultPage:bool", "ResultPage:ResultPageBinding", "RequiredBytes:u32", "Detail:bytes16")},
 		},
 		NestedLayouts: []PublicControlNestedDescriptor{
 			{Name: "ClientRequestID", Fields: fields("ClientID:bytes16(nonzero)", "Sequence:u64(nonzero)")},
@@ -78,22 +102,34 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 			"cs425/crane/submit-control-command/v1",
 			"cs425/crane/cancel-control-command/v1",
 		},
+		ErrorCodeMatrix: []string{
+			"Unbound=Malformed,UnsupportedSchema,InvalidRequest",
+			"SubmitRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,CapacityExhausted",
+			"CancelRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,NotFound,RevisionMismatch",
+			"StatusRequest=Starting,NotLeader,NotFound",
+			"ResultPageRequest=Starting,NotLeader,NotFound,PageLimitTooSmall,ResultUnavailable,CorruptResult",
+		},
 		Rules: []string{
 			"payload-prefix-is-schema-version-then-message-type",
 			"submit-digest-binds-client-request-and-canonical-topology",
 			"cancel-digest-binds-client-request-job-and-expected-revision",
 			"mutation-response-echoes-request-digest-job-revision-and-terminal-command-state",
+			"submit-response-revision-is-one-and-cancel-response-revision-is-checked-successor",
 			"status-binds-applied-index-topology-assignment-manifest-and-failure-identities",
+			"status-lifecycle-binds-immutable-result-partition-count-and-progress-matrix",
 			"result-page-cursor-is-global-stateless-and-bound-to-job-manifest-and-page-limit",
 			"result-record-entries-are-complete-canonical-streams-and-never-split",
 			"result-records-are-strictly-globally-increasing-and-cross-job-records-are-rejected",
 			"nonempty-page-next-cursor-equals-last-record",
 			"empty-terminal-page-preserves-request-cursor",
 			"page-limit-too-small-repeats-request-binding-required-bytes-and-does-not-advance",
+			"page-limit-required-bytes-is-one-complete-encoded-result-entry-from-170-through-680",
+			"result-page-serving-sizes-records-with-encoded-result-page-record-bytes",
 			"redirect-endpoints-are-exactly-one-or-three-or-five-canonical-sorted-unique-control-endpoints",
 			"control-error-binding-selectors-are-exclusive-and-match-related-request-type",
 			"mutation-control-errors-echo-client-request-and-candidate-command-digest",
-			"unbound-control-errors-are-limited-to-predecode-starting-or-not-leader-codes",
+			"control-error-request-type-and-code-follow-the-fingerprinted-compatibility-matrix",
+			"unbound-control-errors-are-limited-to-malformed-unsupported-schema-or-invalid-request-before-trust",
 			"decoded-variable-values-are-owned",
 			"bounds-and-declared-lengths-are-checked-before-allocation",
 			"unknown-enums-trailing-bytes-type-mismatches-and-noncanonical-bytes-are-rejected",
@@ -110,9 +146,10 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 	got.NestedLayouts[0].Fields[0].Encoding = "mutated"
 	got.EnumDomains[0].Values[0] = "mutated"
 	got.IdentityDomains[0] = "mutated"
+	got.ErrorCodeMatrix[0] = "mutated"
 	got.Rules[0] = "mutated"
 	again := PublicControlContractV1()
-	if again.Messages[0].Name != "SubmitRequest" || again.Messages[0].Fields[0].Name != "Request" || again.NestedLayouts[0].Fields[0].Encoding != "bytes16(nonzero)" || again.EnumDomains[0].Values[0] != "Pending=1" || again.IdentityDomains[0] != "cs425/crane/submit-control-command/v1" || again.Rules[0] != "payload-prefix-is-schema-version-then-message-type" {
+	if again.Messages[0].Name != "SubmitRequest" || again.Messages[0].Fields[0].Name != "Request" || again.NestedLayouts[0].Fields[0].Encoding != "bytes16(nonzero)" || again.EnumDomains[0].Values[0] != "Pending=1" || again.IdentityDomains[0] != "cs425/crane/submit-control-command/v1" || again.ErrorCodeMatrix[0] != "Unbound=Malformed,UnsupportedSchema,InvalidRequest" || again.Rules[0] != "payload-prefix-is-schema-version-then-message-type" {
 		t.Fatalf("PublicControlContractV1 shares mutable storage: %#v", again)
 	}
 }

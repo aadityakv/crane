@@ -63,7 +63,7 @@ const (
 
 	// The current authenticated frame is a 55-byte header plus a 32-byte MAC.
 	v1AuthenticatedFrameBytes = uint64(87)
-	// SubmitRequest: frame + schema + message type + ClientRequestID + topology digest.
+	// SubmitRequest: frame + schema + message type + ClientRequestID + complete submit-command digest.
 	v1SubmitRequestFixedBytes = v1AuthenticatedFrameBytes + 2*v1Uint16Bytes + (16 + v1Uint64Bytes) + v1DigestBytes
 	// SubmitJob: schema + consensus fingerprint + kind + envelope selector +
 	// ClientRequestID + complete client-command digest.

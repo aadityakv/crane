@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/wire"
@@ -2190,6 +2191,97 @@ func ControlEncodingLayout(message ControlMessage) ([]model.PublicControlFieldDe
 	return append([]model.PublicControlFieldDescriptor(nil), encoder.layout...), nil
 }
 
+// ControlNestedEncodingLayouts returns nested layouts traced through the same
+// primitive appenders used by the public-control encoder.
+func ControlNestedEncodingLayouts() []model.PublicControlNestedDescriptor {
+	encoder := controlEncoder{traceNested: true, nestedSeen: make(map[string]bool)}
+	encoder.request(model.ClientRequestID{})
+	encoder.job(model.JobID{})
+	encoder.task(model.TaskID{})
+	encoder.tuple(model.TupleID{})
+	encoder.topology(model.TopologySpec{})
+	encoder.resultEntry(model.ResultRecord{})
+	encoder.pageBinding(ResultPageRequest{})
+	result := append([]model.PublicControlNestedDescriptor(nil), encoder.nestedLayouts...)
+	for index := range result {
+		result[index].Fields = append([]model.PublicControlFieldDescriptor(nil), result[index].Fields...)
+	}
+	return result
+}
+
+// ControlEnumDomains returns names paired with the actual accepted enum constants.
+func ControlEnumDomains() []model.PublicControlEnumDescriptor {
+	return []model.PublicControlEnumDescriptor{
+		{Name: "JobState", Values: []string{fmt.Sprintf("Pending=%d", JobPending), fmt.Sprintf("Deploying=%d", JobDeploying), fmt.Sprintf("Running=%d", JobRunning), fmt.Sprintf("Draining=%d", JobDraining), fmt.Sprintf("Succeeded=%d", JobSucceeded), fmt.Sprintf("Failed=%d", JobFailed), fmt.Sprintf("Canceled=%d", JobCanceled)}},
+		{Name: "ControlErrorCode", Values: []string{fmt.Sprintf("Malformed=%d", ControlErrorMalformed), fmt.Sprintf("UnsupportedSchema=%d", ControlErrorUnsupportedSchema), fmt.Sprintf("InvalidRequest=%d", ControlErrorInvalidRequest), fmt.Sprintf("Starting=%d", ControlErrorStarting), fmt.Sprintf("NotLeader=%d", ControlErrorNotLeader), fmt.Sprintf("StaleRequest=%d", ControlErrorStaleRequest), fmt.Sprintf("SkippedRequest=%d", ControlErrorSkippedRequest), fmt.Sprintf("IdentityReuse=%d", ControlErrorIdentityReuse), fmt.Sprintf("NotFound=%d", ControlErrorNotFound), fmt.Sprintf("RevisionMismatch=%d", ControlErrorRevisionMismatch), fmt.Sprintf("CapacityExhausted=%d", ControlErrorCapacityExhausted), fmt.Sprintf("PageLimitTooSmall=%d", ControlErrorPageLimitTooSmall), fmt.Sprintf("ResultUnavailable=%d", ControlErrorResultUnavailable), fmt.Sprintf("CorruptResult=%d", ControlErrorCorruptResult)}},
+		{Name: "FailureCode", Values: []string{fmt.Sprintf("Operator=%d", model.FailureOperator), fmt.Sprintf("TupleInvalid=%d", model.FailureTupleInvalid), fmt.Sprintf("Storage=%d", model.FailureStorage)}},
+	}
+}
+
+// ControlErrorCodeMatrix derives the exact binding/code matrix from the real validator.
+func ControlErrorCodeMatrix() []string {
+	rows := []struct {
+		name    string
+		message wire.MessageType
+	}{
+		{name: "Unbound"},
+		{name: "SubmitRequest", message: wire.MessageCraneSubmitRequest},
+		{name: "CancelRequest", message: wire.MessageCraneCancelRequest},
+		{name: "StatusRequest", message: wire.MessageCraneStatusRequest},
+		{name: "ResultPageRequest", message: wire.MessageCraneResultPageRequest},
+	}
+	result := make([]string, len(rows))
+	for index, row := range rows {
+		values := make([]string, 0, int(ControlErrorCorruptResult))
+		for code := ControlErrorMalformed; code <= ControlErrorCorruptResult; code++ {
+			allowed := predecodeControlError(code)
+			if row.message != 0 {
+				allowed = controlErrorCodeCompatible(row.message, code)
+			}
+			if allowed {
+				values = append(values, controlErrorCodeName(code))
+			}
+		}
+		result[index] = row.name + "=" + strings.Join(values, ",")
+	}
+	return result
+}
+
+func controlErrorCodeName(code ControlErrorCode) string {
+	switch code {
+	case ControlErrorMalformed:
+		return "Malformed"
+	case ControlErrorUnsupportedSchema:
+		return "UnsupportedSchema"
+	case ControlErrorInvalidRequest:
+		return "InvalidRequest"
+	case ControlErrorStarting:
+		return "Starting"
+	case ControlErrorNotLeader:
+		return "NotLeader"
+	case ControlErrorStaleRequest:
+		return "StaleRequest"
+	case ControlErrorSkippedRequest:
+		return "SkippedRequest"
+	case ControlErrorIdentityReuse:
+		return "IdentityReuse"
+	case ControlErrorNotFound:
+		return "NotFound"
+	case ControlErrorRevisionMismatch:
+		return "RevisionMismatch"
+	case ControlErrorCapacityExhausted:
+		return "CapacityExhausted"
+	case ControlErrorPageLimitTooSmall:
+		return "PageLimitTooSmall"
+	case ControlErrorResultUnavailable:
+		return "ResultUnavailable"
+	case ControlErrorCorruptResult:
+		return "CorruptResult"
+	default:
+		return ""
+	}
+}
+
 // MarshalSubmitRequest emits a canonical submit request.
 func MarshalSubmitRequest(value SubmitRequest) ([]byte, error) { return MarshalControlMessage(value) }
 
@@ -2358,10 +2450,13 @@ func unmarshalControlMessageWith(messageType wire.MessageType, encoded []byte, d
 }
 
 type controlEncoder struct {
-	output []byte
-	err    error
-	trace  bool
-	layout []model.PublicControlFieldDescriptor
+	output        []byte
+	err           error
+	trace         bool
+	layout        []model.PublicControlFieldDescriptor
+	traceNested   bool
+	nestedSeen    map[string]bool
+	nestedLayouts []model.PublicControlNestedDescriptor
 }
 
 func (encoder *controlEncoder) owned() []byte { return append([]byte(nil), encoder.output...) }
@@ -2382,6 +2477,23 @@ func (encoder *controlEncoder) field(name, encoding string, appendValue func()) 
 		encoder.layout = append(encoder.layout, model.PublicControlFieldDescriptor{Name: name, Encoding: encoding})
 	}
 	appendValue()
+}
+
+func (encoder *controlEncoder) nested(layout string, appendFields func(func(string, string, func()))) {
+	record := encoder.traceNested && !encoder.nestedSeen[layout]
+	descriptorIndex := -1
+	if record {
+		encoder.nestedSeen[layout] = true
+		encoder.nestedLayouts = append(encoder.nestedLayouts, model.PublicControlNestedDescriptor{Name: layout})
+		descriptorIndex = len(encoder.nestedLayouts) - 1
+	}
+	field := func(name, encoding string, appendValue func()) {
+		if record {
+			encoder.nestedLayouts[descriptorIndex].Fields = append(encoder.nestedLayouts[descriptorIndex].Fields, model.PublicControlFieldDescriptor{Name: name, Encoding: encoding})
+		}
+		appendValue()
+	}
+	appendFields(field)
 }
 
 func (encoder *controlEncoder) u8(value byte) { encoder.add([]byte{value}) }
@@ -2415,59 +2527,84 @@ func (encoder *controlEncoder) bytes16(value []byte) {
 	encoder.u16(uint16(len(value)))
 	encoder.add(value)
 }
+func (encoder *controlEncoder) job(value model.JobID) {
+	encoder.nested("JobID", func(field func(string, string, func())) {
+		field("Value", "bytes16(nonzero)", func() { encoder.add(value[:]) })
+	})
+}
 func (encoder *controlEncoder) request(value model.ClientRequestID) {
-	encoder.add(value.ClientID[:])
-	encoder.u64(value.Sequence)
+	encoder.nested("ClientRequestID", func(field func(string, string, func())) {
+		field("ClientID", "bytes16(nonzero)", func() { encoder.add(value.ClientID[:]) })
+		field("Sequence", "u64(nonzero)", func() { encoder.u64(value.Sequence) })
+	})
 }
 func (encoder *controlEncoder) task(value model.TaskID) {
-	encoder.add(value.JobID[:])
-	encoder.u16(value.StageID)
-	encoder.u16(value.Partition)
+	encoder.nested("TaskID", func(field func(string, string, func())) {
+		field("JobID", "JobID", func() { encoder.job(value.JobID) })
+		field("StageID", "u16(nonzero)", func() { encoder.u16(value.StageID) })
+		field("Partition", "u16", func() { encoder.u16(value.Partition) })
+	})
 }
 func (encoder *controlEncoder) tuple(value model.TupleID) {
-	encoder.add(value.JobID[:])
-	encoder.task(value.SourceTask)
-	encoder.u64(value.SourceSequence)
-	encoder.add(value.PathDigest[:])
+	encoder.nested("TupleID", func(field func(string, string, func())) {
+		field("JobID", "JobID", func() { encoder.job(value.JobID) })
+		field("SourceTask", "TaskID", func() { encoder.task(value.SourceTask) })
+		field("SourceSequence", "u64(nonzero)", func() { encoder.u64(value.SourceSequence) })
+		field("PathDigest", "sha256(nonzero)", func() { encoder.add(value.PathDigest[:]) })
+	})
+}
+func (encoder *controlEncoder) topology(value model.TopologySpec) {
+	encoder.nested("TopologySpec", func(field func(string, string, func())) {
+		field("CanonicalTopology", "bytes64", func() {
+			validated, _ := model.ValidateTopology(value)
+			encoder.add(validated.CanonicalBytes())
+		})
+	})
+}
+func (encoder *controlEncoder) resultEntry(record model.ResultRecord) {
+	encoder.nested("ResultRecordEntry", func(field func(string, string, func())) {
+		stream, _ := model.MarshalResultRecord(record)
+		field("Length", "u32", func() { encoder.u32(uint32(len(stream))) })
+		field("Record", "canonical-result-record-v1", func() { encoder.add(stream) })
+	})
 }
 func (encoder *controlEncoder) pageBinding(value ResultPageRequest) {
-	encoder.add(value.JobID[:])
-	encoder.add(value.ManifestDigest[:])
-	encoder.bool(value.HasLastTuple)
-	encoder.tuple(value.Last)
-	encoder.u32(value.PageBytes)
+	encoder.nested("ResultPageBinding", func(field func(string, string, func())) {
+		field("JobID", "JobID", func() { encoder.job(value.JobID) })
+		field("ManifestDigest", "sha256", func() { encoder.add(value.ManifestDigest[:]) })
+		field("HasLastTuple", "bool", func() { encoder.bool(value.HasLastTuple) })
+		field("Last", "TupleID", func() { encoder.tuple(value.Last) })
+		field("PageBytes", "u32", func() { encoder.u32(value.PageBytes) })
+	})
 }
 
 func (encoder *controlEncoder) message(message ControlMessage) error {
 	switch value := message.(type) {
 	case SubmitRequest:
 		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
-		encoder.field("Topology", "TopologySpec", func() {
-			validated, _ := model.ValidateTopology(value.Topology)
-			encoder.add(validated.CanonicalBytes())
-		})
+		encoder.field("Topology", "TopologySpec", func() { encoder.topology(value.Topology) })
 		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
 	case SubmitResponse:
 		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
 		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
-		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.job(value.JobID) })
 		encoder.field("JobControlRevision", "u64", func() { encoder.u64(value.JobControlRevision) })
 		encoder.field("State", "u8", func() { encoder.u8(byte(value.State)) })
 	case CancelRequest:
 		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
-		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.job(value.JobID) })
 		encoder.field("ExpectedJobControlRevision", "u64", func() { encoder.u64(value.ExpectedJobControlRevision) })
 		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
 	case CancelResponse:
 		encoder.field("Request", "ClientRequestID", func() { encoder.request(value.Request) })
 		encoder.field("Digest", "sha256", func() { encoder.add(value.Digest[:]) })
-		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.job(value.JobID) })
 		encoder.field("JobControlRevision", "u64", func() { encoder.u64(value.JobControlRevision) })
 		encoder.field("State", "u8", func() { encoder.u8(byte(value.State)) })
 	case StatusRequest:
-		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.job(value.JobID) })
 	case StatusResponse:
-		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.job(value.JobID) })
 		encoder.field("AppliedIndex", "u64", func() { encoder.u64(value.AppliedIndex) })
 		encoder.field("TopologyDigest", "sha256", func() { encoder.add(value.TopologyDigest[:]) })
 		encoder.field("JobControlRevision", "u64", func() { encoder.u64(value.JobControlRevision) })
@@ -2476,6 +2613,7 @@ func (encoder *controlEncoder) message(message ControlMessage) error {
 		encoder.field("AssignmentRevision", "u64", func() { encoder.u64(value.AssignmentRevision) })
 		encoder.field("AssignmentDigest", "sha256", func() { encoder.add(value.AssignmentDigest[:]) })
 		encoder.field("SourceTaskCount", "u16", func() { encoder.u16(value.SourceTaskCount) })
+		encoder.field("ResultPartitionCount", "u16", func() { encoder.u16(value.ResultPartitionCount) })
 		encoder.field("CompletedSourceTasks", "u16", func() { encoder.u16(value.CompletedSourceTasks) })
 		encoder.field("ManifestCount", "u16", func() { encoder.u16(value.ManifestCount) })
 		encoder.field("HasManifestSet", "bool", func() { encoder.bool(value.HasManifestSet) })
@@ -2484,13 +2622,13 @@ func (encoder *controlEncoder) message(message ControlMessage) error {
 		encoder.field("FailureCode", "u16", func() { encoder.u16(uint16(value.FailureCode)) })
 		encoder.field("FailureDetailDigest", "sha256", func() { encoder.add(value.FailureDetailDigest[:]) })
 	case ResultPageRequest:
-		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.job(value.JobID) })
 		encoder.field("ManifestDigest", "sha256", func() { encoder.add(value.ManifestDigest[:]) })
 		encoder.field("HasLastTuple", "bool", func() { encoder.bool(value.HasLastTuple) })
 		encoder.field("Last", "TupleID", func() { encoder.tuple(value.Last) })
 		encoder.field("PageBytes", "u32", func() { encoder.u32(value.PageBytes) })
 	case ResultPageResponse:
-		encoder.field("JobID", "JobID", func() { encoder.add(value.JobID[:]) })
+		encoder.field("JobID", "JobID", func() { encoder.job(value.JobID) })
 		encoder.field("ManifestDigest", "sha256", func() { encoder.add(value.ManifestDigest[:]) })
 		encoder.field("RequestHasLastTuple", "bool", func() { encoder.bool(value.RequestHasLastTuple) })
 		encoder.field("RequestLast", "TupleID", func() { encoder.tuple(value.RequestLast) })
@@ -2498,9 +2636,7 @@ func (encoder *controlEncoder) message(message ControlMessage) error {
 		encoder.field("Records", "list(ResultRecordEntry)", func() {
 			encoder.u16(uint16(len(value.Records)))
 			for _, record := range value.Records {
-				stream, _ := model.MarshalResultRecord(record)
-				encoder.u32(uint32(len(stream)))
-				encoder.add(stream)
+				encoder.resultEntry(record)
 			}
 		})
 		encoder.field("NextHasLastTuple", "bool", func() { encoder.bool(value.NextHasLastTuple) })
@@ -2520,6 +2656,8 @@ func (encoder *controlEncoder) message(message ControlMessage) error {
 		encoder.field("HasClientRequest", "bool", func() { encoder.bool(value.HasClientRequest) })
 		encoder.field("ClientRequest", "ClientRequestID", func() { encoder.request(value.ClientRequest) })
 		encoder.field("ClientDigest", "sha256", func() { encoder.add(value.ClientDigest[:]) })
+		encoder.field("HasStatusRequest", "bool", func() { encoder.bool(value.HasStatusRequest) })
+		encoder.field("StatusJobID", "JobID", func() { encoder.job(value.StatusJobID) })
 		encoder.field("HasResultPage", "bool", func() { encoder.bool(value.HasResultPage) })
 		encoder.field("ResultPage", "ResultPageBinding", func() { encoder.pageBinding(value.ResultPage) })
 		encoder.field("RequiredBytes", "u32", func() { encoder.u32(value.RequiredBytes) })
@@ -2848,6 +2986,10 @@ func (decoder *controlDecoder) statusResponse() (ControlMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	resultPartitions, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
 	completed, err := decoder.u16()
 	if err != nil {
 		return nil, err
@@ -2873,7 +3015,7 @@ func (decoder *controlDecoder) statusResponse() (ControlMessage, error) {
 		return nil, err
 	}
 	failureDigest, err := decoder.digest()
-	return StatusResponse{JobID: job, AppliedIndex: applied, TopologyDigest: topology, JobControlRevision: jobRevision, State: JobState(state), HasAssignment: hasAssignment, AssignmentRevision: assignmentRevision, AssignmentDigest: assignmentDigest, SourceTaskCount: sources, CompletedSourceTasks: completed, ManifestCount: manifests, HasManifestSet: hasManifest, ManifestSetDigest: manifestDigest, HasFailure: hasFailure, FailureCode: model.FailureCode(failureCode), FailureDetailDigest: failureDigest}, err
+	return StatusResponse{JobID: job, AppliedIndex: applied, TopologyDigest: topology, JobControlRevision: jobRevision, State: JobState(state), HasAssignment: hasAssignment, AssignmentRevision: assignmentRevision, AssignmentDigest: assignmentDigest, SourceTaskCount: sources, ResultPartitionCount: resultPartitions, CompletedSourceTasks: completed, ManifestCount: manifests, HasManifestSet: hasManifest, ManifestSetDigest: manifestDigest, HasFailure: hasFailure, FailureCode: model.FailureCode(failureCode), FailureDetailDigest: failureDigest}, err
 }
 
 func (decoder *controlDecoder) resultPageResponse() (ControlMessage, error) {
@@ -2957,6 +3099,14 @@ func (decoder *controlDecoder) controlError() (ControlMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	hasStatus, err := decoder.bool()
+	if err != nil {
+		return nil, err
+	}
+	statusJob, err := decoder.job()
+	if err != nil {
+		return nil, err
+	}
 	hasPage, err := decoder.bool()
 	if err != nil {
 		return nil, err
@@ -2970,7 +3120,7 @@ func (decoder *controlDecoder) controlError() (ControlMessage, error) {
 		return nil, err
 	}
 	detail, err := decoder.bytes16(MaxControlErrorDetailBytes)
-	return ControlError{RelatedMessage: wire.MessageType(related), Code: ControlErrorCode(code), Retryable: retryable, HasClientRequest: hasClient, ClientRequest: client, ClientDigest: clientDigest, HasResultPage: hasPage, ResultPage: page, RequiredBytes: required, Detail: detail}, err
+	return ControlError{RelatedMessage: wire.MessageType(related), Code: ControlErrorCode(code), Retryable: retryable, HasClientRequest: hasClient, ClientRequest: client, ClientDigest: clientDigest, HasStatusRequest: hasStatus, StatusJobID: statusJob, HasResultPage: hasPage, ResultPage: page, RequiredBytes: required, Detail: detail}, err
 }
 
 func preflightTupleDelivery(input []byte) error {

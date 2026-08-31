@@ -72,11 +72,11 @@ func TestV1FingerprintsMatchIndependentGoldens(t *testing.T) {
 	if got := hex.EncodeToString(registry[:]); got != "56b222c3476fa78b244396eb8c12a74b1d6f4cfa1ab0b8cf7655d76cfb81d6d0" {
 		t.Fatalf("RegistryFingerprint() = %s", got)
 	}
-	if got := ConsensusFingerprintHex(); got != "ca963a3a7c09dd3e8e9998492cbe0890f2805effeb60d49e5c0209db1f0cbdf4" {
+	if got := ConsensusFingerprintHex(); got != "319f149ce4c71c7148c674d26387a5a628f1f181a27e018d538942c58a9f934f" {
 		t.Fatalf("ConsensusFingerprintHex() = %s", got)
 	}
 	consensus := ConsensusFingerprint()
-	if got := hex.EncodeToString(consensus[:]); got != "ca963a3a7c09dd3e8e9998492cbe0890f2805effeb60d49e5c0209db1f0cbdf4" {
+	if got := hex.EncodeToString(consensus[:]); got != "319f149ce4c71c7148c674d26387a5a628f1f181a27e018d538942c58a9f934f" {
 		t.Fatalf("ConsensusFingerprint() = %s", got)
 	}
 }

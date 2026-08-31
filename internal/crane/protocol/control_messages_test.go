@@ -494,10 +494,10 @@ func TestResultPageLimitsAndPageLimitTooSmallRepeatBindingWithoutAdvancement(t *
 func TestControlErrorBindingSelectorsAreExclusiveAndMatchRelatedRequest(t *testing.T) {
 	fixture := controlFixture(t)
 	mutation := ControlError{RelatedMessage: wire.MessageCraneSubmitRequest, Code: ControlErrorCapacityExhausted, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.submitDigest, Detail: []byte("capacity")}
-	status := ControlError{RelatedMessage: wire.MessageCraneStatusRequest, Code: ControlErrorNotFound, Detail: []byte("missing")}
+	status := ControlError{RelatedMessage: wire.MessageCraneStatusRequest, Code: ControlErrorNotFound, HasStatusRequest: true, StatusJobID: fixture.job, Detail: []byte("missing")}
 	unboundMutation := ControlError{RelatedMessage: wire.MessageCraneCancelRequest, Code: ControlErrorMalformed, Detail: []byte("predecode")}
-	unboundPage := ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: ControlErrorStarting, Retryable: true}
-	for _, valid := range []ControlError{mutation, status, fixture.controlError, unboundMutation, unboundPage} {
+	boundPage := ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: ControlErrorStarting, Retryable: true, HasResultPage: true, ResultPage: fixture.pageRequest}
+	for _, valid := range []ControlError{mutation, status, fixture.controlError, unboundMutation, boundPage} {
 		if _, err := MarshalControlError(valid); err != nil {
 			t.Fatalf("valid selector %#v: %v", valid, err)
 		}
@@ -527,6 +527,7 @@ func TestControlErrorBindingSelectorsAreExclusiveAndMatchRelatedRequest(t *testi
 			v := status
 			v.HasClientRequest = true
 			v.ClientRequest = fixture.request
+			v.ClientDigest = fixture.submitDigest
 			return v
 		}(),
 		func() ControlError { v := status; v.RelatedMessage = wire.MessageCraneSubmitResponse; return v }(),
@@ -794,7 +795,7 @@ func makeControlFixture() (controlMessageFixture, error) {
 		cancelRequest:  CancelRequest{Request: request, JobID: job, ExpectedJobControlRevision: 9, Digest: cancelDigest},
 		cancelResponse: CancelResponse{Request: request, Digest: cancelDigest, JobID: job, JobControlRevision: 10, State: JobCanceled},
 		statusRequest:  StatusRequest{JobID: job},
-		statusResponse: StatusResponse{JobID: job, AppliedIndex: 11, TopologyDigest: validated.Digest(), JobControlRevision: 10, State: JobDraining, HasAssignment: true, AssignmentRevision: 3, AssignmentDigest: [32]byte{0x22}, SourceTaskCount: 1, CompletedSourceTasks: 1, ManifestCount: 1, HasManifestSet: true, ManifestSetDigest: manifestDigest},
+		statusResponse: StatusResponse{JobID: job, AppliedIndex: 11, TopologyDigest: validated.Digest(), JobControlRevision: 10, State: JobDraining, HasAssignment: true, AssignmentRevision: 3, AssignmentDigest: [32]byte{0x22}, SourceTaskCount: 1, ResultPartitionCount: 1, CompletedSourceTasks: 1, ManifestCount: 1, HasManifestSet: true, ManifestSetDigest: manifestDigest},
 		pageRequest:    pageRequest, pageResponse: pageResponse,
 		redirect:     LeaderRedirect{Endpoints: []string{"node-1.example.test:8006", "node-2.example.test:8106", "node-3.example.test:8206"}},
 		controlError: ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: ControlErrorPageLimitTooSmall, HasResultPage: true, ResultPage: pageLimitRequest, RequiredBytes: uint32(4 + mustResultStreamLength(records[0])), Detail: []byte("page too small")},
@@ -954,6 +955,7 @@ func goldenStatusResponse(f controlMessageFixture) []byte {
 	encoded = appendU64Golden(encoded, m.AssignmentRevision)
 	encoded = append(encoded, m.AssignmentDigest[:]...)
 	encoded = appendU16Golden(encoded, m.SourceTaskCount)
+	encoded = appendU16Golden(encoded, m.ResultPartitionCount)
 	encoded = appendU16Golden(encoded, m.CompletedSourceTasks)
 	encoded = appendU16Golden(encoded, m.ManifestCount)
 	encoded = appendBoolGolden(encoded, m.HasManifestSet)
@@ -1001,6 +1003,8 @@ func goldenControlError(f controlMessageFixture) []byte {
 	encoded = appendBoolGolden(encoded, m.HasClientRequest)
 	encoded = appendRequestGolden(encoded, m.ClientRequest)
 	encoded = append(encoded, m.ClientDigest[:]...)
+	encoded = appendBoolGolden(encoded, m.HasStatusRequest)
+	encoded = append(encoded, m.StatusJobID[:]...)
 	encoded = appendBoolGolden(encoded, m.HasResultPage)
 	encoded = appendPageBindingGolden(encoded, m.ResultPage)
 	encoded = appendU32Golden(encoded, m.RequiredBytes)

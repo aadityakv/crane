@@ -195,6 +195,8 @@ type StatusResponse struct {
 	AssignmentDigest [32]byte
 	// SourceTaskCount is the immutable number of source partitions.
 	SourceTaskCount uint16
+	// ResultPartitionCount is the immutable expected number of result manifests.
+	ResultPartitionCount uint16
 	// CompletedSourceTasks counts checkpoints exactly at committed EOF.
 	CompletedSourceTasks uint16
 	// ManifestCount is the number of committed result manifests.
@@ -279,6 +281,10 @@ type ControlError struct {
 	ClientRequest model.ClientRequestID
 	// ClientDigest is the exact candidate command digest when the mutation binding is selected.
 	ClientDigest [32]byte
+	// HasStatusRequest selects the exact retained-job status binding.
+	HasStatusRequest bool
+	// StatusJobID is the exact status subject when selected.
+	StatusJobID model.JobID
 	// HasResultPage selects the fixed stateless result-page binding.
 	HasResultPage bool
 	// ResultPage is the exact page request when selected.
@@ -312,8 +318,8 @@ func CancelCommandDigest(request model.ClientRequestID, job model.JobID, expecte
 	if err := job.Validate(); err != nil {
 		return [32]byte{}, err
 	}
-	if expectedRevision == 0 {
-		return [32]byte{}, errors.New("zero expected job-control revision")
+	if expectedRevision == 0 || expectedRevision == ^uint64(0) {
+		return [32]byte{}, errors.New("expected job-control revision has no valid successor")
 	}
 	return model.PublicCancelCommandDigest(request, job, expectedRevision), nil
 }
@@ -331,7 +337,7 @@ func ValidateSubmitResponseCorrelation(request SubmitRequest, response SubmitRes
 		return err
 	}
 	wantJob := model.DeriveJobID(request.Request, validated.Digest())
-	if response.Request != request.Request || response.Digest != request.Digest || response.JobID != wantJob {
+	if response.Request != request.Request || response.Digest != request.Digest || response.JobID != wantJob || response.JobControlRevision != 1 {
 		return errors.New("submit response does not bind the exact durable request")
 	}
 	return nil
@@ -345,8 +351,65 @@ func ValidateCancelResponseCorrelation(request CancelRequest, response CancelRes
 	if err := validateControlMessage(response); err != nil {
 		return err
 	}
-	if response.Request != request.Request || response.Digest != request.Digest || response.JobID != request.JobID {
+	wantRevision := request.ExpectedJobControlRevision + 1
+	if response.Request != request.Request || response.Digest != request.Digest || response.JobID != request.JobID || response.JobControlRevision != wantRevision {
 		return errors.New("cancel response does not bind the exact durable request")
+	}
+	return nil
+}
+
+// ValidateSubmitErrorCorrelation binds an error to one exact canonical submit request.
+func ValidateSubmitErrorCorrelation(request SubmitRequest, controlError ControlError) error {
+	if err := validateControlMessage(request); err != nil {
+		return err
+	}
+	if err := validateControlError(controlError); err != nil {
+		return err
+	}
+	if controlError.RelatedMessage != wire.MessageCraneSubmitRequest || !controlError.HasClientRequest || controlError.ClientRequest != request.Request || controlError.ClientDigest != request.Digest {
+		return errors.New("submit error does not bind the exact request")
+	}
+	return nil
+}
+
+// ValidateCancelErrorCorrelation binds an error to one exact canonical cancel request.
+func ValidateCancelErrorCorrelation(request CancelRequest, controlError ControlError) error {
+	if err := validateControlMessage(request); err != nil {
+		return err
+	}
+	if err := validateControlError(controlError); err != nil {
+		return err
+	}
+	if controlError.RelatedMessage != wire.MessageCraneCancelRequest || !controlError.HasClientRequest || controlError.ClientRequest != request.Request || controlError.ClientDigest != request.Digest {
+		return errors.New("cancel error does not bind the exact request")
+	}
+	return nil
+}
+
+// ValidateStatusErrorCorrelation binds an error to one exact status request.
+func ValidateStatusErrorCorrelation(request StatusRequest, controlError ControlError) error {
+	if err := validateControlMessage(request); err != nil {
+		return err
+	}
+	if err := validateControlError(controlError); err != nil {
+		return err
+	}
+	if controlError.RelatedMessage != wire.MessageCraneStatusRequest || !controlError.HasStatusRequest || controlError.StatusJobID != request.JobID {
+		return errors.New("status error does not bind the exact request")
+	}
+	return nil
+}
+
+// ValidateResultPageErrorCorrelation binds an error to one exact stateless page request.
+func ValidateResultPageErrorCorrelation(request ResultPageRequest, controlError ControlError) error {
+	if err := validateControlMessage(request); err != nil {
+		return err
+	}
+	if err := validateControlError(controlError); err != nil {
+		return err
+	}
+	if controlError.RelatedMessage != wire.MessageCraneResultPageRequest || !controlError.HasResultPage || controlError.ResultPage != request {
+		return errors.New("result-page error does not bind the exact request")
 	}
 	return nil
 }
@@ -388,7 +451,7 @@ func validateControlMessage(message ControlMessage) error {
 			return errors.New("invalid submit request or digest")
 		}
 	case SubmitResponse:
-		if value.Request.Validate() != nil || value.Digest == ([32]byte{}) || value.JobID.Validate() != nil || value.JobControlRevision == 0 || value.State != JobPending {
+		if value.Request.Validate() != nil || value.Digest == ([32]byte{}) || value.JobID.Validate() != nil || value.JobControlRevision != 1 || value.State != JobPending {
 			return errors.New("invalid submit response")
 		}
 	case CancelRequest:
@@ -427,7 +490,7 @@ func validateStatusResponse(value StatusResponse) error {
 	if value.HasAssignment && !assignmentPresent || !value.HasAssignment && !assignmentAbsent {
 		return errors.New("contradictory assignment binding")
 	}
-	if value.SourceTaskCount == 0 || uint64(value.SourceTaskCount) > model.LimitsV1().MaxTasksPerStage || value.CompletedSourceTasks > value.SourceTaskCount || uint64(value.ManifestCount) > model.LimitsV1().MaxResultManifestsPerJob {
+	if value.SourceTaskCount == 0 || uint64(value.SourceTaskCount) > model.LimitsV1().MaxTasksPerStage || value.ResultPartitionCount == 0 || uint64(value.ResultPartitionCount) > model.LimitsV1().MaxResultManifestsPerJob || value.CompletedSourceTasks > value.SourceTaskCount || value.ManifestCount > value.ResultPartitionCount {
 		return errors.New("status progress outside bounds")
 	}
 	manifestPresent := value.ManifestCount > 0 && value.ManifestSetDigest != ([32]byte{})
@@ -442,8 +505,34 @@ func validateStatusResponse(value StatusResponse) error {
 	} else if value.FailureCode != 0 || value.FailureDetailDigest != ([32]byte{}) || value.State == JobFailed {
 		return errors.New("missing or contradictory failure binding")
 	}
-	if value.State == JobSucceeded && (value.CompletedSourceTasks != value.SourceTaskCount || !value.HasManifestSet) {
-		return errors.New("succeeded status is incomplete")
+	if !value.HasAssignment && (value.CompletedSourceTasks != 0 || value.ManifestCount != 0) {
+		return errors.New("progress exists without assignment")
+	}
+	if value.ManifestCount > 0 && (!value.HasAssignment || value.CompletedSourceTasks != value.SourceTaskCount) {
+		return errors.New("manifest exists before assigned sources complete")
+	}
+	switch value.State {
+	case JobPending:
+		if value.HasAssignment || value.CompletedSourceTasks != 0 || value.ManifestCount != 0 {
+			return errors.New("pending status contains deployment progress")
+		}
+	case JobDeploying:
+		if !value.HasAssignment || value.CompletedSourceTasks != 0 || value.ManifestCount != 0 {
+			return errors.New("deploying status contradicts assignment or progress")
+		}
+	case JobRunning:
+		if !value.HasAssignment || value.ManifestCount != 0 {
+			return errors.New("running status contradicts assignment or manifests")
+		}
+	case JobDraining:
+		if !value.HasAssignment || value.CompletedSourceTasks != value.SourceTaskCount {
+			return errors.New("draining status requires completed assigned sources")
+		}
+	case JobSucceeded:
+		if !value.HasAssignment || value.CompletedSourceTasks != value.SourceTaskCount || value.ManifestCount != value.ResultPartitionCount || !value.HasManifestSet {
+			return errors.New("succeeded status is incomplete")
+		}
+	case JobFailed, JobCanceled:
 	}
 	return nil
 }
@@ -554,7 +643,17 @@ func validateControlError(value ControlError) error {
 	if value.Code < ControlErrorMalformed || value.Code > ControlErrorCorruptResult || len(value.Detail) > MaxControlErrorDetailBytes || !utf8.Valid(value.Detail) || bytes.IndexByte(value.Detail, 0) >= 0 {
 		return errors.New("invalid control error code or detail")
 	}
-	if value.HasClientRequest && value.HasResultPage {
+	selectors := 0
+	if value.HasClientRequest {
+		selectors++
+	}
+	if value.HasStatusRequest {
+		selectors++
+	}
+	if value.HasResultPage {
+		selectors++
+	}
+	if selectors > 1 {
 		return errors.New("control error bindings are mutually exclusive")
 	}
 	switch value.RelatedMessage {
@@ -563,11 +662,18 @@ func validateControlError(value ControlError) error {
 		return errors.New("control error relates to a non-request message")
 	}
 	if value.HasClientRequest {
-		if value.RelatedMessage != wire.MessageCraneSubmitRequest && value.RelatedMessage != wire.MessageCraneCancelRequest || value.ClientRequest.Validate() != nil || value.ClientDigest == ([32]byte{}) || value.ResultPage != (ResultPageRequest{}) {
+		if value.RelatedMessage != wire.MessageCraneSubmitRequest && value.RelatedMessage != wire.MessageCraneCancelRequest || value.ClientRequest.Validate() != nil || value.ClientDigest == ([32]byte{}) || value.HasStatusRequest || value.StatusJobID != (model.JobID{}) || value.ResultPage != (ResultPageRequest{}) {
 			return errors.New("mutation error has an incompatible client binding")
 		}
 	} else if value.ClientRequest != (model.ClientRequestID{}) || value.ClientDigest != ([32]byte{}) {
 		return errors.New("unselected client binding is nonzero")
+	}
+	if value.HasStatusRequest {
+		if value.RelatedMessage != wire.MessageCraneStatusRequest || value.StatusJobID.Validate() != nil || value.ResultPage != (ResultPageRequest{}) {
+			return errors.New("status error has an incompatible request binding")
+		}
+	} else if value.StatusJobID != (model.JobID{}) {
+		return errors.New("unselected status binding is nonzero")
 	}
 	if value.HasResultPage {
 		if value.RelatedMessage != wire.MessageCraneResultPageRequest || validateResultPageRequest(value.ResultPage) != nil {
@@ -576,11 +682,14 @@ func validateControlError(value ControlError) error {
 	} else if value.ResultPage != (ResultPageRequest{}) {
 		return errors.New("unselected page binding is nonzero")
 	}
-	if !value.HasClientRequest && !value.HasResultPage && value.RelatedMessage != wire.MessageCraneStatusRequest && !predecodeControlError(value.Code) {
-		return errors.New("unbound mutation or page error is not a predecode rejection")
+	if selectors == 0 && !predecodeControlError(value.Code) {
+		return errors.New("unbound error is not a predecode rejection")
+	}
+	if selectors > 0 && !controlErrorCodeCompatible(value.RelatedMessage, value.Code) {
+		return errors.New("control error code is incompatible with request type")
 	}
 	if value.Code == ControlErrorPageLimitTooSmall {
-		if value.RelatedMessage != wire.MessageCraneResultPageRequest || value.RequiredBytes <= value.ResultPage.PageBytes || value.RequiredBytes > MaxEncodedResultRecordBytes {
+		if value.RelatedMessage != wire.MessageCraneResultPageRequest || value.RequiredBytes < uint32(MinEncodedResultRecordBytes) || value.RequiredBytes > MaxEncodedResultRecordBytes || value.RequiredBytes <= value.ResultPage.PageBytes {
 			return errors.New("invalid PageLimitTooSmall required byte count")
 		}
 	} else if value.RequiredBytes != 0 {
@@ -590,7 +699,25 @@ func validateControlError(value ControlError) error {
 }
 
 func predecodeControlError(code ControlErrorCode) bool {
-	return code == ControlErrorMalformed || code == ControlErrorUnsupportedSchema || code == ControlErrorInvalidRequest || code == ControlErrorStarting || code == ControlErrorNotLeader
+	return code == ControlErrorMalformed || code == ControlErrorUnsupportedSchema || code == ControlErrorInvalidRequest
+}
+
+func controlErrorCodeCompatible(message wire.MessageType, code ControlErrorCode) bool {
+	if code == ControlErrorStarting || code == ControlErrorNotLeader {
+		return true
+	}
+	switch message {
+	case wire.MessageCraneSubmitRequest:
+		return code == ControlErrorStaleRequest || code == ControlErrorSkippedRequest || code == ControlErrorIdentityReuse || code == ControlErrorCapacityExhausted
+	case wire.MessageCraneCancelRequest:
+		return code == ControlErrorStaleRequest || code == ControlErrorSkippedRequest || code == ControlErrorIdentityReuse || code == ControlErrorNotFound || code == ControlErrorRevisionMismatch
+	case wire.MessageCraneStatusRequest:
+		return code == ControlErrorNotFound
+	case wire.MessageCraneResultPageRequest:
+		return code == ControlErrorNotFound || code == ControlErrorPageLimitTooSmall || code == ControlErrorResultUnavailable || code == ControlErrorCorruptResult
+	default:
+		return false
+	}
 }
 
 func tupleIDLess(left, right model.TupleID) bool {

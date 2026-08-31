@@ -37,7 +37,7 @@ const (
 // PublicControlResultRecordEntryBytesV1 calculates one length-prefixed result
 // entry from the canonical tuple byte length using checked arithmetic.
 func PublicControlResultRecordEntryBytesV1(tupleBytes uint64) (uint64, error) {
-	if tupleBytes > LimitsV1().MaxTuplePayloadBytes {
+	if tupleBytes < publicControlMinimumTupleBytesV1 || tupleBytes > LimitsV1().MaxTuplePayloadBytes {
 		return 0, errPublicControlResultEntrySize
 	}
 	result, ok := checkedAddUint64(publicControlResultRecordEntryPrefixBytesV1, publicControlResultRecordStreamFixedBytesV1)
@@ -118,6 +118,8 @@ type PublicControlContract struct {
 	MaxErrorDetailBytes uint64
 	// IdentityDomains pins mutation digest separation.
 	IdentityDomains []string
+	// ErrorCodeMatrix pins the exact accepted code domain for each binding class.
+	ErrorCodeMatrix []string
 	// Rules pins cross-field canonical validation.
 	Rules []string
 }
@@ -128,11 +130,11 @@ var publicControlMessageDescriptorsV1 = []PublicControlMessageDescriptor{
 	{Name: "CancelRequest", MessageType: 242, SchemaVersion: 1, Fields: controlFields("Request", "ClientRequestID", "JobID", "JobID", "ExpectedJobControlRevision", "u64", "Digest", "sha256")},
 	{Name: "CancelResponse", MessageType: 243, SchemaVersion: 1, Fields: controlFields("Request", "ClientRequestID", "Digest", "sha256", "JobID", "JobID", "JobControlRevision", "u64", "State", "u8")},
 	{Name: "StatusRequest", MessageType: 244, SchemaVersion: 1, Fields: controlFields("JobID", "JobID")},
-	{Name: "StatusResponse", MessageType: 245, SchemaVersion: 1, Fields: controlFields("JobID", "JobID", "AppliedIndex", "u64", "TopologyDigest", "sha256", "JobControlRevision", "u64", "State", "u8", "HasAssignment", "bool", "AssignmentRevision", "u64", "AssignmentDigest", "sha256", "SourceTaskCount", "u16", "CompletedSourceTasks", "u16", "ManifestCount", "u16", "HasManifestSet", "bool", "ManifestSetDigest", "sha256", "HasFailure", "bool", "FailureCode", "u16", "FailureDetailDigest", "sha256")},
+	{Name: "StatusResponse", MessageType: 245, SchemaVersion: 1, Fields: controlFields("JobID", "JobID", "AppliedIndex", "u64", "TopologyDigest", "sha256", "JobControlRevision", "u64", "State", "u8", "HasAssignment", "bool", "AssignmentRevision", "u64", "AssignmentDigest", "sha256", "SourceTaskCount", "u16", "ResultPartitionCount", "u16", "CompletedSourceTasks", "u16", "ManifestCount", "u16", "HasManifestSet", "bool", "ManifestSetDigest", "sha256", "HasFailure", "bool", "FailureCode", "u16", "FailureDetailDigest", "sha256")},
 	{Name: "ResultPageRequest", MessageType: 246, SchemaVersion: 1, Fields: controlFields("JobID", "JobID", "ManifestDigest", "sha256", "HasLastTuple", "bool", "Last", "TupleID", "PageBytes", "u32")},
 	{Name: "ResultPageResponse", MessageType: 247, SchemaVersion: 1, Fields: controlFields("JobID", "JobID", "ManifestDigest", "sha256", "RequestHasLastTuple", "bool", "RequestLast", "TupleID", "PageBytes", "u32", "Records", "list(ResultRecordEntry)", "NextHasLastTuple", "bool", "NextLast", "TupleID", "End", "bool")},
 	{Name: "LeaderRedirect", MessageType: 248, SchemaVersion: 1, Fields: controlFields("Endpoints", "list(string16)")},
-	{Name: "ControlError", MessageType: 249, SchemaVersion: 1, Fields: controlFields("RelatedMessage", "u16", "Code", "u16", "Retryable", "bool", "HasClientRequest", "bool", "ClientRequest", "ClientRequestID", "ClientDigest", "sha256", "HasResultPage", "bool", "ResultPage", "ResultPageBinding", "RequiredBytes", "u32", "Detail", "bytes16")},
+	{Name: "ControlError", MessageType: 249, SchemaVersion: 1, Fields: controlFields("RelatedMessage", "u16", "Code", "u16", "Retryable", "bool", "HasClientRequest", "bool", "ClientRequest", "ClientRequestID", "ClientDigest", "sha256", "HasStatusRequest", "bool", "StatusJobID", "JobID", "HasResultPage", "bool", "ResultPage", "ResultPageBinding", "RequiredBytes", "u32", "Detail", "bytes16")},
 }
 
 var publicControlNestedLayoutsV1 = []PublicControlNestedDescriptor{
@@ -156,22 +158,35 @@ var publicControlIdentityDomainsV1 = []string{
 	"cs425/crane/cancel-control-command/v1",
 }
 
+var publicControlErrorCodeMatrixV1 = []string{
+	"Unbound=Malformed,UnsupportedSchema,InvalidRequest",
+	"SubmitRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,CapacityExhausted",
+	"CancelRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,NotFound,RevisionMismatch",
+	"StatusRequest=Starting,NotLeader,NotFound",
+	"ResultPageRequest=Starting,NotLeader,NotFound,PageLimitTooSmall,ResultUnavailable,CorruptResult",
+}
+
 var publicControlRulesV1 = []string{
 	"payload-prefix-is-schema-version-then-message-type",
 	"submit-digest-binds-client-request-and-canonical-topology",
 	"cancel-digest-binds-client-request-job-and-expected-revision",
 	"mutation-response-echoes-request-digest-job-revision-and-terminal-command-state",
+	"submit-response-revision-is-one-and-cancel-response-revision-is-checked-successor",
 	"status-binds-applied-index-topology-assignment-manifest-and-failure-identities",
+	"status-lifecycle-binds-immutable-result-partition-count-and-progress-matrix",
 	"result-page-cursor-is-global-stateless-and-bound-to-job-manifest-and-page-limit",
 	"result-record-entries-are-complete-canonical-streams-and-never-split",
 	"result-records-are-strictly-globally-increasing-and-cross-job-records-are-rejected",
 	"nonempty-page-next-cursor-equals-last-record",
 	"empty-terminal-page-preserves-request-cursor",
 	"page-limit-too-small-repeats-request-binding-required-bytes-and-does-not-advance",
+	"page-limit-required-bytes-is-one-complete-encoded-result-entry-from-170-through-680",
+	"result-page-serving-sizes-records-with-encoded-result-page-record-bytes",
 	"redirect-endpoints-are-exactly-one-or-three-or-five-canonical-sorted-unique-control-endpoints",
 	"control-error-binding-selectors-are-exclusive-and-match-related-request-type",
 	"mutation-control-errors-echo-client-request-and-candidate-command-digest",
-	"unbound-control-errors-are-limited-to-predecode-starting-or-not-leader-codes",
+	"control-error-request-type-and-code-follow-the-fingerprinted-compatibility-matrix",
+	"unbound-control-errors-are-limited-to-malformed-unsupported-schema-or-invalid-request-before-trust",
 	"decoded-variable-values-are-owned",
 	"bounds-and-declared-lengths-are-checked-before-allocation",
 	"unknown-enums-trailing-bytes-type-mismatches-and-noncanonical-bytes-are-rejected",
@@ -193,6 +208,7 @@ func PublicControlContractV1() PublicControlContract {
 		MaxEndpointBytes:            PublicControlMaxEndpointBytesV1,
 		MaxErrorDetailBytes:         PublicControlMaxErrorDetailBytesV1,
 		IdentityDomains:             append([]string(nil), publicControlIdentityDomainsV1...),
+		ErrorCodeMatrix:             append([]string(nil), publicControlErrorCodeMatrixV1...),
 		Rules:                       append([]string(nil), publicControlRulesV1...),
 	}
 }
@@ -243,6 +259,7 @@ func canonicalPublicControlContractBytes(contract PublicControlContract) []byte 
 		encoded = appendUint64(encoded, bound)
 	}
 	encoded = appendStringList(encoded, contract.IdentityDomains)
+	encoded = appendStringList(encoded, contract.ErrorCodeMatrix)
 	return appendStringList(encoded, contract.Rules)
 }
 
