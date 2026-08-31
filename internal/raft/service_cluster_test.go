@@ -378,12 +378,12 @@ func task10ClusterConfigurations(t *testing.T) ([]config.NodeConfig, []byte, []n
 		raftConfig.RPCTimeout = config.Duration(50 * time.Millisecond)
 		raftConfig.SnapshotEntryThreshold = 12
 		raftConfig.SnapshotByteThreshold = math.MaxUint64
-		raftConfig.MaxSnapshotBytes = 1 << 20
+		raftConfig.MaxSnapshotBytes = 8 << 20
 		configuration := config.NodeConfig{
 			NodeID: uint16(index + 1), ClusterID: "10112233-4455-6677-8899-aabbccddeeff",
 			BindHost: "127.0.0.1", AdvertiseHost: "127.0.0.1", BasePort: bases[index],
 			Introducer: "127.0.0.1:1", StorageDir: t.TempDir(), ClusterSecretFile: secretPath,
-			Timing: config.DefaultTimingConfig(), Raft: raftConfig, RaftVoters: append([]config.RaftVoter(nil), voters...),
+			Timing: config.DefaultTimingConfig(), Raft: raftConfig, Crane: config.DefaultCraneConfig(), RaftVoters: append([]config.RaftVoter(nil), voters...),
 		}
 		if err := configuration.Validate(); err != nil {
 			t.Fatal(err)
