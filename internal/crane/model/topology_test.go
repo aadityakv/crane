@@ -159,16 +159,23 @@ func TestTopologyMaximumStructuredEncodingFitsEveryCompleteCommandReservation(t 
 	for id := uint16(1); id <= uint16(limits.MaxStages); id++ {
 		role := StageTransform
 		operator := OperatorSpec{Name: "even", Version: 1}
+		parallelism := uint16(1)
 		if id == 1 {
 			role = StageSource
-			operator = OperatorSpec{Name: "range", Version: 1, Settings: []Setting{{Key: "end_exclusive", Value: "16000000"}, {Key: "start", Value: "0"}}}
+			operator = OperatorSpec{Name: "range", Version: 1, Settings: []Setting{{Key: "end_exclusive", Value: "256000000"}, {Key: "start", Value: "0"}}}
+			parallelism = 256
+		} else if id == 2 {
+			parallelism = 256
+		} else if id == 3 {
+			parallelism = 196
 		} else if id == uint16(limits.MaxStages) {
 			role = StageSink
 			operator = OperatorSpec{Name: "collect", Version: 1}
+			parallelism = 256
 		}
 		name := fmt.Sprintf("stage-%03d", id)
 		name += strings.Repeat("x", int(limits.MaxIdentifierBytes)-len(name))
-		spec.Stages = append(spec.Stages, StageSpec{StageID: id, Name: name, Role: role, Parallelism: 16, Operator: operator})
+		spec.Stages = append(spec.Stages, StageSpec{StageID: id, Name: name, Role: role, Parallelism: parallelism, Operator: operator})
 	}
 	for id := uint16(1); id < uint16(limits.MaxStages); id++ {
 		spec.Edges = append(spec.Edges, EdgeSpec{EdgeID: id, SourceStageID: id, DestinationStageID: id + 1, Routing: RoutingShuffle})
@@ -179,13 +186,120 @@ func TestTopologyMaximumStructuredEncodingFitsEveryCompleteCommandReservation(t 
 	}
 	validated := requireValidTopology(t, spec)
 	encodedLength := uint64(len(validated.CanonicalBytes()))
-	for name, overhead := range map[string]uint64{
-		"SubmitJob":            limits.SubmitJobOverheadBytes,
-		"SubmitRequest":        limits.SubmitRequestOverheadBytes,
-		"AssignmentSetInstall": limits.AssignmentSetOverheadBytes,
-	} {
-		if encodedLength > limits.MaxSubmitJobBytes-overhead {
-			t.Fatalf("%s complete encoding exceeds 1 MiB: topology=%d overhead=%d", name, encodedLength, overhead)
+	maxSlots := uint16(limits.MaxWorkerSlots)
+	workers := []WorkerPlacement{{NodeID: 1, WorkerEpoch: WorkerEpoch{1}, SlotCapacity: maxSlots}, {NodeID: 2, WorkerEpoch: WorkerEpoch{2}, SlotCapacity: maxSlots}, {NodeID: 3, WorkerEpoch: WorkerEpoch{3}, SlotCapacity: maxSlots}, {NodeID: 4, WorkerEpoch: WorkerEpoch{4}, SlotCapacity: maxSlots}}
+	assignment, err := BuildAssignmentSet(JobID{1}, validated.Digest(), 1, validated, workers)
+	if err != nil {
+		t.Fatalf("maximum complete AssignmentSet: %v", err)
+	}
+	if uint64(len(assignment.Tasks)) != limits.MaxTasksPerJob || uint64(len(assignment.ResultReplicas)) != limits.MaxTasksPerStage {
+		t.Fatalf("maximum AssignmentSet counts = %d,%d", len(assignment.Tasks), len(assignment.ResultReplicas))
+	}
+	if complete, err := CompleteSubmitJobBytes(encodedLength); err != nil || complete > limits.MaxSubmitJobBytes {
+		t.Fatalf("SubmitJob complete bytes = %d,%v", complete, err)
+	}
+	if complete, err := CompleteSubmitRequestBytes(encodedLength); err != nil || complete > limits.MaxControlFrameBytes {
+		t.Fatalf("SubmitRequest complete bytes = %d,%v", complete, err)
+	}
+	if complete, err := CompleteAssignmentSetInstallBytes(encodedLength, uint64(len(assignment.Tasks)), uint64(len(assignment.ResultReplicas))); err != nil || complete > limits.MaxWorkerControlFrameBytes {
+		t.Fatalf("AssignmentSetInstall complete bytes = %d,%v", complete, err)
+	}
+}
+
+func TestTopologyRejectsTotalTasksAndSettingsBeforeClone(t *testing.T) {
+	t.Run("tasks", func(t *testing.T) {
+		spec := testTopology()
+		spec.Stages = []StageSpec{
+			{StageID: 1, Name: "source", Role: StageSource, Parallelism: 256, Operator: spec.Stages[0].Operator},
+			{StageID: 2, Name: "a", Role: StageTransform, Parallelism: 256, Operator: OperatorSpec{Name: "even", Version: 1}},
+			{StageID: 3, Name: "b", Role: StageTransform, Parallelism: 256, Operator: OperatorSpec{Name: "even", Version: 1}},
+			{StageID: 4, Name: "c", Role: StageTransform, Parallelism: 256, Operator: OperatorSpec{Name: "even", Version: 1}},
+			{StageID: 5, Name: "sink", Role: StageSink, Parallelism: 1, Operator: OperatorSpec{Name: "collect", Version: 1}},
 		}
+		spec.Edges = []EdgeSpec{{EdgeID: 1, SourceStageID: 1, DestinationStageID: 2, Routing: RoutingShuffle}, {EdgeID: 2, SourceStageID: 2, DestinationStageID: 3, Routing: RoutingShuffle}, {EdgeID: 3, SourceStageID: 3, DestinationStageID: 4, Routing: RoutingShuffle}, {EdgeID: 4, SourceStageID: 4, DestinationStageID: 5, Routing: RoutingShuffle}}
+		if _, err := ValidateTopology(spec); err == nil {
+			t.Fatal("more than 1024 tasks accepted")
+		}
+	})
+	t.Run("settings bytes", func(t *testing.T) {
+		spec := testTopology()
+		spec.Stages = make([]StageSpec, LimitsV1().MaxStages)
+		for i := range spec.Stages {
+			settings := make([]Setting, LimitsV1().MaxSettingsPerStage)
+			for j := range settings {
+				settings[j] = Setting{Key: fmt.Sprintf("k%02d", j), Value: strings.Repeat("v", int(LimitsV1().MaxSettingValueBytes))}
+			}
+			spec.Stages[i] = StageSpec{StageID: uint16(i + 1), Name: fmt.Sprintf("s%02d", i), Role: StageTransform, Parallelism: 1, Operator: OperatorSpec{Name: "even", Version: 1, Settings: settings}}
+		}
+		if _, err := ValidateTopology(spec); err == nil {
+			t.Fatal("more than 64 KiB total settings accepted")
+		}
+	})
+}
+
+func TestTopologyCustodyReservationIsExactBoundedAndImmutable(t *testing.T) {
+	v := requireValidTopology(t, testTopology())
+	job := JobID{1}
+	first, err := v.WorstCaseCustodyBytes(TaskID{JobID: job, StageID: 2, Partition: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := v.WorstCaseCustodyBytes(TaskID{JobID: job, StageID: 2, Partition: 1})
+	if err != nil || second != first {
+		t.Fatalf("per-task reservation mismatch: %d %d %v", first, second, err)
+	}
+	if first != 187_567 {
+		t.Fatalf("stage-2 custody bytes = %d, want independent formula 187567", first)
+	}
+	if _, err := v.WorstCaseCustodyBytes(TaskID{JobID: job, StageID: 2, Partition: 2}); err == nil {
+		t.Fatal("invalid task partition reservation accepted")
+	}
+	if first > LimitsV1().MaxCustodyReservationBytes {
+		t.Fatal("accepted reservation exceeds consensus maximum")
+	}
+}
+
+func TestCompleteEncodingCalculatorsExactMaximumAndPlusOne(t *testing.T) {
+	limits := LimitsV1()
+	cases := []struct {
+		name      string
+		overhead  uint64
+		maximum   uint64
+		calculate func(uint64) (uint64, error)
+	}{
+		{"SubmitRequest", limits.SubmitRequestFixedBytes, limits.MaxControlFrameBytes, CompleteSubmitRequestBytes},
+		{"SubmitJob", limits.SubmitJobFixedBytes, limits.MaxSubmitJobBytes, CompleteSubmitJobBytes},
+		{"AssignmentSetInstall", limits.AssignmentSetInstallFixedBytes, limits.MaxWorkerControlFrameBytes, func(topology uint64) (uint64, error) {
+			return CompleteAssignmentSetInstallBytes(topology, limits.MaxTasksPerJob, limits.MaxTasksPerStage)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			budget := tc.maximum - tc.overhead
+			got, err := tc.calculate(budget)
+			if err != nil || got != tc.maximum {
+				t.Fatalf("exact maximum = %d,%v", got, err)
+			}
+			if _, err := tc.calculate(budget + 1); err == nil {
+				t.Fatal("maximum + 1 accepted")
+			}
+		})
+	}
+	if _, err := CompleteAssignmentSetInstallBytes(0, limits.MaxTasksPerJob+1, 0); err == nil {
+		t.Fatal("assignment task count maximum + 1 accepted")
+	}
+	if _, err := CompleteAssignmentSetInstallBytes(0, 0, limits.MaxTasksPerStage+1); err == nil {
+		t.Fatal("result replica count maximum + 1 accepted")
+	}
+}
+
+func TestCustodyReservationExactMaximumAndPlusOne(t *testing.T) {
+	limits := LimitsV1()
+	got, err := CustodyReservationUpperBoundV1(limits.MaxDerivedDeliveries)
+	if err != nil || got != limits.MaxCustodyReservationBytes {
+		t.Fatalf("maximum custody reservation = %d,%v", got, err)
+	}
+	if _, err := CustodyReservationUpperBoundV1(limits.MaxDerivedDeliveries + 1); err == nil {
+		t.Fatal("custody delivery maximum + 1 accepted")
 	}
 }

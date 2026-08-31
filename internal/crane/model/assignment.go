@@ -1,7 +1,6 @@
 package model
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -44,6 +43,12 @@ func PlaceTasks(job JobID, specificationHash [32]byte, assignmentRevision uint64
 	if assignmentRevision == 0 {
 		return nil, errors.New("zero assignment revision")
 	}
+	if len(tasks) == 0 || uint64(len(tasks)) > LimitsV1().MaxTasksPerJob {
+		return nil, errors.New("task count outside bounds before copy")
+	}
+	if len(workers) == 0 || uint64(len(workers)) > LimitsV1().MaxRegisteredWorkers {
+		return nil, errors.New("worker count outside bounds before copy")
+	}
 	canonicalTasks := append([]TaskID(nil), tasks...)
 	sort.Slice(canonicalTasks, func(i, j int) bool {
 		if canonicalTasks[i].StageID != canonicalTasks[j].StageID {
@@ -51,9 +56,6 @@ func PlaceTasks(job JobID, specificationHash [32]byte, assignmentRevision uint64
 		}
 		return canonicalTasks[i].Partition < canonicalTasks[j].Partition
 	})
-	if len(canonicalTasks) == 0 || uint64(len(canonicalTasks)) > LimitsV1().MaxTasksPerJob {
-		return nil, errors.New("task count outside bounds")
-	}
 	for index, task := range canonicalTasks {
 		if err := task.Validate(); err != nil || task.JobID != job {
 			return nil, errors.New("invalid or foreign task")
@@ -138,7 +140,14 @@ func (set AssignmentSet) Validate(topology ValidatedTopology) error {
 	if len(set.Tasks) != len(wantTasks) {
 		return errors.New("assignment task set is incomplete")
 	}
-	workers := make(map[uint16]WorkerEpoch)
+	epochs := make(map[uint16]WorkerEpoch)
+	registerEpoch := func(nodeID uint16, epoch WorkerEpoch) error {
+		if prior, ok := epochs[nodeID]; ok && prior != epoch {
+			return errors.New("one worker ID carries contradictory epochs across assignment duties")
+		}
+		epochs[nodeID] = epoch
+		return nil
+	}
 	for index, token := range set.Tasks {
 		if err := token.Validate(); err != nil {
 			return fmt.Errorf("task token %d: %w", index, err)
@@ -146,10 +155,9 @@ func (set AssignmentSet) Validate(topology ValidatedTopology) error {
 		if token.Task != wantTasks[index] || token.Task.JobID != set.JobID || token.AssignmentRevision != set.Revision || token.SpecificationHash != topology.digest {
 			return errors.New("assignment token does not match complete topology set")
 		}
-		if epoch, ok := workers[token.WorkerID]; ok && epoch != token.WorkerEpoch {
-			return errors.New("one worker ID carries multiple epochs")
+		if err := registerEpoch(token.WorkerID, token.WorkerEpoch); err != nil {
+			return err
 		}
-		workers[token.WorkerID] = token.WorkerEpoch
 	}
 	var sink StageSpec
 	for _, stage := range topology.spec.Stages {
@@ -166,6 +174,12 @@ func (set AssignmentSet) Validate(topology ValidatedTopology) error {
 			return errors.New("result replicas are not canonical and complete")
 		}
 		if err := replica.Validate(); err != nil {
+			return err
+		}
+		if err := registerEpoch(replica.PrimaryNodeID, replica.PrimaryEpoch); err != nil {
+			return err
+		}
+		if err := registerEpoch(replica.SecondaryNodeID, replica.SecondaryEpoch); err != nil {
 			return err
 		}
 		var token AssignmentToken
@@ -213,13 +227,13 @@ func topologyTasks(job JobID, spec TopologySpec) []TaskID {
 }
 
 func validateWorkers(input []WorkerPlacement) ([]WorkerPlacement, error) {
+	if len(input) == 0 || uint64(len(input)) > LimitsV1().MaxRegisteredWorkers {
+		return nil, errors.New("worker count outside bounds before copy")
+	}
 	workers := append([]WorkerPlacement(nil), input...)
 	sort.Slice(workers, func(i, j int) bool { return workers[i].NodeID < workers[j].NodeID })
-	if len(workers) == 0 || uint64(len(workers)) > LimitsV1().MaxRegisteredWorkers {
-		return nil, errors.New("worker count outside bounds")
-	}
 	for index, worker := range workers {
-		if worker.NodeID == 0 || worker.SlotCapacity == 0 {
+		if worker.NodeID == 0 || worker.SlotCapacity == 0 || uint64(worker.SlotCapacity) > LimitsV1().MaxWorkerSlots {
 			return nil, errors.New("invalid worker placement")
 		}
 		if err := worker.WorkerEpoch.Validate(); err != nil {
@@ -245,11 +259,16 @@ func bestWorker(job JobID, task TaskID, workers []WorkerPlacement, eligible func
 		encoded = appendUint16(encoded, worker.NodeID)
 		encoded = append(encoded, worker.WorkerEpoch[:]...)
 		score := sha256.Sum256(encoded)
-		if !found || compareDigest(score, bestScore) > 0 || bytes.Equal(score[:], bestScore[:]) && worker.NodeID < best.NodeID {
+		if !found || preferRendezvous(score, worker.NodeID, bestScore, best.NodeID) {
 			best, bestScore, found = worker, score, true
 		}
 	}
 	return best, found
+}
+
+func preferRendezvous(candidate [32]byte, candidateNode uint16, current [32]byte, currentNode uint16) bool {
+	comparison := compareDigest(candidate, current)
+	return comparison > 0 || comparison == 0 && candidateNode < currentNode
 }
 
 func assignmentDigest(set AssignmentSet) [32]byte {

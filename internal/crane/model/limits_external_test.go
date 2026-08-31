@@ -13,6 +13,9 @@ func TestConsensusLimitsMatchExistingIndependentTransportBounds(t *testing.T) {
 	if limits.MaxSubmitJobBytes != config.MaxRaftCommandBytes {
 		t.Fatalf("SubmitJob bytes = %d, Raft command bytes = %d", limits.MaxSubmitJobBytes, config.MaxRaftCommandBytes)
 	}
+	if limits.MaxControlFrameBytes != 1<<20 || limits.MaxWorkerControlFrameBytes != 1<<20 {
+		t.Fatalf("Crane control frame bounds = %d,%d", limits.MaxControlFrameBytes, limits.MaxWorkerControlFrameBytes)
+	}
 	if limits.MaxSnapshotBytes > config.MaxRaftSnapshotBytes {
 		t.Fatalf("Crane snapshot bytes = %d, Raft maximum = %d", limits.MaxSnapshotBytes, config.MaxRaftSnapshotBytes)
 	}

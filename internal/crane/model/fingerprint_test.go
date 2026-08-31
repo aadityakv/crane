@@ -8,33 +8,42 @@ import (
 
 func TestLimitsV1PinsEveryConsensusBound(t *testing.T) {
 	want := ConsensusLimits{
-		MaxRegisteredWorkers:        1024,
-		MaxActiveJobs:               64,
-		MaxRetainedJobs:             256,
-		MaxRetainedClientSessions:   1024,
-		MaxResultManifestsPerJob:    256,
-		MaxCachedCommandResultBytes: 64 << 10,
-		MaxResultRecordsBytesPerJob: 64 << 20,
-		MaxSnapshotBytes:            8 << 20,
-		MaxIdentifierBytes:          64,
-		MaxStages:                   64,
-		MaxEdges:                    256,
-		MaxTasksPerStage:            256,
-		MaxTasksPerJob:              1024,
-		MaxSettingsPerStage:         32,
-		MaxSettingKeyBytes:          64,
-		MaxSettingValueBytes:        1024,
-		MaxTotalSettingsBytes:       64 << 10,
-		MaxSourceSequences:          1_000_000,
-		MaxOperatorOutputs:          16,
-		MaxDerivedDeliveries:        4096,
-		MaxTupleFields:              64,
-		MaxTupleFieldPayloadBytes:   512,
-		MaxSubmitJobBytes:           1 << 20,
-		SubmitJobOverheadBytes:      128,
-		SubmitRequestOverheadBytes:  96,
-		AssignmentSetOverheadBytes:  384 << 10,
-		MaxTopologyBytes:            118_784,
+		MaxRegisteredWorkers:           1024,
+		MaxActiveJobs:                  64,
+		MaxRetainedJobs:                256,
+		MaxRetainedClientSessions:      1024,
+		MaxResultManifestsPerJob:       256,
+		MaxCachedCommandResultBytes:    64 << 10,
+		MaxResultRecordsBytesPerJob:    64 << 20,
+		MaxSnapshotBytes:               8 << 20,
+		MaxIdentifierBytes:             64,
+		MaxStages:                      64,
+		MaxEdges:                       256,
+		MaxTasksPerStage:               256,
+		MaxTasksPerJob:                 1024,
+		MaxWorkerSlots:                 256,
+		MaxSettingsPerStage:            32,
+		MaxSettingKeyBytes:             64,
+		MaxSettingValueBytes:           1024,
+		MaxTotalSettingsBytes:          64 << 10,
+		MaxSourceSequences:             1_000_000,
+		MaxOperatorOutputs:             16,
+		MaxDerivedDeliveries:           4096,
+		MaxTupleFields:                 64,
+		MaxTupleFieldPayloadBytes:      512,
+		MaxCanonicalTupleBytes:         37_186,
+		CustodyInboxFixedBytes:         379,
+		CustodyOutboxFixedBytes:        293,
+		ResultCopyFixedBytes:           293,
+		MaxCustodyReservationBytes:     614_445_757,
+		MaxSubmitJobBytes:              1 << 20,
+		MaxControlFrameBytes:           1 << 20,
+		MaxWorkerControlFrameBytes:     1 << 20,
+		AuthenticatedFrameBytes:        87,
+		SubmitJobFixedBytes:            93,
+		SubmitRequestFixedBytes:        145,
+		AssignmentSetInstallFixedBytes: 102_624,
+		MaxTopologyBytes:               118_784,
 	}
 	if got := LimitsV1(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("LimitsV1() = %#v, want %#v", got, want)
@@ -64,11 +73,11 @@ func TestV1FingerprintsMatchIndependentGoldens(t *testing.T) {
 	if got := hex.EncodeToString(registry[:]); got != "56b222c3476fa78b244396eb8c12a74b1d6f4cfa1ab0b8cf7655d76cfb81d6d0" {
 		t.Fatalf("RegistryFingerprint() = %s", got)
 	}
-	if got := ConsensusFingerprintHex(); got != "8d0495049abeac9ed1d1f882133584676f6668d6a8d97b81ec9c1d94773e9e04" {
+	if got := ConsensusFingerprintHex(); got != "bad6fc963d63ba2a021ca91de6bb3960cfa1de84350bfc399676209c6df32b21" {
 		t.Fatalf("ConsensusFingerprintHex() = %s", got)
 	}
 	consensus := ConsensusFingerprint()
-	if got := hex.EncodeToString(consensus[:]); got != "8d0495049abeac9ed1d1f882133584676f6668d6a8d97b81ec9c1d94773e9e04" {
+	if got := hex.EncodeToString(consensus[:]); got != "bad6fc963d63ba2a021ca91de6bb3960cfa1de84350bfc399676209c6df32b21" {
 		t.Fatalf("ConsensusFingerprint() = %s", got)
 	}
 }

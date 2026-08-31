@@ -34,6 +34,17 @@ type ResultCopyProvenance struct {
 
 // NewResultRecord owns value and calculates its immutable logical checksum.
 func NewResultRecord(tuple TupleID, sink TaskID, specificationHash [32]byte, value []byte) (ResultRecord, error) {
+	if uint64(len(value)) > LimitsV1().MaxCanonicalTupleBytes {
+		return ResultRecord{}, errors.New("result value exceeds canonical tuple bound before copy")
+	}
+	decoded, err := UnmarshalTuple(value)
+	if err != nil {
+		return ResultRecord{}, errors.New("result value is not a canonical tuple")
+	}
+	canonical, err := MarshalTuple(decoded)
+	if err != nil || !bytes.Equal(canonical, value) {
+		return ResultRecord{}, errors.New("result value is not canonical")
+	}
 	record := ResultRecord{TupleID: tuple, SinkTask: sink, SpecificationHash: specificationHash, Value: append([]byte(nil), value...)}
 	record.Checksum = resultChecksum(record)
 	if err := record.Validate(); err != nil {
@@ -55,6 +66,9 @@ func (record ResultRecord) Validate() error {
 	}
 	if record.Value == nil {
 		return errors.New("nil result value")
+	}
+	if uint64(len(record.Value)) > LimitsV1().MaxCanonicalTupleBytes {
+		return errors.New("result value exceeds canonical tuple bound")
 	}
 	decoded, err := UnmarshalTuple(record.Value)
 	if err != nil {

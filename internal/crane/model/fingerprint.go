@@ -18,6 +18,7 @@ var identityDomainsV1 = []string{
 	"cs425/crane/route/v1",
 	"cs425/crane/rendezvous/v1",
 	"cs425/crane/internal-command/v1",
+	"cs425/crane/completion-report/v1",
 }
 
 // RegistryFingerprint returns the SHA-256 compatibility fingerprint for v1 operators.
@@ -37,12 +38,18 @@ func ConsensusFingerprint() [32]byte {
 		limits.MaxCachedCommandResultBytes, limits.MaxResultRecordsBytesPerJob,
 		limits.MaxSnapshotBytes, limits.MaxIdentifierBytes, limits.MaxStages,
 		limits.MaxEdges, limits.MaxTasksPerStage, limits.MaxTasksPerJob,
+		limits.MaxWorkerSlots,
 		limits.MaxSettingsPerStage, limits.MaxSettingKeyBytes, limits.MaxSettingValueBytes,
 		limits.MaxTotalSettingsBytes, limits.MaxSourceSequences, limits.MaxOperatorOutputs,
 		limits.MaxDerivedDeliveries, limits.MaxTupleFields, limits.MaxTupleFieldPayloadBytes,
-		limits.MaxSubmitJobBytes,
-		limits.SubmitJobOverheadBytes, limits.SubmitRequestOverheadBytes,
-		limits.AssignmentSetOverheadBytes, limits.MaxTopologyBytes,
+		limits.MaxCanonicalTupleBytes, limits.CustodyInboxFixedBytes,
+		limits.CustodyOutboxFixedBytes, limits.ResultCopyFixedBytes,
+		limits.MaxCustodyReservationBytes,
+		limits.MaxSubmitJobBytes, limits.MaxControlFrameBytes,
+		limits.MaxWorkerControlFrameBytes,
+		limits.AuthenticatedFrameBytes, limits.SubmitJobFixedBytes,
+		limits.SubmitRequestFixedBytes, limits.AssignmentSetInstallFixedBytes,
+		limits.MaxTopologyBytes,
 	} {
 		encoded = appendUint64(encoded, value)
 	}

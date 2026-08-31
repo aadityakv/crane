@@ -75,3 +75,13 @@ func TestPlacementConsumesSlotsAndIsPermutationDeterministic(t *testing.T) {
 		t.Fatal("insufficient slots accepted")
 	}
 }
+
+func TestPlacementRendezvousTieBreaksOnLowerNodeID(t *testing.T) {
+	score := [32]byte{0xaa}
+	if !preferRendezvous(score, 2, score, 7) {
+		t.Fatal("lower NodeID did not win an equal full-digest score")
+	}
+	if preferRendezvous(score, 7, score, 2) {
+		t.Fatal("higher NodeID won an equal full-digest score")
+	}
+}

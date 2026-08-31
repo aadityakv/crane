@@ -73,6 +73,26 @@ func TestOperatorRangeEmptyAndOverflowValidation(t *testing.T) {
 	}
 }
 
+func TestOperatorSourceSequenceExactBounds(t *testing.T) {
+	spec := testTopology()
+	spec.Stages[0].Parallelism = 1
+	spec.Stages[0].Operator.Settings[0].Value = "1000000"
+	spec.Stages[0].Operator.Settings[1].Value = "0"
+	v := requireValidTopology(t, spec)
+	task := TaskID{JobID: JobID{1}, StageID: 1}
+	if _, _, err := SourceTuple(v, task, 0); err == nil {
+		t.Fatal("source sequence zero accepted")
+	}
+	tuple, ok, err := SourceTuple(v, task, LimitsV1().MaxSourceSequences)
+	if err != nil || !ok || tuple.Fields[0].Value.Int64 != 999999 {
+		t.Fatalf("maximum source sequence = %#v,%v,%v", tuple, ok, err)
+	}
+	zero, ok, err := SourceTuple(v, task, LimitsV1().MaxSourceSequences+1)
+	if err != nil || ok || len(zero.Fields) != 0 {
+		t.Fatalf("source sequence after EOF = %#v,%v,%v", zero, ok, err)
+	}
+}
+
 func TestOperatorTransformsExactSchemas(t *testing.T) {
 	input := intTuple(6)
 	out, err := ExecuteOperator(OperatorSpec{Name: "multiply", Version: 1, Settings: []Setting{{Key: "factor", Value: "7"}}}, input)

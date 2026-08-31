@@ -5,6 +5,8 @@ import (
 	"errors"
 )
 
+const completionReportDigestDomain = "cs425/crane/completion-report/v1\x00"
+
 // SchedulingState is the committed admission state for a job.
 type SchedulingState uint8
 
@@ -85,7 +87,7 @@ type WorkerEvent struct {
 
 // CompletionReportDigest hashes every canonical completion field except itself.
 func CompletionReportDigest(report CompletionReport) [32]byte {
-	encoded := appendJobAndRevision(nil, report.JobID, report.JobControlRevision, report.AssignmentRevision)
+	encoded := appendJobAndRevision([]byte(completionReportDigestDomain), report.JobID, report.JobControlRevision, report.AssignmentRevision)
 	encoded = appendTaskID(encoded, report.Source)
 	encoded = appendAssignmentToken(encoded, report.Token)
 	encoded = appendCoordinatorEpoch(encoded, report.Epoch)

@@ -85,13 +85,16 @@ type ValidatedTopology struct {
 	byStage              map[uint16]StageSpec
 	eofs                 map[uint16][]uint64
 	downstreamDeliveries map[uint16]uint64
-	edgeReservations     map[uint16]uint64
+	custodyBytesByStage  map[uint16]uint64
 	collectStageID       uint16
 	collectPartitions    []uint16
 }
 
 // ValidateTopology validates and takes ownership of a complete topology.
 func ValidateTopology(input TopologySpec) (ValidatedTopology, error) {
+	if err := preflightTopologyInput(input); err != nil {
+		return ValidatedTopology{}, err
+	}
 	spec := cloneTopology(input)
 	limits := LimitsV1()
 	if spec.SchemaVersion != 1 {
@@ -111,6 +114,7 @@ func ValidateTopology(input TopologySpec) (ValidatedTopology, error) {
 	}
 
 	byStage := make(map[uint16]StageSpec, len(spec.Stages))
+	outputBounds := make(map[uint16]uint64, len(spec.Stages))
 	names := make(map[string]struct{}, len(spec.Stages))
 	eofs := make(map[uint16][]uint64)
 	var sourceID, sinkID uint16
@@ -143,6 +147,7 @@ func ValidateTopology(input TopologySpec) (ValidatedTopology, error) {
 		if StageRole(descriptor.Role) != stage.Role {
 			return ValidatedTopology{}, errors.New("operator role does not match stage role")
 		}
+		outputBounds[stage.StageID] = uint64(descriptor.MaxOutputs)
 		switch stage.Role {
 		case StageSource:
 			if sourceID != 0 {
@@ -216,7 +221,11 @@ func ValidateTopology(input TopologySpec) (ValidatedTopology, error) {
 	if !allReachable(sourceID, outgoing, len(spec.Stages)) || !allCanReach(sinkID, incoming, len(spec.Stages)) {
 		return ValidatedTopology{}, errors.New("topology contains a stage outside the source-to-sink graph")
 	}
-	downstream, reservations, err := validateExpansion(order, outgoing, byStage, limits.MaxDerivedDeliveries)
+	downstream, err := validateExpansion(order, outgoing, byStage, outputBounds, limits.MaxDerivedDeliveries)
+	if err != nil {
+		return ValidatedTopology{}, err
+	}
+	custody, err := calculateCustodyReservations(order, outgoing, byStage, outputBounds, sinkID, limits)
 	if err != nil {
 		return ValidatedTopology{}, err
 	}
@@ -239,7 +248,7 @@ func ValidateTopology(input TopologySpec) (ValidatedTopology, error) {
 		byStage:              byStage,
 		eofs:                 eofs,
 		downstreamDeliveries: downstream,
-		edgeReservations:     reservations,
+		custodyBytesByStage:  custody,
 		collectStageID:       sinkID,
 		collectPartitions:    collectPartitions,
 	}, nil
@@ -253,6 +262,23 @@ func (v ValidatedTopology) CanonicalBytes() []byte { return append([]byte(nil), 
 
 // Digest returns the SHA-256 digest of the complete canonical topology.
 func (v ValidatedTopology) Digest() [32]byte { return v.digest }
+
+// WorstCaseCustodyBytes returns the immutable checked durable-byte reservation
+// for processing one tuple at the exact destination task.
+func (v ValidatedTopology) WorstCaseCustodyBytes(task TaskID) (uint64, error) {
+	if err := task.Validate(); err != nil {
+		return 0, err
+	}
+	stage, ok := v.byStage[task.StageID]
+	if !ok || task.Partition >= stage.Parallelism {
+		return 0, errors.New("task is outside validated topology")
+	}
+	reservation, ok := v.custodyBytesByStage[task.StageID]
+	if !ok {
+		return 0, errors.New("missing validated custody reservation")
+	}
+	return reservation, nil
+}
 
 // DecodeTopology decodes canonical bytes and revalidates the complete graph.
 func DecodeTopology(encoded []byte) (ValidatedTopology, error) {
@@ -425,6 +451,55 @@ func cloneTopology(spec TopologySpec) TopologySpec {
 	return clone
 }
 
+func preflightTopologyInput(spec TopologySpec) error {
+	limits := LimitsV1()
+	if uint64(len(spec.Stages)) > limits.MaxStages {
+		return errors.New("topology stage count exceeds limit before copy")
+	}
+	if uint64(len(spec.Edges)) > limits.MaxEdges {
+		return errors.New("topology edge count exceeds limit before copy")
+	}
+	if uint64(len(spec.Name)) > limits.MaxIdentifierBytes {
+		return errors.New("topology name exceeds limit before copy")
+	}
+	for _, edge := range spec.Edges {
+		if uint64(len(edge.Field)) > limits.MaxIdentifierBytes {
+			return errors.New("edge field exceeds limit before copy")
+		}
+	}
+	var tasks, totalSettings uint64
+	for _, stage := range spec.Stages {
+		if uint64(len(stage.Name)) > limits.MaxIdentifierBytes || uint64(len(stage.Operator.Name)) > limits.MaxIdentifierBytes {
+			return errors.New("stage or operator name exceeds limit before copy")
+		}
+		if uint64(stage.Parallelism) > limits.MaxTasksPerStage {
+			return errors.New("stage task count exceeds limit before copy")
+		}
+		var ok bool
+		tasks, ok = checkedAddUint64(tasks, uint64(stage.Parallelism))
+		if !ok || tasks > limits.MaxTasksPerJob {
+			return errors.New("job task count exceeds limit before copy")
+		}
+		if uint64(len(stage.Operator.Settings)) > limits.MaxSettingsPerStage {
+			return errors.New("operator setting count exceeds limit before copy")
+		}
+		for _, setting := range stage.Operator.Settings {
+			if uint64(len(setting.Key)) > limits.MaxSettingKeyBytes || uint64(len(setting.Value)) > limits.MaxSettingValueBytes {
+				return errors.New("setting bytes exceed limit before copy")
+			}
+			settingBytes, ok := checkedAddUint64(uint64(len(setting.Key)), uint64(len(setting.Value)))
+			if !ok {
+				return errors.New("setting byte count overflow")
+			}
+			totalSettings, ok = checkedAddUint64(totalSettings, settingBytes)
+			if !ok || totalSettings > limits.MaxTotalSettingsBytes {
+				return errors.New("topology total settings exceed limit before copy")
+			}
+		}
+	}
+	return nil
+}
+
 func validateASCIIName(value string, limit uint64) error {
 	if value == "" || uint64(len(value)) > limit {
 		return errors.New("length outside bounds")
@@ -541,9 +616,8 @@ func allCanReach(sink uint16, edges map[uint16][]EdgeSpec, want int) bool {
 	return len(seen) == want
 }
 
-func validateExpansion(order []uint16, outgoing map[uint16][]EdgeSpec, stages map[uint16]StageSpec, limit uint64) (map[uint16]uint64, map[uint16]uint64, error) {
+func validateExpansion(order []uint16, outgoing map[uint16][]EdgeSpec, stages map[uint16]StageSpec, outputBounds map[uint16]uint64, limit uint64) (map[uint16]uint64, error) {
 	deliveries := make(map[uint16]uint64, len(order))
-	reservations := make(map[uint16]uint64)
 	for index := len(order) - 1; index >= 0; index-- {
 		id := order[index]
 		var total uint64
@@ -554,16 +628,79 @@ func validateExpansion(order []uint16, outgoing map[uint16][]EdgeSpec, stages ma
 			}
 			child := deliveries[edge.DestinationStageID]
 			if child == math.MaxUint64 || factor > limit/(child+1) {
-				return nil, nil, errors.New("topology delivery expansion overflow")
+				return nil, errors.New("topology delivery expansion overflow")
 			}
 			contribution := factor * (child + 1)
 			if total > limit-contribution {
-				return nil, nil, errors.New("topology derived delivery limit exceeded")
+				return nil, errors.New("topology derived delivery limit exceeded")
 			}
-			reservations[edge.EdgeID] = contribution
 			total += contribution
+		}
+		total, ok := checkedMultiplyUint64(total, outputBounds[id])
+		if !ok || total > limit {
+			return nil, errors.New("topology operator delivery expansion exceeds limit")
 		}
 		deliveries[id] = total
 	}
-	return deliveries, reservations, nil
+	return deliveries, nil
+}
+
+func calculateCustodyReservations(order []uint16, outgoing map[uint16][]EdgeSpec, stages map[uint16]StageSpec, outputBounds map[uint16]uint64, sinkID uint16, limits ConsensusLimits) (map[uint16]uint64, error) {
+	inbox, ok := checkedAddUint64(limits.CustodyInboxFixedBytes, limits.MaxCanonicalTupleBytes)
+	if !ok {
+		return nil, errors.New("custody inbox size overflow")
+	}
+	outbox, ok := checkedAddUint64(limits.CustodyOutboxFixedBytes, limits.MaxCanonicalTupleBytes)
+	if !ok {
+		return nil, errors.New("custody outbox size overflow")
+	}
+	result, ok := checkedAddUint64(limits.ResultCopyFixedBytes, limits.MaxCanonicalTupleBytes)
+	if !ok {
+		return nil, errors.New("result copy size overflow")
+	}
+	reservations := make(map[uint16]uint64, len(order))
+	for index := len(order) - 1; index >= 0; index-- {
+		id := order[index]
+		if id == sinkID {
+			copies, ok := checkedMultiplyUint64(2, result)
+			if !ok {
+				return nil, errors.New("result copies overflow")
+			}
+			total, ok := checkedAddUint64(inbox, copies)
+			if !ok || total > limits.MaxCustodyReservationBytes {
+				return nil, errors.New("sink custody reservation exceeds limit")
+			}
+			reservations[id] = total
+			continue
+		}
+		var routed uint64
+		for _, edge := range outgoing[id] {
+			factor := uint64(1)
+			if edge.Routing == RoutingBroadcast {
+				factor = uint64(stages[edge.DestinationStageID].Parallelism)
+			}
+			perDelivery, ok := checkedAddUint64(outbox, reservations[edge.DestinationStageID])
+			if !ok {
+				return nil, errors.New("custody route size overflow")
+			}
+			edgeBytes, ok := checkedMultiplyUint64(factor, perDelivery)
+			if !ok {
+				return nil, errors.New("custody fanout size overflow")
+			}
+			routed, ok = checkedAddUint64(routed, edgeBytes)
+			if !ok {
+				return nil, errors.New("custody route sum overflow")
+			}
+		}
+		routed, ok = checkedMultiplyUint64(routed, outputBounds[id])
+		if !ok {
+			return nil, errors.New("operator custody size overflow")
+		}
+		total, ok := checkedAddUint64(inbox, routed)
+		if !ok || total > limits.MaxCustodyReservationBytes {
+			return nil, errors.New("topology custody reservation exceeds limit")
+		}
+		reservations[id] = total
+	}
+	return reservations, nil
 }

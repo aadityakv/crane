@@ -10,7 +10,6 @@ import (
 
 const (
 	minCraneWorkerSlots uint16 = 1
-	maxCraneWorkerSlots uint16 = 256
 	minWorkerStoreBytes uint64 = 1 << 20
 	maxWorkerStoreBytes uint64 = 1 << 40
 )
@@ -41,8 +40,9 @@ func DefaultCraneConfig() CraneConfig {
 
 // Validate checks every local operational bound and the required compiled contract.
 func (c CraneConfig) Validate() error {
-	if c.WorkerSlots < minCraneWorkerSlots || c.WorkerSlots > maxCraneWorkerSlots {
-		return fmt.Errorf("crane worker slots must be between %d and %d", minCraneWorkerSlots, maxCraneWorkerSlots)
+	maxWorkerSlots := uint16(model.LimitsV1().MaxWorkerSlots)
+	if c.WorkerSlots < minCraneWorkerSlots || c.WorkerSlots > maxWorkerSlots {
+		return fmt.Errorf("crane worker slots must be between %d and %d", minCraneWorkerSlots, maxWorkerSlots)
 	}
 	if err := validateCraneDuration("worker control timeout", c.WorkerControlTimeout, 100*time.Millisecond, 30*time.Second); err != nil {
 		return err
