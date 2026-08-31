@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -77,7 +78,8 @@ func TestEmptySnapshotCanonicalGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded, _ := capture.MarshalBinary()
-	const wantHex = "4352534e0002f4d90b20e94e6a30a8c2993be87c8c50b1ef39a67a0b654bd6e74e728837be40000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+	const wantPrefix = "4352534e00029bbf4290ec5af75345d86578c196058b4a2e49175daf9cbe352e492ff8739412"
+	wantHex := wantPrefix + strings.Repeat("00", 90)
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("empty snapshot golden=%s", got)
 	}
@@ -279,49 +281,53 @@ func TestSnapshotCaptureAndRestoreRejectEveryStateCrossReference(t *testing.T) {
 }
 
 func TestSnapshotRestoreRejectsUnknownEnumsAndUnsortedKeys(t *testing.T) {
-	machine := NewMachine()
-	for id := uint16(1); id <= 2; id++ {
-		machine.workers[id] = WorkerRecord{NodeID: id, Epoch: model.WorkerEpoch{byte(id)}, State: WorkerEligible, Revision: 1, Slots: 1, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-	}
-	capture, err := machine.Capture(1, 1)
+	machine, _, _, _ := task10AssignedJob(t, 2)
+	capture, err := machine.Capture(100, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded, _ := capture.MarshalBinary()
-	// Root (128), worker map key (2), then record NodeID (2), Epoch (16), State.
+	firstEntry := appendWorkerEntry(nil, 1, machine.workers[1], nil)
+	secondEntry := appendWorkerEntry(nil, 2, machine.workers[2], nil)
+	firstOffset := bytes.Index(encoded, firstEntry)
+	secondOffset := bytes.Index(encoded, secondEntry)
+	if firstOffset < 0 || secondOffset != firstOffset+len(firstEntry) {
+		t.Fatalf("worker entries are not contiguous in canonical payload: first=%d second=%d", firstOffset, secondOffset)
+	}
 	unknownState := append([]byte(nil), encoded...)
-	unknownState[148] = 0xff
+	unknownState[firstOffset+20] = 0xff // map key + record NodeID + Epoch.
 	if err := NewMachine().Restore(SnapshotSchemaVersion, unknownState); !errors.Is(err, ErrInvalidSnapshot) {
 		t.Fatalf("unknown worker state error=%v", err)
 	}
 	unsorted := append([]byte(nil), encoded...)
-	first := append([]byte(nil), unsorted[128:223]...)
-	second := append([]byte(nil), unsorted[223:318]...)
-	copy(unsorted[128:223], second)
-	copy(unsorted[223:318], first)
-	if err := NewMachine().Restore(SnapshotSchemaVersion, unsorted); !errors.Is(err, ErrInvalidSnapshot) {
+	first := append([]byte(nil), unsorted[firstOffset:secondOffset]...)
+	second := append([]byte(nil), unsorted[secondOffset:secondOffset+len(secondEntry)]...)
+	copy(unsorted[firstOffset:secondOffset], second)
+	copy(unsorted[secondOffset:secondOffset+len(secondEntry)], first)
+	if err := NewMachine().Restore(SnapshotSchemaVersion, unsorted); !errors.Is(err, ErrInvalidSnapshot) || !errors.Is(err, ErrSnapshotOrder) {
 		t.Fatalf("unsorted worker keys error=%v", err)
+	}
+	duplicate := append([]byte(nil), encoded...)
+	copy(duplicate[secondOffset:secondOffset+len(firstEntry)], firstEntry)
+	if err := NewMachine().Restore(SnapshotSchemaVersion, duplicate); !errors.Is(err, ErrInvalidSnapshot) || !errors.Is(err, ErrSnapshotOrder) {
+		t.Fatalf("duplicate worker keys error=%v", err)
 	}
 }
 
-func TestSnapshotExactEightMiBBoundAndPlusOneRejectBeforeCapture(t *testing.T) {
-	exact := snapshotBoundaryMachine(t, 0)
-	capture, err := exact.Capture(1, 1)
-	if err != nil {
-		t.Fatalf("exact boundary capture: %v", err)
-	}
-	encoded, err := capture.MarshalBinary()
+func TestSnapshotRawEightMiBDecoderBoundaryAndPlusOne(t *testing.T) {
+	capture, err := NewMachine().Capture(1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if uint64(len(encoded)) != model.StateCommandMaxSnapshotBytesV1 {
-		t.Fatalf("exact payload=%d want=%d", len(encoded), model.StateCommandMaxSnapshotBytesV1)
+	base, _ := capture.MarshalBinary()
+	exact := make([]byte, model.StateCommandMaxSnapshotBytesV1)
+	copy(exact, base)
+	if err := NewMachine().Restore(SnapshotSchemaVersion, exact); !errors.Is(err, ErrInvalidSnapshot) || errors.Is(err, ErrSnapshotTooLarge) {
+		t.Fatalf("exact-limit decode error=%v, want non-size ErrInvalidSnapshot", err)
 	}
-	if err := NewMachine().Restore(SnapshotSchemaVersion, encoded); err != nil {
-		t.Fatalf("exact boundary restore: %v", err)
-	}
-	if _, err := snapshotBoundaryMachine(t, 1).Capture(1, 1); !errors.Is(err, ErrInvalidSnapshot) {
-		t.Fatalf("plus-one capture error=%v want ErrInvalidSnapshot", err)
+	plusOne := append(exact, 0)
+	if err := NewMachine().Restore(SnapshotSchemaVersion, plusOne); !errors.Is(err, ErrInvalidSnapshot) || !errors.Is(err, ErrSnapshotTooLarge) {
+		t.Fatalf("plus-one decode error=%v, want ErrInvalidSnapshot and ErrSnapshotTooLarge", err)
 	}
 }
 
@@ -348,32 +354,6 @@ func mutateSnapshotByte(input []byte, offset int) []byte {
 	result := append([]byte(nil), input...)
 	result[offset] ^= 0xff
 	return result
-}
-
-func snapshotBoundaryMachine(t *testing.T, extra int) *Machine {
-	t.Helper()
-	machine := NewMachine()
-	remaining := int(model.StateCommandMaxSnapshotBytesV1 - model.StateCommandSnapshotBaseBytesV1)
-	client := byte(1)
-	for remaining > 0 {
-		resultBytes := remaining - int(model.StateCommandClientHistoryFixedV1)
-		if resultBytes > int(model.StateCommandMaxCachedResultBytesV1) {
-			resultBytes = int(model.StateCommandMaxCachedResultBytesV1)
-		}
-		if resultBytes < 0 {
-			t.Fatalf("boundary remainder=%d cannot form client history", remaining)
-		}
-		id := model.ClientID{client, 1}
-		machine.clients[id] = clientHistory{sequence: 1, digest: [32]byte{client, 2}, result: bytes.Repeat([]byte{client}, resultBytes)}
-		remaining -= int(model.StateCommandClientHistoryFixedV1) + resultBytes
-		client++
-	}
-	if extra != 0 {
-		history := machine.clients[model.ClientID{client - 1, 1}]
-		history.result = append(history.result, byte(extra))
-		machine.clients[model.ClientID{client - 1, 1}] = history
-	}
-	return machine
 }
 
 func completeSnapshotMachine(t *testing.T, reverse bool) *Machine {

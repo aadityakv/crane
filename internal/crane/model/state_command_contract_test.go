@@ -47,7 +47,11 @@ func TestStateCommandContractV1PinsCompleteReplicatedDedupContract(t *testing.T)
 			{Name: "SubjectHistory", Fields: []string{"Revision:u64", "ID:bytes32", "Digest:sha256", "Target:u32-bytes(owned)", "Result:u32-bytes(owned)", "Applied:u8", "AppliedRevision:u64", "AppliedTarget:u32-bytes(owned)", "AppliedResult:u32-bytes(owned)"}},
 			{Name: "CommandResult", Fields: []string{"SchemaVersion:u16", "Code:u16", "Subject:u8", "Revision:u64", "JobID:JobID", "WorkerID:u16", "Epoch:CoordinatorEpoch"}},
 		},
-		SnapshotLayouts: cloneStateCommandLayouts(stateSnapshotLayoutsV2),
+		SnapshotLayouts:            cloneStateCommandLayouts(stateSnapshotLayoutsV2),
+		SnapshotSortRules:          append([]string(nil), stateSnapshotSortRulesV2...),
+		SnapshotMigrationRules:     append([]string(nil), stateSnapshotMigrationRulesV2...),
+		SnapshotValidationRules:    append([]string(nil), stateSnapshotValidationRulesV2...),
+		SnapshotEstimatorConstants: append([]StateCommandConstantDescriptor(nil), stateSnapshotEstimatorConstantsV2...),
 		EnumDomains: []StateCommandEnumDescriptor{
 			{Name: "IdentitySelector", Values: []string{"Client=1", "Internal=2"}},
 			{Name: "CommandKind", Values: []string{"BeginCoordinatorEpoch=1", "RegisterWorker=2", "DrainWorker=3", "DeactivateWorker=4", "ReplaceWorkerEpoch=5", "SubmitJob=6", "CancelJob=7", "RecordSourceEOF=8", "InstallAssignments=9", "ReplaceAssignments=10", "AdvanceCheckpoint=11", "SealManifest=12", "TransitionJob=13", "FailJob=14"}},
@@ -181,6 +185,10 @@ func TestStateCommandContractV1PinsCompleteReplicatedDedupContract(t *testing.T)
 	}
 	got.EnvelopeLayouts[0].Fields[0] = "mutated"
 	got.SnapshotLayouts[0].Fields[0] = "mutated"
+	got.SnapshotSortRules[0] = "mutated"
+	got.SnapshotMigrationRules[0] = "mutated"
+	got.SnapshotValidationRules[0] = "mutated"
+	got.SnapshotEstimatorConstants[0].Value++
 	got.EnumDomains[0].Values[0] = "mutated"
 	got.Rules[0] = "mutated"
 	if again := StateCommandContractV1(); reflect.DeepEqual(got, again) {
@@ -198,6 +206,11 @@ func TestCanonicalStateCommandContractBytesChangeForEveryDefiningField(t *testin
 		func(c *StateCommandContract) { c.EnvelopeLayouts[0].Fields[0] += "x" },
 		func(c *StateCommandContract) { c.SnapshotLayouts[0].Name += "x" },
 		func(c *StateCommandContract) { c.SnapshotLayouts[0].Fields[0] += "x" },
+		func(c *StateCommandContract) { c.SnapshotSortRules[0] += "x" },
+		func(c *StateCommandContract) { c.SnapshotMigrationRules[0] += "x" },
+		func(c *StateCommandContract) { c.SnapshotValidationRules[0] += "x" },
+		func(c *StateCommandContract) { c.SnapshotEstimatorConstants[0].Name += "x" },
+		func(c *StateCommandContract) { c.SnapshotEstimatorConstants[0].Value++ },
 		func(c *StateCommandContract) { c.EnumDomains[0].Name += "x" },
 		func(c *StateCommandContract) { c.EnumDomains[0].Values[0] += "x" },
 		func(c *StateCommandContract) { c.ResultMatrix[0].Code++ },
@@ -250,6 +263,36 @@ func TestCanonicalStateCommandContractBytesChangeForEveryDefiningField(t *testin
 		if reflect.DeepEqual(canonicalStateCommandContractBytes(candidate), want) {
 			t.Fatalf("mutation %d did not change canonical contract bytes", i)
 		}
+	}
+}
+
+func TestSnapshotCompatibilityFingerprintSensitivityByCategory(t *testing.T) {
+	baseline := canonicalStateCommandContractBytes(StateCommandContractV1())
+	tests := map[string]func(*StateCommandContract){
+		"sort comparator": func(contract *StateCommandContract) {
+			contract.SnapshotSortRules[0] += ":changed"
+		},
+		"migration policy": func(contract *StateCommandContract) {
+			contract.SnapshotMigrationRules[0] += ":changed"
+		},
+		"validation and error policy": func(contract *StateCommandContract) {
+			contract.SnapshotValidationRules[0] += ":changed"
+		},
+		"estimator constant name": func(contract *StateCommandContract) {
+			contract.SnapshotEstimatorConstants[0].Name += ":changed"
+		},
+		"estimator constant value": func(contract *StateCommandContract) {
+			contract.SnapshotEstimatorConstants[0].Value++
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := StateCommandContractV1()
+			mutate(&candidate)
+			if reflect.DeepEqual(canonicalStateCommandContractBytes(candidate), baseline) {
+				t.Fatal("compatibility category did not affect consensus fingerprint input")
+			}
+		})
 	}
 }
 

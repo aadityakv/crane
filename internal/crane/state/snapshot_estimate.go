@@ -81,5 +81,30 @@ func estimateJobRecordBytes(job JobRecord) (uint64, bool) {
 }
 
 func assignmentEncodedBytes(set model.AssignmentSet) uint64 {
-	return 16 + 8 + 32 + 2 + uint64(len(set.Tasks))*assignmentTokenEstimatedBytes + 2 + uint64(len(set.ResultReplicas))*resultReplicaEstimatedBytes
+	return model.StateCommandAssignmentFixedBytesV1 + uint64(len(set.Tasks))*assignmentTokenEstimatedBytes + uint64(len(set.ResultReplicas))*resultReplicaEstimatedBytes
+}
+
+// SnapshotEstimatorConstants returns every production-used fixed accounting value.
+func SnapshotEstimatorConstants() []model.StateCommandConstantDescriptor {
+	return []model.StateCommandConstantDescriptor{
+		{Name: "SnapshotBaseFixed", Value: model.StateCommandSnapshotBaseBytesV1},
+		{Name: "ClientHistoryFixed", Value: model.StateCommandClientHistoryFixedV1},
+		{Name: "SubjectHistoryFixed", Value: model.StateCommandSubjectHistoryFixedV1},
+		{Name: "WorkerEntryFixed", Value: model.StateCommandWorkerRecordBytesV1},
+		{Name: "JobRecordFixed", Value: model.StateCommandJobRecordFixedBytesV1},
+		{Name: "AssignmentFixed", Value: model.StateCommandAssignmentFixedBytesV1},
+		{Name: "AssignmentTokenFixed", Value: model.StateCommandAssignmentTokenBytesV1},
+		{Name: "ResultReplicaFixed", Value: model.StateCommandResultReplicaBytesV1},
+		{Name: "ReassignmentMarkerFixed", Value: model.StateCommandReassignmentBytesV1},
+		{Name: "SourceEOFEntryFixed", Value: model.StateCommandSourceEOFEntryBytesV1},
+		{Name: "CheckpointEntryFixed", Value: model.StateCommandCheckpointEntryBytesV1},
+		{Name: "ManifestEntryFixed", Value: model.StateCommandManifestEntryBytesV1},
+		{Name: "FailurePresentFixed", Value: model.StateCommandFailureBytesV1},
+		{Name: "WorkerEventEntryFixed", Value: model.StateCommandWorkerEventBytesV1},
+		{Name: "Bytes32LengthPrefix", Value: model.StateCommandSnapshotBytes32PrefixV2},
+		{Name: "Bytes64LengthPrefix", Value: model.StateCommandSnapshotBytes64PrefixV2},
+		{Name: "RootCollectionCount", Value: model.StateCommandSnapshotRootCountBytesV2},
+		{Name: "NestedCollectionCount", Value: model.StateCommandSnapshotNestedCountBytesV2},
+		{Name: "OptionalSelector", Value: model.StateCommandSnapshotOptionalSelectorBytesV2},
+	}
 }

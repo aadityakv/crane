@@ -1,7 +1,6 @@
 package state
 
 import (
-	"bytes"
 	"sort"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -68,7 +67,7 @@ func (machine *Machine) View() View {
 		view.Clients = append(view.Clients, ClientHistoryView{ClientID: id, Sequence: history.sequence, Digest: history.digest, Result: owned(history.result)})
 	}
 	sort.Slice(view.Clients, func(i, j int) bool {
-		return bytes.Compare(view.Clients[i].ClientID[:], view.Clients[j].ClientID[:]) < 0
+		return compareSnapshotClientID(view.Clients[i].ClientID, view.Clients[j].ClientID) < 0
 	})
 	for subject, history := range machine.subjects {
 		view.Subjects = append(view.Subjects, SubjectHistoryView{
@@ -78,24 +77,25 @@ func (machine *Machine) View() View {
 		})
 	}
 	sort.Slice(view.Subjects, func(i, j int) bool {
-		return bytes.Compare(appendSubject(nil, view.Subjects[i].Subject), appendSubject(nil, view.Subjects[j].Subject)) < 0
+		return compareSnapshotSubject(view.Subjects[i].Subject, view.Subjects[j].Subject) < 0
 	})
 	for _, worker := range machine.workers {
 		view.Workers = append(view.Workers, worker)
 	}
-	sort.Slice(view.Workers, func(i, j int) bool { return view.Workers[i].NodeID < view.Workers[j].NodeID })
+	sort.Slice(view.Workers, func(i, j int) bool {
+		return compareSnapshotWorkerID(view.Workers[i].NodeID, view.Workers[j].NodeID) < 0
+	})
 	for _, job := range machine.jobs {
 		view.Jobs = append(view.Jobs, cloneJobRecord(job))
 	}
-	sort.Slice(view.Jobs, func(i, j int) bool { return bytes.Compare(view.Jobs[i].JobID[:], view.Jobs[j].JobID[:]) < 0 })
+	sort.Slice(view.Jobs, func(i, j int) bool { return compareSnapshotJobID(view.Jobs[i].JobID, view.Jobs[j].JobID) < 0 })
 	for key, cursor := range machine.workerEvents {
 		view.WorkerEvents = append(view.WorkerEvents, WorkerEventView{WorkerID: key.WorkerID, WorkerEpoch: key.WorkerEpoch, TransactionID: cursor.TransactionID, Digest: cursor.Digest})
 	}
 	sort.Slice(view.WorkerEvents, func(i, j int) bool {
-		if view.WorkerEvents[i].WorkerID != view.WorkerEvents[j].WorkerID {
-			return view.WorkerEvents[i].WorkerID < view.WorkerEvents[j].WorkerID
-		}
-		return bytes.Compare(view.WorkerEvents[i].WorkerEpoch[:], view.WorkerEvents[j].WorkerEpoch[:]) < 0
+		left := workerEventKey{WorkerID: view.WorkerEvents[i].WorkerID, WorkerEpoch: view.WorkerEvents[i].WorkerEpoch}
+		right := workerEventKey{WorkerID: view.WorkerEvents[j].WorkerID, WorkerEpoch: view.WorkerEvents[j].WorkerEpoch}
+		return compareSnapshotWorkerEvent(left, right) < 0
 	})
 	return view
 }

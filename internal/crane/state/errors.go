@@ -13,5 +13,11 @@ var (
 	ErrInvalidCommand               = errors.New("invalid crane command")
 	ErrMalformedCommandResult       = errors.New("malformed crane command result")
 	ErrInvalidSnapshot              = errors.New("invalid crane state snapshot")
-	ErrInvalidApplyIndex            = errors.New("invalid crane apply index")
+	// ErrSnapshotTooLarge identifies a snapshot that exceeds the consensus size limit.
+	ErrSnapshotTooLarge = errors.New("crane state snapshot exceeds size limit")
+	// ErrSnapshotOrder identifies a duplicate or non-canonical snapshot collection order.
+	ErrSnapshotOrder = errors.New("invalid crane snapshot collection order")
+	// ErrSnapshotCrossReference identifies inconsistent state between snapshot collections.
+	ErrSnapshotCrossReference = errors.New("invalid crane snapshot cross-reference")
+	ErrInvalidApplyIndex      = errors.New("invalid crane apply index")
 )

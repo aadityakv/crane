@@ -40,11 +40,14 @@ func (machine *Machine) Capture(index, term uint64) (raft.SnapshotCapture, error
 		return nil, fmt.Errorf("%w: capture index %d precedes Crane index %d", ErrInvalidSnapshot, index, machine.lastAppliedIndex)
 	}
 	if err := validateSnapshotState(machine); err != nil {
-		return nil, fmt.Errorf("%w: live state: %v", ErrInvalidSnapshot, err)
+		return nil, fmt.Errorf("%w: live state: %w", ErrInvalidSnapshot, err)
 	}
 	estimated, ok := machine.estimateCanonicalSnapshotBytesLocked()
 	if !ok {
 		return nil, fmt.Errorf("%w: canonical state exceeds snapshot bound", ErrInvalidSnapshot)
+	}
+	if machine.estimatedSnapshotBytes != estimated {
+		return nil, fmt.Errorf("%w: incremental estimator=%d canonical=%d", ErrInvalidSnapshot, machine.estimatedSnapshotBytes, estimated)
 	}
 	encoded := machine.appendCanonicalSnapshotLocked(make([]byte, 0, estimated), nil)
 	if uint64(len(encoded)) != estimated || uint64(len(encoded)) > model.StateCommandMaxSnapshotBytesV1 {
@@ -57,7 +60,11 @@ func (machine *Machine) Capture(index, term uint64) (raft.SnapshotCapture, error
 // into the machine atomically. Schemas zero and one are bootstrap-only and are
 // accepted solely with an empty payload.
 func (machine *Machine) Restore(schemaVersion uint32, encoded []byte) error {
-	if schemaVersion == 0 || schemaVersion == 1 {
+	policy, supported := snapshotMigrationFor(schemaVersion)
+	if !supported {
+		return fmt.Errorf("%w: %w: snapshot schema %d", ErrInvalidSnapshot, ErrUnsupportedCommandSchema, schemaVersion)
+	}
+	if policy.emptyOnly {
 		if len(encoded) != 0 {
 			return fmt.Errorf("%w: legacy schema %d has a payload", ErrInvalidSnapshot, schemaVersion)
 		}
@@ -65,10 +72,10 @@ func (machine *Machine) Restore(schemaVersion uint32, encoded []byte) error {
 		machine.replaceWith(empty)
 		return nil
 	}
-	if schemaVersion != SnapshotSchemaVersion {
-		return fmt.Errorf("%w: unsupported schema %d", ErrInvalidSnapshot, schemaVersion)
-	}
 	if len(encoded) == 0 || uint64(len(encoded)) > model.StateCommandMaxSnapshotBytesV1 {
+		if uint64(len(encoded)) > model.StateCommandMaxSnapshotBytesV1 {
+			return fmt.Errorf("%w: %w: payload length %d", ErrInvalidSnapshot, ErrSnapshotTooLarge, len(encoded))
+		}
 		return fmt.Errorf("%w: payload length %d", ErrInvalidSnapshot, len(encoded))
 	}
 	temporary, err := decodeSnapshot(encoded)
@@ -76,7 +83,7 @@ func (machine *Machine) Restore(schemaVersion uint32, encoded []byte) error {
 		return err
 	}
 	canonical := temporary.appendCanonicalSnapshotLocked(make([]byte, 0, len(encoded)), nil)
-	if !bytes.Equal(canonical, encoded) {
+	if snapshotRequireCanonicalReencode && !bytes.Equal(canonical, encoded) {
 		return fmt.Errorf("%w: payload is not canonical", ErrInvalidSnapshot)
 	}
 	estimated, ok := temporary.estimateCanonicalSnapshotBytesLocked()
@@ -86,6 +93,67 @@ func (machine *Machine) Restore(schemaVersion uint32, encoded []byte) error {
 	temporary.estimatedSnapshotBytes = estimated
 	machine.replaceWith(temporary)
 	return nil
+}
+
+type snapshotMigrationPolicy struct {
+	schema     uint32
+	emptyOnly  bool
+	descriptor string
+}
+
+var snapshotMigrationPolicies = []snapshotMigrationPolicy{
+	{schema: 0, emptyOnly: true, descriptor: "schema-0:empty-payload-only:restore-empty"},
+	{schema: 1, emptyOnly: true, descriptor: "schema-1:empty-payload-only:restore-empty"},
+	{schema: SnapshotSchemaVersion, descriptor: "schema-2:nonempty-bounded-canonical:decode-current"},
+}
+
+const snapshotRequireCanonicalReencode = true
+
+func snapshotMigrationFor(schema uint32) (snapshotMigrationPolicy, bool) {
+	for _, policy := range snapshotMigrationPolicies {
+		if policy.schema == schema {
+			return policy, true
+		}
+	}
+	return snapshotMigrationPolicy{}, false
+}
+
+// SnapshotMigrationRules returns the production-used accepted-schema table.
+func SnapshotMigrationRules() []string {
+	rules := make([]string, 0, len(snapshotMigrationPolicies)+1)
+	for _, policy := range snapshotMigrationPolicies {
+		rules = append(rules, policy.descriptor)
+	}
+	return append(rules, "other-schema:reject-unsupported")
+}
+
+// SnapshotValidationRules returns consensus-visible validation and error policy.
+func SnapshotValidationRules() []string {
+	return []string{
+		"capture:incremental-estimate-equals-canonical-estimate-equals-encoded-length",
+		"restore:temporary-owned-validate-canonical-reencode-byte-equality-then-atomic-swap",
+		"ordering:all-declared-sorted-collections-are-strictly-increasing-and-duplicate-free",
+		"errors:every-failure-wraps-ErrInvalidSnapshot-and-preserves-nested-sentinel",
+		"cached-results:canonical-command-result-and-subject-identity-revision-epoch-correlated",
+		"retained-targets:canonical-structural-and-current-authoritative-revision-semantics",
+		"reverse-references:coordinator-worker-job-control-eof-checkpoint-manifest",
+		"artifacts:checked-per-job-aggregate-at-most-MaxResultBytes",
+	}
+}
+
+// SnapshotSortRules returns every production collection's canonical key order.
+func SnapshotSortRules() []string {
+	return []string{
+		"Clients:ClientID:unsigned-lexicographic-bytes16",
+		"Subjects:SubjectKey:unsigned-lexicographic-canonical-bytes39",
+		"Workers:NodeID:unsigned-u16",
+		"Jobs:JobID:unsigned-lexicographic-bytes16",
+		"WorkerEvents:WorkerID-unsigned-u16,WorkerEpoch-unsigned-lexicographic-bytes16",
+		"NeedsReassignment:Kind,active-TaskID,ReplicaRole,OldWorkerID,OldWorkerEpoch",
+		"SourceEOFs:TaskID:unsigned-lexicographic-canonical-bytes20",
+		"Checkpoints:TaskID:unsigned-lexicographic-canonical-bytes20",
+		"Manifests:TaskID:unsigned-lexicographic-canonical-bytes20",
+	}
 }
 
 func (machine *Machine) replaceWith(source *Machine) {
@@ -157,13 +225,13 @@ func (machine *Machine) appendCanonicalSnapshotLocked(encoded []byte, trace *[]s
 	for _, subject := range sortedSubjectKeys(machine.subjects) {
 		encoded = appendSubjectHistory(encoded, subject, machine.subjects[subject], nil)
 	}
-	workerIDs := make([]int, 0, len(machine.workers))
+	workerIDs := make([]uint16, 0, len(machine.workers))
 	for id := range machine.workers {
-		workerIDs = append(workerIDs, int(id))
+		workerIDs = append(workerIDs, id)
 	}
-	sort.Ints(workerIDs)
+	sort.Slice(workerIDs, func(i, j int) bool { return compareSnapshotWorkerID(workerIDs[i], workerIDs[j]) < 0 })
 	for _, id := range workerIDs {
-		encoded = appendWorkerEntry(encoded, uint16(id), machine.workers[uint16(id)], nil)
+		encoded = appendWorkerEntry(encoded, id, machine.workers[id], nil)
 	}
 	for _, id := range sortedJobIDs(machine.jobs) {
 		encoded = appendJobEntry(encoded, id, machine.jobs[id], nil)
@@ -306,7 +374,7 @@ func appendWorkerEventEntry(encoded []byte, key workerEventKey, cursor workerEve
 }
 
 func appendBytes32(encoded, value []byte) []byte {
-	var fixed [4]byte
+	var fixed [model.StateCommandSnapshotBytes32PrefixV2]byte
 	binary.BigEndian.PutUint32(fixed[:], uint32(len(value)))
 	encoded = append(encoded, fixed[:]...)
 	return append(encoded, value...)
@@ -317,7 +385,7 @@ func sortedClientIDs(values map[model.ClientID]clientHistory) []model.ClientID {
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+	sort.Slice(keys, func(i, j int) bool { return compareSnapshotClientID(keys[i], keys[j]) < 0 })
 	return keys
 }
 func sortedSubjectKeys(values map[SubjectKey]subjectHistory) []SubjectKey {
@@ -325,9 +393,7 @@ func sortedSubjectKeys(values map[SubjectKey]subjectHistory) []SubjectKey {
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		return bytes.Compare(appendSubject(nil, keys[i]), appendSubject(nil, keys[j])) < 0
-	})
+	sort.Slice(keys, func(i, j int) bool { return compareSnapshotSubject(keys[i], keys[j]) < 0 })
 	return keys
 }
 func sortedJobIDs(values map[model.JobID]JobRecord) []model.JobID {
@@ -335,7 +401,7 @@ func sortedJobIDs(values map[model.JobID]JobRecord) []model.JobID {
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+	sort.Slice(keys, func(i, j int) bool { return compareSnapshotJobID(keys[i], keys[j]) < 0 })
 	return keys
 }
 func sortedWorkerEventKeys(values map[workerEventKey]workerEventCursor) []workerEventKey {
@@ -343,12 +409,7 @@ func sortedWorkerEventKeys(values map[workerEventKey]workerEventCursor) []worker
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].WorkerID != keys[j].WorkerID {
-			return keys[i].WorkerID < keys[j].WorkerID
-		}
-		return bytes.Compare(keys[i].WorkerEpoch[:], keys[j].WorkerEpoch[:]) < 0
-	})
+	sort.Slice(keys, func(i, j int) bool { return compareSnapshotWorkerEvent(keys[i], keys[j]) < 0 })
 	return keys
 }
 func sortedTaskKeysEOF(values map[model.TaskID]SourceEOFRecord) []model.TaskID {
@@ -356,7 +417,7 @@ func sortedTaskKeysEOF(values map[model.TaskID]SourceEOFRecord) []model.TaskID {
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(taskBytes(keys[i]), taskBytes(keys[j])) < 0 })
+	sort.Slice(keys, func(i, j int) bool { return compareSnapshotTask(keys[i], keys[j]) < 0 })
 	return keys
 }
 func sortedTaskKeysCheckpoint(values map[model.TaskID]CheckpointRecord) []model.TaskID {
@@ -364,7 +425,7 @@ func sortedTaskKeysCheckpoint(values map[model.TaskID]CheckpointRecord) []model.
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(taskBytes(keys[i]), taskBytes(keys[j])) < 0 })
+	sort.Slice(keys, func(i, j int) bool { return compareSnapshotTask(keys[i], keys[j]) < 0 })
 	return keys
 }
 func sortedTaskKeysManifest(values map[model.TaskID]ResultManifest) []model.TaskID {
@@ -372,8 +433,41 @@ func sortedTaskKeysManifest(values map[model.TaskID]ResultManifest) []model.Task
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(taskBytes(keys[i]), taskBytes(keys[j])) < 0 })
+	sort.Slice(keys, func(i, j int) bool { return compareSnapshotTask(keys[i], keys[j]) < 0 })
 	return keys
+}
+
+func compareSnapshotClientID(left, right model.ClientID) int { return bytes.Compare(left[:], right[:]) }
+func compareSnapshotSubject(left, right SubjectKey) int {
+	return bytes.Compare(appendSubject(nil, left), appendSubject(nil, right))
+}
+func compareSnapshotWorkerID(left, right uint16) int {
+	if left < right {
+		return -1
+	}
+	if left > right {
+		return 1
+	}
+	return 0
+}
+func compareSnapshotJobID(left, right model.JobID) int { return bytes.Compare(left[:], right[:]) }
+func compareSnapshotWorkerEvent(left, right workerEventKey) int {
+	if comparison := compareSnapshotWorkerID(left.WorkerID, right.WorkerID); comparison != 0 {
+		return comparison
+	}
+	return bytes.Compare(left.WorkerEpoch[:], right.WorkerEpoch[:])
+}
+func compareSnapshotTask(left, right model.TaskID) int {
+	return bytes.Compare(taskBytes(left), taskBytes(right))
+}
+func compareSnapshotMarker(left, right NeedsReassignment) int {
+	if markerLess(left, right) {
+		return -1
+	}
+	if markerLess(right, left) {
+		return 1
+	}
+	return 0
 }
 
 type snapshotDecoder struct{ commandDecoder }
@@ -385,12 +479,18 @@ func decodeSnapshot(encoded []byte) (*Machine, error) {
 		return nil, snapshotDecodeError("magic", err)
 	}
 	version, err := decoder.u16()
-	if err != nil || version != uint16(SnapshotSchemaVersion) {
+	if err != nil {
 		return nil, snapshotDecodeError("schema", err)
 	}
+	if version != uint16(SnapshotSchemaVersion) {
+		return nil, fmt.Errorf("%w: %w: embedded snapshot schema %d", ErrInvalidSnapshot, ErrUnsupportedCommandSchema, version)
+	}
 	fingerprint, err := decoder.array32()
-	if err != nil || fingerprint != model.ConsensusFingerprint() {
+	if err != nil {
 		return nil, snapshotDecodeError("consensus fingerprint", err)
+	}
+	if fingerprint != model.ConsensusFingerprint() {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidSnapshot, ErrConsensusFingerprintMismatch)
 	}
 	lastApplied, err := decoder.u64()
 	if err != nil {
@@ -445,7 +545,7 @@ func decodeSnapshot(encoded []byte) (*Machine, error) {
 		return nil, fmt.Errorf("%w: trailing bytes", ErrInvalidSnapshot)
 	}
 	if err := validateSnapshotState(temporary); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidSnapshot, err)
+		return nil, fmt.Errorf("%w: state validation: %w", ErrInvalidSnapshot, err)
 	}
 	return temporary, nil
 }
@@ -454,7 +554,7 @@ func snapshotDecodeError(field string, err error) error {
 	if err == nil {
 		return fmt.Errorf("%w: invalid %s", ErrInvalidSnapshot, field)
 	}
-	return fmt.Errorf("%w: %s: %v", ErrInvalidSnapshot, field, err)
+	return fmt.Errorf("%w: %s: %w", ErrInvalidSnapshot, field, err)
 }
 
 func (decoder *snapshotDecoder) boundedCount(limit, minimum uint64, field string) (uint64, error) {
@@ -469,7 +569,7 @@ func (decoder *snapshotDecoder) boundedCount(limit, minimum uint64, field string
 }
 
 func (decoder *snapshotDecoder) bytes32(limit uint64, field string) ([]byte, error) {
-	fixed, err := decoder.take(4)
+	fixed, err := decoder.take(int(model.StateCommandSnapshotBytes32PrefixV2))
 	if err != nil {
 		return nil, snapshotDecodeError(field+" length", err)
 	}
@@ -507,8 +607,8 @@ func (decoder *snapshotDecoder) clients(machine *Machine, count uint64) error {
 			return snapshotDecodeError("client ID", err)
 		}
 		id := model.ClientID(idBytes)
-		if id.Validate() != nil || index > 0 && bytes.Compare(previous[:], id[:]) >= 0 {
-			return fmt.Errorf("%w: client keys are invalid or unsorted", ErrInvalidSnapshot)
+		if id.Validate() != nil || index > 0 && compareSnapshotClientID(previous, id) >= 0 {
+			return fmt.Errorf("%w: %w: client keys are invalid or unsorted", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		sequence, err := decoder.u64()
 		if err != nil {
@@ -532,15 +632,14 @@ func (decoder *snapshotDecoder) clients(machine *Machine, count uint64) error {
 }
 
 func (decoder *snapshotDecoder) subjects(machine *Machine, count uint64) error {
-	var previous []byte
+	var previous SubjectKey
 	for index := uint64(0); index < count; index++ {
 		subject, err := decoder.subject()
 		if err != nil {
 			return snapshotDecodeError("subject key", err)
 		}
-		keyBytes := appendSubject(nil, subject)
-		if subject.Validate() != nil || index > 0 && bytes.Compare(previous, keyBytes) >= 0 {
-			return fmt.Errorf("%w: subject keys are invalid or unsorted", ErrInvalidSnapshot)
+		if subject.Validate() != nil || index > 0 && compareSnapshotSubject(previous, subject) >= 0 {
+			return fmt.Errorf("%w: %w: subject keys are invalid or unsorted", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		revision, err := decoder.u64()
 		if err != nil {
@@ -582,7 +681,7 @@ func (decoder *snapshotDecoder) subjects(machine *Machine, count uint64) error {
 			return fmt.Errorf("%w: zero subject history identity", ErrInvalidSnapshot)
 		}
 		machine.subjects[subject] = subjectHistory{revision: revision, id: InternalCommandID(id), digest: digest, target: target, result: result, applied: appliedByte == 1, appliedRevision: appliedRevision, appliedTarget: appliedTarget, appliedResult: appliedResult}
-		previous = keyBytes
+		previous = subject
 	}
 	return nil
 }
@@ -598,8 +697,8 @@ func (decoder *snapshotDecoder) workers(machine *Machine, count uint64) error {
 		if err != nil {
 			return snapshotDecodeError("worker record", err)
 		}
-		if key == 0 || index > 0 && key <= previous || worker.NodeID != key || worker.Validate() != nil {
-			return fmt.Errorf("%w: invalid or unsorted worker entry", ErrInvalidSnapshot)
+		if key == 0 || index > 0 && compareSnapshotWorkerID(previous, key) >= 0 || worker.NodeID != key || worker.Validate() != nil {
+			return fmt.Errorf("%w: %w: invalid or unsorted worker entry", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		machine.workers[key] = worker
 		previous = key
@@ -614,8 +713,8 @@ func (decoder *snapshotDecoder) jobs(machine *Machine, count uint64) error {
 		if err != nil {
 			return snapshotDecodeError("job key", err)
 		}
-		if key.Validate() != nil || index > 0 && bytes.Compare(previous[:], key[:]) >= 0 {
-			return fmt.Errorf("%w: invalid or unsorted job key", ErrInvalidSnapshot)
+		if key.Validate() != nil || index > 0 && compareSnapshotJobID(previous, key) >= 0 {
+			return fmt.Errorf("%w: %w: invalid or unsorted job key", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		record, err := decoder.jobRecord()
 		if err != nil {
@@ -752,7 +851,7 @@ func (decoder *snapshotDecoder) sourceEOFs(job model.JobID) (map[model.TaskID]So
 		return nil, fmt.Errorf("%w: source EOF count", ErrInvalidSnapshot)
 	}
 	result := make(map[model.TaskID]SourceEOFRecord, int(count))
-	var previous []byte
+	var previous model.TaskID
 	for index := 0; index < int(count); index++ {
 		task, err := decoder.taskID()
 		if err != nil {
@@ -766,12 +865,11 @@ func (decoder *snapshotDecoder) sourceEOFs(job model.JobID) (map[model.TaskID]So
 		if err != nil {
 			return nil, err
 		}
-		key := taskBytes(task)
-		if task.JobID != job || index > 0 && bytes.Compare(previous, key) >= 0 {
-			return nil, fmt.Errorf("%w: source EOF keys", ErrInvalidSnapshot)
+		if task.JobID != job || index > 0 && compareSnapshotTask(previous, task) >= 0 {
+			return nil, fmt.Errorf("%w: %w: source EOF keys", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		result[task] = SourceEOFRecord{EOF: eof, Revision: revision}
-		previous = key
+		previous = task
 	}
 	return result, nil
 }
@@ -785,7 +883,7 @@ func (decoder *snapshotDecoder) checkpoints(job model.JobID) (map[model.TaskID]C
 		return nil, fmt.Errorf("%w: checkpoint count", ErrInvalidSnapshot)
 	}
 	result := make(map[model.TaskID]CheckpointRecord, int(count))
-	var previous []byte
+	var previous model.TaskID
 	for index := 0; index < int(count); index++ {
 		task, err := decoder.taskID()
 		if err != nil {
@@ -799,12 +897,11 @@ func (decoder *snapshotDecoder) checkpoints(job model.JobID) (map[model.TaskID]C
 		if err != nil {
 			return nil, err
 		}
-		key := taskBytes(task)
-		if task.JobID != job || index > 0 && bytes.Compare(previous, key) >= 0 {
-			return nil, fmt.Errorf("%w: checkpoint keys", ErrInvalidSnapshot)
+		if task.JobID != job || index > 0 && compareSnapshotTask(previous, task) >= 0 {
+			return nil, fmt.Errorf("%w: %w: checkpoint keys", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		result[task] = CheckpointRecord{Watermark: watermark, Revision: revision}
-		previous = key
+		previous = task
 	}
 	return result, nil
 }
@@ -818,7 +915,7 @@ func (decoder *snapshotDecoder) manifests(job model.JobID) (map[model.TaskID]Res
 		return nil, fmt.Errorf("%w: manifest count", ErrInvalidSnapshot)
 	}
 	result := make(map[model.TaskID]ResultManifest, int(count))
-	var previous []byte
+	var previous model.TaskID
 	for index := 0; index < int(count); index++ {
 		task, err := decoder.taskID()
 		if err != nil {
@@ -828,12 +925,11 @@ func (decoder *snapshotDecoder) manifests(job model.JobID) (map[model.TaskID]Res
 		if err != nil {
 			return nil, err
 		}
-		key := taskBytes(task)
-		if task.JobID != job || manifest.SinkTask != task || index > 0 && bytes.Compare(previous, key) >= 0 {
-			return nil, fmt.Errorf("%w: manifest keys", ErrInvalidSnapshot)
+		if task.JobID != job || manifest.SinkTask != task || index > 0 && compareSnapshotTask(previous, task) >= 0 {
+			return nil, fmt.Errorf("%w: %w: manifest keys", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		result[task] = manifest
-		previous = key
+		previous = task
 	}
 	return result, nil
 }
@@ -858,8 +954,8 @@ func (decoder *snapshotDecoder) workerEvents(machine *Machine, count uint64) err
 			return err
 		}
 		key := workerEventKey{WorkerID: worker, WorkerEpoch: epoch}
-		if worker == 0 || index > 0 && !workerEventLess(previous, key) {
-			return fmt.Errorf("%w: worker event keys", ErrInvalidSnapshot)
+		if worker == 0 || index > 0 && compareSnapshotWorkerEvent(previous, key) >= 0 {
+			return fmt.Errorf("%w: %w: worker event keys", ErrInvalidSnapshot, ErrSnapshotOrder)
 		}
 		machine.workerEvents[key] = workerEventCursor{TransactionID: transaction, Digest: digest}
 		previous = key
@@ -868,10 +964,7 @@ func (decoder *snapshotDecoder) workerEvents(machine *Machine, count uint64) err
 }
 
 func workerEventLess(left, right workerEventKey) bool {
-	if left.WorkerID != right.WorkerID {
-		return left.WorkerID < right.WorkerID
-	}
-	return bytes.Compare(left.WorkerEpoch[:], right.WorkerEpoch[:]) < 0
+	return compareSnapshotWorkerEvent(left, right) < 0
 }
 
 func validateSnapshotState(machine *Machine) error {
@@ -889,13 +982,16 @@ func validateSnapshotState(machine *Machine) error {
 		return errors.New("active job count exceeds bound")
 	}
 	for id, history := range machine.clients {
-		if id.Validate() != nil || history.sequence == 0 || history.digest == ([32]byte{}) || uint64(len(history.result)) > model.StateCommandMaxCachedResultBytesV1 {
-			return errors.New("invalid client history")
+		if err := validateClientSnapshotHistory(machine, id, history); err != nil {
+			return err
 		}
 	}
 	for id, worker := range machine.workers {
 		if id == 0 || worker.NodeID != id || worker.Validate() != nil {
 			return errors.New("invalid worker entry")
+		}
+		if err := requireAppliedSubject(machine, SubjectKey{Kind: SubjectWorker, WorkerID: id}, worker.Revision); err != nil {
+			return fmt.Errorf("worker %d history: %w", id, err)
 		}
 	}
 	for _, subject := range sortedSubjectKeys(machine.subjects) {
@@ -907,6 +1003,11 @@ func validateSnapshotState(machine *Machine) error {
 	for id, job := range machine.jobs {
 		if err := validateSnapshotJob(machine, id, job, usedSlots); err != nil {
 			return err
+		}
+	}
+	if machine.coordinatorRevision != 0 {
+		if err := requireAppliedSubject(machine, SubjectKey{Kind: SubjectCoordinator}, machine.coordinatorRevision); err != nil {
+			return fmt.Errorf("coordinator history: %w", err)
 		}
 	}
 	for id, used := range usedSlots {
@@ -924,11 +1025,43 @@ func validateSnapshotState(machine *Machine) error {
 }
 
 func validateSubjectHistory(machine *Machine, subject SubjectKey, history subjectHistory) error {
-	if subject.Validate() != nil || history.id == (InternalCommandID{}) || history.digest == ([32]byte{}) || uint64(len(history.result)) > model.StateCommandMaxCachedResultBytesV1 || uint64(len(history.appliedResult)) > model.StateCommandMaxCachedResultBytesV1 || uint64(len(history.target)) > model.LimitsV1().MaxSubmitJobBytes || uint64(len(history.appliedTarget)) > model.LimitsV1().MaxSubmitJobBytes {
+	if subject.Validate() != nil || history.id == (InternalCommandID{}) || history.digest == ([32]byte{}) || len(history.target) == 0 || len(history.result) == 0 || uint64(len(history.result)) > model.StateCommandMaxCachedResultBytesV1 || uint64(len(history.appliedResult)) > model.StateCommandMaxCachedResultBytesV1 || uint64(len(history.target)) > model.LimitsV1().MaxSubmitJobBytes || uint64(len(history.appliedTarget)) > model.LimitsV1().MaxSubmitJobBytes {
 		return errors.New("invalid subject history")
 	}
-	if history.appliedRevision > history.revision || history.appliedRevision == 0 && (len(history.appliedTarget) != 0 || len(history.appliedResult) != 0) || history.appliedRevision != 0 && (len(history.appliedTarget) == 0 || len(history.appliedResult) == 0) || history.applied && history.appliedRevision != history.revision {
+	if history.appliedRevision > history.revision || history.appliedRevision == 0 && (len(history.appliedTarget) != 0 || len(history.appliedResult) != 0 || history.applied) || history.appliedRevision != 0 && (len(history.appliedTarget) == 0 || len(history.appliedResult) == 0) || history.applied && history.appliedRevision != history.revision {
 		return errors.New("invalid applied subject history")
+	}
+	current, err := decodeCanonicalSnapshotResult(history.result, "subject current result")
+	if err != nil {
+		return err
+	}
+	if err := validateSubjectResult(machine, subject, history.revision, current, false); err != nil {
+		return err
+	}
+	if err := validateSnapshotSubjectTarget(machine, subject, history.target, history.revision, false); err != nil {
+		return fmt.Errorf("current target: %w", err)
+	}
+	if history.appliedRevision != 0 {
+		applied, err := decodeCanonicalSnapshotResult(history.appliedResult, "subject applied result")
+		if err != nil {
+			return err
+		}
+		if err := validateSubjectResult(machine, subject, history.appliedRevision, applied, true); err != nil {
+			return err
+		}
+		if err := validateSnapshotSubjectTarget(machine, subject, history.appliedTarget, history.appliedRevision, true); err != nil {
+			return fmt.Errorf("applied target: %w", err)
+		}
+	}
+	if history.applied {
+		if !bytes.Equal(history.result, history.appliedResult) {
+			return errors.New("applied current result differs from retained applied result")
+		}
+		if subject.Kind != SubjectCoordinator && !bytes.Equal(history.target, history.appliedTarget) {
+			return errors.New("applied current target differs from retained applied target")
+		}
+	} else if current.Code == ResultSuccess {
+		return errors.New("non-applied current history retains success")
 	}
 	authoritative := machine.subjectRevision(subject)
 	if subject.Kind == SubjectJobControl {
@@ -941,20 +1074,399 @@ func validateSubjectHistory(machine *Machine, subject SubjectKey, history subjec
 	return nil
 }
 
+func validateClientSnapshotHistory(machine *Machine, id model.ClientID, history clientHistory) error {
+	if id.Validate() != nil || history.sequence == 0 || history.digest == ([32]byte{}) || len(history.result) == 0 || uint64(len(history.result)) > model.StateCommandMaxCachedResultBytesV1 {
+		return errors.New("invalid client history")
+	}
+	result, err := decodeCanonicalSnapshotResult(history.result, "client result")
+	if err != nil {
+		return err
+	}
+	if result.Subject != SubjectJobControl || result.JobID.Validate() != nil || result.WorkerID != 0 || result.Epoch != (model.CoordinatorEpoch{}) {
+		return errors.New("client result is not bound to one job-control subject")
+	}
+	if result.Code != ResultSuccess && result.Code != ResultIdentityReuse && result.Code != ResultRevisionMismatch {
+		return errors.New("client result code cannot be retained")
+	}
+	request := model.ClientRequestID{ClientID: id, Sequence: history.sequence}
+	for _, job := range machine.jobs {
+		if job.DefiningRequest != request {
+			continue
+		}
+		if result.Code != ResultSuccess || result.JobID != job.JobID || history.digest != model.PublicSubmitCommandDigest(request, job.TopologyBytes) {
+			return errors.New("defining submit client history mismatch")
+		}
+	}
+	return nil
+}
+
+func decodeCanonicalSnapshotResult(encoded []byte, field string) (CommandResult, error) {
+	result, err := UnmarshalCommandResult(encoded)
+	if err != nil {
+		return CommandResult{}, fmt.Errorf("%s: %w", field, err)
+	}
+	canonical, err := MarshalCommandResult(result)
+	if err != nil {
+		return CommandResult{}, fmt.Errorf("%s canonical encode: %w", field, err)
+	}
+	if !bytes.Equal(canonical, encoded) {
+		return CommandResult{}, fmt.Errorf("%s is noncanonical", field)
+	}
+	return result, nil
+}
+
+func validateSubjectResult(machine *Machine, subject SubjectKey, revision uint64, result CommandResult, applied bool) error {
+	if result.Subject != subject.Kind || result.Revision != revision {
+		return errors.New("subject result kind or revision mismatch")
+	}
+	switch subject.Kind {
+	case SubjectCoordinator:
+		if result.JobID != (model.JobID{}) || result.WorkerID != 0 || revision != 0 && result.Epoch != machine.coordinatorEpoch {
+			return errors.New("coordinator result identity or epoch mismatch")
+		}
+	case SubjectWorker:
+		if result.JobID != (model.JobID{}) || result.WorkerID != subject.WorkerID || result.Epoch != (model.CoordinatorEpoch{}) {
+			return errors.New("worker result identity mismatch")
+		}
+	default:
+		if result.JobID != subject.JobID || result.WorkerID != 0 || result.Epoch != (model.CoordinatorEpoch{}) {
+			return errors.New("job-scoped result identity mismatch")
+		}
+	}
+	if applied {
+		if result.Code != ResultSuccess {
+			return errors.New("retained applied result is not success")
+		}
+		return nil
+	}
+	if result.Code != ResultSuccess && result.Code != ResultRevisionMismatch && result.Code != ResultResultTooLarge {
+		return errors.New("subject result code cannot be retained")
+	}
+	return nil
+}
+
+func requireAppliedSubject(machine *Machine, subject SubjectKey, revision uint64) error {
+	history, ok := machine.subjects[subject]
+	if !ok {
+		return fmt.Errorf("%w: missing required subject history", ErrSnapshotCrossReference)
+	}
+	if revision == 0 || history.appliedRevision != revision {
+		return fmt.Errorf("%w: applied revision %d does not match authoritative %d", ErrSnapshotCrossReference, history.appliedRevision, revision)
+	}
+	return nil
+}
+
+func validateSnapshotSubjectTarget(machine *Machine, subject SubjectKey, target []byte, revision uint64, applied bool) error {
+	switch subject.Kind {
+	case SubjectCoordinator:
+		return validateCoordinatorSnapshotTarget(machine, target, applied)
+	case SubjectWorker:
+		return validateWorkerSnapshotTarget(machine, subject, target, revision, applied)
+	case SubjectJobControl:
+		return validateJobControlSnapshotTarget(machine, subject, target, revision, applied)
+	case SubjectSourceEOF:
+		decoder := commandDecoder{input: target}
+		task, err := decoder.taskID()
+		if err != nil {
+			return err
+		}
+		eof, err := decoder.u64()
+		if err != nil || !decoder.done() || task != subject.TaskID {
+			return fmt.Errorf("%w: malformed source EOF target", ErrMalformedCommand)
+		}
+		if applied {
+			record, ok := machine.jobs[subject.JobID].SourceEOFs[subject.TaskID]
+			if !ok || record.Revision != revision || record.EOF != eof {
+				return errors.New("source EOF applied target mismatch")
+			}
+		}
+		return nil
+	case SubjectSourceCheckpoint:
+		decoder := commandDecoder{input: target}
+		report, err := decoder.completionReport()
+		if err != nil {
+			return err
+		}
+		if !decoder.done() || report.Validate() != nil || report.JobID != subject.JobID || report.Source != subject.TaskID {
+			return fmt.Errorf("%w: malformed checkpoint target", ErrMalformedCommand)
+		}
+		if applied {
+			record, ok := machine.jobs[subject.JobID].Checkpoints[subject.TaskID]
+			if !ok || record.Revision != revision || report.ExpectedCheckpointRevision == ^uint64(0) || report.ExpectedCheckpointRevision+1 != revision || report.New != record.Watermark {
+				return errors.New("checkpoint applied target mismatch")
+			}
+		}
+		return nil
+	case SubjectResultManifest:
+		decoder := commandDecoder{input: target}
+		manifest, err := decoder.manifest()
+		if err != nil {
+			return err
+		}
+		if !decoder.done() || manifest.Validate() != nil || manifest.JobID != subject.JobID || manifest.SinkTask != subject.TaskID {
+			return fmt.Errorf("%w: malformed manifest target", ErrMalformedCommand)
+		}
+		if applied {
+			record, ok := machine.jobs[subject.JobID].Manifests[subject.TaskID]
+			if !ok || record != manifest || manifest.ManifestRevision != revision {
+				return errors.New("manifest applied target mismatch")
+			}
+		}
+		return nil
+	default:
+		return errors.New("unknown snapshot subject target")
+	}
+}
+
+func validateCoordinatorSnapshotTarget(machine *Machine, target []byte, applied bool) error {
+	decoder := commandDecoder{input: target}
+	if applied {
+		term, err := decoder.u64()
+		if err != nil {
+			return err
+		}
+		coordinator, err := decoder.u16()
+		if err != nil {
+			return err
+		}
+		nonce, err := decoder.array16()
+		if err != nil || !decoder.done() {
+			return fmt.Errorf("%w: malformed coordinator applied target", ErrMalformedCommand)
+		}
+		if term != machine.coordinatorEpoch.Term || coordinator != machine.coordinatorEpoch.Coordinator || nonce != machine.coordinatorEpoch.Nonce {
+			return errors.New("coordinator applied target does not identify current epoch")
+		}
+		return nil
+	}
+	coordinator, err := decoder.u16()
+	if err != nil {
+		return err
+	}
+	nonce, err := decoder.array16()
+	if err != nil || !decoder.done() || coordinator == 0 || nonce == ([16]byte{}) {
+		return fmt.Errorf("%w: malformed coordinator target", ErrMalformedCommand)
+	}
+	return nil
+}
+
+func validateWorkerSnapshotTarget(machine *Machine, subject SubjectKey, target []byte, revision uint64, applied bool) error {
+	const workerRecordBytes = int(model.StateCommandWorkerRecordBytesV1 - 2)
+	if len(target) == workerRecordBytes {
+		decoder := commandDecoder{input: target}
+		record, err := decoder.workerRecord()
+		if err != nil || !decoder.done() || record.Validate() != nil || record.NodeID != subject.WorkerID {
+			return fmt.Errorf("%w: malformed worker registration target", ErrMalformedCommand)
+		}
+		if applied && (record.Revision != revision || machine.workers[subject.WorkerID] != record) {
+			return errors.New("worker registration applied target mismatch")
+		}
+		return nil
+	}
+	if len(target) == 18 {
+		decoder := commandDecoder{input: target}
+		workerID, err := decoder.u16()
+		if err != nil {
+			return err
+		}
+		epoch, err := decoder.workerEpoch()
+		if err != nil || !decoder.done() || workerID != subject.WorkerID || epoch.Validate() != nil {
+			return fmt.Errorf("%w: malformed worker drain target", ErrMalformedCommand)
+		}
+		if applied {
+			worker := machine.workers[subject.WorkerID]
+			if worker.Revision != revision || worker.Epoch != epoch || worker.State != WorkerDraining {
+				return errors.New("worker drain applied target mismatch")
+			}
+		}
+		return nil
+	}
+	if len(target) >= 20 && (len(target)-20)%64 == 0 {
+		decoder := commandDecoder{input: target}
+		workerID, err := decoder.u16()
+		if err != nil {
+			return err
+		}
+		epoch, err := decoder.workerEpoch()
+		if err != nil {
+			return err
+		}
+		affected, err := decoder.affected()
+		if err != nil || !decoder.done() || validateAffected(affected) != nil || workerID != subject.WorkerID || epoch.Validate() != nil {
+			return fmt.Errorf("%w: malformed worker deactivation target", ErrMalformedCommand)
+		}
+		if applied {
+			worker := machine.workers[subject.WorkerID]
+			if worker.Revision != revision || worker.Epoch != epoch || worker.State != WorkerOffline {
+				return errors.New("worker deactivation applied target mismatch")
+			}
+		}
+		return nil
+	}
+	if len(target) >= 113 && (len(target)-113)%64 == 0 {
+		decoder := commandDecoder{input: target}
+		workerID, err := decoder.u16()
+		if err != nil {
+			return err
+		}
+		oldEpoch, err := decoder.workerEpoch()
+		if err != nil {
+			return err
+		}
+		record, err := decoder.workerRecord()
+		if err != nil {
+			return err
+		}
+		affected, err := decoder.affected()
+		if err != nil || !decoder.done() || validateAffected(affected) != nil || workerID != subject.WorkerID || oldEpoch.Validate() != nil || record.Validate() != nil || record.NodeID != workerID || record.Epoch == oldEpoch {
+			return fmt.Errorf("%w: malformed worker replacement target", ErrMalformedCommand)
+		}
+		if applied && (record.Revision != revision || machine.workers[subject.WorkerID] != record) {
+			return errors.New("worker replacement applied target mismatch")
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: unknown worker target layout", ErrMalformedCommand)
+}
+
+func validateJobControlSnapshotTarget(machine *Machine, subject SubjectKey, target []byte, revision uint64, applied bool) error {
+	if len(target) == 18 {
+		decoder := commandDecoder{input: target}
+		job, err := decoder.jobID()
+		if err != nil {
+			return err
+		}
+		from, err := decoder.byte()
+		if err != nil {
+			return err
+		}
+		to, err := decoder.byte()
+		if err != nil || !decoder.done() || job != subject.JobID || JobLifecycle(from) < JobPending || JobLifecycle(from) > JobCanceled || JobLifecycle(to) < JobPending || JobLifecycle(to) > JobCanceled || from == to {
+			return fmt.Errorf("%w: malformed job transition target", ErrMalformedCommand)
+		}
+		if record, exists := machine.jobs[subject.JobID]; applied && exists && record.JobControlRevision == revision && record.Lifecycle != JobLifecycle(to) {
+			return errors.New("job transition applied target mismatch")
+		}
+		return nil
+	}
+	if len(target) == int(model.StateCommandFailureBytesV1) {
+		decoder := commandDecoder{input: target}
+		report, err := decoder.failureReport()
+		if err != nil || !decoder.done() || report.Validate() != nil || report.JobID != subject.JobID {
+			return fmt.Errorf("%w: malformed failure target", ErrMalformedCommand)
+		}
+		if record, exists := machine.jobs[subject.JobID]; applied && exists && record.JobControlRevision == revision && (record.Failure == nil || *record.Failure != report) {
+			return errors.New("job failure applied target mismatch")
+		}
+		return nil
+	}
+	if assignment, ok := decodeSnapshotAssignmentTarget(target); ok {
+		if assignment.JobID != subject.JobID {
+			return errors.New("assignment target job mismatch")
+		}
+		if job, exists := machine.jobs[subject.JobID]; exists {
+			topology, err := model.DecodeTopology(job.TopologyBytes)
+			if err != nil {
+				return fmt.Errorf("%w: assignment target topology: %w", ErrInvalidCommand, err)
+			}
+			if err := assignment.Validate(topology); err != nil {
+				return fmt.Errorf("%w: assignment target: %w", ErrInvalidCommandSubject, err)
+			}
+			if applied && job.JobControlRevision == revision && (job.Assignment == nil || !bytes.Equal(appendAssignment(nil, assignment), appendAssignment(nil, *job.Assignment))) {
+				return errors.New("assignment applied target mismatch")
+			}
+		}
+		return nil
+	}
+	if replacement, ok := decodeSnapshotReplacementTarget(target); ok {
+		if replacement.JobID != subject.JobID || replacement.ExpectedRevision == 0 || replacement.ExpectedDigest == ([32]byte{}) || replacement.ExpectedMarkersDigest == ([32]byte{}) || replacement.Target.JobID != subject.JobID {
+			return errors.New("replacement assignment target mismatch")
+		}
+		if job, exists := machine.jobs[subject.JobID]; exists {
+			topology, err := model.DecodeTopology(job.TopologyBytes)
+			if err != nil {
+				return fmt.Errorf("%w: replacement target topology: %w", ErrInvalidCommand, err)
+			}
+			if err := replacement.Target.Validate(topology); err != nil {
+				return fmt.Errorf("%w: replacement target: %w", ErrInvalidCommandSubject, err)
+			}
+			if applied && job.JobControlRevision == revision && (job.Assignment == nil || !bytes.Equal(appendAssignment(nil, replacement.Target), appendAssignment(nil, *job.Assignment))) {
+				return errors.New("replacement applied target mismatch")
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: unknown job-control target layout", ErrMalformedCommand)
+}
+
+type snapshotReplacementTarget struct {
+	JobID                 model.JobID
+	ExpectedRevision      uint64
+	ExpectedDigest        [32]byte
+	ExpectedMarkersDigest [32]byte
+	Target                model.AssignmentSet
+}
+
+func decodeSnapshotAssignmentTarget(target []byte) (model.AssignmentSet, bool) {
+	decoder := commandDecoder{input: target}
+	assignment, err := decoder.assignment()
+	return assignment, err == nil && decoder.done()
+}
+
+func decodeSnapshotReplacementTarget(target []byte) (snapshotReplacementTarget, bool) {
+	decoder := commandDecoder{input: target}
+	job, err := decoder.jobID()
+	if err != nil {
+		return snapshotReplacementTarget{}, false
+	}
+	revision, err := decoder.u64()
+	if err != nil {
+		return snapshotReplacementTarget{}, false
+	}
+	digest, err := decoder.array32()
+	if err != nil {
+		return snapshotReplacementTarget{}, false
+	}
+	markers, err := decoder.array32()
+	if err != nil {
+		return snapshotReplacementTarget{}, false
+	}
+	assignment, err := decoder.assignment()
+	if err != nil || !decoder.done() {
+		return snapshotReplacementTarget{}, false
+	}
+	return snapshotReplacementTarget{JobID: job, ExpectedRevision: revision, ExpectedDigest: digest, ExpectedMarkersDigest: markers, Target: assignment}, true
+}
+
 func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedSlots map[uint16]uint64) error {
 	if job.JobID != key || key.Validate() != nil || job.DefiningRequest.Validate() != nil || job.JobControlRevision == 0 || job.Lifecycle < JobPending || job.Lifecycle > JobCanceled {
 		return errors.New("invalid job identity, revision, or lifecycle")
 	}
 	topology, err := model.DecodeTopology(job.TopologyBytes)
-	if err != nil || topology.Digest() != job.TopologyDigest || model.DeriveJobID(job.DefiningRequest, job.TopologyDigest) != job.JobID {
+	if err != nil {
+		return fmt.Errorf("%w: topology: %w", ErrInvalidCommand, err)
+	}
+	if topology.Digest() != job.TopologyDigest || model.DeriveJobID(job.DefiningRequest, job.TopologyDigest) != job.JobID {
 		return errors.New("job topology definition mismatch")
 	}
 	if err := validateMarkers(job.NeedsReassignment, job.JobID); err != nil {
 		return err
 	}
+	client, ok := machine.clients[job.DefiningRequest.ClientID]
+	if !ok || client.sequence < job.DefiningRequest.Sequence {
+		return errors.New("job defining request has no retained client history")
+	}
+	if client.sequence == job.DefiningRequest.Sequence && client.digest != model.PublicSubmitCommandDigest(job.DefiningRequest, job.TopologyBytes) {
+		return errors.New("job defining request digest mismatch")
+	}
+	if job.Assignment != nil || job.Lifecycle == JobDeploying || job.Lifecycle == JobRunning || job.Lifecycle == JobDraining || job.Lifecycle == JobSucceeded || job.Lifecycle == JobFailed {
+		history, exists := machine.subjects[SubjectKey{Kind: SubjectJobControl, JobID: job.JobID}]
+		if !exists || history.appliedRevision == 0 || history.appliedRevision > job.JobControlRevision {
+			return errors.New("job state lacks required applied job-control history")
+		}
+	}
 	if job.Assignment != nil {
 		if err := job.Assignment.Validate(topology); err != nil {
-			return err
+			return fmt.Errorf("%w: assignment: %w", ErrInvalidCommandSubject, err)
 		}
 	}
 	if job.Lifecycle == JobPending && job.Assignment != nil || (job.Lifecycle == JobDeploying || job.Lifecycle == JobRunning || job.Lifecycle == JobDraining || job.Lifecycle == JobSucceeded) && job.Assignment == nil {
@@ -962,8 +1474,11 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 	}
 	for source, eof := range job.SourceEOFs {
 		want, sourceErr := model.SourceEOF(topology, source)
-		if sourceErr != nil || want != eof.EOF || eof.Revision == 0 {
+		if sourceErr != nil || want != eof.EOF || eof.Revision != 1 {
 			return errors.New("source EOF cross-reference mismatch")
+		}
+		if err := requireAppliedSubject(machine, SubjectKey{Kind: SubjectSourceEOF, JobID: job.JobID, TaskID: source}, eof.Revision); err != nil {
+			return fmt.Errorf("source EOF history: %w", err)
 		}
 	}
 	for source, checkpoint := range job.Checkpoints {
@@ -971,7 +1486,11 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 		if !ok || checkpoint.Revision == 0 || checkpoint.Watermark > eof.EOF {
 			return errors.New("checkpoint cross-reference mismatch")
 		}
+		if err := requireAppliedSubject(machine, SubjectKey{Kind: SubjectSourceCheckpoint, JobID: job.JobID, TaskID: source}, checkpoint.Revision); err != nil {
+			return fmt.Errorf("checkpoint history: %w", err)
+		}
 	}
+	var artifactBytes uint64
 	for sink, manifest := range job.Manifests {
 		if manifest.Validate() != nil || manifest.JobID != job.JobID || manifest.SinkTask != sink || manifest.SpecificationHash != job.TopologyDigest || job.Assignment == nil {
 			return errors.New("manifest cross-reference mismatch")
@@ -979,6 +1498,13 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 		replica, ok := resultReplica(job.Assignment, sink)
 		if !ok || replica != manifest.Replicas {
 			return errors.New("manifest assignment mismatch")
+		}
+		if manifest.TotalBytes > model.LimitsV1().MaxResultRecordsBytesPerJob-artifactBytes {
+			return errors.New("aggregate result artifact bytes exceed per-job bound")
+		}
+		artifactBytes += manifest.TotalBytes
+		if err := requireAppliedSubject(machine, SubjectKey{Kind: SubjectResultManifest, JobID: job.JobID, TaskID: sink}, manifest.ManifestRevision); err != nil {
+			return fmt.Errorf("manifest history: %w", err)
 		}
 	}
 	if job.Failure != nil {

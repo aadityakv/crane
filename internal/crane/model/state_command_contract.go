@@ -3,6 +3,19 @@ package model
 const stateCommandContractFingerprintDomain = "cs425/crane/state-command-contract/v1\x00"
 
 const (
+	stateSnapshotMagicBytesV2          = 4
+	stateSnapshotSchemaBytesV2         = 2
+	stateSnapshotFingerprintBytesV2    = 32
+	stateSnapshotIndexBytesV2          = 8
+	stateSnapshotRevisionBytesV2       = 8
+	stateSnapshotEpochBytesV2          = 34
+	stateSnapshotRootCollectionCountV2 = 5
+	stateSnapshotRootCountBytesV2      = 8
+	stateSnapshotBytes32PrefixV2       = 4
+	stateSnapshotBytes64PrefixV2       = 8
+	stateSnapshotNestedCountBytesV2    = 2
+	stateSnapshotOptionalSelectorV2    = 1
+
 	// StateCommandSchemaVersionV1 is the canonical command schema version.
 	StateCommandSchemaVersionV1 uint16 = 1
 	// StateSnapshotSchemaVersionV2 is the canonical Crane snapshot schema.
@@ -28,7 +41,7 @@ const (
 	// StateCommandCommandResultBytesV1 counts one canonical result.
 	StateCommandCommandResultBytesV1 uint64 = 65
 	// StateCommandSnapshotBaseBytesV1 counts root selectors and collection counts.
-	StateCommandSnapshotBaseBytesV1 uint64 = 128
+	StateCommandSnapshotBaseBytesV1 uint64 = stateSnapshotMagicBytesV2 + stateSnapshotSchemaBytesV2 + stateSnapshotFingerprintBytesV2 + stateSnapshotIndexBytesV2 + stateSnapshotRevisionBytesV2 + stateSnapshotEpochBytesV2 + stateSnapshotRootCollectionCountV2*stateSnapshotRootCountBytesV2
 	// StateCommandClientHistoryFixedV1 counts one client key and fixed history fields.
 	StateCommandClientHistoryFixedV1 uint64 = 60
 	// StateCommandSubjectHistoryFixedV1 counts one subject key and fixed history fields.
@@ -53,12 +66,30 @@ const (
 	StateCommandFailureBytesV1 uint64 = 194
 	// StateCommandWorkerEventBytesV1 counts one worker-event key and cursor.
 	StateCommandWorkerEventBytesV1 uint64 = 58
+	// StateCommandAssignmentFixedBytesV1 counts assignment identity, digest, and both list counts.
+	StateCommandAssignmentFixedBytesV1 uint64 = 16 + 8 + 32 + 2*stateSnapshotNestedCountBytesV2
+	// StateCommandSnapshotBytes32PrefixV2 counts one u32 variable-length prefix.
+	StateCommandSnapshotBytes32PrefixV2 uint64 = stateSnapshotBytes32PrefixV2
+	// StateCommandSnapshotBytes64PrefixV2 counts one u64 variable-length prefix.
+	StateCommandSnapshotBytes64PrefixV2 uint64 = stateSnapshotBytes64PrefixV2
+	// StateCommandSnapshotRootCountBytesV2 counts one root u64 collection count.
+	StateCommandSnapshotRootCountBytesV2 uint64 = stateSnapshotRootCountBytesV2
+	// StateCommandSnapshotNestedCountBytesV2 counts one nested u16 collection count.
+	StateCommandSnapshotNestedCountBytesV2 uint64 = stateSnapshotNestedCountBytesV2
+	// StateCommandSnapshotOptionalSelectorBytesV2 counts one optional-value selector.
+	StateCommandSnapshotOptionalSelectorBytesV2 uint64 = stateSnapshotOptionalSelectorV2
 )
 
 // StateCommandLayoutDescriptor pins one canonical Raft-applied layout.
 type StateCommandLayoutDescriptor struct {
 	Name   string
 	Fields []string
+}
+
+// StateCommandConstantDescriptor pins one named snapshot-accounting constant.
+type StateCommandConstantDescriptor struct {
+	Name  string
+	Value uint64
 }
 
 // StateCommandEnumDescriptor pins one complete accepted enum domain.
@@ -110,11 +141,15 @@ type StateCommandContract struct {
 	SchemaVersion         uint16
 	SnapshotSchemaVersion uint32
 
-	EnvelopeLayouts []StateCommandLayoutDescriptor
-	SnapshotLayouts []StateCommandLayoutDescriptor
-	EnumDomains     []StateCommandEnumDescriptor
-	ResultMatrix    []StateCommandResultRule
-	DigestDomains   []string
+	EnvelopeLayouts            []StateCommandLayoutDescriptor
+	SnapshotLayouts            []StateCommandLayoutDescriptor
+	SnapshotSortRules          []string
+	SnapshotMigrationRules     []string
+	SnapshotValidationRules    []string
+	SnapshotEstimatorConstants []StateCommandConstantDescriptor
+	EnumDomains                []StateCommandEnumDescriptor
+	ResultMatrix               []StateCommandResultRule
+	DigestDomains              []string
 
 	MaxClientSessions    uint64
 	MaxSubjectHistories  uint64
@@ -217,6 +252,58 @@ var stateSnapshotLayoutsV2 = []StateCommandLayoutDescriptor{
 	{Name: "NeedsReassignment", Fields: []string{"Kind:ReassignmentTargetKind", "Task:TaskID", "SinkTask:TaskID", "ReplicaRole:ResultReplicaRole", "OldWorkerID:u16(nonzero)", "OldWorkerEpoch:bytes16(nonzero)"}},
 	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet"}},
 	{Name: "JobFailureReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Task:AssignmentToken", "Epoch:CoordinatorEpoch", "TransactionID:u64(nonzero)", "Code:FailureCode", "DetailDigest:sha256(nonzero)"}},
+}
+
+var stateSnapshotSortRulesV2 = []string{
+	"Clients:ClientID:unsigned-lexicographic-bytes16",
+	"Subjects:SubjectKey:unsigned-lexicographic-canonical-bytes39",
+	"Workers:NodeID:unsigned-u16",
+	"Jobs:JobID:unsigned-lexicographic-bytes16",
+	"WorkerEvents:WorkerID-unsigned-u16,WorkerEpoch-unsigned-lexicographic-bytes16",
+	"NeedsReassignment:Kind,active-TaskID,ReplicaRole,OldWorkerID,OldWorkerEpoch",
+	"SourceEOFs:TaskID:unsigned-lexicographic-canonical-bytes20",
+	"Checkpoints:TaskID:unsigned-lexicographic-canonical-bytes20",
+	"Manifests:TaskID:unsigned-lexicographic-canonical-bytes20",
+}
+
+var stateSnapshotMigrationRulesV2 = []string{
+	"schema-0:empty-payload-only:restore-empty",
+	"schema-1:empty-payload-only:restore-empty",
+	"schema-2:nonempty-bounded-canonical:decode-current",
+	"other-schema:reject-unsupported",
+}
+
+var stateSnapshotValidationRulesV2 = []string{
+	"capture:incremental-estimate-equals-canonical-estimate-equals-encoded-length",
+	"restore:temporary-owned-validate-canonical-reencode-byte-equality-then-atomic-swap",
+	"ordering:all-declared-sorted-collections-are-strictly-increasing-and-duplicate-free",
+	"errors:every-failure-wraps-ErrInvalidSnapshot-and-preserves-nested-sentinel",
+	"cached-results:canonical-command-result-and-subject-identity-revision-epoch-correlated",
+	"retained-targets:canonical-structural-and-current-authoritative-revision-semantics",
+	"reverse-references:coordinator-worker-job-control-eof-checkpoint-manifest",
+	"artifacts:checked-per-job-aggregate-at-most-MaxResultBytes",
+}
+
+var stateSnapshotEstimatorConstantsV2 = []StateCommandConstantDescriptor{
+	{Name: "SnapshotBaseFixed", Value: StateCommandSnapshotBaseBytesV1},
+	{Name: "ClientHistoryFixed", Value: StateCommandClientHistoryFixedV1},
+	{Name: "SubjectHistoryFixed", Value: StateCommandSubjectHistoryFixedV1},
+	{Name: "WorkerEntryFixed", Value: StateCommandWorkerRecordBytesV1},
+	{Name: "JobRecordFixed", Value: StateCommandJobRecordFixedBytesV1},
+	{Name: "AssignmentFixed", Value: StateCommandAssignmentFixedBytesV1},
+	{Name: "AssignmentTokenFixed", Value: StateCommandAssignmentTokenBytesV1},
+	{Name: "ResultReplicaFixed", Value: StateCommandResultReplicaBytesV1},
+	{Name: "ReassignmentMarkerFixed", Value: StateCommandReassignmentBytesV1},
+	{Name: "SourceEOFEntryFixed", Value: StateCommandSourceEOFEntryBytesV1},
+	{Name: "CheckpointEntryFixed", Value: StateCommandCheckpointEntryBytesV1},
+	{Name: "ManifestEntryFixed", Value: StateCommandManifestEntryBytesV1},
+	{Name: "FailurePresentFixed", Value: StateCommandFailureBytesV1},
+	{Name: "WorkerEventEntryFixed", Value: StateCommandWorkerEventBytesV1},
+	{Name: "Bytes32LengthPrefix", Value: StateCommandSnapshotBytes32PrefixV2},
+	{Name: "Bytes64LengthPrefix", Value: StateCommandSnapshotBytes64PrefixV2},
+	{Name: "RootCollectionCount", Value: StateCommandSnapshotRootCountBytesV2},
+	{Name: "NestedCollectionCount", Value: StateCommandSnapshotNestedCountBytesV2},
+	{Name: "OptionalSelector", Value: StateCommandSnapshotOptionalSelectorBytesV2},
 }
 
 var stateCommandEnumsV1 = []StateCommandEnumDescriptor{
@@ -334,50 +421,54 @@ var stateCommandRulesV1 = []string{
 // StateCommandContractV1 returns deep-owned consensus descriptor slices.
 func StateCommandContractV1() StateCommandContract {
 	return StateCommandContract{
-		SchemaVersion:            StateCommandSchemaVersionV1,
-		SnapshotSchemaVersion:    StateSnapshotSchemaVersionV2,
-		EnvelopeLayouts:          cloneStateCommandLayouts(stateCommandLayoutsV1),
-		SnapshotLayouts:          cloneStateCommandLayouts(stateSnapshotLayoutsV2),
-		EnumDomains:              cloneStateCommandEnums(stateCommandEnumsV1),
-		ResultMatrix:             append([]StateCommandResultRule(nil), stateCommandResultMatrixV1...),
-		DigestDomains:            []string{"cs425/crane/internal-command/v1", "cs425/crane/needs-reassignment/v1", "cs425/crane/completion-report/v1", "cs425/crane/job-failure-event/v1", AssignmentSetDigestDomainV1},
-		MaxClientSessions:        StateCommandMaxClientSessionsV1,
-		MaxSubjectHistories:      StateCommandMaxSubjectHistoriesV1,
-		MaxCachedResultBytes:     StateCommandMaxCachedResultBytesV1,
-		MaxSnapshotBytes:         StateCommandMaxSnapshotBytesV1,
-		MaxWorkers:               LimitsV1().MaxRegisteredWorkers,
-		MaxActiveJobs:            LimitsV1().MaxActiveJobs,
-		MaxRetainedJobs:          LimitsV1().MaxRetainedJobs,
-		MaxTasksPerJob:           LimitsV1().MaxTasksPerJob,
-		MaxManifestsPerJob:       LimitsV1().MaxResultManifestsPerJob,
-		MaxReassignmentMarks:     LimitsV1().MaxTasksPerJob + 2*LimitsV1().MaxResultManifestsPerJob,
-		MaxWorkerSlots:           LimitsV1().MaxWorkerSlots,
-		MaxCommandBytes:          LimitsV1().MaxSubmitJobBytes,
-		MaxTopologyBytes:         LimitsV1().MaxTopologyBytes,
-		MaxResultBytes:           LimitsV1().MaxResultRecordsBytesPerJob,
-		MinResultRecordBytes:     ResultArtifactMinRecordBytesV1,
-		MaxResultRecordBytes:     ResultArtifactMaxRecordBytesV1,
-		MaxManifestRecords:       ResultArtifactMaxRecordCountV1,
-		FixedEnvelopeBytes:       StateCommandFixedEnvelopeBytesV1,
-		ClientEnvelopeBytes:      StateCommandClientEnvelopeBytesV1,
-		InternalEnvelopeBytes:    StateCommandInternalEnvelopeBytesV1,
-		SubjectKeyBytes:          StateCommandSubjectKeyBytesV1,
-		BeginTargetBytes:         StateCommandBeginTargetBytesV1,
-		CommandResultBytes:       StateCommandCommandResultBytesV1,
-		SnapshotBaseBytes:        StateCommandSnapshotBaseBytesV1,
-		ClientHistoryFixedBytes:  StateCommandClientHistoryFixedV1,
-		SubjectHistoryFixedBytes: StateCommandSubjectHistoryFixedV1,
-		WorkerRecordBytes:        StateCommandWorkerRecordBytesV1,
-		JobRecordFixedBytes:      StateCommandJobRecordFixedBytesV1,
-		AssignmentTokenBytes:     StateCommandAssignmentTokenBytesV1,
-		ResultReplicaBytes:       StateCommandResultReplicaBytesV1,
-		ReassignmentBytes:        StateCommandReassignmentBytesV1,
-		SourceEOFEntryBytes:      StateCommandSourceEOFEntryBytesV1,
-		CheckpointEntryBytes:     StateCommandCheckpointEntryBytesV1,
-		ManifestEntryBytes:       StateCommandManifestEntryBytesV1,
-		FailureBytes:             StateCommandFailureBytesV1,
-		WorkerEventBytes:         StateCommandWorkerEventBytesV1,
-		Rules:                    append([]string(nil), stateCommandRulesV1...),
+		SchemaVersion:              StateCommandSchemaVersionV1,
+		SnapshotSchemaVersion:      StateSnapshotSchemaVersionV2,
+		EnvelopeLayouts:            cloneStateCommandLayouts(stateCommandLayoutsV1),
+		SnapshotLayouts:            cloneStateCommandLayouts(stateSnapshotLayoutsV2),
+		SnapshotSortRules:          append([]string(nil), stateSnapshotSortRulesV2...),
+		SnapshotMigrationRules:     append([]string(nil), stateSnapshotMigrationRulesV2...),
+		SnapshotValidationRules:    append([]string(nil), stateSnapshotValidationRulesV2...),
+		SnapshotEstimatorConstants: append([]StateCommandConstantDescriptor(nil), stateSnapshotEstimatorConstantsV2...),
+		EnumDomains:                cloneStateCommandEnums(stateCommandEnumsV1),
+		ResultMatrix:               append([]StateCommandResultRule(nil), stateCommandResultMatrixV1...),
+		DigestDomains:              []string{"cs425/crane/internal-command/v1", "cs425/crane/needs-reassignment/v1", "cs425/crane/completion-report/v1", "cs425/crane/job-failure-event/v1", AssignmentSetDigestDomainV1},
+		MaxClientSessions:          StateCommandMaxClientSessionsV1,
+		MaxSubjectHistories:        StateCommandMaxSubjectHistoriesV1,
+		MaxCachedResultBytes:       StateCommandMaxCachedResultBytesV1,
+		MaxSnapshotBytes:           StateCommandMaxSnapshotBytesV1,
+		MaxWorkers:                 LimitsV1().MaxRegisteredWorkers,
+		MaxActiveJobs:              LimitsV1().MaxActiveJobs,
+		MaxRetainedJobs:            LimitsV1().MaxRetainedJobs,
+		MaxTasksPerJob:             LimitsV1().MaxTasksPerJob,
+		MaxManifestsPerJob:         LimitsV1().MaxResultManifestsPerJob,
+		MaxReassignmentMarks:       LimitsV1().MaxTasksPerJob + 2*LimitsV1().MaxResultManifestsPerJob,
+		MaxWorkerSlots:             LimitsV1().MaxWorkerSlots,
+		MaxCommandBytes:            LimitsV1().MaxSubmitJobBytes,
+		MaxTopologyBytes:           LimitsV1().MaxTopologyBytes,
+		MaxResultBytes:             LimitsV1().MaxResultRecordsBytesPerJob,
+		MinResultRecordBytes:       ResultArtifactMinRecordBytesV1,
+		MaxResultRecordBytes:       ResultArtifactMaxRecordBytesV1,
+		MaxManifestRecords:         ResultArtifactMaxRecordCountV1,
+		FixedEnvelopeBytes:         StateCommandFixedEnvelopeBytesV1,
+		ClientEnvelopeBytes:        StateCommandClientEnvelopeBytesV1,
+		InternalEnvelopeBytes:      StateCommandInternalEnvelopeBytesV1,
+		SubjectKeyBytes:            StateCommandSubjectKeyBytesV1,
+		BeginTargetBytes:           StateCommandBeginTargetBytesV1,
+		CommandResultBytes:         StateCommandCommandResultBytesV1,
+		SnapshotBaseBytes:          StateCommandSnapshotBaseBytesV1,
+		ClientHistoryFixedBytes:    StateCommandClientHistoryFixedV1,
+		SubjectHistoryFixedBytes:   StateCommandSubjectHistoryFixedV1,
+		WorkerRecordBytes:          StateCommandWorkerRecordBytesV1,
+		JobRecordFixedBytes:        StateCommandJobRecordFixedBytesV1,
+		AssignmentTokenBytes:       StateCommandAssignmentTokenBytesV1,
+		ResultReplicaBytes:         StateCommandResultReplicaBytesV1,
+		ReassignmentBytes:          StateCommandReassignmentBytesV1,
+		SourceEOFEntryBytes:        StateCommandSourceEOFEntryBytesV1,
+		CheckpointEntryBytes:       StateCommandCheckpointEntryBytesV1,
+		ManifestEntryBytes:         StateCommandManifestEntryBytesV1,
+		FailureBytes:               StateCommandFailureBytesV1,
+		WorkerEventBytes:           StateCommandWorkerEventBytesV1,
+		Rules:                      append([]string(nil), stateCommandRulesV1...),
 	}
 }
 
@@ -394,6 +485,14 @@ func canonicalStateCommandContractBytes(contract StateCommandContract) []byte {
 	for _, layout := range contract.SnapshotLayouts {
 		encoded = appendString(encoded, layout.Name)
 		encoded = appendStringList(encoded, layout.Fields)
+	}
+	encoded = appendStringList(encoded, contract.SnapshotSortRules)
+	encoded = appendStringList(encoded, contract.SnapshotMigrationRules)
+	encoded = appendStringList(encoded, contract.SnapshotValidationRules)
+	encoded = appendUint16(encoded, uint16(len(contract.SnapshotEstimatorConstants)))
+	for _, constant := range contract.SnapshotEstimatorConstants {
+		encoded = appendString(encoded, constant.Name)
+		encoded = appendUint64(encoded, constant.Value)
 	}
 	encoded = appendUint16(encoded, uint16(len(contract.EnumDomains)))
 	for _, enum := range contract.EnumDomains {
