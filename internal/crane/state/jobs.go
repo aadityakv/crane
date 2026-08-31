@@ -54,6 +54,7 @@ type CancelJob struct {
 	ExpectedRevision uint64      // ExpectedRevision fences job control.
 }
 
+// NewSubmitJob validates and owns one immutable topology under a client identity.
 func NewSubmitJob(request model.ClientRequestID, topology model.TopologySpec, fences ...model.CoordinatorEpoch) (SubmitJob, error) {
 	validated, err := model.ValidateTopology(topology)
 	if err != nil {
@@ -77,6 +78,7 @@ func (command SubmitJob) JobID() model.JobID {
 	return model.DeriveJobID(command.Envelope.Client.Request, validated.Digest())
 }
 
+// NewCancelJob builds one client-deduplicated conditional cancellation.
 func NewCancelJob(request model.ClientRequestID, job model.JobID, expectedRevision uint64, fences ...model.CoordinatorEpoch) (CancelJob, error) {
 	command := CancelJob{Job: job, ExpectedRevision: expectedRevision}
 	var fence model.CoordinatorEpoch

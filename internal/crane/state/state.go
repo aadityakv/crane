@@ -38,8 +38,9 @@ type subjectHistory struct {
 	result   []byte
 	applied  bool
 
-	appliedTarget []byte
-	appliedResult []byte
+	appliedTarget   []byte
+	appliedResult   []byte
+	appliedRevision uint64
 }
 
 // Machine owns deterministic command deduplication state. Construction has no
@@ -259,7 +260,7 @@ func (machine *Machine) applyInternalResolvedAtLocked(envelope Envelope, target,
 	if envelope.Kind != CommandBeginCoordinatorEpoch && envelope.CoordinatorEpoch != machine.coordinatorEpoch {
 		return marshalBusinessResult(ResultStaleEpoch, internal.Subject, currentRevision, machine.coordinatorEpoch)
 	}
-	if exists && history.appliedTarget != nil && bytes.Equal(history.appliedTarget, appliedTarget) && (authoritativeRevision == nil || history.revision == *authoritativeRevision) {
+	if exists && history.appliedTarget != nil && bytes.Equal(history.appliedTarget, appliedTarget) && history.appliedRevision == currentRevision {
 		newSize, ok := machine.preflightSubjectHistoryLengths(history, true, uint64(len(target)), uint64(len(history.appliedResult)), uint64(len(history.appliedTarget)), uint64(len(history.appliedResult)))
 		if !ok {
 			return marshalBusinessResult(ResultCapacityExhausted, internal.Subject, history.revision, machine.epochForSubject(internal.Subject, history.revision))
@@ -267,7 +268,7 @@ func (machine *Machine) applyInternalResolvedAtLocked(envelope Envelope, target,
 		newHistory := subjectHistory{
 			revision: history.revision, id: internal.ID, digest: internal.Digest,
 			target: owned(target), result: owned(history.appliedResult), applied: true,
-			appliedTarget: owned(history.appliedTarget), appliedResult: owned(history.appliedResult),
+			appliedTarget: owned(history.appliedTarget), appliedResult: owned(history.appliedResult), appliedRevision: history.appliedRevision,
 		}
 		machine.subjects[internal.Subject] = newHistory
 		machine.estimatedSnapshotBytes = newSize
@@ -323,11 +324,13 @@ func (machine *Machine) applyInternalResolvedAtLocked(envelope Envelope, target,
 	if exists {
 		newHistory.appliedTarget = owned(history.appliedTarget)
 		newHistory.appliedResult = owned(history.appliedResult)
+		newHistory.appliedRevision = history.appliedRevision
 	}
 	if !plan.reject {
 		newHistory.revision = currentRevision + 1
 		newHistory.appliedTarget = owned(appliedTarget)
 		newHistory.appliedResult = owned(plan.result)
+		newHistory.appliedRevision = currentRevision + 1
 	}
 	if plan.commit != nil && !plan.reject {
 		plan.commit()
@@ -349,6 +352,7 @@ func (machine *Machine) cacheInternalOperation(internal *InternalEnvelope, targe
 		revision: old.revision, id: internal.ID, digest: internal.Digest,
 		target: owned(target), result: owned(result), applied: applied,
 		appliedTarget: owned(old.appliedTarget), appliedResult: owned(old.appliedResult),
+		appliedRevision: old.appliedRevision,
 	}
 	machine.subjects[internal.Subject] = history
 	machine.estimatedSnapshotBytes = newSize

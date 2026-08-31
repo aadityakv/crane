@@ -95,6 +95,7 @@ func validateMarkers(markers []NeedsReassignment, job model.JobID) error {
 	return nil
 }
 
+// NeedsReassignmentDigest binds the exact sorted complete invalid-target list.
 func NeedsReassignmentDigest(markers []NeedsReassignment) [32]byte {
 	encoded := append([]byte(needsReassignmentDigestDomain), byte(len(markers)>>8), byte(len(markers)))
 	for _, marker := range markers {
@@ -119,6 +120,7 @@ type ReplaceAssignments struct {
 	Target                     model.AssignmentSet // Target is the complete successor set.
 }
 
+// NewInstallAssignments owns one complete initial assignment set.
 func NewInstallAssignments(id InternalCommandID, expectedJobRevision uint64, assignment model.AssignmentSet, fence ...model.CoordinatorEpoch) (InstallAssignments, error) {
 	command := InstallAssignments{Assignment: cloneAssignment(assignment)}
 	command.Envelope = newInternalEnvelope(CommandInstallAssignments, SubjectKey{Kind: SubjectJobControl, JobID: assignment.JobID}, id, expectedJobRevision, fence...)
@@ -126,6 +128,7 @@ func NewInstallAssignments(id InternalCommandID, expectedJobRevision uint64, ass
 	return command, command.Validate()
 }
 
+// NewReplaceAssignments owns a complete successor and all old-set conditional fences.
 func NewReplaceAssignments(id InternalCommandID, expectedJobRevision uint64, job model.JobID, expectedAssignmentRevision uint64, expectedDigest, expectedMarkersDigest [32]byte, target model.AssignmentSet, fence ...model.CoordinatorEpoch) (ReplaceAssignments, error) {
 	command := ReplaceAssignments{JobID: job, ExpectedAssignmentRevision: expectedAssignmentRevision, ExpectedDigest: expectedDigest, ExpectedMarkersDigest: expectedMarkersDigest, Target: cloneAssignment(target)}
 	command.Envelope = newInternalEnvelope(CommandReplaceAssignments, SubjectKey{Kind: SubjectJobControl, JobID: job}, id, expectedJobRevision, fence...)
@@ -282,7 +285,7 @@ func (machine *Machine) applyReplaceAssignmentsLocked(command ReplaceAssignments
 		if err != nil {
 			return mutationPlan{}, fmt.Errorf("impossible retained topology: %w", err)
 		}
-		if err := command.Target.Validate(topology); err != nil || !machine.assignmentUsesCurrentEligibleWorkers(command.Target, command.JobID) || validateReplacement(*record.Assignment, command.Target, record.NeedsReassignment) != nil {
+		if err := command.Target.Validate(topology); err != nil || validateReplacement(*record.Assignment, command.Target, record.NeedsReassignment) != nil || !machine.replacementUsesCurrentWorkers(*record.Assignment, command.Target, command.JobID) {
 			result, resultErr := marshalBusinessResult(ResultInvalidTarget, key, currentRevision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, resultErr
 		}
@@ -343,30 +346,51 @@ func (machine *Machine) residualEligiblePlacements(excludeJob model.JobID) []mod
 	return placements
 }
 
-func (machine *Machine) assignmentUsesCurrentEligibleWorkers(set model.AssignmentSet, excludeJob model.JobID) bool {
-	available := make(map[uint16]uint64)
-	for _, placement := range machine.residualEligiblePlacements(excludeJob) {
-		available[placement.NodeID] = uint64(placement.SlotCapacity)
+func (machine *Machine) replacementUsesCurrentWorkers(old, target model.AssignmentSet, excludeJob model.JobID) bool {
+	usedByOtherJobs := make(map[uint16]uint64)
+	for jobID, job := range machine.jobs {
+		if jobID == excludeJob || job.Lifecycle.terminal() || job.Assignment == nil {
+			continue
+		}
+		for _, token := range job.Assignment.Tasks {
+			usedByOtherJobs[token.WorkerID]++
+		}
 	}
-	used := make(map[uint16]uint64)
-	for _, token := range set.Tasks {
+	usedByTarget := make(map[uint16]uint64)
+	for index, token := range target.Tasks {
+		before := old.Tasks[index]
+		changed := before.WorkerID != token.WorkerID || before.WorkerEpoch != token.WorkerEpoch
 		worker, ok := machine.workers[token.WorkerID]
-		if !ok || worker.State != WorkerEligible || worker.Epoch != token.WorkerEpoch {
+		if !ok || worker.Epoch != token.WorkerEpoch || !replacementWorkerStateAllowed(worker.State, changed) {
 			return false
 		}
-		used[token.WorkerID]++
-		if used[token.WorkerID] > available[token.WorkerID] {
+		usedByTarget[token.WorkerID]++
+		if usedByOtherJobs[token.WorkerID] > uint64(worker.Slots) || usedByTarget[token.WorkerID] > uint64(worker.Slots)-usedByOtherJobs[token.WorkerID] {
 			return false
 		}
 	}
-	for _, replica := range set.ResultReplicas {
-		primary, primaryOK := machine.workers[replica.PrimaryNodeID]
-		secondary, secondaryOK := machine.workers[replica.SecondaryNodeID]
-		if !primaryOK || !secondaryOK || primary.State != WorkerEligible || secondary.State != WorkerEligible || primary.Epoch != replica.PrimaryEpoch || secondary.Epoch != replica.SecondaryEpoch {
+	for index, replica := range target.ResultReplicas {
+		before := old.ResultReplicas[index]
+		if !machine.replacementEndpointCurrent(replica.PrimaryNodeID, replica.PrimaryEpoch, before.PrimaryNodeID != replica.PrimaryNodeID || before.PrimaryEpoch != replica.PrimaryEpoch) {
+			return false
+		}
+		if !machine.replacementEndpointCurrent(replica.SecondaryNodeID, replica.SecondaryEpoch, before.SecondaryNodeID != replica.SecondaryNodeID || before.SecondaryEpoch != replica.SecondaryEpoch) {
 			return false
 		}
 	}
 	return true
+}
+
+func replacementWorkerStateAllowed(state WorkerState, changed bool) bool {
+	if changed {
+		return state == WorkerEligible
+	}
+	return state == WorkerEligible || state == WorkerDraining
+}
+
+func (machine *Machine) replacementEndpointCurrent(workerID uint16, epoch model.WorkerEpoch, changed bool) bool {
+	worker, ok := machine.workers[workerID]
+	return ok && worker.Epoch == epoch && replacementWorkerStateAllowed(worker.State, changed)
 }
 
 func validateReplacement(old, target model.AssignmentSet, markers []NeedsReassignment) error {

@@ -30,7 +30,7 @@ const (
 	// StateCommandClientHistoryFixedV1 counts one client key and fixed history fields.
 	StateCommandClientHistoryFixedV1 uint64 = 60
 	// StateCommandSubjectHistoryFixedV1 counts one subject key and fixed history fields.
-	StateCommandSubjectHistoryFixedV1 uint64 = 128
+	StateCommandSubjectHistoryFixedV1 uint64 = 136
 	// StateCommandWorkerRecordBytesV1 counts a worker map key and record.
 	StateCommandWorkerRecordBytesV1 uint64 = 95
 	// StateCommandJobRecordFixedBytesV1 counts a job key, fixed fields, selectors, and counts.
@@ -188,6 +188,7 @@ var stateCommandLayoutsV1 = []StateCommandLayoutDescriptor{
 	{Name: "CheckpointRecord", Fields: []string{"Watermark:u64", "Revision:u64(nonzero)"}},
 	{Name: "WorkerEventCursor", Fields: []string{"WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "TransactionID:u64(nonzero)", "Digest:sha256(nonzero)"}},
 	{Name: "JobRecord", Fields: []string{"JobID:JobID", "DefiningRequest:ClientRequestID", "TopologyDigest:sha256", "TopologyBytes:owned-canonical-topology", "Lifecycle:JobLifecycle", "JobControlRevision:u64", "Assignment:optional(AssignmentSet)", "NeedsReassignment:sorted-list(NeedsReassignment)", "SourceEOFs:task-keyed(SourceEOFRecord)", "Checkpoints:task-keyed(CheckpointRecord)", "Manifests:task-keyed(ResultManifest)", "Failure:optional(JobFailureReport)"}},
+	{Name: "SubjectHistory", Fields: []string{"Revision:u64", "ID:bytes32", "Digest:sha256", "Target:u32-bytes(owned)", "Result:u32-bytes(owned)", "Applied:u8", "AppliedRevision:u64", "AppliedTarget:u32-bytes(owned)", "AppliedResult:u32-bytes(owned)"}},
 	{Name: "CommandResult", Fields: []string{"SchemaVersion:u16", "Code:u16", "Subject:u8", "Revision:u64", "JobID:JobID", "WorkerID:u16", "Epoch:CoordinatorEpoch"}},
 }
 
@@ -260,6 +261,7 @@ var stateCommandRulesV1 = []string{
 	"internal-same-id-changed-bytes-is-identity-reuse",
 	"internal-revisions-are-independent-per-exact-subject-key",
 	"exact-already-target-replays-prior-success-without-revision-change",
+	"exact-target-replay-requires-the-retained-success-applied-revision-to-equal-the-current-authoritative-subject-revision",
 	"begin-coordinator-exact-target-is-apply-term-plus-coordinator-plus-nonce",
 	"begin-index-and-term-come-only-from-nonzero-apply-position",
 	"coordinator-epochs-are-strictly-ordered-by-term-then-begin-index",
@@ -282,7 +284,9 @@ var stateCommandRulesV1 = []string{
 	"assignment-install-is-one-complete-canonical-set-and-every-token-revision-equals-the-enclosing-set-revision",
 	"assignment-replacement-requires-the-exact-old-set-revision-digest-and-reassignment-marker-digest",
 	"assignment-replacement-changes-only-marked-targets-advances-only-their-attempts-and-replaces-result-replicas-by-marked-role",
+	"assignment-replacement-requires-newly-changed-task-and-replica-endpoints-to-be-current-eligible-while-unchanged-exact-epoch-endpoints-may-be-eligible-or-draining-but-never-offline-missing-or-stale",
 	"worker-slots-are-cluster-wide-across-task-tokens-in-all-nonterminal-jobs-replacement-excludes-the-current-job-and-result-replicas-consume-no-slots",
+	"assignment-replacement-slot-validation-counts-every-target-task-token-including-unchanged-draining-placements-against-residual-capacity-after-other-nonterminal-jobs",
 	"worker-deactivation-and-epoch-replacement-require-the-sorted-complete-affected-job-list-and-atomically-union-sorted-reassignment-markers",
 	"checkpoint-manifest-and-job-control-subject-revisions-advance-independently",
 	"worker-event-transactions-use-one-strictly-increasing-digest-bound-cursor-per-exact-worker-id-and-worker-epoch-across-all-jobs-and-sources",

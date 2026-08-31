@@ -68,6 +68,7 @@ type FailJob struct {
 	Report   model.JobFailureReport // Report binds the worker cursor and current token.
 }
 
+// NewSealManifest builds one independently revisioned sink-artifact seal.
 func NewSealManifest(id InternalCommandID, expectedRevision uint64, manifest ResultManifest, fence ...model.CoordinatorEpoch) (SealManifest, error) {
 	command := SealManifest{Manifest: manifest}
 	command.Envelope = newInternalEnvelope(CommandSealManifest, SubjectKey{Kind: SubjectResultManifest, JobID: manifest.JobID, TaskID: manifest.SinkTask}, id, expectedRevision, fence...)
@@ -75,6 +76,7 @@ func NewSealManifest(id InternalCommandID, expectedRevision uint64, manifest Res
 	return command, command.Validate()
 }
 
+// NewTransitionJob builds one conditional normal-lifecycle transition.
 func NewTransitionJob(id InternalCommandID, expectedRevision uint64, job model.JobID, from, to JobLifecycle, fence ...model.CoordinatorEpoch) (TransitionJob, error) {
 	command := TransitionJob{JobID: job, From: from, To: to}
 	command.Envelope = newInternalEnvelope(CommandTransitionJob, SubjectKey{Kind: SubjectJobControl, JobID: job}, id, expectedRevision, fence...)
@@ -82,6 +84,7 @@ func NewTransitionJob(id InternalCommandID, expectedRevision uint64, job model.J
 	return command, command.Validate()
 }
 
+// NewFailJob builds one current-token terminal worker failure event.
 func NewFailJob(id InternalCommandID, expectedRevision uint64, report model.JobFailureReport, fence ...model.CoordinatorEpoch) (FailJob, error) {
 	command := FailJob{Report: report}
 	command.Envelope = newInternalEnvelope(CommandFailJob, SubjectKey{Kind: SubjectJobControl, JobID: report.JobID}, id, expectedRevision, fence...)

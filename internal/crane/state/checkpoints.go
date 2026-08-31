@@ -46,6 +46,7 @@ type AdvanceCheckpoint struct {
 	Report   model.CompletionReport // Report binds token, cursor, prior, and new progress.
 }
 
+// NewRecordSourceEOF builds the immutable topology-derived bound for one source.
 func NewRecordSourceEOF(id InternalCommandID, expectedRevision uint64, source model.TaskID, eof uint64, fence ...model.CoordinatorEpoch) (RecordSourceEOF, error) {
 	command := RecordSourceEOF{Source: source, EOF: eof}
 	command.Envelope = newInternalEnvelope(CommandRecordSourceEOF, SubjectKey{Kind: SubjectSourceEOF, JobID: source.JobID, TaskID: source}, id, expectedRevision, fence...)
@@ -53,6 +54,7 @@ func NewRecordSourceEOF(id InternalCommandID, expectedRevision uint64, source mo
 	return command, command.Validate()
 }
 
+// NewAdvanceCheckpoint builds one current-token globally ordered progress event.
 func NewAdvanceCheckpoint(id InternalCommandID, expectedRevision uint64, report model.CompletionReport, fence ...model.CoordinatorEpoch) (AdvanceCheckpoint, error) {
 	command := AdvanceCheckpoint{Report: report}
 	command.Envelope = newInternalEnvelope(CommandAdvanceCheckpoint, SubjectKey{Kind: SubjectSourceCheckpoint, JobID: report.JobID, TaskID: report.Source}, id, expectedRevision, fence...)

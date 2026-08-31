@@ -62,7 +62,7 @@ func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 		bundle = append(bundle, encoded...)
 	}
 	digest := sha256.Sum256(bundle)
-	const want = "c420f8a0fb39373dfb471c67da880347edddabf216f851f750fa3a52cdfe4dcf"
+	const want = "1ae05d64364b31986e0f713c96fb858cb4fc81a50a013bc57aaf9444c3a3d36d"
 	if got := hex.EncodeToString(digest[:]); got != want {
 		t.Fatalf("Task 10 canonical command bundle SHA-256 = %s, want %s", got, want)
 	}
@@ -129,6 +129,7 @@ func TestManifestAndSucceededRequireFinalCheckpointsAndTwoCurrentCopies(t *testi
 	if machine.jobs[job].JobControlRevision != jobRevision {
 		t.Fatal("manifest advanced JobControlRevision")
 	}
+	assertCanonicalSnapshotEstimate(t, machine)
 	succeed, _ := NewTransitionJob(InternalCommandID{0xb3}, jobRevision, job, JobDraining, JobSucceeded)
 	if got := applyTask10(t, machine, 82, succeed); got.Code != ResultSuccess || machine.jobs[job].Lifecycle != JobSucceeded {
 		t.Fatalf("succeed = %#v lifecycle=%d", got, machine.jobs[job].Lifecycle)
@@ -146,6 +147,7 @@ func TestFailureReportUsesGlobalCursorAndCurrentAssignmentFence(t *testing.T) {
 	if machine.workerEvents[workerEventKey{WorkerID: token.WorkerID, WorkerEpoch: token.WorkerEpoch}].TransactionID != 7 {
 		t.Fatal("failure did not advance global worker-event cursor")
 	}
+	assertCanonicalSnapshotEstimate(t, machine)
 }
 
 func TestLifecycleEveryNormalTransitionPairAndSpecialTerminalPath(t *testing.T) {

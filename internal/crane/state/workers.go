@@ -109,6 +109,7 @@ type ReplaceWorkerEpoch struct {
 	Affected []AffectedAssignment // Affected is the sorted complete affected-job list.
 }
 
+// NewRegisterWorker builds a digest-bound worker successor under one coordinator fence.
 func NewRegisterWorker(id InternalCommandID, expectedRevision uint64, target WorkerRecord, fence ...model.CoordinatorEpoch) (RegisterWorker, error) {
 	command := RegisterWorker{Worker: target}
 	command.Envelope = newInternalEnvelope(CommandRegisterWorker, SubjectKey{Kind: SubjectWorker, WorkerID: target.NodeID}, id, expectedRevision, fence...)
@@ -116,6 +117,7 @@ func NewRegisterWorker(id InternalCommandID, expectedRevision uint64, target Wor
 	return command, command.Validate()
 }
 
+// NewDrainWorker builds a conditional operator drain for one exact incarnation.
 func NewDrainWorker(id InternalCommandID, expectedRevision uint64, workerID uint16, epoch model.WorkerEpoch, fence ...model.CoordinatorEpoch) (DrainWorker, error) {
 	command := DrainWorker{WorkerID: workerID, WorkerEpoch: epoch}
 	command.Envelope = newInternalEnvelope(CommandDrainWorker, SubjectKey{Kind: SubjectWorker, WorkerID: workerID}, id, expectedRevision, fence...)
@@ -123,6 +125,7 @@ func NewDrainWorker(id InternalCommandID, expectedRevision uint64, workerID uint
 	return command, command.Validate()
 }
 
+// NewDeactivateWorker owns the sorted complete affected-job list for atomic invalidation.
 func NewDeactivateWorker(id InternalCommandID, expectedRevision uint64, workerID uint16, epoch model.WorkerEpoch, affected []AffectedAssignment, fence ...model.CoordinatorEpoch) (DeactivateWorker, error) {
 	command := DeactivateWorker{WorkerID: workerID, WorkerEpoch: epoch, Affected: cloneAffected(affected)}
 	command.Envelope = newInternalEnvelope(CommandDeactivateWorker, SubjectKey{Kind: SubjectWorker, WorkerID: workerID}, id, expectedRevision, fence...)
@@ -130,6 +133,7 @@ func NewDeactivateWorker(id InternalCommandID, expectedRevision uint64, workerID
 	return command, command.Validate()
 }
 
+// NewReplaceWorkerEpoch builds an atomic incarnation replacement preserving operator state.
 func NewReplaceWorkerEpoch(id InternalCommandID, expectedRevision uint64, workerID uint16, oldEpoch model.WorkerEpoch, target WorkerRecord, affected []AffectedAssignment, fence ...model.CoordinatorEpoch) (ReplaceWorkerEpoch, error) {
 	command := ReplaceWorkerEpoch{WorkerID: workerID, OldEpoch: oldEpoch, Target: target, Affected: cloneAffected(affected)}
 	command.Envelope = newInternalEnvelope(CommandReplaceWorkerEpoch, SubjectKey{Kind: SubjectWorker, WorkerID: workerID}, id, expectedRevision, fence...)

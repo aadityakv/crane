@@ -113,6 +113,7 @@ func TestWorkerEventCursorResetsForNewEpochWhileOldTokenStaysFenced(t *testing.T
 	if _, retained := machine.workerEvents[workerEventKey{WorkerID: worker.NodeID, WorkerEpoch: worker.Epoch}]; retained {
 		t.Fatal("replaced worker epoch retained an unreachable event cursor")
 	}
+	assertCanonicalSnapshotEstimate(t, machine)
 
 	tokens := append([]model.AssignmentToken(nil), assignment.Tasks...)
 	for index := range tokens {
@@ -140,6 +141,7 @@ func TestWorkerEventCursorResetsForNewEpochWhileOldTokenStaysFenced(t *testing.T
 	if got := applyTask10(t, machine, 63, replaceSet); got.Code != ResultSuccess {
 		t.Fatalf("replace assignment = %#v markers=%#v", got, marked.NeedsReassignment)
 	}
+	assertCanonicalSnapshotEstimate(t, machine)
 	newToken, ok := assignmentToken(machine.jobs[job].Assignment, oldToken.Task)
 	if !ok || newToken.WorkerEpoch != newEpoch || newToken.Attempt != oldToken.Attempt+1 {
 		t.Fatalf("new token = %#v", newToken)
@@ -150,6 +152,7 @@ func TestWorkerEventCursorResetsForNewEpochWhileOldTokenStaysFenced(t *testing.T
 	if got := applyTask10(t, machine, 64, advanceNew); got.Code != ResultSuccess {
 		t.Fatalf("new epoch tx=5 = %#v", got)
 	}
+	assertCanonicalSnapshotEstimate(t, machine)
 
 	staleFailure := model.JobFailureReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Task: oldToken, Epoch: machine.coordinatorEpoch, TransactionID: 1001, Code: model.FailureOperator, DetailDigest: [32]byte{1}}
 	fail, _ := NewFailJob(InternalCommandID{0x96}, machine.jobs[job].JobControlRevision, staleFailure)
