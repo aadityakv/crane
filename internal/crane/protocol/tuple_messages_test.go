@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"reflect"
@@ -305,33 +306,80 @@ func TestTupleTrafficExactSizesRejectPlusOneAndTruncatedSuffix(t *testing.T) {
 }
 
 func TestTupleMalformedDeclarationAllocatesFixedBytesNotDeclaredBytes(t *testing.T) {
-	impossible := []byte{0, 1, 1, 24}
-	impossible = append(impossible, make([]byte, 98)...)
-	impossible = append(impossible, 0xff, 0xff)
-	declaredBytes := benchmarkTupleDecodeBytes(impossible)
-	t.Logf("65,535-declared malformed frame: %d allocated bytes/op", declaredBytes)
-	if declaredBytes > 2_048 {
-		t.Fatalf("65,535-declared malformed frame allocated %d bytes/op, want <= 2048", declaredBytes)
+	const maximumAllocatedBytesPerInput = int64(2_048)
+	inputs := make([]struct {
+		name  string
+		input []byte
+	}, 0, 24)
+	for _, declared := range []uint16{0, 1, 511, 512, 513, math.MaxUint16} {
+		inputs = append(inputs,
+			struct {
+				name  string
+				input []byte
+			}{name: fmt.Sprintf("declared-%d-suffix-minus-one", declared), input: malformedDeliveryShape(declared, -1, uint64(declared)+1)},
+			struct {
+				name  string
+				input []byte
+			}{name: fmt.Sprintf("declared-%d-suffix-plus-one", declared), input: malformedDeliveryShape(declared, 1, uint64(declared)+2)},
+		)
+	}
+	random := rand.New(rand.NewPCG(0x425, 0x65535))
+	for index := 0; index < 8; index++ {
+		declared := uint16(random.Uint32())
+		delta := -1
+		if random.Uint32()%2 == 0 {
+			delta = 1
+		}
+		inputs = append(inputs, struct {
+			name  string
+			input []byte
+		}{name: fmt.Sprintf("random-%d-declared-%d-delta-%d", index, declared, delta), input: malformedDeliveryShape(declared, delta, random.Uint64())})
 	}
 
-	random := rand.New(rand.NewPCG(0x425, 0x65535))
-	randomMalformed := make([][]byte, 256)
-	for index := range randomMalformed {
-		length := random.IntN(TupleDeliveryMaxPayloadBytes() + 64)
-		randomMalformed[index] = make([]byte, length)
-		for offset := range randomMalformed[index] {
-			randomMalformed[index][offset] = byte(random.Uint32())
-		}
+	worstBytes := int64(0)
+	worstName := ""
+	for _, test := range inputs {
+		t.Run(test.name, func(t *testing.T) {
+			if test.input[0] != 0 || test.input[1] != byte(TupleDeliverySchemaVersion) || test.input[2] != 1 || test.input[3] != 24 {
+				t.Fatalf("input does not preserve valid delivery schema/type prefix: %x", test.input[:4])
+			}
+			decoderCalls := 0
+			if _, err := unmarshalTupleDeliveryWith(test.input, func([]byte) (model.Tuple, error) {
+				decoderCalls++
+				panic("malformed shape reached tuple decoder")
+			}); err == nil {
+				t.Fatal("malformed delivery shape was accepted")
+			}
+			if decoderCalls != 0 {
+				t.Fatalf("tuple decoder calls = %d, want 0", decoderCalls)
+			}
+			allocated := benchmarkTupleDecodeBytes(test.input)
+			if allocated > worstBytes {
+				worstBytes, worstName = allocated, test.name
+			}
+			if allocated > maximumAllocatedBytesPerInput {
+				t.Fatalf("allocated %d bytes/op for one malformed input, want <= %d", allocated, maximumAllocatedBytesPerInput)
+			}
+		})
 	}
-	result := testing.Benchmark(func(benchmark *testing.B) {
-		for index := 0; index < benchmark.N; index++ {
-			_, _ = UnmarshalTupleDelivery(randomMalformed[index%len(randomMalformed)])
-		}
-	})
-	t.Logf("deterministic randomized malformed frames: %d allocated bytes/op", result.AllocedBytesPerOp())
-	if got := result.AllocedBytesPerOp(); got > 2_048 {
-		t.Fatalf("random malformed frames allocated %d bytes/op, want <= 2048", got)
+	t.Logf("worst individual malformed input allocation: %d bytes/op (%s)", worstBytes, worstName)
+}
+
+func malformedDeliveryShape(declared uint16, suffixDelta int, seed uint64) []byte {
+	expected := TupleDeliveryFixedPayloadBytes + int(declared)
+	length := expected + suffixDelta
+	if length < TupleDeliveryMinPayloadBytes || length > TupleDeliveryMaxPayloadBytes() {
+		length = TupleDeliveryMinPayloadBytes
 	}
+	input := make([]byte, length)
+	input[1] = byte(TupleDeliverySchemaVersion)
+	input[2], input[3] = 1, 24
+	input[102], input[103] = byte(declared>>8), byte(declared)
+	random := rand.New(rand.NewPCG(seed, seed^0x280282))
+	for offset := 104; offset < len(input); offset++ {
+		input[offset] = byte(random.Uint32())
+	}
+	return input
 }
 
 func TestTupleTrafficDecodersRejectPayloadLimitPlusOneBeforeFields(t *testing.T) {
