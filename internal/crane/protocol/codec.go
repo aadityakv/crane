@@ -4,10 +4,1735 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
+
+// MarshalWorkerMessage validates and emits the sole canonical payload for IDs 200-218.
+func MarshalWorkerMessage(message WorkerMessage) ([]byte, error) {
+	if message == nil {
+		return nil, ErrUnexpectedWorkerMessage
+	}
+	if message.MessageType() < wire.MessageCraneWorkerHandshake || message.MessageType() > wire.MessageCraneWorkerError {
+		return nil, ErrUnexpectedWorkerMessage
+	}
+	if err := validateWorkerMessage(message); err != nil {
+		return nil, invalidWorker(message, err)
+	}
+	e := workerEncoder{}
+	e.u16(WorkerControlSchemaVersion)
+	e.u16(uint16(message.MessageType()))
+	if err := e.message(message); err != nil {
+		return nil, err
+	}
+	return e.owned(), nil
+}
+
+// UnmarshalWorkerMessage decodes one complete canonical payload for IDs 200-218.
+func UnmarshalWorkerMessage(messageType wire.MessageType, encoded []byte) (WorkerMessage, error) {
+	if messageType < wire.MessageCraneWorkerHandshake || messageType > wire.MessageCraneWorkerError {
+		return nil, ErrUnexpectedWorkerMessage
+	}
+	if len(encoded) > MaxWorkerControlPayloadBytes {
+		return nil, fmt.Errorf("%w: %d", ErrWorkerMessageTooLarge, len(encoded))
+	}
+	d := workerDecoder{input: encoded}
+	version, err := d.u16()
+	if err != nil {
+		return nil, err
+	}
+	if version != WorkerControlSchemaVersion {
+		return nil, fmt.Errorf("%w: %d", ErrUnsupportedWorkerSchema, version)
+	}
+	got, err := d.u16()
+	if err != nil {
+		return nil, err
+	}
+	if wire.MessageType(got) != messageType {
+		return nil, fmt.Errorf("%w: got %d want %d", ErrUnexpectedWorkerMessage, got, messageType)
+	}
+	message, err := d.message(messageType)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.finish(); err != nil {
+		return nil, err
+	}
+	if err := validateWorkerMessage(message); err != nil {
+		return nil, invalidWorker(message, err)
+	}
+	canonical, err := MarshalWorkerMessage(message)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return nil, fmt.Errorf("%w: non-canonical payload", ErrMalformedWorkerMessage)
+	}
+	return message, nil
+}
+
+func MarshalWorkerHandshake(v WorkerHandshake) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalWorkerHandshake(b []byte) (WorkerHandshake, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerHandshake, b)
+	if e != nil {
+		return WorkerHandshake{}, e
+	}
+	return v.(WorkerHandshake), nil
+}
+func MarshalWorkerHandshakeAck(v WorkerHandshakeAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalWorkerHandshakeAck(b []byte) (WorkerHandshakeAck, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerHandshakeAck, b)
+	if e != nil {
+		return WorkerHandshakeAck{}, e
+	}
+	return v.(WorkerHandshakeAck), nil
+}
+func MarshalFenceRequest(v FenceRequest) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalFenceRequest(b []byte) (FenceRequest, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerFenceRequest, b)
+	if e != nil {
+		return FenceRequest{}, e
+	}
+	return v.(FenceRequest), nil
+}
+func MarshalFenceResponse(v FenceResponse) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalFenceResponse(b []byte) (FenceResponse, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerFenceResponse, b)
+	if e != nil {
+		return FenceResponse{}, e
+	}
+	return v.(FenceResponse), nil
+}
+func MarshalWorkerRegisterRequest(v WorkerRegisterRequest) ([]byte, error) {
+	return MarshalWorkerMessage(v)
+}
+func UnmarshalWorkerRegisterRequest(b []byte) (WorkerRegisterRequest, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerRegisterRequest, b)
+	if e != nil {
+		return WorkerRegisterRequest{}, e
+	}
+	return v.(WorkerRegisterRequest), nil
+}
+func MarshalWorkerRegisterResponse(v WorkerRegisterResponse) ([]byte, error) {
+	return MarshalWorkerMessage(v)
+}
+func UnmarshalWorkerRegisterResponse(b []byte) (WorkerRegisterResponse, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerRegisterResponse, b)
+	if e != nil {
+		return WorkerRegisterResponse{}, e
+	}
+	return v.(WorkerRegisterResponse), nil
+}
+func MarshalAssignmentSetInstall(v AssignmentSetInstall) ([]byte, error) {
+	return MarshalWorkerMessage(v)
+}
+func UnmarshalAssignmentSetInstall(b []byte) (AssignmentSetInstall, error) {
+	return unmarshalAssignmentSetInstallWith(b, model.DecodeTopology)
+}
+func MarshalAssignmentSetInstallAck(v AssignmentSetInstallAck) ([]byte, error) {
+	return MarshalWorkerMessage(v)
+}
+func UnmarshalAssignmentSetInstallAck(b []byte) (AssignmentSetInstallAck, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneAssignmentSetInstallAck, b)
+	if e != nil {
+		return AssignmentSetInstallAck{}, e
+	}
+	return v.(AssignmentSetInstallAck), nil
+}
+func MarshalWorkerStatusRequest(v WorkerStatusRequest) ([]byte, error) {
+	return MarshalWorkerMessage(v)
+}
+func UnmarshalWorkerStatusRequest(b []byte) (WorkerStatusRequest, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerStatusRequest, b)
+	if e != nil {
+		return WorkerStatusRequest{}, e
+	}
+	return v.(WorkerStatusRequest), nil
+}
+func MarshalWorkerStatus(v WorkerStatus) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalWorkerStatus(b []byte) (WorkerStatus, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerStatusReport, b)
+	if e != nil {
+		return WorkerStatus{}, e
+	}
+	return v.(WorkerStatus), nil
+}
+func MarshalCheckpointNotice(v CheckpointNotice) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalCheckpointNotice(b []byte) (CheckpointNotice, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneCheckpointNotice, b)
+	if e != nil {
+		return CheckpointNotice{}, e
+	}
+	return v.(CheckpointNotice), nil
+}
+func MarshalCheckpointAck(v CheckpointAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalCheckpointAck(b []byte) (CheckpointAck, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneCheckpointAck, b)
+	if e != nil {
+		return CheckpointAck{}, e
+	}
+	return v.(CheckpointAck), nil
+}
+func MarshalResultRecordChunk(v ResultRecordChunk) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalResultRecordChunk(b []byte) (ResultRecordChunk, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultRecordChunk, b)
+	if e != nil {
+		return ResultRecordChunk{}, e
+	}
+	return v.(ResultRecordChunk), nil
+}
+func MarshalResultRecordAck(v ResultRecordAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalResultRecordAck(b []byte) (ResultRecordAck, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultRecordAck, b)
+	if e != nil {
+		return ResultRecordAck{}, e
+	}
+	return v.(ResultRecordAck), nil
+}
+func MarshalResultArtifactChunk(v ResultArtifactChunk) ([]byte, error) {
+	return MarshalWorkerMessage(v)
+}
+func UnmarshalResultArtifactChunk(b []byte) (ResultArtifactChunk, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultArtifactChunk, b)
+	if e != nil {
+		return ResultArtifactChunk{}, e
+	}
+	return v.(ResultArtifactChunk), nil
+}
+func MarshalResultArtifactAck(v ResultArtifactAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalResultArtifactAck(b []byte) (ResultArtifactAck, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultArtifactAck, b)
+	if e != nil {
+		return ResultArtifactAck{}, e
+	}
+	return v.(ResultArtifactAck), nil
+}
+func MarshalResultFetchRequest(v ResultFetchRequest) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalResultFetchRequest(b []byte) (ResultFetchRequest, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultFetchRequest, b)
+	if e != nil {
+		return ResultFetchRequest{}, e
+	}
+	return v.(ResultFetchRequest), nil
+}
+func MarshalResultFetchChunk(v ResultFetchChunk) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalResultFetchChunk(b []byte) (ResultFetchChunk, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultFetchChunk, b)
+	if e != nil {
+		return ResultFetchChunk{}, e
+	}
+	return v.(ResultFetchChunk), nil
+}
+func MarshalWorkerError(v WorkerError) ([]byte, error) { return MarshalWorkerMessage(v) }
+func UnmarshalWorkerError(b []byte) (WorkerError, error) {
+	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerError, b)
+	if e != nil {
+		return WorkerError{}, e
+	}
+	return v.(WorkerError), nil
+}
+
+type topologyDecodeFunc func([]byte) (model.ValidatedTopology, error)
+
+func unmarshalAssignmentSetInstallWith(encoded []byte, decode topologyDecodeFunc) (AssignmentSetInstall, error) {
+	if len(encoded) > MaxWorkerControlPayloadBytes {
+		return AssignmentSetInstall{}, ErrWorkerMessageTooLarge
+	}
+	if len(encoded) < 12 {
+		return AssignmentSetInstall{}, ErrMalformedWorkerMessage
+	}
+	if binary.BigEndian.Uint16(encoded[:2]) != WorkerControlSchemaVersion || wire.MessageType(binary.BigEndian.Uint16(encoded[2:4])) != wire.MessageCraneAssignmentSetInstall {
+		return AssignmentSetInstall{}, ErrUnexpectedWorkerMessage
+	}
+	declared := binary.BigEndian.Uint64(encoded[4:12])
+	if declared > model.LimitsV1().MaxTopologyBytes-8 {
+		return AssignmentSetInstall{}, fmt.Errorf("%w: declared topology %d", ErrWorkerMessageTooLarge, declared)
+	}
+	if declared > uint64(len(encoded)-12) {
+		return AssignmentSetInstall{}, ErrMalformedWorkerMessage
+	}
+	topoBytes := encoded[4 : 12+declared]
+	validated, err := decode(topoBytes)
+	if err != nil {
+		return AssignmentSetInstall{}, fmt.Errorf("%w: topology: %v", ErrInvalidWorkerMessage, err)
+	}
+	v, err := UnmarshalWorkerMessage(wire.MessageCraneAssignmentSetInstall, encoded)
+	if err != nil {
+		return AssignmentSetInstall{}, err
+	}
+	install := v.(AssignmentSetInstall)
+	if install.SpecificationDigest != validated.Digest() {
+		return AssignmentSetInstall{}, ErrInvalidWorkerMessage
+	}
+	return install, nil
+}
+
+type workerEncoder struct {
+	output []byte
+	err    error
+}
+
+func (e *workerEncoder) owned() []byte { return append([]byte(nil), e.output...) }
+func (e *workerEncoder) add(v []byte) {
+	if e.err != nil {
+		return
+	}
+	if len(v) > MaxWorkerControlPayloadBytes-len(e.output) {
+		e.err = ErrWorkerMessageTooLarge
+		return
+	}
+	e.output = append(e.output, v...)
+}
+func (e *workerEncoder) u8(v byte) { e.add([]byte{v}) }
+func (e *workerEncoder) bool(v bool) {
+	if v {
+		e.u8(1)
+	} else {
+		e.u8(0)
+	}
+}
+func (e *workerEncoder) u16(v uint16) {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], v)
+	e.add(b[:])
+}
+func (e *workerEncoder) u32(v uint32) {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], v)
+	e.add(b[:])
+}
+func (e *workerEncoder) u64(v uint64) {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], v)
+	e.add(b[:])
+}
+func (e *workerEncoder) bytes16(v []byte) {
+	if len(v) > math.MaxUint16 {
+		e.err = ErrWorkerMessageTooLarge
+		return
+	}
+	e.u16(uint16(len(v)))
+	e.add(v)
+}
+func (e *workerEncoder) bytes32(v []byte) {
+	if uint64(len(v)) > math.MaxUint32 {
+		e.err = ErrWorkerMessageTooLarge
+		return
+	}
+	e.u32(uint32(len(v)))
+	e.add(v)
+}
+func (e *workerEncoder) epoch(v model.CoordinatorEpoch) {
+	e.u64(v.Term)
+	e.u64(v.BeginIndex)
+	e.u16(v.Coordinator)
+	e.add(v.Nonce[:])
+}
+func (e *workerEncoder) task(v model.TaskID) { e.add(v.JobID[:]); e.u16(v.StageID); e.u16(v.Partition) }
+func (e *workerEncoder) tupleID(v model.TupleID) {
+	e.add(v.JobID[:])
+	e.task(v.SourceTask)
+	e.u64(v.SourceSequence)
+	e.add(v.PathDigest[:])
+}
+func (e *workerEncoder) worker(node uint16, epoch model.WorkerEpoch) { e.u16(node); e.add(epoch[:]) }
+func (e *workerEncoder) token(v model.AssignmentToken) {
+	e.task(v.Task)
+	e.worker(v.WorkerID, v.WorkerEpoch)
+	e.u64(v.Attempt)
+	e.add(v.SpecificationHash[:])
+	e.u64(v.AssignmentRevision)
+}
+func (e *workerEncoder) replica(v model.ResultReplicaSet) {
+	e.task(v.SinkTask)
+	e.u16(v.PrimaryNodeID)
+	e.u16(v.SecondaryNodeID)
+	e.add(v.PrimaryEpoch[:])
+	e.add(v.SecondaryEpoch[:])
+}
+func (e *workerEncoder) assignment(v model.AssignmentSet) {
+	e.add(v.JobID[:])
+	e.u64(v.Revision)
+	e.add(v.Digest[:])
+	e.u16(uint16(len(v.Tasks)))
+	for _, t := range v.Tasks {
+		e.token(t)
+	}
+	e.u16(uint16(len(v.ResultReplicas)))
+	for _, r := range v.ResultReplicas {
+		e.replica(r)
+	}
+}
+func (e *workerEncoder) checkpoints(v []SourceCheckpoint) {
+	e.u16(uint16(len(v)))
+	for _, c := range v {
+		e.task(c.Source)
+		e.u64(c.Watermark)
+	}
+}
+func (e *workerEncoder) inventory(v ResultInventoryQuery) {
+	e.add(v.JobID[:])
+	e.task(v.SinkTask)
+	e.add(v.SpecificationHash[:])
+	e.u64(v.AssignmentRevision)
+	e.add(v.AssignmentDigest[:])
+	e.checkpoints(v.Checkpoints)
+	e.add(v.CheckpointDigest[:])
+	e.add(v.QueryDigest[:])
+}
+func (e *workerEncoder) repair(v RepairResultPartition) {
+	e.add(v.RepairID[:])
+	e.epoch(v.CoordinatorEpoch)
+	e.add(v.JobID[:])
+	e.u64(v.AssignmentRevision)
+	e.add(v.AssignmentDigest[:])
+	e.worker(v.SourceNodeID, v.SourceWorkerEpoch)
+	e.worker(v.DestinationNodeID, v.DestinationWorkerEpoch)
+	e.task(v.SinkTask)
+	e.add(v.SpecificationHash[:])
+	e.checkpoints(v.Checkpoints)
+	e.add(v.CheckpointDigest[:])
+	e.u64(v.ExpectedRecordCount)
+	e.u64(v.ExpectedTotalBytes)
+	e.add(v.ExpectedContentDigest[:])
+	e.add(v.InstructionDigest[:])
+}
+func (e *workerEncoder) transfer(v TransferChunk) {
+	e.add(v.TransferID[:])
+	e.add(v.JobID[:])
+	e.u64(v.TotalLength)
+	e.add(v.Checksum[:])
+	e.u64(v.Offset)
+	e.bytes32(v.Data)
+	e.bool(v.Final)
+}
+func (e *workerEncoder) artifact(v ResultArtifact) {
+	e.add(v.JobID[:])
+	e.task(v.SinkTask)
+	e.add(v.SpecificationHash[:])
+	e.u64(v.RecordCount)
+	e.u64(v.TotalLength)
+	e.add(v.Checksum[:])
+}
+func (e *workerEncoder) record(v model.ResultRecord) {
+	e.tupleID(v.TupleID)
+	e.task(v.SinkTask)
+	e.add(v.SpecificationHash[:])
+	e.bytes16(v.Value)
+	e.add(v.Checksum[:])
+}
+func (e *workerEncoder) provenance(v model.ResultCopyProvenance) {
+	e.u64(v.AssignmentRevision)
+	e.add(v.AssignmentDigest[:])
+	e.replica(v.ReplicaSet)
+	e.u8(byte(v.DestinationRole))
+	e.epoch(v.CoordinatorEpoch)
+}
+func (e *workerEncoder) event(v model.WorkerEvent) {
+	e.worker(v.WorkerID, v.WorkerEpoch)
+	e.u64(v.TransactionID)
+	e.u8(byte(v.Kind))
+	if v.Completion != nil {
+		r := v.Completion
+		e.add(r.JobID[:])
+		e.u64(r.JobControlRevision)
+		e.u64(r.AssignmentRevision)
+		e.task(r.Source)
+		e.token(r.Token)
+		e.epoch(r.Epoch)
+		e.u64(r.ExpectedCheckpointRevision)
+		e.u64(r.Prior)
+		e.u64(r.New)
+		e.u64(r.EOF)
+		e.u64(r.WorkerTransactionID)
+		e.add(r.Digest[:])
+	} else {
+		r := v.Failure
+		e.add(r.JobID[:])
+		e.u64(r.JobControlRevision)
+		e.u64(r.AssignmentRevision)
+		e.token(r.Task)
+		e.epoch(r.Epoch)
+		e.u64(r.TransactionID)
+		e.u16(uint16(r.Code))
+		e.add(r.DetailDigest[:])
+	}
+}
+
+func (e *workerEncoder) message(message WorkerMessage) error {
+	switch m := message.(type) {
+	case WorkerHandshake:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.add(m.ConsensusFingerprint[:])
+		e.add(m.RegistryFingerprint[:])
+	case WorkerHandshakeAck:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.add(m.ConsensusFingerprint[:])
+		e.add(m.RegistryFingerprint[:])
+	case FenceRequest:
+		e.epoch(m.CoordinatorEpoch)
+	case FenceResponse:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.epoch(m.CoordinatorEpoch)
+	case WorkerRegisterRequest:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.u16(m.SlotCapacity)
+		e.epoch(m.CoordinatorEpoch)
+		e.add(m.ConsensusFingerprint[:])
+		e.add(m.RegistryFingerprint[:])
+	case WorkerRegisterResponse:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.u64(m.WorkerRevision)
+		e.epoch(m.CoordinatorEpoch)
+		e.bool(m.Accepted)
+	case AssignmentSetInstall:
+		validated, _ := model.ValidateTopology(m.Specification)
+		e.add(validated.CanonicalBytes())
+		e.assignment(m.Assignment)
+		e.add(m.SpecificationDigest[:])
+		e.u64(m.JobControlRevision)
+		e.u8(byte(m.SchedulingState))
+		e.epoch(m.CoordinatorEpoch)
+	case AssignmentSetInstallAck:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.add(m.JobID[:])
+		e.u64(m.AssignmentRevision)
+		e.add(m.AssignmentDigest[:])
+		e.u64(m.JobControlRevision)
+		e.u8(byte(m.SchedulingState))
+		e.epoch(m.CoordinatorEpoch)
+	case WorkerStatusRequest:
+		e.epoch(m.CoordinatorEpoch)
+		e.u64(m.AfterTransactionID)
+		e.u16(m.MaxEvents)
+		if m.Inventory != nil {
+			e.u8(1)
+			e.inventory(*m.Inventory)
+		} else if m.Repair != nil {
+			e.u8(2)
+			e.repair(m.Repair.Instruction)
+			e.u8(byte(m.Repair.Role))
+		} else {
+			e.u8(0)
+		}
+	case WorkerStatus:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.epoch(m.CoordinatorEpoch)
+		e.u64(m.StoreTransactionID)
+		e.u64(m.AfterTransactionID)
+		e.u16(uint16(len(m.Assignments)))
+		for _, a := range m.Assignments {
+			e.add(a.JobID[:])
+			e.u64(a.JobControlRevision)
+			e.u64(a.AssignmentRevision)
+			e.add(a.AssignmentDigest[:])
+			e.add(a.SpecificationDigest[:])
+			e.u8(byte(a.SchedulingState))
+		}
+		e.u16(uint16(len(m.Events)))
+		for _, v := range m.Events {
+			e.event(v)
+		}
+		e.u64(m.LastTransactionID)
+		e.bool(m.HasMore)
+		if m.Inventory != nil {
+			e.u8(1)
+			e.add(m.Inventory.QueryDigest[:])
+			e.u64(m.Inventory.RecordCount)
+			e.u64(m.Inventory.TotalBytes)
+			e.add(m.Inventory.ContentDigest[:])
+		} else if m.Repair != nil {
+			e.u8(2)
+			e.add(m.Repair.RepairID[:])
+			e.add(m.Repair.InstructionDigest[:])
+			e.u8(byte(m.Repair.Role))
+			e.u8(byte(m.Repair.State))
+			e.u64(m.Repair.RecordCount)
+			e.u64(m.Repair.TotalBytes)
+			e.add(m.Repair.ContentDigest[:])
+			e.u16(uint16(m.Repair.ErrorCode))
+		} else {
+			e.u8(0)
+		}
+	case CheckpointNotice:
+		e.add(m.Notice.JobID[:])
+		e.task(m.Notice.Source)
+		e.u64(m.Notice.Watermark)
+		e.u64(m.Notice.RaftIndex)
+		e.epoch(m.Notice.Epoch)
+		e.u64(m.JobControlRevision)
+		e.u64(m.AssignmentRevision)
+		e.add(m.AssignmentDigest[:])
+	case CheckpointAck:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.add(m.JobID[:])
+		e.task(m.Source)
+		e.u64(m.Watermark)
+		e.u64(m.RaftIndex)
+		e.u64(m.JobControlRevision)
+		e.u64(m.AssignmentRevision)
+		e.add(m.AssignmentDigest[:])
+		e.epoch(m.CoordinatorEpoch)
+	case ResultRecordChunk:
+		e.transfer(m.Transfer)
+		e.record(m.Record)
+		e.provenance(m.Provenance)
+		e.worker(m.DestinationNodeID, m.DestinationWorkerEpoch)
+		e.add(m.RepairID[:])
+		e.add(m.RepairInstructionDigest[:])
+	case ResultRecordAck:
+		e.add(m.TransferID[:])
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.add(m.RepairID[:])
+		e.add(m.RepairInstructionDigest[:])
+		e.u64(m.NextOffset)
+		e.u64(m.TotalLength)
+		e.add(m.Checksum[:])
+		e.bool(m.Complete)
+		e.epoch(m.CoordinatorEpoch)
+	case ResultArtifactChunk:
+		e.transfer(m.Transfer)
+		e.artifact(m.Artifact)
+		e.worker(m.DestinationNodeID, m.DestinationWorkerEpoch)
+		e.epoch(m.CoordinatorEpoch)
+	case ResultArtifactAck:
+		e.add(m.TransferID[:])
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.artifact(m.Artifact)
+		e.u64(m.NextOffset)
+		e.bool(m.Complete)
+		e.epoch(m.CoordinatorEpoch)
+	case ResultFetchRequest:
+		e.artifact(m.Artifact)
+		e.worker(m.ReplicaNodeID, m.ReplicaWorkerEpoch)
+		e.u64(m.Offset)
+		e.epoch(m.CoordinatorEpoch)
+	case ResultFetchChunk:
+		e.transfer(m.Transfer)
+		e.artifact(m.Artifact)
+		e.worker(m.SourceNodeID, m.SourceWorkerEpoch)
+		e.epoch(m.CoordinatorEpoch)
+	case WorkerError:
+		e.worker(m.NodeID, m.WorkerEpoch)
+		e.epoch(m.CoordinatorEpoch)
+		e.u16(uint16(m.RelatedMessage))
+		e.u16(uint16(m.Code))
+		e.bool(m.Retryable)
+		e.bytes16(m.Detail)
+	default:
+		return ErrUnexpectedWorkerMessage
+	}
+	return e.err
+}
+
+type workerDecoder struct {
+	input  []byte
+	offset int
+}
+
+func (d *workerDecoder) remaining() int { return len(d.input) - d.offset }
+func (d *workerDecoder) take(n int) ([]byte, error) {
+	if n < 0 || n > d.remaining() {
+		return nil, fmt.Errorf("%w: truncated field", ErrMalformedWorkerMessage)
+	}
+	v := d.input[d.offset : d.offset+n]
+	d.offset += n
+	return v, nil
+}
+func (d *workerDecoder) finish() error {
+	if d.remaining() != 0 {
+		return fmt.Errorf("%w: %d trailing bytes", ErrMalformedWorkerMessage, d.remaining())
+	}
+	return nil
+}
+func (d *workerDecoder) u8() (byte, error) {
+	v, e := d.take(1)
+	if e != nil {
+		return 0, e
+	}
+	return v[0], nil
+}
+func (d *workerDecoder) bool() (bool, error) {
+	v, e := d.u8()
+	if e != nil {
+		return false, e
+	}
+	if v > 1 {
+		return false, ErrMalformedWorkerMessage
+	}
+	return v == 1, nil
+}
+func (d *workerDecoder) u16() (uint16, error) {
+	v, e := d.take(2)
+	if e != nil {
+		return 0, e
+	}
+	return binary.BigEndian.Uint16(v), nil
+}
+func (d *workerDecoder) u32() (uint32, error) {
+	v, e := d.take(4)
+	if e != nil {
+		return 0, e
+	}
+	return binary.BigEndian.Uint32(v), nil
+}
+func (d *workerDecoder) u64() (uint64, error) {
+	v, e := d.take(8)
+	if e != nil {
+		return 0, e
+	}
+	return binary.BigEndian.Uint64(v), nil
+}
+func (d *workerDecoder) fixed16() (v [16]byte, err error) {
+	b, err := d.take(16)
+	if err == nil {
+		copy(v[:], b)
+	}
+	return
+}
+func (d *workerDecoder) fixed32() (v [32]byte, err error) {
+	b, err := d.take(32)
+	if err == nil {
+		copy(v[:], b)
+	}
+	return
+}
+func (d *workerDecoder) bytes16(limit uint64) ([]byte, error) {
+	n, e := d.u16()
+	if e != nil {
+		return nil, e
+	}
+	if uint64(n) > limit {
+		return nil, ErrWorkerMessageTooLarge
+	}
+	v, e := d.take(int(n))
+	if e != nil {
+		return nil, e
+	}
+	return append([]byte(nil), v...), nil
+}
+func (d *workerDecoder) bytes32(limit uint64) ([]byte, error) {
+	n, e := d.u32()
+	if e != nil {
+		return nil, e
+	}
+	if uint64(n) > limit {
+		return nil, ErrWorkerMessageTooLarge
+	}
+	if uint64(n) > uint64(d.remaining()) {
+		return nil, ErrMalformedWorkerMessage
+	}
+	v, e := d.take(int(n))
+	if e != nil {
+		return nil, e
+	}
+	return append([]byte(nil), v...), nil
+}
+func (d *workerDecoder) topology(limit uint64) ([]byte, error) {
+	start := d.offset
+	n, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	if limit < 8 || n > limit-8 {
+		return nil, ErrWorkerMessageTooLarge
+	}
+	if n > uint64(d.remaining()) || n > uint64(math.MaxInt) {
+		return nil, ErrMalformedWorkerMessage
+	}
+	if _, err := d.take(int(n)); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), d.input[start:d.offset]...), nil
+}
+func (d *workerDecoder) epoch() (v model.CoordinatorEpoch, err error) {
+	v.Term, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.BeginIndex, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.Coordinator, err = d.u16()
+	if err != nil {
+		return
+	}
+	v.Nonce, err = d.fixed16()
+	return
+}
+func (d *workerDecoder) task() (v model.TaskID, err error) {
+	job, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.JobID = model.JobID(job)
+	v.StageID, err = d.u16()
+	if err != nil {
+		return
+	}
+	v.Partition, err = d.u16()
+	return
+}
+func (d *workerDecoder) tupleID() (v model.TupleID, err error) {
+	job, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.JobID = model.JobID(job)
+	v.SourceTask, err = d.task()
+	if err != nil {
+		return
+	}
+	v.SourceSequence, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.PathDigest, err = d.fixed32()
+	return
+}
+func (d *workerDecoder) worker() (node uint16, epoch model.WorkerEpoch, err error) {
+	node, err = d.u16()
+	if err != nil {
+		return
+	}
+	raw, e := d.fixed16()
+	err = e
+	epoch = model.WorkerEpoch(raw)
+	return
+}
+func (d *workerDecoder) token() (v model.AssignmentToken, err error) {
+	v.Task, err = d.task()
+	if err != nil {
+		return
+	}
+	v.WorkerID, v.WorkerEpoch, err = d.worker()
+	if err != nil {
+		return
+	}
+	v.Attempt, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.SpecificationHash, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.AssignmentRevision, err = d.u64()
+	return
+}
+func (d *workerDecoder) replica() (v model.ResultReplicaSet, err error) {
+	v.SinkTask, err = d.task()
+	if err != nil {
+		return
+	}
+	v.PrimaryNodeID, err = d.u16()
+	if err != nil {
+		return
+	}
+	v.SecondaryNodeID, err = d.u16()
+	if err != nil {
+		return
+	}
+	raw, er := d.fixed16()
+	if er != nil {
+		return v, er
+	}
+	v.PrimaryEpoch = model.WorkerEpoch(raw)
+	raw, err = d.fixed16()
+	v.SecondaryEpoch = model.WorkerEpoch(raw)
+	return
+}
+func (d *workerDecoder) assignment() (v model.AssignmentSet, err error) {
+	job, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.JobID = model.JobID(job)
+	v.Revision, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.Digest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	count, err := d.u16()
+	if err != nil {
+		return v, err
+	}
+	if uint64(count) > model.LimitsV1().MaxTasksPerJob || int(count) > d.remaining()/86 {
+		return v, ErrMalformedWorkerMessage
+	}
+	v.Tasks = make([]model.AssignmentToken, int(count))
+	for i := range v.Tasks {
+		v.Tasks[i], err = d.token()
+		if err != nil {
+			return v, err
+		}
+	}
+	rc, err := d.u16()
+	if err != nil {
+		return v, err
+	}
+	if uint64(rc) > model.LimitsV1().MaxTasksPerStage || int(rc) > d.remaining()/56 {
+		return v, ErrMalformedWorkerMessage
+	}
+	v.ResultReplicas = make([]model.ResultReplicaSet, int(rc))
+	for i := range v.ResultReplicas {
+		v.ResultReplicas[i], err = d.replica()
+		if err != nil {
+			return v, err
+		}
+	}
+	return
+}
+func (d *workerDecoder) checkpoints(job model.JobID) (v []SourceCheckpoint, err error) {
+	count, err := d.u16()
+	if err != nil {
+		return nil, err
+	}
+	if count == 0 || count > MaxInventoryCheckpoints || int(count) > d.remaining()/28 {
+		return nil, ErrMalformedWorkerMessage
+	}
+	v = make([]SourceCheckpoint, int(count))
+	for i := range v {
+		v[i].Source, err = d.task()
+		if err != nil {
+			return nil, err
+		}
+		v[i].Watermark, err = d.u64()
+		if err != nil {
+			return nil, err
+		}
+		if v[i].Source.JobID != job {
+			return nil, ErrInvalidWorkerMessage
+		}
+	}
+	return
+}
+func (d *workerDecoder) inventory() (v ResultInventoryQuery, err error) {
+	job, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.JobID = model.JobID(job)
+	v.SinkTask, err = d.task()
+	if err != nil {
+		return
+	}
+	v.SpecificationHash, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.AssignmentRevision, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.AssignmentDigest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.Checkpoints, err = d.checkpoints(v.JobID)
+	if err != nil {
+		return
+	}
+	v.CheckpointDigest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.QueryDigest, err = d.fixed32()
+	return
+}
+func (d *workerDecoder) repair() (v RepairResultPartition, err error) {
+	v.RepairID, err = d.fixed16()
+	if err != nil {
+		return
+	}
+	v.CoordinatorEpoch, err = d.epoch()
+	if err != nil {
+		return
+	}
+	job, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.JobID = model.JobID(job)
+	v.AssignmentRevision, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.AssignmentDigest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.SourceNodeID, v.SourceWorkerEpoch, err = d.worker()
+	if err != nil {
+		return
+	}
+	v.DestinationNodeID, v.DestinationWorkerEpoch, err = d.worker()
+	if err != nil {
+		return
+	}
+	v.SinkTask, err = d.task()
+	if err != nil {
+		return
+	}
+	v.SpecificationHash, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.Checkpoints, err = d.checkpoints(v.JobID)
+	if err != nil {
+		return
+	}
+	v.CheckpointDigest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.ExpectedRecordCount, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.ExpectedTotalBytes, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.ExpectedContentDigest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.InstructionDigest, err = d.fixed32()
+	return
+}
+func (d *workerDecoder) transfer() (v TransferChunk, err error) {
+	raw, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.TransferID = TransferID(raw)
+	job, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.JobID = model.JobID(job)
+	v.TotalLength, err = d.u64()
+	if err != nil {
+		return
+	}
+	if v.TotalLength > MaxTransferTotalBytes {
+		return v, ErrWorkerMessageTooLarge
+	}
+	v.Checksum, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.Offset, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.Data, err = d.bytes32(MaxTransferChunkBytes)
+	if err != nil {
+		return
+	}
+	v.Final, err = d.bool()
+	return
+}
+func (d *workerDecoder) artifact() (v ResultArtifact, err error) {
+	job, err := d.fixed16()
+	if err != nil {
+		return v, err
+	}
+	v.JobID = model.JobID(job)
+	v.SinkTask, err = d.task()
+	if err != nil {
+		return
+	}
+	v.SpecificationHash, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.RecordCount, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.TotalLength, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.Checksum, err = d.fixed32()
+	return
+}
+func (d *workerDecoder) record() (v model.ResultRecord, err error) {
+	v.TupleID, err = d.tupleID()
+	if err != nil {
+		return
+	}
+	v.SinkTask, err = d.task()
+	if err != nil {
+		return
+	}
+	v.SpecificationHash, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.Value, err = d.bytes16(model.LimitsV1().MaxTuplePayloadBytes)
+	if err != nil {
+		return
+	}
+	v.Checksum, err = d.fixed32()
+	return
+}
+func (d *workerDecoder) provenance() (v model.ResultCopyProvenance, err error) {
+	v.AssignmentRevision, err = d.u64()
+	if err != nil {
+		return
+	}
+	v.AssignmentDigest, err = d.fixed32()
+	if err != nil {
+		return
+	}
+	v.ReplicaSet, err = d.replica()
+	if err != nil {
+		return
+	}
+	role, err := d.u8()
+	if err != nil {
+		return v, err
+	}
+	v.DestinationRole = model.ResultReplicaRole(role)
+	v.CoordinatorEpoch, err = d.epoch()
+	return
+}
+func (d *workerDecoder) event() (v model.WorkerEvent, err error) {
+	v.WorkerID, v.WorkerEpoch, err = d.worker()
+	if err != nil {
+		return
+	}
+	v.TransactionID, err = d.u64()
+	if err != nil {
+		return
+	}
+	kind, err := d.u8()
+	if err != nil {
+		return v, err
+	}
+	v.Kind = model.WorkerEventKind(kind)
+	switch v.Kind {
+	case model.WorkerEventCompletion:
+		r := &model.CompletionReport{}
+		job, e := d.fixed16()
+		if e != nil {
+			return v, e
+		}
+		r.JobID = model.JobID(job)
+		r.JobControlRevision, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.AssignmentRevision, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.Source, err = d.task()
+		if err != nil {
+			return
+		}
+		r.Token, err = d.token()
+		if err != nil {
+			return
+		}
+		r.Epoch, err = d.epoch()
+		if err != nil {
+			return
+		}
+		r.ExpectedCheckpointRevision, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.Prior, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.New, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.EOF, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.WorkerTransactionID, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.Digest, err = d.fixed32()
+		v.Completion = r
+	case model.WorkerEventFailure:
+		r := &model.JobFailureReport{}
+		job, e := d.fixed16()
+		if e != nil {
+			return v, e
+		}
+		r.JobID = model.JobID(job)
+		r.JobControlRevision, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.AssignmentRevision, err = d.u64()
+		if err != nil {
+			return
+		}
+		r.Task, err = d.token()
+		if err != nil {
+			return
+		}
+		r.Epoch, err = d.epoch()
+		if err != nil {
+			return
+		}
+		r.TransactionID, err = d.u64()
+		if err != nil {
+			return
+		}
+		code, e := d.u16()
+		if e != nil {
+			return v, e
+		}
+		r.Code = model.FailureCode(code)
+		r.DetailDigest, err = d.fixed32()
+		v.Failure = r
+	default:
+		return v, ErrInvalidWorkerMessage
+	}
+	return
+}
+
+func (d *workerDecoder) message(mt wire.MessageType) (WorkerMessage, error) {
+	switch mt {
+	case wire.MessageCraneWorkerHandshake:
+		n, e1, e := d.worker()
+		if e != nil {
+			return nil, e
+		}
+		c, e := d.fixed32()
+		if e != nil {
+			return nil, e
+		}
+		r, e := d.fixed32()
+		return WorkerHandshake{n, e1, c, r}, e
+	case wire.MessageCraneWorkerHandshakeAck:
+		n, e1, e := d.worker()
+		if e != nil {
+			return nil, e
+		}
+		c, e := d.fixed32()
+		if e != nil {
+			return nil, e
+		}
+		r, e := d.fixed32()
+		return WorkerHandshakeAck{n, e1, c, r}, e
+	case wire.MessageCraneWorkerFenceRequest:
+		e, err := d.epoch()
+		return FenceRequest{e}, err
+	case wire.MessageCraneWorkerFenceResponse:
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		e, err := d.epoch()
+		return FenceResponse{n, we, e}, err
+	case wire.MessageCraneWorkerRegisterRequest:
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		slots, err := d.u16()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		if err != nil {
+			return nil, err
+		}
+		c, err := d.fixed32()
+		if err != nil {
+			return nil, err
+		}
+		r, err := d.fixed32()
+		return WorkerRegisterRequest{n, we, slots, ep, c, r}, err
+	case wire.MessageCraneWorkerRegisterResponse:
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		rev, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		if err != nil {
+			return nil, err
+		}
+		ok, err := d.bool()
+		return WorkerRegisterResponse{n, we, rev, ep, ok}, err
+	case wire.MessageCraneAssignmentSetInstall:
+		topo, err := d.topology(model.LimitsV1().MaxTopologyBytes)
+		if err != nil {
+			return nil, err
+		}
+		validated, err := model.DecodeTopology(topo)
+		if err != nil {
+			return nil, err
+		}
+		set, err := d.assignment()
+		if err != nil {
+			return nil, err
+		}
+		digest, err := d.fixed32()
+		if err != nil {
+			return nil, err
+		}
+		jobRev, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		state, err := d.u8()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return AssignmentSetInstall{set, validated.Spec(), digest, jobRev, model.SchedulingState(state), ep}, err
+	case wire.MessageCraneAssignmentSetInstallAck:
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		job, err := d.fixed16()
+		if err != nil {
+			return nil, err
+		}
+		ar, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		ad, err := d.fixed32()
+		if err != nil {
+			return nil, err
+		}
+		jr, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		s, err := d.u8()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return AssignmentSetInstallAck{n, we, model.JobID(job), ar, ad, jr, model.SchedulingState(s), ep}, err
+	case wire.MessageCraneWorkerStatusRequest:
+		ep, err := d.epoch()
+		if err != nil {
+			return nil, err
+		}
+		after, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		max, err := d.u16()
+		if err != nil {
+			return nil, err
+		}
+		tag, err := d.u8()
+		if err != nil {
+			return nil, err
+		}
+		v := WorkerStatusRequest{CoordinatorEpoch: ep, AfterTransactionID: after, MaxEvents: max}
+		switch tag {
+		case 0:
+		case 1:
+			q, e := d.inventory()
+			if e != nil {
+				return nil, e
+			}
+			v.Inventory = &q
+		case 2:
+			r, e := d.repair()
+			if e != nil {
+				return nil, e
+			}
+			role, e := d.u8()
+			if e != nil {
+				return nil, e
+			}
+			v.Repair = &RepairGrant{r, RepairEndpointRole(role)}
+		default:
+			return nil, ErrMalformedWorkerMessage
+		}
+		return v, nil
+	case wire.MessageCraneWorkerStatusReport:
+		return d.status()
+	case wire.MessageCraneCheckpointNotice:
+		return d.checkpointNotice()
+	case wire.MessageCraneCheckpointAck:
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		job, err := d.fixed16()
+		if err != nil {
+			return nil, err
+		}
+		source, err := d.task()
+		if err != nil {
+			return nil, err
+		}
+		wm, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		ri, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		jr, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		ar, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		ad, err := d.fixed32()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return CheckpointAck{NodeID: n, WorkerEpoch: we, JobID: model.JobID(job), Source: source, Watermark: wm, RaftIndex: ri, JobControlRevision: jr, AssignmentRevision: ar, AssignmentDigest: ad, CoordinatorEpoch: ep}, err
+	case wire.MessageCraneResultRecordChunk:
+		tr, err := d.transfer()
+		if err != nil {
+			return nil, err
+		}
+		rec, err := d.record()
+		if err != nil {
+			return nil, err
+		}
+		p, err := d.provenance()
+		if err != nil {
+			return nil, err
+		}
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		rid, err := d.fixed16()
+		if err != nil {
+			return nil, err
+		}
+		dig, err := d.fixed32()
+		return ResultRecordChunk{tr, rec, p, n, we, rid, dig}, err
+	case wire.MessageCraneResultRecordAck:
+		id, err := d.fixed16()
+		if err != nil {
+			return nil, err
+		}
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		rid, err := d.fixed16()
+		if err != nil {
+			return nil, err
+		}
+		dig, err := d.fixed32()
+		if err != nil {
+			return nil, err
+		}
+		next, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		total, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		sum, err := d.fixed32()
+		if err != nil {
+			return nil, err
+		}
+		complete, err := d.bool()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return ResultRecordAck{TransferID(id), n, we, rid, dig, next, total, sum, complete, ep}, err
+	case wire.MessageCraneResultArtifactChunk:
+		tr, err := d.transfer()
+		if err != nil {
+			return nil, err
+		}
+		a, err := d.artifact()
+		if err != nil {
+			return nil, err
+		}
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return ResultArtifactChunk{tr, a, n, we, ep}, err
+	case wire.MessageCraneResultArtifactAck:
+		id, err := d.fixed16()
+		if err != nil {
+			return nil, err
+		}
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		a, err := d.artifact()
+		if err != nil {
+			return nil, err
+		}
+		next, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		complete, err := d.bool()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return ResultArtifactAck{TransferID(id), n, we, a, next, complete, ep}, err
+	case wire.MessageCraneResultFetchRequest:
+		a, err := d.artifact()
+		if err != nil {
+			return nil, err
+		}
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		off, err := d.u64()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return ResultFetchRequest{a, n, we, off, ep}, err
+	case wire.MessageCraneResultFetchChunk:
+		tr, err := d.transfer()
+		if err != nil {
+			return nil, err
+		}
+		a, err := d.artifact()
+		if err != nil {
+			return nil, err
+		}
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		return ResultFetchChunk{tr, a, n, we, ep}, err
+	case wire.MessageCraneWorkerError:
+		n, we, err := d.worker()
+		if err != nil {
+			return nil, err
+		}
+		ep, err := d.epoch()
+		if err != nil {
+			return nil, err
+		}
+		related, err := d.u16()
+		if err != nil {
+			return nil, err
+		}
+		code, err := d.u16()
+		if err != nil {
+			return nil, err
+		}
+		retry, err := d.bool()
+		if err != nil {
+			return nil, err
+		}
+		detail, err := d.bytes16(MaxWorkerErrorDetailBytes)
+		return WorkerError{n, we, ep, wire.MessageType(related), WorkerErrorCode(code), retry, detail}, err
+	default:
+		return nil, ErrUnexpectedWorkerMessage
+	}
+}
+
+func (d *workerDecoder) status() (WorkerMessage, error) {
+	n, we, err := d.worker()
+	if err != nil {
+		return nil, err
+	}
+	ep, err := d.epoch()
+	if err != nil {
+		return nil, err
+	}
+	store, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	after, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	count, err := d.u16()
+	if err != nil {
+		return nil, err
+	}
+	if uint64(count) > model.LimitsV1().MaxRetainedJobs || int(count) > d.remaining()/97 {
+		return nil, ErrMalformedWorkerMessage
+	}
+	assignments := make([]InstalledAssignmentStatus, int(count))
+	for i := range assignments {
+		job, e := d.fixed16()
+		if e != nil {
+			return nil, e
+		}
+		assignments[i].JobID = model.JobID(job)
+		assignments[i].JobControlRevision, e = d.u64()
+		if e != nil {
+			return nil, e
+		}
+		assignments[i].AssignmentRevision, e = d.u64()
+		if e != nil {
+			return nil, e
+		}
+		assignments[i].AssignmentDigest, e = d.fixed32()
+		if e != nil {
+			return nil, e
+		}
+		assignments[i].SpecificationDigest, e = d.fixed32()
+		if e != nil {
+			return nil, e
+		}
+		state, e := d.u8()
+		if e != nil {
+			return nil, e
+		}
+		assignments[i].SchedulingState = model.SchedulingState(state)
+	}
+	ec, err := d.u16()
+	if err != nil {
+		return nil, err
+	}
+	if ec > MaxWorkerStatusEvents {
+		return nil, ErrMalformedWorkerMessage
+	}
+	events := make([]model.WorkerEvent, int(ec))
+	for i := range events {
+		events[i], err = d.event()
+		if err != nil {
+			return nil, err
+		}
+	}
+	last, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	more, err := d.bool()
+	if err != nil {
+		return nil, err
+	}
+	tag, err := d.u8()
+	if err != nil {
+		return nil, err
+	}
+	v := WorkerStatus{NodeID: n, WorkerEpoch: we, CoordinatorEpoch: ep, StoreTransactionID: store, AfterTransactionID: after, Assignments: assignments, Events: events, LastTransactionID: last, HasMore: more}
+	switch tag {
+	case 0:
+	case 1:
+		q, er := d.fixed32()
+		if er != nil {
+			return nil, er
+		}
+		rc, er := d.u64()
+		if er != nil {
+			return nil, er
+		}
+		total, er := d.u64()
+		if er != nil {
+			return nil, er
+		}
+		content, er := d.fixed32()
+		if er != nil {
+			return nil, er
+		}
+		v.Inventory = &ResultInventorySummary{q, rc, total, content}
+	case 2:
+		id, er := d.fixed16()
+		if er != nil {
+			return nil, er
+		}
+		dig, er := d.fixed32()
+		if er != nil {
+			return nil, er
+		}
+		role, er := d.u8()
+		if er != nil {
+			return nil, er
+		}
+		state, er := d.u8()
+		if er != nil {
+			return nil, er
+		}
+		rc, er := d.u64()
+		if er != nil {
+			return nil, er
+		}
+		total, er := d.u64()
+		if er != nil {
+			return nil, er
+		}
+		content, er := d.fixed32()
+		if er != nil {
+			return nil, er
+		}
+		code, er := d.u16()
+		if er != nil {
+			return nil, er
+		}
+		v.Repair = &ResultRepairStatus{id, dig, RepairEndpointRole(role), ResultRepairState(state), rc, total, content, WorkerErrorCode(code)}
+	default:
+		return nil, ErrMalformedWorkerMessage
+	}
+	return v, nil
+}
+func (d *workerDecoder) checkpointNotice() (WorkerMessage, error) {
+	job, err := d.fixed16()
+	if err != nil {
+		return nil, err
+	}
+	source, err := d.task()
+	if err != nil {
+		return nil, err
+	}
+	wm, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	ri, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	ep, err := d.epoch()
+	if err != nil {
+		return nil, err
+	}
+	jr, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	ar, err := d.u64()
+	if err != nil {
+		return nil, err
+	}
+	ad, err := d.fixed32()
+	return CheckpointNotice{model.CheckpointNotice{JobID: model.JobID(job), Source: source, Watermark: wm, RaftIndex: ri, Epoch: ep}, jr, ar, ad}, err
+}
 
 const maxTupleMessagePayloadBytes = wire.MaxCraneDatagramBytesV1 - wire.FixedHeaderSize - wire.MACSize
 
