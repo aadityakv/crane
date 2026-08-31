@@ -5,6 +5,8 @@ const stateCommandContractFingerprintDomain = "cs425/crane/state-command-contrac
 const (
 	// StateCommandSchemaVersionV1 is the canonical command schema version.
 	StateCommandSchemaVersionV1 uint16 = 1
+	// StateSnapshotSchemaVersionV2 is the canonical Crane snapshot schema.
+	StateSnapshotSchemaVersionV2 uint32 = 2
 	// StateCommandMaxClientSessionsV1 bounds retained public dedup sessions.
 	StateCommandMaxClientSessionsV1 uint64 = 1024
 	// StateCommandMaxSubjectHistoriesV1 bounds retained internal subject histories.
@@ -105,9 +107,11 @@ type StateCommandResultRule struct {
 // StateCommandContract is the dependency-leaf consensus contract for command
 // envelopes, results, deduplication, and coordinator fencing.
 type StateCommandContract struct {
-	SchemaVersion uint16
+	SchemaVersion         uint16
+	SnapshotSchemaVersion uint32
 
 	EnvelopeLayouts []StateCommandLayoutDescriptor
+	SnapshotLayouts []StateCommandLayoutDescriptor
 	EnumDomains     []StateCommandEnumDescriptor
 	ResultMatrix    []StateCommandResultRule
 	DigestDomains   []string
@@ -190,6 +194,29 @@ var stateCommandLayoutsV1 = []StateCommandLayoutDescriptor{
 	{Name: "JobRecord", Fields: []string{"JobID:JobID", "DefiningRequest:ClientRequestID", "TopologyDigest:sha256", "TopologyBytes:owned-canonical-topology", "Lifecycle:JobLifecycle", "JobControlRevision:u64", "Assignment:optional(AssignmentSet)", "NeedsReassignment:sorted-list(NeedsReassignment)", "SourceEOFs:task-keyed(SourceEOFRecord)", "Checkpoints:task-keyed(CheckpointRecord)", "Manifests:task-keyed(ResultManifest)", "Failure:optional(JobFailureReport)"}},
 	{Name: "SubjectHistory", Fields: []string{"Revision:u64", "ID:bytes32", "Digest:sha256", "Target:u32-bytes(owned)", "Result:u32-bytes(owned)", "Applied:u8", "AppliedRevision:u64", "AppliedTarget:u32-bytes(owned)", "AppliedResult:u32-bytes(owned)"}},
 	{Name: "CommandResult", Fields: []string{"SchemaVersion:u16", "Code:u16", "Subject:u8", "Revision:u64", "JobID:JobID", "WorkerID:u16", "Epoch:CoordinatorEpoch"}},
+}
+
+var stateSnapshotLayoutsV2 = []StateCommandLayoutDescriptor{
+	{Name: "SnapshotRoot", Fields: []string{"Magic:bytes4(CRSN)", "SchemaVersion:u16(2)", "ConsensusFingerprint:sha256", "LastAppliedCraneIndex:u64", "CoordinatorRevision:u64", "CoordinatorEpoch:CoordinatorEpoch", "Clients:u64-count+sorted(ClientHistory)", "Subjects:u64-count+sorted(SubjectHistory)", "Workers:u64-count+sorted(WorkerEntry)", "Jobs:u64-count+sorted(JobRecord)", "WorkerEvents:u64-count+sorted(WorkerEventEntry)"}},
+	{Name: "ClientHistory", Fields: []string{"ClientID:bytes16(nonzero)", "Sequence:u64(nonzero)", "Digest:sha256(nonzero)", "Result:u32-bytes(owned,bounded)"}},
+	{Name: "SubjectHistory", Fields: []string{"Subject:SubjectKey", "Revision:u64", "ID:bytes32(nonzero)", "Digest:sha256(nonzero)", "Target:u32-bytes(owned,bounded)", "Result:u32-bytes(owned,bounded)", "Applied:u8(bool)", "AppliedRevision:u64", "AppliedTarget:u32-bytes(owned,bounded)", "AppliedResult:u32-bytes(owned,bounded)"}},
+	{Name: "WorkerEntry", Fields: []string{"NodeIDKey:u16(nonzero)", "Worker:WorkerRecord"}},
+	{Name: "JobRecord", Fields: []string{"JobIDKey:bytes16(nonzero)", "JobID:bytes16(nonzero)", "DefiningRequest:ClientRequestID", "TopologyDigest:sha256(nonzero)", "TopologyBytes:u64-bytes(canonical,bounded)", "Lifecycle:JobLifecycle", "JobControlRevision:u64(nonzero)", "Assignment:optional(AssignmentSet)", "NeedsReassignment:u16-count+sorted(NeedsReassignment)", "SourceEOFs:u16-count+sorted(SourceEOFEntry)", "Checkpoints:u16-count+sorted(CheckpointEntry)", "Manifests:u16-count+sorted(ManifestEntry)", "Failure:optional(JobFailureReport)"}},
+	{Name: "ClientRequestID", Fields: []string{"ClientID:bytes16(nonzero)", "Sequence:u64(nonzero)"}},
+	{Name: "SourceEOFEntry", Fields: []string{"Source:TaskID", "EOF:u64", "Revision:u64(nonzero)"}},
+	{Name: "CheckpointEntry", Fields: []string{"Source:TaskID", "Watermark:u64", "Revision:u64(nonzero)"}},
+	{Name: "ManifestEntry", Fields: []string{"SinkTask:TaskID", "Manifest:ResultManifest"}},
+	{Name: "WorkerEventEntry", Fields: []string{"WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "TransactionID:u64(nonzero)", "Digest:sha256(nonzero)"}},
+	{Name: "WorkerRecord", Fields: []string{"NodeID:u16(nonzero)", "Epoch:bytes16(nonzero)", "State:u8", "Revision:u64(nonzero)", "Slots:u16", "ConsensusFingerprint:sha256", "RegistryFingerprint:sha256"}},
+	{Name: "SubjectKey", Fields: []string{"Kind:u8", "JobID:JobID", "TaskID:TaskID", "WorkerID:u16"}},
+	{Name: "TaskID", Fields: []string{"JobID:bytes16(nonzero)", "StageID:u16(nonzero)", "Partition:u16"}},
+	{Name: "CoordinatorEpoch", Fields: []string{"Term:u64(nonzero)", "BeginIndex:u64(nonzero)", "Coordinator:u16(nonzero)", "Nonce:bytes16(nonzero)"}},
+	{Name: "AssignmentSet", Fields: []string{"JobID:bytes16(nonzero)", "Revision:u64(nonzero)", "Digest:sha256(nonzero)", "Tasks:u16-count+list(AssignmentToken)", "ResultReplicas:u16-count+list(ResultReplicaSet)"}},
+	{Name: "AssignmentToken", Fields: []string{"Task:TaskID", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "Attempt:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "AssignmentRevision:u64(nonzero)"}},
+	{Name: "ResultReplicaSet", Fields: []string{"SinkTask:TaskID", "PrimaryNodeID:u16(nonzero)", "SecondaryNodeID:u16(nonzero-distinct)", "PrimaryEpoch:bytes16(nonzero)", "SecondaryEpoch:bytes16(nonzero)"}},
+	{Name: "NeedsReassignment", Fields: []string{"Kind:ReassignmentTargetKind", "Task:TaskID", "SinkTask:TaskID", "ReplicaRole:ResultReplicaRole", "OldWorkerID:u16(nonzero)", "OldWorkerEpoch:bytes16(nonzero)"}},
+	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet"}},
+	{Name: "JobFailureReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Task:AssignmentToken", "Epoch:CoordinatorEpoch", "TransactionID:u64(nonzero)", "Code:FailureCode", "DetailDigest:sha256(nonzero)"}},
 }
 
 var stateCommandEnumsV1 = []StateCommandEnumDescriptor{
@@ -298,13 +325,19 @@ var stateCommandRulesV1 = []string{
 	"snapshot-accounting-includes-every-root-and-job-collection-count-map-key-entry-and-optional-selector-before-mutation",
 	"only-deploying-to-running-running-to-draining-and-draining-to-succeeded-are-normal-internal-lifecycle-transitions",
 	"all-declared-collection-counts-and-command-sizes-are-bounded-before-allocation-or-mutation",
+	"snapshot-schema-two-encodes-the-complete-state-as-canonical-sorted-bounded-collections-with-an-exact-eight-mibibyte-limit",
+	"snapshot-schema-zero-and-one-are-accepted-only-with-an-empty-payload-and-restore-the-empty-crane-state",
+	"snapshot-restore-decodes-to-temporary-owned-state-validates-cross-references-and-canonical-reencoding-before-atomic-replacement",
+	"snapshot-last-applied-index-is-the-last-successful-crane-command-index-not-the-raft-snapshot-barrier-position",
 }
 
 // StateCommandContractV1 returns deep-owned consensus descriptor slices.
 func StateCommandContractV1() StateCommandContract {
 	return StateCommandContract{
 		SchemaVersion:            StateCommandSchemaVersionV1,
+		SnapshotSchemaVersion:    StateSnapshotSchemaVersionV2,
 		EnvelopeLayouts:          cloneStateCommandLayouts(stateCommandLayoutsV1),
+		SnapshotLayouts:          cloneStateCommandLayouts(stateSnapshotLayoutsV2),
 		EnumDomains:              cloneStateCommandEnums(stateCommandEnumsV1),
 		ResultMatrix:             append([]StateCommandResultRule(nil), stateCommandResultMatrixV1...),
 		DigestDomains:            []string{"cs425/crane/internal-command/v1", "cs425/crane/needs-reassignment/v1", "cs425/crane/completion-report/v1", "cs425/crane/job-failure-event/v1", AssignmentSetDigestDomainV1},
@@ -351,8 +384,14 @@ func StateCommandContractV1() StateCommandContract {
 func canonicalStateCommandContractBytes(contract StateCommandContract) []byte {
 	encoded := appendString([]byte(stateCommandContractFingerprintDomain), "crane-state-command")
 	encoded = appendUint16(encoded, contract.SchemaVersion)
+	encoded = appendUint32(encoded, contract.SnapshotSchemaVersion)
 	encoded = appendUint16(encoded, uint16(len(contract.EnvelopeLayouts)))
 	for _, layout := range contract.EnvelopeLayouts {
+		encoded = appendString(encoded, layout.Name)
+		encoded = appendStringList(encoded, layout.Fields)
+	}
+	encoded = appendUint16(encoded, uint16(len(contract.SnapshotLayouts)))
+	for _, layout := range contract.SnapshotLayouts {
 		encoded = appendString(encoded, layout.Name)
 		encoded = appendStringList(encoded, layout.Fields)
 	}

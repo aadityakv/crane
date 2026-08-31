@@ -7,7 +7,8 @@ import (
 
 func TestStateCommandContractV1PinsCompleteReplicatedDedupContract(t *testing.T) {
 	want := StateCommandContract{
-		SchemaVersion: 1,
+		SchemaVersion:         1,
+		SnapshotSchemaVersion: 2,
 		EnvelopeLayouts: []StateCommandLayoutDescriptor{
 			{Name: "Envelope", Fields: []string{"SchemaVersion:u16", "ConsensusFingerprint:sha256", "Kind:u16", "CoordinatorEpoch:CoordinatorEpoch(zero-only-for-begin)", "IdentitySelector:u8", "Identity:ClientEnvelope|InternalEnvelope", "Target:concrete-command-fields"}},
 			{Name: "ClientEnvelope", Fields: []string{"ClientID:bytes16(nonzero)", "Sequence:u64(nonzero)", "Digest:sha256(nonzero)"}},
@@ -46,6 +47,7 @@ func TestStateCommandContractV1PinsCompleteReplicatedDedupContract(t *testing.T)
 			{Name: "SubjectHistory", Fields: []string{"Revision:u64", "ID:bytes32", "Digest:sha256", "Target:u32-bytes(owned)", "Result:u32-bytes(owned)", "Applied:u8", "AppliedRevision:u64", "AppliedTarget:u32-bytes(owned)", "AppliedResult:u32-bytes(owned)"}},
 			{Name: "CommandResult", Fields: []string{"SchemaVersion:u16", "Code:u16", "Subject:u8", "Revision:u64", "JobID:JobID", "WorkerID:u16", "Epoch:CoordinatorEpoch"}},
 		},
+		SnapshotLayouts: cloneStateCommandLayouts(stateSnapshotLayoutsV2),
 		EnumDomains: []StateCommandEnumDescriptor{
 			{Name: "IdentitySelector", Values: []string{"Client=1", "Internal=2"}},
 			{Name: "CommandKind", Values: []string{"BeginCoordinatorEpoch=1", "RegisterWorker=2", "DrainWorker=3", "DeactivateWorker=4", "ReplaceWorkerEpoch=5", "SubmitJob=6", "CancelJob=7", "RecordSourceEOF=8", "InstallAssignments=9", "ReplaceAssignments=10", "AdvanceCheckpoint=11", "SealManifest=12", "TransitionJob=13", "FailJob=14"}},
@@ -163,6 +165,10 @@ func TestStateCommandContractV1PinsCompleteReplicatedDedupContract(t *testing.T)
 			"snapshot-accounting-includes-every-root-and-job-collection-count-map-key-entry-and-optional-selector-before-mutation",
 			"only-deploying-to-running-running-to-draining-and-draining-to-succeeded-are-normal-internal-lifecycle-transitions",
 			"all-declared-collection-counts-and-command-sizes-are-bounded-before-allocation-or-mutation",
+			"snapshot-schema-two-encodes-the-complete-state-as-canonical-sorted-bounded-collections-with-an-exact-eight-mibibyte-limit",
+			"snapshot-schema-zero-and-one-are-accepted-only-with-an-empty-payload-and-restore-the-empty-crane-state",
+			"snapshot-restore-decodes-to-temporary-owned-state-validates-cross-references-and-canonical-reencoding-before-atomic-replacement",
+			"snapshot-last-applied-index-is-the-last-successful-crane-command-index-not-the-raft-snapshot-barrier-position",
 		},
 	}
 	got := StateCommandContractV1()
@@ -174,6 +180,7 @@ func TestStateCommandContractV1PinsCompleteReplicatedDedupContract(t *testing.T)
 		t.Fatal("StateCommandContractV1 returned shared result-matrix storage")
 	}
 	got.EnvelopeLayouts[0].Fields[0] = "mutated"
+	got.SnapshotLayouts[0].Fields[0] = "mutated"
 	got.EnumDomains[0].Values[0] = "mutated"
 	got.Rules[0] = "mutated"
 	if again := StateCommandContractV1(); reflect.DeepEqual(got, again) {
@@ -186,8 +193,11 @@ func TestCanonicalStateCommandContractBytesChangeForEveryDefiningField(t *testin
 	want := canonicalStateCommandContractBytes(base)
 	mutations := []func(*StateCommandContract){
 		func(c *StateCommandContract) { c.SchemaVersion++ },
+		func(c *StateCommandContract) { c.SnapshotSchemaVersion++ },
 		func(c *StateCommandContract) { c.EnvelopeLayouts[0].Name += "x" },
 		func(c *StateCommandContract) { c.EnvelopeLayouts[0].Fields[0] += "x" },
+		func(c *StateCommandContract) { c.SnapshotLayouts[0].Name += "x" },
+		func(c *StateCommandContract) { c.SnapshotLayouts[0].Fields[0] += "x" },
 		func(c *StateCommandContract) { c.EnumDomains[0].Name += "x" },
 		func(c *StateCommandContract) { c.EnumDomains[0].Values[0] += "x" },
 		func(c *StateCommandContract) { c.ResultMatrix[0].Code++ },

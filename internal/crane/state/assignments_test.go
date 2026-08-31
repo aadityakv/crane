@@ -185,7 +185,7 @@ func task10AssignedJob(t *testing.T, workerCount int) (*Machine, model.JobID, mo
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := applyTask10(t, machine, uint64(index), register); got.Code != ResultSuccess {
+		if got := applyTask10(t, machine, uint64(index+1), register); got.Code != ResultSuccess {
 			t.Fatalf("register %d = %#v", index, got)
 		}
 	}
@@ -194,7 +194,7 @@ func task10AssignedJob(t *testing.T, workerCount int) (*Machine, model.JobID, mo
 		for index := workerCount + 1; index <= 2; index++ {
 			record := WorkerRecord{NodeID: uint16(index), Epoch: model.WorkerEpoch{byte(index)}, State: WorkerEligible, Revision: 1, Slots: 16, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
 			register, _ := NewRegisterWorker(InternalCommandID{byte(index), 0x10}, 0, record, machine.coordinatorEpoch)
-			applyTask10(t, machine, uint64(index), register)
+			applyTask10(t, machine, uint64(index+1), register)
 		}
 	}
 	topology, err := model.ValidateTopology(task10Topology(0))

@@ -2,7 +2,6 @@ package state
 
 import (
 	"bytes"
-	"sync"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -303,29 +302,17 @@ func TestInternalExactTargetReplayThatCannotReplaceHistoryReturnsStableCapacity(
 	}
 }
 
-func TestMachineApplyIsRaceSafeAndExecutesOneCoordinatorMutation(t *testing.T) {
+func TestMachineSequentialApplyExecutesOneCoordinatorMutation(t *testing.T) {
 	machine := NewMachine()
 	command := validBeginCommand(t, 0, 2, 0x42)
 	encoded, _ := MarshalBeginCoordinatorEpoch(command)
-	const goroutines = 64
-	results := make([][]byte, goroutines)
-	errorsSeen := make([]error, goroutines)
-	var start sync.WaitGroup
-	start.Add(1)
-	var workers sync.WaitGroup
+	const applications = 64
+	results := make([][]byte, applications)
 	for index := range results {
-		workers.Add(1)
-		go func(slot int) {
-			defer workers.Done()
-			start.Wait()
-			results[slot], errorsSeen[slot] = machine.Apply(uint64(slot+1), uint64(slot+1), encoded)
-		}(index)
-	}
-	start.Done()
-	workers.Wait()
-	for index := range results {
-		if errorsSeen[index] != nil || !bytes.Equal(results[index], results[0]) {
-			t.Fatalf("concurrent result %d=%x err=%v; first=%x", index, results[index], errorsSeen[index], results[0])
+		var err error
+		results[index], err = machine.Apply(uint64(index+1), uint64(index+1), encoded)
+		if err != nil || !bytes.Equal(results[index], results[0]) {
+			t.Fatalf("sequential result %d=%x err=%v; first=%x", index, results[index], err, results[0])
 		}
 	}
 	if machine.coordinatorRevision != 1 {

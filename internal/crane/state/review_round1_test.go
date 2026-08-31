@@ -356,7 +356,7 @@ func TestEveryTask10MutationRejectsUnseenStaleFenceBeforeMutation(t *testing.T) 
 	}
 
 	commands := []any{staleRegister, drain, deactivate, replaceWorker, submit, cancel, recordEOF, install, replaceSet, advance, seal, transition, fail}
-	for _, command := range commands {
+	for offset, command := range commands {
 		clientsBefore, subjectsBefore := len(machine.clients), len(machine.subjects)
 		bytesBefore := machine.estimatedSnapshotBytes
 		workerBefore := machine.workers[1]
@@ -365,7 +365,7 @@ func TestEveryTask10MutationRejectsUnseenStaleFenceBeforeMutation(t *testing.T) 
 		if err != nil {
 			t.Fatalf("MarshalCommand(%T): %v", command, err)
 		}
-		got := mustApplyResult(t, machine, 102, 2, encoded)
+		got := mustApplyResult(t, machine, 102+uint64(offset), 2, encoded)
 		if got.Code != ResultStaleEpoch || got.Epoch != currentFence {
 			t.Fatalf("%T stale result = %#v, want current fence %#v", command, got, currentFence)
 		}

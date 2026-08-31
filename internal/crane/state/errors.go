@@ -12,4 +12,6 @@ var (
 	ErrInvalidCommandSubject        = errors.New("invalid crane command subject")
 	ErrInvalidCommand               = errors.New("invalid crane command")
 	ErrMalformedCommandResult       = errors.New("malformed crane command result")
+	ErrInvalidSnapshot              = errors.New("invalid crane state snapshot")
+	ErrInvalidApplyIndex            = errors.New("invalid crane apply index")
 )

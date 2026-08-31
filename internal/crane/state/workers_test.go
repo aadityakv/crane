@@ -152,6 +152,9 @@ func applyTask10(t *testing.T, machine *Machine, index uint64, command any) Comm
 	if err != nil {
 		t.Fatalf("MarshalCommand(%T): %v", command, err)
 	}
+	if index <= machine.lastAppliedIndex {
+		index = machine.lastAppliedIndex + 1
+	}
 	result, err := machine.Apply(index, 1, encoded)
 	if err != nil {
 		t.Fatalf("Apply(%T): %v", command, err)

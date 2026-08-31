@@ -134,6 +134,12 @@ func appendUint16(destination []byte, value uint16) []byte {
 	return append(destination, encoded[:]...)
 }
 
+func appendUint32(destination []byte, value uint32) []byte {
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], value)
+	return append(destination, encoded[:]...)
+}
+
 func appendUint64(destination []byte, value uint64) []byte {
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], value)

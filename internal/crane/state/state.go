@@ -56,6 +56,7 @@ type Machine struct {
 	workers             map[uint16]WorkerRecord
 	jobs                map[model.JobID]JobRecord
 	workerEvents        map[workerEventKey]workerEventCursor
+	lastAppliedIndex    uint64
 
 	estimatedSnapshotBytes uint64
 }
@@ -82,38 +83,47 @@ func (machine *Machine) Apply(index, term uint64, encoded []byte) ([]byte, error
 
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
+	if index <= machine.lastAppliedIndex {
+		return nil, fmt.Errorf("%w: index %d is not greater than %d", ErrInvalidApplyIndex, index, machine.lastAppliedIndex)
+	}
+	var result []byte
 	switch command := decoded.(type) {
 	case BeginCoordinatorEpoch:
-		return machine.applyBeginCoordinatorLocked(index, term, command)
+		result, err = machine.applyBeginCoordinatorLocked(index, term, command)
 	case RegisterWorker:
-		return machine.applyRegisterWorkerLocked(command)
+		result, err = machine.applyRegisterWorkerLocked(command)
 	case DrainWorker:
-		return machine.applyDrainWorkerLocked(command)
+		result, err = machine.applyDrainWorkerLocked(command)
 	case DeactivateWorker:
-		return machine.applyDeactivateWorkerLocked(command)
+		result, err = machine.applyDeactivateWorkerLocked(command)
 	case ReplaceWorkerEpoch:
-		return machine.applyReplaceWorkerEpochLocked(command)
+		result, err = machine.applyReplaceWorkerEpochLocked(command)
 	case SubmitJob:
-		return machine.applySubmitJobLocked(command)
+		result, err = machine.applySubmitJobLocked(command)
 	case CancelJob:
-		return machine.applyCancelJobLocked(command)
+		result, err = machine.applyCancelJobLocked(command)
 	case RecordSourceEOF:
-		return machine.applyRecordSourceEOFLocked(command)
+		result, err = machine.applyRecordSourceEOFLocked(command)
 	case InstallAssignments:
-		return machine.applyInstallAssignmentsLocked(command)
+		result, err = machine.applyInstallAssignmentsLocked(command)
 	case ReplaceAssignments:
-		return machine.applyReplaceAssignmentsLocked(command)
+		result, err = machine.applyReplaceAssignmentsLocked(command)
 	case AdvanceCheckpoint:
-		return machine.applyAdvanceCheckpointLocked(command)
+		result, err = machine.applyAdvanceCheckpointLocked(command)
 	case SealManifest:
-		return machine.applySealManifestLocked(command)
+		result, err = machine.applySealManifestLocked(command)
 	case TransitionJob:
-		return machine.applyTransitionJobLocked(command)
+		result, err = machine.applyTransitionJobLocked(command)
 	case FailJob:
-		return machine.applyFailJobLocked(command)
+		result, err = machine.applyFailJobLocked(command)
 	default:
 		return nil, errors.New("impossible decoded command type")
 	}
+	if err != nil {
+		return nil, err
+	}
+	machine.lastAppliedIndex = index
+	return result, nil
 }
 
 func (machine *Machine) applyBeginCoordinatorLocked(index, term uint64, command BeginCoordinatorEpoch) ([]byte, error) {
