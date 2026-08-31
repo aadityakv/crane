@@ -4,10 +4,48 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 )
+
+func TestResultReplicaSetContractSchemaMatchesCanonicalEncoderOrder(t *testing.T) {
+	var schema string
+	for _, candidate := range model.WorkerControlContractV1().NestedSchemas {
+		if strings.HasPrefix(candidate, "ResultReplicaSet=") {
+			schema = strings.TrimPrefix(candidate, "ResultReplicaSet=")
+			break
+		}
+	}
+	if schema == "" {
+		t.Fatal("worker-control contract omits ResultReplicaSet schema")
+	}
+	replica := model.ResultReplicaSet{SinkTask: model.TaskID{JobID: model.JobID{1}, StageID: 2, Partition: 3}, PrimaryNodeID: 0x0405, SecondaryNodeID: 0x0607, PrimaryEpoch: model.WorkerEpoch{8}, SecondaryEpoch: model.WorkerEpoch{9}}
+	fieldBytes := map[string][]byte{
+		"SinkTask:TaskID":            append(append(append([]byte(nil), replica.SinkTask.JobID[:]...), byte(replica.SinkTask.StageID>>8), byte(replica.SinkTask.StageID)), byte(replica.SinkTask.Partition>>8), byte(replica.SinkTask.Partition)),
+		"PrimaryNodeID:u16":          {byte(replica.PrimaryNodeID >> 8), byte(replica.PrimaryNodeID)},
+		"SecondaryNodeID:u16":        {byte(replica.SecondaryNodeID >> 8), byte(replica.SecondaryNodeID)},
+		"PrimaryEpoch:WorkerEpoch":   replica.PrimaryEpoch[:],
+		"SecondaryEpoch:WorkerEpoch": replica.SecondaryEpoch[:],
+	}
+	var want []byte
+	for _, field := range strings.Split(schema, ",") {
+		encoded, ok := fieldBytes[field]
+		if !ok {
+			t.Fatalf("unrecognized ResultReplicaSet contract field %q", field)
+		}
+		want = append(want, encoded...)
+	}
+	encoder := workerEncoder{}
+	encoder.replica(replica)
+	if encoder.err != nil {
+		t.Fatal(encoder.err)
+	}
+	if !bytes.Equal(encoder.output, want) {
+		t.Fatalf("contract schema order encodes %x, canonical encoder emits %x", want, encoder.output)
+	}
+}
 
 func TestProtocolUsesAuthoritativeWorkerControlContract(t *testing.T) {
 	contract := model.WorkerControlContractV1()
@@ -158,5 +196,41 @@ func TestResultRecordChunksAreExactSlicesOfCanonicalLogicalStream(t *testing.T) 
 				t.Fatal("accepted ACK correlation mismatch")
 			}
 		})
+	}
+	partial := fixture.recordChunk
+	cut := len(stream) / 2
+	partial.Transfer.Data = append([]byte(nil), stream[:cut]...)
+	partial.Transfer.Final = false
+	partialACK := fixture.recordAck
+	partialACK.NextOffset = uint64(cut)
+	partialACK.Complete = false
+	if err := ValidateResultRecordAckCorrelation(partial, partialACK); err != nil {
+		t.Fatalf("valid partial ACK correlation: %v", err)
+	}
+	for name, mutate := range map[string]func(*ResultRecordAck){
+		"partial incorrect offset":   func(v *ResultRecordAck) { v.NextOffset++ },
+		"partial premature complete": func(v *ResultRecordAck) { v.NextOffset = v.TotalLength; v.Complete = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := partialACK
+			mutate(&invalid)
+			if err := ValidateResultRecordAckCorrelation(partial, invalid); err == nil {
+				t.Fatal("accepted ACK that does not advance the supplied partial chunk")
+			}
+		})
+	}
+	if err := ValidateResultRecordAckCorrelation(fixture.recordChunk, fixture.recordAck); err != nil {
+		t.Fatalf("valid final ACK correlation: %v", err)
+	}
+	finalIncomplete := fixture.recordAck
+	finalIncomplete.NextOffset--
+	finalIncomplete.Complete = false
+	if err := ValidateResultRecordAckCorrelation(fixture.recordChunk, finalIncomplete); err == nil {
+		t.Fatal("accepted incorrect offset for final chunk")
+	}
+	finalWrongComplete := fixture.recordAck
+	finalWrongComplete.Complete = false
+	if err := ValidateResultRecordAckCorrelation(fixture.recordChunk, finalWrongComplete); err == nil {
+		t.Fatal("accepted incomplete ACK for final chunk")
 	}
 }

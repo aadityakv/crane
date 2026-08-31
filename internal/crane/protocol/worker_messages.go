@@ -766,8 +766,16 @@ func ValidateResultRecordAckCorrelation(chunk ResultRecordChunk, ack ResultRecor
 	if err := ack.validate(); err != nil {
 		return err
 	}
+	chunkLength := uint64(len(chunk.Transfer.Data))
+	if chunk.Transfer.Offset > ^uint64(0)-chunkLength {
+		return errors.New("record chunk end offset overflow")
+	}
+	expectedNextOffset := chunk.Transfer.Offset + chunkLength
 	if ack.TransferID != chunk.Transfer.TransferID || ack.NodeID != chunk.DestinationNodeID || ack.WorkerEpoch != chunk.DestinationWorkerEpoch || ack.RepairID != chunk.RepairID || ack.RepairInstructionDigest != chunk.RepairInstructionDigest || ack.TotalLength != chunk.Transfer.TotalLength || ack.Checksum != chunk.Transfer.Checksum || ack.CoordinatorEpoch != chunk.Provenance.CoordinatorEpoch {
 		return errors.New("record ACK does not bind the canonical transfer")
+	}
+	if ack.NextOffset != expectedNextOffset || ack.Complete != chunk.Transfer.Final {
+		return errors.New("record ACK does not advance the supplied chunk")
 	}
 	return nil
 }

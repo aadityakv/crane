@@ -23,11 +23,11 @@ func TestWorkerMessageTableValidInvalidGoldenTruncationAndOwnership(t *testing.T
 		invalid WorkerMessage
 		golden  string
 	}{
-		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "64f4fe7842d40aa1b126657df3a0dc2d15a3582363072d31182d75720137b223"},
-		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "b61ed3924574c58bdf300a62adfd83afc5c0d7c0183611ba25b2df6168846067"},
+		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "e3fdc4269f0dc83b2e43dd406e5fd71e88409341488dc3edd047d9b1711f79e5"},
+		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "e70617ed8d56f18dd63ac04a23bdd8d7650b3563c539d08de4c34d1b42072474"},
 		{"fence_request", 202, fixture.fence, FenceRequest{}, "188908a1e60279df9bdf19b5f3f559c2a3749a3d5637c769a1f4947060cb236a"},
 		{"fence_response", 203, fixture.fenceResponse, FenceResponse{}, "d4b8e6ec7790fa83a009b8944bd2c12889059da4e9bd27ed68ed1ae4f92db417"},
-		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "f801d79d7f87b249aea34bf04f40bec0999cbac7b7087475caa4f48355cb8d5e"},
+		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "0034ae45c3b9a28cbe834ab8b50f3638763a8022d3a61dcbcf6baeca722299ed"},
 		{"register_response", 205, fixture.registerResponse, WorkerRegisterResponse{}, "754be824632090c1ccdc0a08ed2ff6d599c6c461d1f7027618687c691e41a4ad"},
 		{"assignment_install", 206, fixture.install, AssignmentSetInstall{}, "16e239886543b95509ee672c8226a31fb619ca8a37d81889b9967ee625c2eb6c"},
 		{"assignment_ack", 207, fixture.installAck, AssignmentSetInstallAck{}, "6f805e4bea27a0895c250671132928b832197be2d5141b01c29d4edac2a18b4f"},
@@ -176,6 +176,53 @@ func TestCheckpointAckRepeatsExactCommittedAndAssignmentCorrelation(t *testing.T
 
 func TestAssignmentInstallWorstLegalShapeFitsAuthenticatedFrameAndPreflightsDeclaredLength(t *testing.T) {
 	install := worstLegalAssignmentInstall(t)
+	consensus := model.LimitsV1()
+	if uint64(len(install.Specification.Stages)) != consensus.MaxStages || uint64(len(install.Specification.Edges)) != consensus.MaxEdges || uint64(len(install.Assignment.Tasks)) != consensus.MaxTasksPerJob || uint64(len(install.Assignment.ResultReplicas)) != consensus.MaxTasksPerStage {
+		t.Fatal("maximum proof fixture misses a structural/count maximum")
+	}
+	if len(install.Specification.Name) != int(consensus.MaxIdentifierBytes) {
+		t.Fatal("maximum proof fixture job name is not maximal")
+	}
+	largestTransform := largestLegalTransformOperator(t)
+	for index, stage := range install.Specification.Stages {
+		if len(stage.Name) != int(consensus.MaxIdentifierBytes) {
+			t.Fatalf("stage %d name is not maximal", index)
+		}
+		if stage.Role == model.Transform && !reflect.DeepEqual(stage.Operator, largestTransform) {
+			t.Fatalf("stage %d does not use the largest legal transform/settings encoding: %#v", index, stage.Operator)
+		}
+	}
+	source := install.Specification.Stages[0]
+	if source.Role != model.Source || source.Parallelism != uint16(consensus.MaxTasksPerStage) || source.Operator.Name != "range" || !reflect.DeepEqual(source.Operator.Settings, []model.Setting{{Key: "end_exclusive", Value: "-9223372036853775808"}, {Key: "start", Value: "-9223372036854775808"}}) {
+		t.Fatalf("source does not maximize legal range/settings/task dimensions: %#v", source)
+	}
+	sink := install.Specification.Stages[len(install.Specification.Stages)-1]
+	if sink.Role != model.Sink || sink.Parallelism != uint16(consensus.MaxTasksPerStage) || sink.Operator.Name != "collect" || len(sink.Operator.Settings) != 0 {
+		t.Fatalf("sink does not maximize legal replica/task dimensions: %#v", sink)
+	}
+	for index, edge := range install.Specification.Edges {
+		if edge.Routing != model.FieldHash || edge.Field != "value" {
+			t.Fatalf("edge %d omits the largest legal routing-field encoding: %#v", index, edge)
+		}
+	}
+	overlongField := install.Specification
+	overlongField.Edges = append([]model.EdgeSpec(nil), overlongField.Edges...)
+	overlongField.Edges[0].Field = strings.Repeat("v", int(consensus.MaxIdentifierBytes))
+	if _, err := model.ValidateTopology(overlongField); err == nil {
+		t.Fatal("consensus unexpectedly permits a longer field-hash routing field than value")
+	}
+	tasksPerWorker := make(map[uint16]int)
+	for _, token := range install.Assignment.Tasks {
+		tasksPerWorker[token.WorkerID]++
+	}
+	if len(tasksPerWorker) != 4 {
+		t.Fatalf("maximum set does not use the four required max-slot workers: %v", tasksPerWorker)
+	}
+	for node, count := range tasksPerWorker {
+		if count != int(consensus.MaxWorkerSlots) {
+			t.Fatalf("worker %d owns %d tasks, want max %d", node, count, consensus.MaxWorkerSlots)
+		}
+	}
 	payload, err := MarshalWorkerMessage(install)
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +235,9 @@ func TestAssignmentInstallWorstLegalShapeFitsAuthenticatedFrameAndPreflightsDecl
 	}
 	if uint64(len(frame)) > model.LimitsV1().MaxWorkerControlFrameBytes {
 		t.Fatalf("authenticated install = %d, max %d", len(frame), model.LimitsV1().MaxWorkerControlFrameBytes)
+	}
+	if len(frame) != 113932 {
+		t.Fatalf("maximum structured authenticated install = %d, want independently accounted 113932", len(frame))
 	}
 	if want, err := model.CompleteAssignmentSetInstallBytes(uint64(len(mustValidatedTopology(t, install.Specification).CanonicalBytes())), uint64(len(install.Assignment.Tasks)), uint64(len(install.Assignment.ResultReplicas))); err != nil || want != uint64(len(frame)) {
 		t.Fatalf("model/real frame accounting = %d/%d/%v", want, len(frame), err)
@@ -227,7 +277,7 @@ func worstLegalAssignmentInstall(t *testing.T) AssignmentSetInstall {
 	limits := model.LimitsV1()
 	stages := make([]model.StageSpec, limits.MaxStages)
 	for index := range stages {
-		role, operator := model.Transform, model.OperatorSpec{Name: "multiply", Version: 1, Settings: []model.Setting{{Key: "factor", Value: "-9223372036854775808"}}}
+		role, operator := model.Transform, largestLegalTransformOperator(t)
 		parallelism := uint16(1)
 		if index == 0 {
 			role, operator, parallelism = model.Source, model.OperatorSpec{Name: "range", Version: 1, Settings: []model.Setting{{Key: "end_exclusive", Value: "-9223372036853775808"}, {Key: "start", Value: "-9223372036854775808"}}}, 256
@@ -245,10 +295,10 @@ func worstLegalAssignmentInstall(t *testing.T) AssignmentSetInstall {
 	}
 	edges := make([]model.EdgeSpec, 0, limits.MaxEdges)
 	for index := 0; index < len(stages)-1; index++ {
-		edges = append(edges, model.EdgeSpec{EdgeID: uint16(len(edges) + 1), SourceStageID: uint16(index + 1), DestinationStageID: uint16(index + 2), Routing: model.Shuffle})
+		edges = append(edges, model.EdgeSpec{EdgeID: uint16(len(edges) + 1), SourceStageID: uint16(index + 1), DestinationStageID: uint16(index + 2), Routing: model.FieldHash, Field: "value"})
 	}
 	for uint64(len(edges)) < limits.MaxEdges {
-		edges = append(edges, model.EdgeSpec{EdgeID: uint16(len(edges) + 1), SourceStageID: 1, DestinationStageID: uint16(len(stages)), Routing: model.Shuffle})
+		edges = append(edges, model.EdgeSpec{EdgeID: uint16(len(edges) + 1), SourceStageID: 1, DestinationStageID: uint16(len(stages)), Routing: model.FieldHash, Field: "value"})
 	}
 	spec := model.TopologySpec{SchemaVersion: 1, Name: string(bytes.Repeat([]byte{'z'}, 64)), Stages: stages, Edges: edges, RegistryFingerprint: model.RegistryFingerprint()}
 	validated, err := model.ValidateTopology(spec)
@@ -267,6 +317,34 @@ func worstLegalAssignmentInstall(t *testing.T) AssignmentSetInstall {
 		t.Fatalf("worst assignment shape = %d tasks/%d replicas", len(set.Tasks), len(set.ResultReplicas))
 	}
 	return AssignmentSetInstall{Assignment: set, Specification: spec, SpecificationDigest: validated.Digest(), JobControlRevision: 1, SchedulingState: model.Closed, CoordinatorEpoch: model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}}
+}
+
+func largestLegalTransformOperator(t *testing.T) model.OperatorSpec {
+	t.Helper()
+	var largest model.OperatorSpec
+	largestBytes := -1
+	for _, descriptor := range model.RegistryV1().Operators {
+		if descriptor.Role != model.OperatorRoleTransform {
+			continue
+		}
+		operator := model.OperatorSpec{Name: descriptor.Name, Version: descriptor.Version}
+		encodedBytes := 2 + len(descriptor.Name) + 2 + 2
+		for _, setting := range descriptor.Settings {
+			if !setting.Required || setting.Type != model.SettingTypeInt64 {
+				t.Fatalf("unexpected optional/non-int transform setting in v1 registry: %#v", setting)
+			}
+			value := "-9223372036854775808"
+			operator.Settings = append(operator.Settings, model.Setting{Key: setting.Name, Value: value})
+			encodedBytes += 2 + len(setting.Name) + 2 + len(value)
+		}
+		if encodedBytes > largestBytes {
+			largest, largestBytes = operator, encodedBytes
+		}
+	}
+	if largestBytes < 0 {
+		t.Fatal("v1 registry has no transform operator")
+	}
+	return largest
 }
 
 func mustValidatedTopology(t *testing.T, spec model.TopologySpec) model.ValidatedTopology {
