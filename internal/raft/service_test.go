@@ -701,7 +701,7 @@ func task10ServiceConfig(t *testing.T, localID, basePort uint16) (config.NodeCon
 		NodeID: localID, ClusterID: "00112233-4455-6677-8899-aabbccddeeff",
 		BindHost: "127.0.0.1", AdvertiseHost: "127.0.0.1", BasePort: basePort,
 		Introducer: net.JoinHostPort("127.0.0.1", "1"), StorageDir: storage, ClusterSecretFile: secretPath,
-		Timing: config.DefaultTimingConfig(), Raft: config.DefaultRaftConfig(),
+		Timing: config.DefaultTimingConfig(), Raft: config.DefaultRaftConfig(), Crane: config.DefaultCraneConfig(),
 		RaftVoters: []config.RaftVoter{
 			{NodeID: 1, Endpoint: net.JoinHostPort("127.0.0.1", task10Port(basePort, 1))},
 			{NodeID: 2, Endpoint: net.JoinHostPort("127.0.0.1", task10Port(basePort, 2))},

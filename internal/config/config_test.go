@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -141,6 +142,7 @@ func validConfig(secretPath string) NodeConfig {
 		},
 		Timing: DefaultTimingConfig(),
 		Raft:   DefaultRaftConfig(),
+		Crane:  DefaultCraneConfig(),
 	}
 }
 
@@ -272,7 +274,7 @@ func TestNodeConfigAcceptsAbsoluteDNSHosts(t *testing.T) {
 			cfg := validConfig(createSecret(t, 0o600))
 			cfg.BindHost = tt.bindHost
 			cfg.AdvertiseHost = tt.advertise
-			cfg.RaftVoters[0].Endpoint = tt.advertise + ":8008"
+			cfg.RaftVoters[0].Endpoint = strings.TrimSuffix(strings.ToLower(tt.advertise), ".") + ":8008"
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("Validate: %v", err)
 			}
@@ -314,7 +316,8 @@ func TestDecodeAppliesTimingDefaults(t *testing.T) {
 "node_id":1,"cluster_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 "bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
 "introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
-"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}]
+"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}],
+"crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"6bb91cd246800bf6edaf0a2c3a57b684991b06b53ce2ee7a17a9ef24ddae6927"}
 }`, secret)
 	cfg, err := Decode(bytes.NewBufferString(input))
 	if err != nil {
@@ -331,7 +334,8 @@ func TestDecodeAppliesAndMergesRaftDefaults(t *testing.T) {
 "node_id":1,"cluster_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 "bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
 "introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
-"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}]`, secret)
+"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}],
+"crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"6bb91cd246800bf6edaf0a2c3a57b684991b06b53ce2ee7a17a9ef24ddae6927"}`, secret)
 	t.Run("omitted", func(t *testing.T) {
 		cfg, err := Decode(bytes.NewBufferString(base + `}`))
 		if err != nil {

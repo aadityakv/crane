@@ -372,6 +372,7 @@ func writeNodeTestConfig(t *testing.T) config.NodeConfig {
 		},
 		Timing: config.DefaultTimingConfig(),
 		Raft:   config.DefaultRaftConfig(),
+		Crane:  config.DefaultCraneConfig(),
 	}
 }
 

@@ -31,6 +31,15 @@
     "snapshot_byte_threshold": 67108864,
     "max_snapshot_bytes": 16777216
   },
+  "crane": {
+    "worker_slots": 4,
+    "worker_control_timeout": "2s",
+    "tuple_retry_interval": "200ms",
+    "tuple_completion_retry_interval": "1s",
+    "failure_grace_period": "5s",
+    "max_worker_store_bytes": 1073741824,
+    "consensus_fingerprint": "6bb91cd246800bf6edaf0a2c3a57b684991b06b53ce2ee7a17a9ef24ddae6927"
+  },
   "timing": {
     "probe_interval": "1s",
     "direct_probe_timeout": "300ms",

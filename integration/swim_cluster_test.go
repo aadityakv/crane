@@ -297,6 +297,7 @@ func integrationConfigsForNodes(t *testing.T, startingBasePort uint16, secretFil
 				ReplayWindow:         config.Duration(time.Minute),
 			},
 			Raft: config.DefaultRaftConfig(),
+			Crane: config.DefaultCraneConfig(),
 		}
 		if err := configuration.Validate(); err != nil {
 			t.Fatalf("validate node %d config: %v", index+1, err)

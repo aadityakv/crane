@@ -34,6 +34,8 @@ type NodeConfig struct {
 	RaftVoters []RaftVoter `json:"raft_voters"`
 	// Raft controls fixed-voter protocol timing and bounded persistence behavior.
 	Raft RaftConfig `json:"raft"`
+	// Crane controls local worker operation and pins the binary's consensus contract.
+	Crane CraneConfig `json:"crane"`
 	// Timing controls validated SWIM and replay-protection intervals.
 	Timing TimingConfig `json:"timing"`
 }
@@ -85,7 +87,9 @@ func DefaultTimingConfig() TimingConfig {
 
 // Decode strictly decodes, defaults, and validates one JSON node configuration.
 func Decode(reader io.Reader) (NodeConfig, error) {
-	config := NodeConfig{Timing: DefaultTimingConfig(), Raft: DefaultRaftConfig()}
+	crane := DefaultCraneConfig()
+	crane.ConsensusFingerprint = ""
+	config := NodeConfig{Timing: DefaultTimingConfig(), Raft: DefaultRaftConfig(), Crane: crane}
 	decoder := json.NewDecoder(reader)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&config); err != nil {
@@ -128,6 +132,9 @@ func (c NodeConfig) Validate() error {
 	if err := validateAdvertiseHost(c.AdvertiseHost); err != nil {
 		return err
 	}
+	if err := c.Crane.Validate(); err != nil {
+		return err
+	}
 	for _, service := range Services() {
 		if _, err := c.BindEndpoint(service.Service); err != nil {
 			return fmt.Errorf("derive bind endpoint for %s: %w", service.Name, err)
@@ -160,6 +167,7 @@ func (c NodeConfig) Validate() error {
 	if err != nil {
 		return err
 	}
+	localVoter := false
 	for _, voter := range c.RaftVoters {
 		if voter.NodeID == 0 {
 			return fmt.Errorf("raft voter ID must be nonzero")
@@ -172,15 +180,25 @@ func (c NodeConfig) Validate() error {
 		if err != nil {
 			return fmt.Errorf("invalid raft voter endpoint for node %d: %w", voter.NodeID, err)
 		}
+		if voter.Endpoint != endpoint.String() {
+			return fmt.Errorf("raft voter endpoint for node %d must use canonical host and port spelling", voter.NodeID)
+		}
+		if _, err := CraneControlEndpointFromRaft(endpoint); err != nil {
+			return fmt.Errorf("derive crane control endpoint for raft voter %d: %w", voter.NodeID, err)
+		}
 		if _, exists := voterEndpoints[endpoint]; exists {
 			return fmt.Errorf("duplicate raft voter endpoint %q", endpoint)
 		}
 		voterEndpoints[endpoint] = struct{}{}
 		if voter.NodeID == c.NodeID {
+			localVoter = true
 			if !SameEndpoint(endpoint, localEndpoint) {
 				return fmt.Errorf("local raft voter endpoint %q does not match advertised endpoint %q", endpoint, localEndpoint)
 			}
 		}
+	}
+	if localVoter && c.Raft.MaxSnapshotBytes < requiredCraneSnapshotBytes() {
+		return fmt.Errorf("raft maximum snapshot bytes must be at least %d for a crane voter", requiredCraneSnapshotBytes())
 	}
 	return nil
 }

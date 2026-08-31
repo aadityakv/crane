@@ -80,6 +80,7 @@ func GenerateConfigs(options ClusterOptions) ([]config.NodeConfig, error) {
 			RaftVoters:        append([]config.RaftVoter(nil), voters...),
 			Timing:            config.DefaultTimingConfig(),
 			Raft:              config.DefaultRaftConfig(),
+			Crane:             config.DefaultCraneConfig(),
 		}
 		if err := result[index].Validate(); err != nil {
 			return nil, fmt.Errorf("validate generated config for node %d: %w", index+1, err)
