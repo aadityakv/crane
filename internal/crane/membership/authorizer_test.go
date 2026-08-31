@@ -176,7 +176,7 @@ func TestAuthorizerBoundedSubscriptionsRequireScopedSnapshotAfterOverflowAndUpst
 	if err != nil || len(resynced.Members) != 1 || resynced.Members[0].NodeID != 5 {
 		t.Fatalf("upstream replacement snapshot=%#v err=%v", resynced, err)
 	}
-	staleFirst := swim.Member{NodeID: 1, Host: "127.0.0.10", BasePort: 9100, Incarnation: 1, Status: swim.Alive}
+	staleFirst := swim.Member{NodeID: 1, Host: "127.0.0.10", BasePort: 9100, Incarnation: 1, Status: swim.Suspect}
 	freshFirst := staleFirst
 	freshFirst.Incarnation = 2
 	upstream.events <- swim.MembershipEvent{Current: staleFirst, Cause: swim.EventMemberChanged, ReporterID: 5}
@@ -200,6 +200,123 @@ func TestAuthorizerBoundedSubscriptionsRequireScopedSnapshotAfterOverflowAndUpst
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run cancellation: %v", err)
+	}
+}
+
+func TestAuthorizerExactOmissionRequiresHigherIncarnationSnapshot(t *testing.T) {
+	configuration := authorizerTestConfig(t)
+	first := swim.Member{NodeID: 1, Host: "127.0.0.1", BasePort: 9100, Incarnation: 4, Status: swim.Alive}
+	second := swim.Member{NodeID: 2, Host: "127.0.0.2", BasePort: 9200, Incarnation: 1, Status: swim.Alive}
+	upstream := &fakeMembershipSubscription{
+		events: make(chan swim.MembershipEvent, 8), gate: closedChannel(), snapshot: []swim.Member{first},
+	}
+	authorizer, err := newAuthorizerWithSource(configuration, &fakeMembershipSource{ready: closedChannel(), subscription: upstream}, &staticResolver{}, clock.NewManual(time.Unix(4500, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- authorizer.Run(ctx) }()
+	waitAuthorizerReady(t, authorizer)
+
+	upstream.setSnapshot([]swim.Member{second})
+	upstream.events <- swim.MembershipEvent{Cause: swim.EventResyncRequired}
+	waitAuthorizerRevision(t, authorizer, 2)
+	staleSuspect := first
+	staleSuspect.Status = swim.Suspect
+	upstream.events <- swim.MembershipEvent{Current: staleSuspect, Cause: swim.EventMemberChanged, ReporterID: 2}
+	barrier := second
+	barrier.Incarnation = 2
+	upstream.events <- swim.MembershipEvent{Current: barrier, Cause: swim.EventMemberChanged, ReporterID: 2}
+	waitAuthorizerRevision(t, authorizer, 3)
+	if view := authorizer.View(); view.Revision != 3 || len(view.Members) != 1 || view.Members[0] != barrier {
+		t.Fatalf("same-incarnation delta revived omitted member: %#v", view)
+	}
+
+	upstream.setSnapshot([]swim.Member{first, barrier})
+	upstream.events <- swim.MembershipEvent{Cause: swim.EventResyncRequired}
+	waitAuthorizerRevision(t, authorizer, 4)
+	if view := authorizer.View(); len(view.Members) != 1 || view.Members[0] != barrier {
+		t.Fatalf("same-incarnation exact snapshot revived omitted member: %#v", view)
+	}
+
+	higher := first
+	higher.Incarnation++
+	upstream.setSnapshot([]swim.Member{higher, barrier})
+	upstream.events <- swim.MembershipEvent{Cause: swim.EventResyncRequired}
+	waitAuthorizerRevision(t, authorizer, 5)
+	if view := authorizer.View(); len(view.Members) != 2 || view.Members[0] != higher {
+		t.Fatalf("higher-incarnation exact snapshot did not revive member: %#v", view)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run cancellation: %v", err)
+	}
+}
+
+func TestAuthorizerRetriesSupersededScopedSnapshotsBeforeReadyAndResync(t *testing.T) {
+	configuration := authorizerTestConfig(t)
+	gate := make(chan struct{})
+	initial := swim.Member{NodeID: 1, Host: "127.0.0.1", BasePort: 9100, Incarnation: 1, Status: swim.Alive}
+	upstream := &fakeMembershipSubscription{
+		events: make(chan swim.MembershipEvent, 8), gate: gate, snapshot: []swim.Member{initial},
+		snapshotErrors: []error{swim.ErrSnapshotSuperseded, swim.ErrSnapshotSuperseded},
+	}
+	authorizer, err := newAuthorizerWithSource(configuration, &fakeMembershipSource{ready: closedChannel(), subscription: upstream}, &staticResolver{}, clock.NewManual(time.Unix(4700, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- authorizer.Run(ctx) }()
+	waitSnapshotCalls(t, upstream, 3)
+	select {
+	case <-authorizer.Ready():
+		t.Fatal("authorizer became ready before a supersession-free exact snapshot")
+	default:
+	}
+	close(gate)
+	waitAuthorizerReady(t, authorizer)
+
+	higher := initial
+	higher.Incarnation++
+	upstream.setSnapshot([]swim.Member{higher})
+	upstream.setSnapshotErrors(swim.ErrSnapshotSuperseded)
+	before := upstream.snapshotCallCount()
+	upstream.events <- swim.MembershipEvent{Cause: swim.EventResyncRequired}
+	waitSnapshotCalls(t, upstream, before+2)
+	waitAuthorizerRevision(t, authorizer, 2)
+	if view := authorizer.View(); len(view.Members) != 1 || view.Members[0] != higher {
+		t.Fatalf("retried resync snapshot view=%#v", view)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run cancellation: %v", err)
+	}
+}
+
+func TestAuthorizerDoesNotRetryNonSupersededSnapshotError(t *testing.T) {
+	configuration := authorizerTestConfig(t)
+	sentinel := errors.New("snapshot storage failed")
+	upstream := &fakeMembershipSubscription{
+		events: make(chan swim.MembershipEvent), gate: closedChannel(), snapshotErrors: []error{sentinel},
+	}
+	authorizer, err := newAuthorizerWithSource(configuration, &fakeMembershipSource{ready: closedChannel(), subscription: upstream}, &staticResolver{}, clock.NewManual(time.Unix(4800, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authorizer.Run(context.Background()); !errors.Is(err, sentinel) {
+		t.Fatalf("Run error=%v want wrapped sentinel", err)
+	}
+	if calls := upstream.snapshotCallCount(); calls != 1 {
+		t.Fatalf("non-superseded snapshot calls=%d want 1", calls)
+	}
+	select {
+	case <-authorizer.Ready():
+		t.Fatal("authorizer became ready after fatal snapshot error")
+	default:
 	}
 }
 
@@ -377,22 +494,46 @@ func (s *fakeMembershipSource) Subscribe(context.Context, int) (membershipSubscr
 }
 
 type fakeMembershipSubscription struct {
-	mu       sync.Mutex
-	events   chan swim.MembershipEvent
-	gate     <-chan struct{}
-	snapshot []swim.Member
+	mu             sync.Mutex
+	events         chan swim.MembershipEvent
+	gate           <-chan struct{}
+	snapshot       []swim.Member
+	snapshotErrors []error
+	snapshotCalls  int
 }
 
 func (s *fakeMembershipSubscription) Events() <-chan swim.MembershipEvent { return s.events }
 func (s *fakeMembershipSubscription) Snapshot(ctx context.Context) ([]swim.Member, error) {
+	s.mu.Lock()
+	s.snapshotCalls++
+	if len(s.snapshotErrors) > 0 {
+		err := s.snapshotErrors[0]
+		s.snapshotErrors = s.snapshotErrors[1:]
+		s.mu.Unlock()
+		return nil, err
+	}
+	gate := s.gate
+	s.mu.Unlock()
 	select {
-	case <-s.gate:
+	case <-gate:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]swim.Member(nil), s.snapshot...), nil
+}
+
+func (s *fakeMembershipSubscription) setSnapshotErrors(snapshotErrors ...error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshotErrors = append([]error(nil), snapshotErrors...)
+}
+
+func (s *fakeMembershipSubscription) snapshotCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotCalls
 }
 func (s *fakeMembershipSubscription) setSnapshot(members []swim.Member) {
 	s.mu.Lock()
@@ -449,6 +590,18 @@ func waitAuthorizerRevision(t *testing.T, authorizer *Authorizer, revision uint6
 		select {
 		case <-deadline:
 			t.Fatalf("authorizer revision=%d want >=%d", authorizer.View().Revision, revision)
+		default:
+		}
+	}
+}
+
+func waitSnapshotCalls(t *testing.T, subscription *fakeMembershipSubscription, calls int) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for subscription.snapshotCallCount() < calls {
+		select {
+		case <-deadline:
+			t.Fatalf("snapshot calls=%d want >=%d", subscription.snapshotCallCount(), calls)
 		default:
 		}
 	}

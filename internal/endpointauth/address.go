@@ -45,6 +45,9 @@ type Matcher struct {
 	mu    sync.Mutex
 	cache map[string]*cacheEntry
 	order list.List
+	// generation fences every lookup that began before any explicit
+	// invalidation, including invalidations of currently uncached identities.
+	generation uint64
 }
 
 type cacheEntry struct {
@@ -74,7 +77,7 @@ func NewMatcher(resolver Resolver, sourceClock clock.Clock, options Options) *Ma
 	if options.CacheEntries <= 0 {
 		options.CacheEntries = defaultCacheEntries
 	}
-	return &Matcher{resolver: resolver, clock: sourceClock, options: options, cache: make(map[string]*cacheEntry)}
+	return &Matcher{resolver: resolver, clock: sourceClock, options: options, cache: make(map[string]*cacheEntry), generation: 1}
 }
 
 // MatchTCP reports whether remote is a numeric TCP address whose canonical IP
@@ -118,12 +121,13 @@ func (matcher *Matcher) Invalidate(host string) {
 	if matcher == nil {
 		return
 	}
+	matcher.mu.Lock()
+	defer matcher.mu.Unlock()
+	matcher.advanceGenerationLocked()
 	if _, err := netip.ParseAddr(host); err == nil {
 		return
 	}
 	key := canonicalHost(host)
-	matcher.mu.Lock()
-	defer matcher.mu.Unlock()
 	if entry := matcher.cache[key]; entry != nil {
 		matcher.removeLocked(key, entry)
 	}
@@ -134,8 +138,9 @@ func (matcher *Matcher) resolve(ctx context.Context, host string) ([]netip.Addr,
 		return []netip.Addr{address.Unmap()}, nil
 	}
 	key := canonicalHost(host)
-	if addresses, err, ok := matcher.cached(key); ok {
-		return addresses, err
+	cachedAddresses, cachedError, ok, generation := matcher.cached(key)
+	if ok {
+		return cachedAddresses, cachedError
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -145,7 +150,7 @@ func (matcher *Matcher) resolve(ctx context.Context, host string) ([]netip.Addr,
 	addresses, err := matcher.resolver.LookupNetIP(lookupContext, "ip", key)
 	if err != nil {
 		if ctx.Err() == nil {
-			matcher.store(key, nil, err, matcher.options.NegativeTTL)
+			matcher.store(key, nil, err, matcher.options.NegativeTTL, generation)
 		}
 		return nil, err
 	}
@@ -164,31 +169,35 @@ func (matcher *Matcher) resolve(ctx context.Context, host string) ([]netip.Addr,
 	}
 	if len(canonical) == 0 {
 		err = &net.DNSError{Name: key, Err: "no addresses"}
-		matcher.store(key, nil, err, matcher.options.NegativeTTL)
+		matcher.store(key, nil, err, matcher.options.NegativeTTL, generation)
 		return nil, err
 	}
-	matcher.store(key, canonical, nil, matcher.options.PositiveTTL)
+	matcher.store(key, canonical, nil, matcher.options.PositiveTTL, generation)
 	return append([]netip.Addr(nil), canonical...), nil
 }
 
-func (matcher *Matcher) cached(key string) ([]netip.Addr, error, bool) {
+func (matcher *Matcher) cached(key string) ([]netip.Addr, error, bool, uint64) {
 	matcher.mu.Lock()
 	defer matcher.mu.Unlock()
+	generation := matcher.generation
 	entry := matcher.cache[key]
 	if entry == nil {
-		return nil, nil, false
+		return nil, nil, false, generation
 	}
 	if !matcher.clock.Now().Before(entry.expires) {
 		matcher.removeLocked(key, entry)
-		return nil, nil, false
+		return nil, nil, false, generation
 	}
 	matcher.order.MoveToBack(entry.element)
-	return append([]netip.Addr(nil), entry.addresses...), entry.err, true
+	return append([]netip.Addr(nil), entry.addresses...), entry.err, true, generation
 }
 
-func (matcher *Matcher) store(key string, addresses []netip.Addr, err error, ttl time.Duration) {
+func (matcher *Matcher) store(key string, addresses []netip.Addr, err error, ttl time.Duration, generation uint64) {
 	matcher.mu.Lock()
 	defer matcher.mu.Unlock()
+	if generation != matcher.generation {
+		return
+	}
 	if entry := matcher.cache[key]; entry != nil {
 		matcher.removeLocked(key, entry)
 	}
@@ -202,6 +211,19 @@ func (matcher *Matcher) store(key string, addresses []netip.Addr, err error, ttl
 	}
 	element := matcher.order.PushBack(key)
 	matcher.cache[key] = &cacheEntry{addresses: append([]netip.Addr(nil), addresses...), err: err, expires: matcher.clock.Now().Add(ttl), element: element}
+}
+
+func (matcher *Matcher) advanceGenerationLocked() {
+	if matcher.generation == ^uint64(0) {
+		matcher.generation = 1
+		matcher.cache = make(map[string]*cacheEntry)
+		matcher.order.Init()
+		return
+	}
+	matcher.generation++
+	if matcher.generation == 0 {
+		matcher.generation = 1
+	}
 }
 
 func (matcher *Matcher) removeLocked(key string, entry *cacheEntry) {

@@ -98,6 +98,68 @@ func TestAddressMatcherBoundsCacheByCanonicalIdentity(t *testing.T) {
 	}
 }
 
+func TestAddressMatcherInvalidationFencesConcurrentLookupCaching(t *testing.T) {
+	tests := []struct {
+		name      string
+		first     []netip.Addr
+		firstErr  error
+		firstWant bool
+	}{
+		{name: "positive", first: []netip.Addr{netip.MustParseAddr("192.0.2.1")}, firstWant: true},
+		{name: "negative", firstErr: errors.New("stale DNS failure")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resolver := &delayedResolver{
+				first: test.first, firstErr: test.firstErr,
+				next:    []netip.Addr{netip.MustParseAddr("192.0.2.2")},
+				started: make(chan struct{}), release: make(chan struct{}),
+			}
+			matcher := NewMatcher(resolver, clock.NewManual(time.Unix(3500, 0)), Options{})
+			advertised := config.Endpoint{Host: "peer.test", Port: 7000}
+			result := make(chan bool, 1)
+			go func() {
+				result <- matcher.MatchTCP(context.Background(), &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}, advertised)
+			}()
+			select {
+			case <-resolver.started:
+			case <-time.After(time.Second):
+				t.Fatal("first DNS lookup did not start")
+			}
+			matcher.Invalidate("PEER.TEST.")
+			close(resolver.release)
+			if got := <-result; got != test.firstWant {
+				t.Fatalf("in-flight caller result=%t want %t", got, test.firstWant)
+			}
+			if !matcher.MatchTCP(context.Background(), &net.TCPAddr{IP: net.ParseIP("192.0.2.2"), Port: 1}, advertised) {
+				t.Fatal("post-invalidation caller reused the stale in-flight result")
+			}
+			if calls := resolver.Calls(); calls != 2 {
+				t.Fatalf("DNS calls=%d want 2", calls)
+			}
+		})
+	}
+}
+
+func TestAddressMatcherInvalidationGenerationWrapIsDeterministic(t *testing.T) {
+	resolver := &mutableResolver{answers: map[string][]netip.Addr{"peer.test": {netip.MustParseAddr("192.0.2.1")}}}
+	matcher := NewMatcher(resolver, clock.NewManual(time.Unix(3600, 0)), Options{})
+	if !matcher.MatchTCP(context.Background(), &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}, config.Endpoint{Host: "peer.test", Port: 7000}) {
+		t.Fatal("failed to populate cache")
+	}
+	matcher.mu.Lock()
+	matcher.generation = ^uint64(0)
+	matcher.mu.Unlock()
+	matcher.Invalidate("uncached.test")
+	matcher.mu.Lock()
+	generation := matcher.generation
+	cacheEntries := len(matcher.cache)
+	matcher.mu.Unlock()
+	if generation != 1 || cacheEntries != 0 {
+		t.Fatalf("wrapped invalidation generation=%d cache entries=%d, want 1/0", generation, cacheEntries)
+	}
+}
+
 func FuzzAddressMatcherLiteralIPCanonicalization(f *testing.F) {
 	f.Add("192.0.2.1", "::ffff:192.0.2.1")
 	f.Add("2001:db8::1", "2001:0db8:0:0:0:0:0:1")
@@ -126,6 +188,42 @@ type mutableResolver struct {
 	answers map[string][]netip.Addr
 	errors  map[string]error
 	calls   int
+}
+
+type delayedResolver struct {
+	mu       sync.Mutex
+	first    []netip.Addr
+	firstErr error
+	next     []netip.Addr
+	started  chan struct{}
+	release  chan struct{}
+	calls    int
+}
+
+func (resolver *delayedResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	resolver.mu.Lock()
+	resolver.calls++
+	call := resolver.calls
+	first := append([]netip.Addr(nil), resolver.first...)
+	firstErr := resolver.firstErr
+	next := append([]netip.Addr(nil), resolver.next...)
+	resolver.mu.Unlock()
+	if call == 1 {
+		close(resolver.started)
+		select {
+		case <-resolver.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return first, firstErr
+	}
+	return next, nil
+}
+
+func (resolver *delayedResolver) Calls() int {
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
+	return resolver.calls
 }
 
 func (r *mutableResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {

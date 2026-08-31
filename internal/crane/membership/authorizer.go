@@ -97,7 +97,10 @@ type Authorizer struct {
 	members  map[uint16]swim.Member
 	// floors retains the greatest observed version for every identity, even
 	// when an exact replacement snapshot omits that identity.
-	floors      map[uint16]swim.Member
+	floors map[uint16]swim.Member
+	// omitted retains the incarnation fence for identities absent from an
+	// exact replacement. Only a higher incarnation may become visible again.
+	omitted     map[uint16]uint64
 	blocked     map[uint16]struct{}
 	subscribers map[uint64]*subscriber
 	nextID      uint64
@@ -129,6 +132,7 @@ func newAuthorizerWithSource(configuration config.NodeConfig, source membershipS
 		done:          make(chan struct{}),
 		members:       make(map[uint16]swim.Member),
 		floors:        make(map[uint16]swim.Member),
+		omitted:       make(map[uint16]uint64),
 		blocked:       make(map[uint16]struct{}),
 		subscribers:   make(map[uint64]*subscriber),
 	}, nil
@@ -174,7 +178,7 @@ func (authorizer *Authorizer) Run(ctx context.Context) error {
 	if subscription == nil {
 		return errors.New("subscribe to SWIM membership: nil subscription")
 	}
-	snapshot, err := subscription.Snapshot(ctx)
+	snapshot, err := exactSnapshot(ctx, subscription)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil
@@ -196,7 +200,7 @@ func (authorizer *Authorizer) Run(ctx context.Context) error {
 				return errors.New("SWIM membership subscription closed")
 			}
 			if event.Cause == swim.EventResyncRequired {
-				snapshot, err := subscription.Snapshot(ctx)
+				snapshot, err := exactSnapshot(ctx, subscription)
 				if err != nil {
 					if ctx.Err() != nil {
 						return nil
@@ -211,6 +215,21 @@ func (authorizer *Authorizer) Run(ctx context.Context) error {
 			authorizer.apply(event)
 		case <-ctx.Done():
 			return nil
+		}
+	}
+}
+
+func exactSnapshot(ctx context.Context, subscription membershipSubscription) ([]swim.Member, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		snapshot, err := subscription.Snapshot(ctx)
+		if err == nil {
+			return snapshot, nil
+		}
+		if !errors.Is(err, swim.ErrSnapshotSuperseded) {
+			return nil, err
 		}
 	}
 }
@@ -329,7 +348,7 @@ func (subscription *Subscription) Snapshot(ctx context.Context) (View, error) {
 }
 
 func (authorizer *Authorizer) installInitial(snapshot []swim.Member) error {
-	members, floors, err := validatedSnapshot(snapshot, nil)
+	members, floors, omitted, err := validatedSnapshot(snapshot, nil, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -337,6 +356,7 @@ func (authorizer *Authorizer) installInitial(snapshot []swim.Member) error {
 	defer authorizer.mu.Unlock()
 	authorizer.members = members
 	authorizer.floors = floors
+	authorizer.omitted = omitted
 	authorizer.revision = 1
 	return nil
 }
@@ -344,10 +364,11 @@ func (authorizer *Authorizer) installInitial(snapshot []swim.Member) error {
 func (authorizer *Authorizer) replaceSnapshot(snapshot []swim.Member) error {
 	authorizer.mu.RLock()
 	retained := cloneMembers(authorizer.floors)
+	retainedOmissions := cloneIncarnations(authorizer.omitted)
 	oldMembers := cloneMembers(authorizer.members)
 	authorizer.mu.RUnlock()
 
-	members, floors, err := validatedSnapshot(snapshot, retained)
+	members, floors, omitted, err := validatedSnapshot(snapshot, retained, retainedOmissions, oldMembers)
 	if err != nil {
 		return err
 	}
@@ -373,6 +394,7 @@ func (authorizer *Authorizer) replaceSnapshot(snapshot []swim.Member) error {
 	authorizer.mu.Lock()
 	authorizer.members = members
 	authorizer.floors = floors
+	authorizer.omitted = omitted
 	for nodeID := range blocked {
 		delete(authorizer.blocked, nodeID)
 	}
@@ -389,6 +411,10 @@ func (authorizer *Authorizer) apply(event swim.MembershipEvent) {
 	}
 	authorizer.mu.Lock()
 	previous, visible := authorizer.members[incoming.NodeID]
+	if omittedIncarnation, omitted := authorizer.omitted[incoming.NodeID]; omitted && incoming.Incarnation <= omittedIncarnation {
+		authorizer.mu.Unlock()
+		return
+	}
 	reference, referenced := previous, visible
 	if floor, exists := authorizer.floors[incoming.NodeID]; exists && (!referenced || compareMember(floor, reference) > 0) {
 		reference, referenced = floor, true
@@ -417,6 +443,7 @@ func (authorizer *Authorizer) apply(event swim.MembershipEvent) {
 
 	authorizer.mu.Lock()
 	authorizer.members[incoming.NodeID] = incoming
+	delete(authorizer.omitted, incoming.NodeID)
 	if floor, exists := authorizer.floors[incoming.NodeID]; !exists || compareMember(incoming, floor) > 0 {
 		authorizer.floors[incoming.NodeID] = incoming
 	}
@@ -426,18 +453,24 @@ func (authorizer *Authorizer) apply(event swim.MembershipEvent) {
 	authorizer.mu.Unlock()
 }
 
-func validatedSnapshot(snapshot []swim.Member, retained map[uint16]swim.Member) (map[uint16]swim.Member, map[uint16]swim.Member, error) {
+func validatedSnapshot(snapshot []swim.Member, retained map[uint16]swim.Member, retainedOmissions map[uint16]uint64, previousMembers map[uint16]swim.Member) (map[uint16]swim.Member, map[uint16]swim.Member, map[uint16]uint64, error) {
 	members := make(map[uint16]swim.Member, len(snapshot))
 	floors := cloneMembers(retained)
+	omitted := cloneIncarnations(retainedOmissions)
 	seen := make(map[uint16]struct{}, len(snapshot))
 	for _, member := range snapshot {
 		if err := validateMember(member); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if _, duplicate := seen[member.NodeID]; duplicate {
-			return nil, nil, fmt.Errorf("duplicate member node ID %d", member.NodeID)
+			return nil, nil, nil, fmt.Errorf("duplicate member node ID %d", member.NodeID)
 		}
 		seen[member.NodeID] = struct{}{}
+	}
+	for _, member := range snapshot {
+		if omittedIncarnation, exists := omitted[member.NodeID]; exists && member.Incarnation <= omittedIncarnation {
+			continue
+		}
 		if floor, exists := floors[member.NodeID]; exists {
 			switch {
 			case member.Incarnation < floor.Incarnation:
@@ -455,11 +488,29 @@ func validatedSnapshot(snapshot []swim.Member, retained map[uint16]swim.Member) 
 			}
 		}
 		members[member.NodeID] = member
+		delete(omitted, member.NodeID)
 		if floor, exists := floors[member.NodeID]; !exists || compareMember(member, floor) > 0 {
 			floors[member.NodeID] = member
 		}
 	}
-	return members, floors, nil
+	for nodeID, previous := range previousMembers {
+		if _, visible := members[nodeID]; visible {
+			continue
+		}
+		incarnation := previous.Incarnation
+		if floor, exists := floors[nodeID]; exists && floor.Incarnation > incarnation {
+			incarnation = floor.Incarnation
+		}
+		if incarnation > omitted[nodeID] {
+			omitted[nodeID] = incarnation
+		}
+	}
+	for nodeID, floor := range floors {
+		if _, visible := members[nodeID]; !visible && floor.Incarnation > omitted[nodeID] {
+			omitted[nodeID] = floor.Incarnation
+		}
+	}
+	return members, floors, omitted, nil
 }
 
 func validateMember(member swim.Member) error {
@@ -578,6 +629,14 @@ func cloneMembers(source map[uint16]swim.Member) map[uint16]swim.Member {
 	result := make(map[uint16]swim.Member, len(source))
 	for nodeID, member := range source {
 		result[nodeID] = member
+	}
+	return result
+}
+
+func cloneIncarnations(source map[uint16]uint64) map[uint16]uint64 {
+	result := make(map[uint16]uint64, len(source))
+	for nodeID, incarnation := range source {
+		result[nodeID] = incarnation
 	}
 	return result
 }
