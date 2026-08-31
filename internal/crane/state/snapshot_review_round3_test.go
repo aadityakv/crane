@@ -22,6 +22,61 @@ func TestSnapshotRejectsFabricatedMarkerForCurrentEligibleWorker(t *testing.T) {
 	assertCaptureAndRawRestoreRejectSnapshot(t, machine)
 }
 
+func TestSnapshotRejectsActiveInvalidationClaimingOverwritingRegistrationRevision(t *testing.T) {
+	machine, jobID, _, assignment := task10AssignedJob(t, 4)
+	install, _ := NewInstallAssignments(InternalCommandID{0xd2}, 1, assignment, machine.coordinatorEpoch)
+	applyTask10(t, machine, 12, install)
+	worker := machine.workers[assignment.Tasks[0].WorkerID]
+	affected := []AffectedAssignment{{JobID: jobID, JobControlRevision: 2, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest}}
+	deactivate, _ := NewDeactivateWorker(InternalCommandID{0xd3}, worker.Revision, worker.NodeID, worker.Epoch, affected, machine.coordinatorEpoch)
+	applyTask10(t, machine, 13, deactivate)
+	rejoined := machine.workers[worker.NodeID]
+	rejoined.State = WorkerEligible
+	rejoined.Revision++
+	register, _ := NewRegisterWorker(InternalCommandID{0xd4}, rejoined.Revision-1, rejoined, machine.coordinatorEpoch)
+	applyTask10(t, machine, 14, register)
+	drain, _ := NewDrainWorker(InternalCommandID{0xd5}, rejoined.Revision, rejoined.NodeID, rejoined.Epoch, machine.coordinatorEpoch)
+	applyTask10(t, machine, 15, drain)
+
+	record := cloneJobRecord(machine.jobs[jobID])
+	if record.invalidationHistory[0].Kind != 0 || record.invalidationHistory[0].WorkerRevision != 0 || machine.workers[worker.NodeID].Revision != 4 {
+		t.Fatalf("canonical forgotten worker anchor kind/revision=%d/%d worker=%d, want 0/0 and 4", record.invalidationHistory[0].Kind, record.invalidationHistory[0].WorkerRevision, machine.workers[worker.NodeID].Revision)
+	}
+	record.invalidationHistory[0].Kind = workerInvalidationDeactivate
+	record.invalidationHistory[0].WorkerRevision = 3
+	machine.jobs[jobID] = record
+	recomputeSnapshotEstimateForReview(t, machine)
+
+	assertCaptureAndRawRestoreRejectSnapshot(t, machine)
+}
+
+func TestSnapshotRejectsJointlyShiftedRepairAndRetainedWorkerPredecessor(t *testing.T) {
+	machine, worker, _ := round3RepairedDeactivation(t)
+	var jobID model.JobID
+	for id := range machine.jobs {
+		jobID = id
+	}
+	record := cloneJobRecord(machine.jobs[jobID])
+	provenance := &record.invalidationHistory[0]
+	if provenance.JobControlRevision != 2 || provenance.RepairJobControlRevision != 4 {
+		t.Fatalf("fixture revisions predecessor=%d repair=%d, want 2 and 4", provenance.JobControlRevision, provenance.RepairJobControlRevision)
+	}
+	provenance.JobControlRevision = 1
+	provenance.RepairJobControlRevision = 3
+	machine.jobs[jobID] = record
+
+	key := SubjectKey{Kind: SubjectWorker, WorkerID: worker.NodeID}
+	history := machine.subjects[key]
+	shifted := []AffectedAssignment{{JobID: jobID, JobControlRevision: 1, AssignmentRevision: provenance.AssignmentRevision, AssignmentDigest: provenance.AssignmentDigest}}
+	target := deactivateWorkerTarget(DeactivateWorker{WorkerID: worker.NodeID, WorkerEpoch: worker.Epoch, Affected: shifted})
+	history.target = append([]byte(nil), target...)
+	history.appliedTarget = append([]byte(nil), target...)
+	machine.subjects[key] = history
+	recomputeSnapshotEstimateForReview(t, machine)
+
+	assertCaptureAndRawRestoreRejectSnapshot(t, machine)
+}
+
 func TestSnapshotRejectsCorruptRetainedAffectedFenceAfterRepair(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -187,12 +242,100 @@ func TestSnapshotAcceptsActiveReplacementAndPrunesConsumedProvenance(t *testing.
 	rejoined.Revision++
 	register, _ := NewRegisterWorker(InternalCommandID{0xcf}, rejoined.Revision-1, rejoined, repaired.coordinatorEpoch)
 	applyTask10(t, repaired, 15, register)
+	history := repaired.jobs[repairedJob].invalidationHistory
+	if len(history) != 1 || history[0].Kind != 0 || history[0].WorkerRevision != 0 || history[0].RepairState != invalidationRepairAnchored {
+		t.Fatalf("worker overwrite did not retain only job-control-anchored provenance: %#v", history)
+	}
+	running, _ := NewTransitionJob(InternalCommandID{0xd6}, repaired.jobs[repairedJob].JobControlRevision, repairedJob, JobDeploying, JobRunning, repaired.coordinatorEpoch)
+	applyTask10(t, repaired, 16, running)
 	if len(repaired.jobs[repairedJob].invalidationHistory) != 0 {
-		t.Fatalf("overwritten worker history did not prune consumed provenance: %#v", repaired.jobs[repairedJob].invalidationHistory)
+		t.Fatalf("overwriting both anchors did not prune consumed provenance: %#v", repaired.jobs[repairedJob].invalidationHistory)
 	}
 	if _, err := repaired.Capture(101, 100); err != nil {
 		t.Fatalf("capture after consumed provenance prune: %v", err)
 	}
+}
+
+func TestSnapshotAcceptsForgottenRepairWhileWorkerTargetRemains(t *testing.T) {
+	machine, worker, _ := round3RepairedDeactivation(t)
+	var jobID model.JobID
+	for id := range machine.jobs {
+		jobID = id
+	}
+	running, _ := NewTransitionJob(InternalCommandID{0xd7}, machine.jobs[jobID].JobControlRevision, jobID, JobDeploying, JobRunning, machine.coordinatorEpoch)
+	applyTask10(t, machine, 15, running)
+	history := machine.jobs[jobID].invalidationHistory
+	if len(history) != 1 || history[0].RepairState != invalidationRepairForgotten || history[0].WorkerRevision != machine.workers[worker.NodeID].Revision || history[0].RepairJobControlRevision != 0 || history[0].RepairAssignmentRevision != 0 || history[0].RepairAssignmentDigest != ([32]byte{}) || history[0].RepairMarkersDigest != ([32]byte{}) {
+		t.Fatalf("job-control overwrite did not retain only worker-anchored provenance: %#v", history)
+	}
+	if _, err := machine.Capture(103, 100); err != nil {
+		t.Fatalf("forgotten repair with retained worker target: %v", err)
+	}
+
+	rejoined := machine.workers[worker.NodeID]
+	rejoined.State = WorkerEligible
+	rejoined.Revision++
+	register, _ := NewRegisterWorker(InternalCommandID{0xd8}, rejoined.Revision-1, rejoined, machine.coordinatorEpoch)
+	applyTask10(t, machine, 16, register)
+	if len(machine.jobs[jobID].invalidationHistory) != 0 {
+		t.Fatalf("worker overwrite did not drop provenance after both anchors were forgotten: %#v", machine.jobs[jobID].invalidationHistory)
+	}
+	if _, err := machine.Capture(104, 100); err != nil {
+		t.Fatalf("capture after both anchors were forgotten: %v", err)
+	}
+}
+
+func TestSnapshotNormalizesAnchoredRepairOnFailureButNotCancellation(t *testing.T) {
+	t.Run("failure forgets job-control anchor", func(t *testing.T) {
+		machine, _, _ := round3RepairedDeactivation(t)
+		var jobID model.JobID
+		for id := range machine.jobs {
+			jobID = id
+		}
+		record := machine.jobs[jobID]
+		var token model.AssignmentToken
+		for _, candidate := range record.Assignment.Tasks {
+			worker := machine.workers[candidate.WorkerID]
+			if worker.Epoch == candidate.WorkerEpoch && worker.State != WorkerOffline {
+				token = candidate
+				break
+			}
+		}
+		if token.WorkerID == 0 {
+			t.Fatal("fixture has no available failure token")
+		}
+		report := model.JobFailureReport{JobID: jobID, JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision, Task: token, Epoch: machine.coordinatorEpoch, TransactionID: 1, Code: model.FailureOperator, DetailDigest: [32]byte{0xd9}}
+		fail, _ := NewFailJob(InternalCommandID{0xd9}, record.JobControlRevision, report, machine.coordinatorEpoch)
+		if got := applyTask10(t, machine, 15, fail); got.Code != ResultSuccess {
+			t.Fatalf("fail repaired job: %#v", got)
+		}
+		history := machine.jobs[jobID].invalidationHistory
+		if len(history) != 1 || history[0].RepairState != invalidationRepairForgotten || history[0].RepairJobControlRevision != 0 {
+			t.Fatalf("failure did not forget prior job-control anchor: %#v", history)
+		}
+		if _, err := machine.Capture(105, 100); err != nil {
+			t.Fatalf("failed job with forgotten repair: %v", err)
+		}
+	})
+
+	t.Run("client cancellation preserves job-control anchor", func(t *testing.T) {
+		machine, _, _ := round3RepairedDeactivation(t)
+		var jobID model.JobID
+		for id := range machine.jobs {
+			jobID = id
+		}
+		cancel, _ := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{0xda}, Sequence: 1}, jobID, machine.jobs[jobID].JobControlRevision, machine.coordinatorEpoch)
+		if got := applyTask10(t, machine, 15, cancel); got.Code != ResultSuccess {
+			t.Fatalf("cancel repaired job: %#v", got)
+		}
+		history := machine.jobs[jobID].invalidationHistory
+		if len(history) != 1 || history[0].RepairState != invalidationRepairAnchored || history[0].RepairJobControlRevision == 0 {
+			t.Fatalf("client cancellation changed job-control anchor: %#v", history)
+		}
+		if _, err := machine.Capture(106, 100); err != nil {
+			t.Fatalf("canceled job with anchored repair: %v", err)
+		}
+	})
 }
 
 func TestSnapshotAcceptsMultipleInvalidationRepairGenerations(t *testing.T) {

@@ -290,11 +290,13 @@ func (machine *Machine) applyReplaceAssignmentsLocked(command ReplaceAssignments
 			return mutationPlan{result: result, reject: true}, resultErr
 		}
 		candidate := cloneJobRecord(record)
+		candidate.invalidationHistory = machine.forgetJobControlInvalidationHistory(candidate.JobID, candidate.invalidationHistory)
 		for index := range candidate.invalidationHistory {
 			provenance := &candidate.invalidationHistory[index]
-			if provenance.RepairJobControlRevision != 0 {
+			if provenance.RepairState != invalidationRepairActive {
 				continue
 			}
+			provenance.RepairState = invalidationRepairAnchored
 			provenance.RepairJobControlRevision = nextRevision
 			provenance.RepairAssignmentRevision = command.Target.Revision
 			provenance.RepairAssignmentDigest = command.Target.Digest
@@ -303,7 +305,6 @@ func (machine *Machine) applyReplaceAssignmentsLocked(command ReplaceAssignments
 		candidate.Assignment = assignmentPointer(command.Target)
 		candidate.NeedsReassignment = nil
 		candidate.JobControlRevision = nextRevision
-		candidate.invalidationHistory = machine.pruneConsumedInvalidationHistory(candidate.JobID, candidate.invalidationHistory, 0)
 		beforeBytes, beforeOK := estimateJobRecordBytes(record)
 		afterBytes, afterOK := estimateJobRecordBytes(candidate)
 		if !beforeOK || !afterOK {

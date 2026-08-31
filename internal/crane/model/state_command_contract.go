@@ -57,7 +57,7 @@ const (
 	// StateCommandReassignmentBytesV1 counts one reassignment marker.
 	StateCommandReassignmentBytesV1 uint64 = 60
 	// StateCommandInvalidationProvenanceFixedBytesV1 counts one provenance record excluding its marker list.
-	StateCommandInvalidationProvenanceFixedBytesV1 uint64 = 157
+	StateCommandInvalidationProvenanceFixedBytesV1 uint64 = 158
 	// StateCommandMaxInvalidationProvenanceV1 is the hard per-job u16 provenance-count bound.
 	StateCommandMaxInvalidationProvenanceV1 uint64 = 1<<16 - 1
 	// StateCommandSourceEOFEntryBytesV1 counts a source key and EOF record.
@@ -226,7 +226,7 @@ var stateCommandLayoutsV1 = []StateCommandLayoutDescriptor{
 	{Name: "AssignmentSet", Fields: []string{"JobID:bytes16(nonzero)", "Revision:u64(nonzero)", "Digest:sha256(nonzero)", "Tasks:u16-count+list(AssignmentToken)", "ResultReplicas:u16-count+list(ResultReplicaSet)"}},
 	{Name: "AssignmentSetDigest", Fields: AssignmentSetDigestLayoutV1()},
 	{Name: "NeedsReassignment", Fields: []string{"Kind:ReassignmentTargetKind", "Task:TaskID", "SinkTask:TaskID", "ReplicaRole:ResultReplicaRole", "OldWorkerID:u16(nonzero)", "OldWorkerEpoch:bytes16(nonzero)"}},
-	{Name: "InvalidationProvenance", Fields: []string{"Kind:WorkerInvalidationKind", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "WorkerRevision:u64(nonzero)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)", "Markers:u16-count+sorted(NeedsReassignment)", "RepairJobControlRevision:u64(zero-or-nonzero)", "RepairAssignmentRevision:u64(zero-or-successor)", "RepairAssignmentDigest:sha256(zero-iff-active)", "RepairMarkersDigest:sha256(zero-iff-active)"}},
+	{Name: "InvalidationProvenance", Fields: []string{"Kind:WorkerInvalidationKind(zero-iff-worker-anchor-forgotten)", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "WorkerRevision:u64(zero-iff-worker-anchor-forgotten)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)", "Markers:u16-count+sorted(NeedsReassignment)", "RepairState:InvalidationRepairState", "RepairJobControlRevision:u64(nonzero-iff-anchored)", "RepairAssignmentRevision:u64(successor-iff-anchored)", "RepairAssignmentDigest:sha256(nonzero-iff-anchored)", "RepairMarkersDigest:sha256(nonzero-iff-anchored)"}},
 	{Name: "CompletionReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Source:TaskID", "Token:AssignmentToken", "Epoch:CoordinatorEpoch", "ExpectedCheckpointRevision:u64", "Prior:u64", "New:u64", "EOF:u64", "WorkerTransactionID:u64(nonzero)", "Digest:sha256(nonzero)"}},
 	{Name: "JobFailureReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Task:AssignmentToken", "Epoch:CoordinatorEpoch", "TransactionID:u64(nonzero)", "Code:FailureCode", "DetailDigest:sha256(nonzero)"}},
 	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet"}},
@@ -257,7 +257,7 @@ var stateSnapshotLayoutsV2 = []StateCommandLayoutDescriptor{
 	{Name: "AssignmentToken", Fields: []string{"Task:TaskID", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "Attempt:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "AssignmentRevision:u64(nonzero)"}},
 	{Name: "ResultReplicaSet", Fields: []string{"SinkTask:TaskID", "PrimaryNodeID:u16(nonzero)", "SecondaryNodeID:u16(nonzero-distinct)", "PrimaryEpoch:bytes16(nonzero)", "SecondaryEpoch:bytes16(nonzero)"}},
 	{Name: "NeedsReassignment", Fields: []string{"Kind:ReassignmentTargetKind", "Task:TaskID", "SinkTask:TaskID", "ReplicaRole:ResultReplicaRole", "OldWorkerID:u16(nonzero)", "OldWorkerEpoch:bytes16(nonzero)"}},
-	{Name: "InvalidationProvenance", Fields: []string{"Kind:WorkerInvalidationKind", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "WorkerRevision:u64(nonzero)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)", "Markers:u16-count+sorted(NeedsReassignment)", "RepairJobControlRevision:u64(zero-or-nonzero)", "RepairAssignmentRevision:u64(zero-or-successor)", "RepairAssignmentDigest:sha256(zero-iff-active)", "RepairMarkersDigest:sha256(zero-iff-active)"}},
+	{Name: "InvalidationProvenance", Fields: []string{"Kind:WorkerInvalidationKind(zero-iff-worker-anchor-forgotten)", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "WorkerRevision:u64(zero-iff-worker-anchor-forgotten)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)", "Markers:u16-count+sorted(NeedsReassignment)", "RepairState:InvalidationRepairState", "RepairJobControlRevision:u64(nonzero-iff-anchored)", "RepairAssignmentRevision:u64(successor-iff-anchored)", "RepairAssignmentDigest:sha256(nonzero-iff-anchored)", "RepairMarkersDigest:sha256(nonzero-iff-anchored)"}},
 	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet"}},
 	{Name: "JobFailureReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Task:AssignmentToken", "Epoch:CoordinatorEpoch", "TransactionID:u64(nonzero)", "Code:FailureCode", "DetailDigest:sha256(nonzero)"}},
 }
@@ -290,7 +290,7 @@ var stateSnapshotValidationRulesV2 = []string{
 	"cached-results:canonical-command-result-and-subject-identity-revision-epoch-correlated",
 	"retained-targets:canonical-complete-semantic-correlation-with-authoritative-state",
 	"job-control-lag:exact-active-provenance-count-plus-optional-client-cancellation",
-	"worker-invalidations:bounded-causal-provenance-exact-retained-affected-target-and-repair-predecessor-fences",
+	"worker-invalidations:bounded-active-anchored-forgotten-provenance-with-exact-retained-worker-or-job-control-authority-and-canonical-anchor-forgetting",
 	"job-definitions:DefiningRequest-unique-across-all-retained-jobs",
 	"assigned-jobs:complete-immutable-source-eofs-including-terminal",
 	"reverse-references:coordinator-worker-job-control-eof-checkpoint-manifest",
@@ -329,7 +329,8 @@ var stateCommandEnumsV1 = []StateCommandEnumDescriptor{
 	{Name: "SubjectKind", Values: []string{"None=0", "Coordinator=1", "Worker=2", "JobControl=3", "SourceEOF=4", "SourceCheckpoint=5", "ResultManifest=6"}},
 	{Name: "ResultCode", Values: []string{"Success=1", "IdentityReuse=2", "StaleRequest=3", "SkippedRequest=4", "CapacityExhausted=5", "RevisionMismatch=6", "StaleEpoch=7", "ResultTooLarge=8"}},
 	{Name: "ReassignmentTargetKind", Values: []string{"Task=1", "ResultReplica=2"}},
-	{Name: "WorkerInvalidationKind", Values: []string{"Deactivate=1", "ReplaceEpoch=2"}},
+	{Name: "WorkerInvalidationKind", Values: []string{"Forgotten=0", "Deactivate=1", "ReplaceEpoch=2"}},
+	{Name: "InvalidationRepairState", Values: []string{"Active=1", "Anchored=2", "Forgotten=3"}},
 	{Name: "ResultReplicaRole", Values: []string{"Primary=1", "Secondary=2"}},
 	{Name: "FailureCode", Values: []string{"Operator=1", "TupleInvalid=2", "Storage=3"}},
 }
@@ -418,7 +419,7 @@ var stateCommandRulesV1 = []string{
 	"worker-slots-are-cluster-wide-across-task-tokens-in-all-nonterminal-jobs-replacement-excludes-the-current-job-and-result-replicas-consume-no-slots",
 	"assignment-replacement-slot-validation-counts-every-target-task-token-including-unchanged-draining-placements-against-residual-capacity-after-other-nonterminal-jobs",
 	"worker-deactivation-and-epoch-replacement-require-the-sorted-complete-affected-job-list-and-atomically-union-sorted-reassignment-markers",
-	"worker-invalidations-append-bounded-causal-provenance-repeat-marked-incarnations-do-not-advance-jobs-and-repairs-bind-exact-predecessor-fences",
+	"worker-invalidations-append-bounded-active-causal-provenance-repeat-marked-incarnations-do-not-advance-jobs-worker-history-overwrites-clear-exact-worker-anchors-repairs-become-job-control-anchored-and-later-job-control-successes-forget-or-prune-consumed-evidence",
 	"checkpoint-manifest-and-job-control-subject-revisions-advance-independently",
 	"worker-event-transactions-use-one-strictly-increasing-digest-bound-cursor-per-exact-worker-id-and-worker-epoch-across-all-jobs-and-sources",
 	"worker-epoch-replacement-discards-the-old-epoch-event-cursor-before-the-new-epoch-starts-at-zero",

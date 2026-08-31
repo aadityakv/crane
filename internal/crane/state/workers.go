@@ -61,6 +61,14 @@ const (
 	workerInvalidationReplaceEpoch
 )
 
+type invalidationRepairState uint8
+
+const (
+	invalidationRepairActive invalidationRepairState = iota + 1
+	invalidationRepairAnchored
+	invalidationRepairForgotten
+)
+
 type invalidationProvenance struct {
 	Kind                     workerInvalidationKind
 	WorkerID                 uint16
@@ -70,6 +78,7 @@ type invalidationProvenance struct {
 	AssignmentRevision       uint64
 	AssignmentDigest         [32]byte
 	Markers                  []NeedsReassignment
+	RepairState              invalidationRepairState
 	RepairJobControlRevision uint64
 	RepairAssignmentRevision uint64
 	RepairAssignmentDigest   [32]byte
@@ -422,6 +431,7 @@ func (machine *Machine) prepareWorkerInvalidation(kind workerInvalidationKind, w
 					Kind: kind, WorkerID: workerID, WorkerEpoch: epoch, WorkerRevision: workerRevision,
 					JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision,
 					AssignmentDigest: record.Assignment.Digest, Markers: append([]NeedsReassignment(nil), markers...),
+					RepairState: invalidationRepairActive,
 				})
 				candidate.JobControlRevision++
 			}
@@ -464,22 +474,42 @@ func (machine *Machine) prepareConsumedInvalidationPrune(workerID uint16) (map[m
 }
 
 func (machine *Machine) pruneConsumedInvalidationHistory(jobID model.JobID, history []invalidationProvenance, overwrittenWorker uint16) []invalidationProvenance {
-	neededRepairs := make(map[uint64]bool)
-	for _, provenance := range history {
-		if provenance.RepairJobControlRevision == 0 || provenance.WorkerID == overwrittenWorker {
-			continue
-		}
-		if machine.subjectRetainsInvalidation(jobID, provenance) {
-			neededRepairs[provenance.RepairJobControlRevision] = true
+	normalized := cloneInvalidationProvenance(history)
+	if overwrittenWorker != 0 {
+		for index := range normalized {
+			if normalized[index].WorkerID == overwrittenWorker {
+				normalized[index].Kind = 0
+				normalized[index].WorkerRevision = 0
+			}
 		}
 	}
-	result := make([]invalidationProvenance, 0, len(history))
-	for _, provenance := range history {
-		if provenance.RepairJobControlRevision == 0 || neededRepairs[provenance.RepairJobControlRevision] {
-			clone := provenance
-			clone.Markers = append([]NeedsReassignment(nil), provenance.Markers...)
-			result = append(result, clone)
+	result := make([]invalidationProvenance, 0, len(normalized))
+	for _, provenance := range normalized {
+		if provenance.RepairState == invalidationRepairForgotten && !machine.subjectRetainsInvalidation(jobID, provenance) {
+			continue
 		}
+		clone := provenance
+		clone.Markers = append([]NeedsReassignment(nil), provenance.Markers...)
+		result = append(result, clone)
+	}
+	return result
+}
+
+func (machine *Machine) forgetJobControlInvalidationHistory(jobID model.JobID, history []invalidationProvenance) []invalidationProvenance {
+	normalized := cloneInvalidationProvenance(history)
+	result := make([]invalidationProvenance, 0, len(normalized))
+	for _, provenance := range normalized {
+		if provenance.RepairState == invalidationRepairAnchored {
+			provenance.RepairState = invalidationRepairForgotten
+			provenance.RepairJobControlRevision = 0
+			provenance.RepairAssignmentRevision = 0
+			provenance.RepairAssignmentDigest = [32]byte{}
+			provenance.RepairMarkersDigest = [32]byte{}
+		}
+		if provenance.RepairState == invalidationRepairForgotten && !machine.subjectRetainsInvalidation(jobID, provenance) {
+			continue
+		}
+		result = append(result, provenance)
 	}
 	return result
 }

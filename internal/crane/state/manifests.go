@@ -200,10 +200,16 @@ func (machine *Machine) applyTransitionJobLocked(command TransitionJob) ([]byte,
 			return mutationPlan{result: result, reject: true}, err
 		}
 		candidate := cloneJobRecord(record)
+		candidate.invalidationHistory = machine.forgetJobControlInvalidationHistory(candidate.JobID, candidate.invalidationHistory)
 		candidate.Lifecycle = command.To
 		candidate.JobControlRevision = nextRevision
+		beforeBytes, beforeOK := estimateJobRecordBytes(record)
+		afterBytes, afterOK := estimateJobRecordBytes(candidate)
+		if !beforeOK || !afterOK {
+			return mutationPlan{}, errors.New("impossible transition provenance accounting")
+		}
 		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
-		return mutationPlan{result: result, commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
+		return mutationPlan{result: result, stateDelta: signedSizeDelta(afterBytes, beforeBytes), commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
 	})
 }
 
@@ -235,12 +241,19 @@ func (machine *Machine) applyFailJobLocked(command FailJob) ([]byte, error) {
 			return mutationPlan{result: result, reject: true}, resultErr
 		}
 		candidate := cloneJobRecord(record)
+		candidate.invalidationHistory = machine.forgetJobControlInvalidationHistory(candidate.JobID, candidate.invalidationHistory)
 		failure := report
 		candidate.Failure = &failure
 		candidate.Lifecycle = JobFailed
 		candidate.JobControlRevision = nextRevision
 		_, cursorExists := machine.workerEvents[cursorKey]
 		delta := int64(jobFailureEstimatedBytes)
+		beforeBytes, beforeOK := estimateJobRecordBytes(record)
+		afterBytes, afterOK := estimateJobRecordBytes(candidate)
+		if !beforeOK || !afterOK {
+			return mutationPlan{}, errors.New("impossible failure provenance accounting")
+		}
+		delta += signedSizeDelta(afterBytes, beforeBytes) - int64(jobFailureEstimatedBytes)
 		if !cursorExists {
 			delta += int64(workerEventEntryEstimatedBytes)
 		}
