@@ -92,7 +92,7 @@ func (matcher *Matcher) MatchUDP(ctx context.Context, remote net.Addr, advertise
 }
 
 func (matcher *Matcher) matches(ctx context.Context, source netip.Addr, advertised config.Endpoint) bool {
-	if matcher == nil || !source.IsValid() {
+	if matcher == nil || !source.IsValid() || source.IsUnspecified() {
 		return false
 	}
 	canonical, err := config.CanonicalEndpoint(advertised)
@@ -105,7 +105,7 @@ func (matcher *Matcher) matches(ctx context.Context, source netip.Addr, advertis
 	}
 	source = source.Unmap()
 	for _, address := range addresses {
-		if source == address {
+		if !address.IsUnspecified() && source == address {
 			return true
 		}
 	}
@@ -215,7 +215,7 @@ func canonicalHost(host string) string {
 
 func tcpAddress(remote net.Addr) (netip.Addr, bool) {
 	address, ok := remote.(*net.TCPAddr)
-	if !ok || address == nil {
+	if !ok || address == nil || address.Zone != "" {
 		return netip.Addr{}, false
 	}
 	return canonicalIP(address.IP)
@@ -223,7 +223,7 @@ func tcpAddress(remote net.Addr) (netip.Addr, bool) {
 
 func udpAddress(remote net.Addr) (netip.Addr, uint16, bool) {
 	address, ok := remote.(*net.UDPAddr)
-	if !ok || address == nil || address.Port <= 0 || address.Port > 65535 {
+	if !ok || address == nil || address.Zone != "" || address.Port <= 0 || address.Port > 65535 {
 		return netip.Addr{}, 0, false
 	}
 	canonical, ok := canonicalIP(address.IP)

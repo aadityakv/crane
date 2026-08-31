@@ -98,6 +98,24 @@ func TestAddressMatcherBoundsCacheByCanonicalIdentity(t *testing.T) {
 	}
 }
 
+func FuzzAddressMatcherLiteralIPCanonicalization(f *testing.F) {
+	f.Add("192.0.2.1", "::ffff:192.0.2.1")
+	f.Add("2001:db8::1", "2001:0db8:0:0:0:0:0:1")
+	f.Fuzz(func(t *testing.T, advertisedText, remoteText string) {
+		advertised, advertisedError := netip.ParseAddr(advertisedText)
+		remote, remoteError := netip.ParseAddr(remoteText)
+		if advertisedError != nil || remoteError != nil {
+			return
+		}
+		matcher := NewMatcher(nil, clock.NewManual(time.Unix(7000, 0)), Options{})
+		got := matcher.MatchTCP(context.Background(), net.TCPAddrFromAddrPort(netip.AddrPortFrom(remote, 49152)), config.Endpoint{Host: advertised.String(), Port: 9000})
+		want := advertised.Unmap() == remote.Unmap() && !advertised.IsUnspecified() && !remote.IsUnspecified() && remote.Zone() == ""
+		if got != want {
+			t.Fatalf("MatchTCP(%s,%s)=%t want %t", advertised, remote, got, want)
+		}
+	})
+}
+
 type hostnameAddr string
 
 func (hostnameAddr) Network() string  { return "tcp" }
