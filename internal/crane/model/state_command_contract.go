@@ -31,6 +31,42 @@ type StateCommandEnumDescriptor struct {
 	Values []string
 }
 
+// StateCommandRevisionPolicy pins the legal revision shape for one result pair.
+type StateCommandRevisionPolicy uint8
+
+const (
+	StateCommandRevisionZero    StateCommandRevisionPolicy = 1
+	StateCommandRevisionNonZero StateCommandRevisionPolicy = 2
+	StateCommandRevisionAny     StateCommandRevisionPolicy = 3
+)
+
+// StateCommandIdentityPolicy pins the legal JobID/WorkerID correlation fields.
+type StateCommandIdentityPolicy uint8
+
+const (
+	StateCommandIdentityUnbound     StateCommandIdentityPolicy = 1
+	StateCommandIdentityCoordinator StateCommandIdentityPolicy = 2
+	StateCommandIdentityWorker      StateCommandIdentityPolicy = 3
+	StateCommandIdentityJob         StateCommandIdentityPolicy = 4
+)
+
+// StateCommandEpochPolicy pins whether a result may carry a coordinator epoch.
+type StateCommandEpochPolicy uint8
+
+const (
+	StateCommandEpochZero                StateCommandEpochPolicy = 1
+	StateCommandEpochCoordinatorRevision StateCommandEpochPolicy = 2
+)
+
+// StateCommandResultRule pins one accepted ResultCode/SubjectKind combination.
+type StateCommandResultRule struct {
+	Code     uint16
+	Subject  uint8
+	Revision StateCommandRevisionPolicy
+	Identity StateCommandIdentityPolicy
+	Epoch    StateCommandEpochPolicy
+}
+
 // StateCommandContract is the dependency-leaf consensus contract for command
 // envelopes, results, deduplication, and coordinator fencing.
 type StateCommandContract struct {
@@ -38,6 +74,7 @@ type StateCommandContract struct {
 
 	EnvelopeLayouts []StateCommandLayoutDescriptor
 	EnumDomains     []StateCommandEnumDescriptor
+	ResultMatrix    []StateCommandResultRule
 	DigestDomains   []string
 
 	MaxClientSessions    uint64
@@ -74,6 +111,45 @@ var stateCommandEnumsV1 = []StateCommandEnumDescriptor{
 	{Name: "ResultCode", Values: []string{"Success=1", "IdentityReuse=2", "StaleRequest=3", "SkippedRequest=4", "CapacityExhausted=5", "RevisionMismatch=6", "StaleEpoch=7", "ResultTooLarge=8"}},
 }
 
+var stateCommandResultMatrixV1 = []StateCommandResultRule{
+	{Code: 1, Subject: 1, Revision: StateCommandRevisionNonZero, Identity: StateCommandIdentityCoordinator, Epoch: StateCommandEpochCoordinatorRevision},
+	{Code: 1, Subject: 2, Revision: StateCommandRevisionNonZero, Identity: StateCommandIdentityWorker, Epoch: StateCommandEpochZero},
+	{Code: 1, Subject: 3, Revision: StateCommandRevisionNonZero, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 1, Subject: 4, Revision: StateCommandRevisionNonZero, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 1, Subject: 5, Revision: StateCommandRevisionNonZero, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 1, Subject: 6, Revision: StateCommandRevisionNonZero, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 2, Subject: 0, Revision: StateCommandRevisionZero, Identity: StateCommandIdentityUnbound, Epoch: StateCommandEpochZero},
+	{Code: 2, Subject: 1, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityCoordinator, Epoch: StateCommandEpochCoordinatorRevision},
+	{Code: 2, Subject: 2, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityWorker, Epoch: StateCommandEpochZero},
+	{Code: 2, Subject: 3, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 2, Subject: 4, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 2, Subject: 5, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 2, Subject: 6, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 3, Subject: 0, Revision: StateCommandRevisionZero, Identity: StateCommandIdentityUnbound, Epoch: StateCommandEpochZero},
+	{Code: 4, Subject: 0, Revision: StateCommandRevisionZero, Identity: StateCommandIdentityUnbound, Epoch: StateCommandEpochZero},
+	{Code: 5, Subject: 0, Revision: StateCommandRevisionZero, Identity: StateCommandIdentityUnbound, Epoch: StateCommandEpochZero},
+	{Code: 5, Subject: 1, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityCoordinator, Epoch: StateCommandEpochCoordinatorRevision},
+	{Code: 5, Subject: 2, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityWorker, Epoch: StateCommandEpochZero},
+	{Code: 5, Subject: 3, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 5, Subject: 4, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 5, Subject: 5, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 5, Subject: 6, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 6, Subject: 1, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityCoordinator, Epoch: StateCommandEpochCoordinatorRevision},
+	{Code: 6, Subject: 2, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityWorker, Epoch: StateCommandEpochZero},
+	{Code: 6, Subject: 3, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 6, Subject: 4, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 6, Subject: 5, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 6, Subject: 6, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 7, Subject: 1, Revision: StateCommandRevisionNonZero, Identity: StateCommandIdentityCoordinator, Epoch: StateCommandEpochCoordinatorRevision},
+	{Code: 8, Subject: 0, Revision: StateCommandRevisionZero, Identity: StateCommandIdentityUnbound, Epoch: StateCommandEpochZero},
+	{Code: 8, Subject: 1, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityCoordinator, Epoch: StateCommandEpochCoordinatorRevision},
+	{Code: 8, Subject: 2, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityWorker, Epoch: StateCommandEpochZero},
+	{Code: 8, Subject: 3, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 8, Subject: 4, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 8, Subject: 5, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+	{Code: 8, Subject: 6, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
+}
+
 var stateCommandRulesV1 = []string{
 	"exactly-one-client-or-internal-identity",
 	"begin-coordinator-epoch-is-internal-only-and-coordinator-singleton",
@@ -105,6 +181,7 @@ func StateCommandContractV1() StateCommandContract {
 		SchemaVersion:            StateCommandSchemaVersionV1,
 		EnvelopeLayouts:          cloneStateCommandLayouts(stateCommandLayoutsV1),
 		EnumDomains:              cloneStateCommandEnums(stateCommandEnumsV1),
+		ResultMatrix:             append([]StateCommandResultRule(nil), stateCommandResultMatrixV1...),
 		DigestDomains:            []string{"cs425/crane/internal-command/v1"},
 		MaxClientSessions:        StateCommandMaxClientSessionsV1,
 		MaxSubjectHistories:      StateCommandMaxSubjectHistoriesV1,
@@ -136,6 +213,11 @@ func canonicalStateCommandContractBytes(contract StateCommandContract) []byte {
 		encoded = appendString(encoded, enum.Name)
 		encoded = appendStringList(encoded, enum.Values)
 	}
+	encoded = appendUint16(encoded, uint16(len(contract.ResultMatrix)))
+	for _, rule := range contract.ResultMatrix {
+		encoded = appendUint16(encoded, rule.Code)
+		encoded = append(encoded, rule.Subject, byte(rule.Revision), byte(rule.Identity), byte(rule.Epoch))
+	}
 	encoded = appendStringList(encoded, contract.DigestDomains)
 	for _, value := range []uint64{
 		contract.MaxClientSessions, contract.MaxSubjectHistories,
@@ -149,6 +231,16 @@ func canonicalStateCommandContractBytes(contract StateCommandContract) []byte {
 		encoded = appendUint64(encoded, value)
 	}
 	return appendStringList(encoded, contract.Rules)
+}
+
+// StateCommandResultRuleV1 returns the exact accepted rule for code and subject.
+func StateCommandResultRuleV1(code uint16, subject uint8) (StateCommandResultRule, bool) {
+	for _, rule := range stateCommandResultMatrixV1 {
+		if rule.Code == code && rule.Subject == subject {
+			return rule, true
+		}
+	}
+	return StateCommandResultRule{}, false
 }
 
 func cloneStateCommandLayouts(input []StateCommandLayoutDescriptor) []StateCommandLayoutDescriptor {

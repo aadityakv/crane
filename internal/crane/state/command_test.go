@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -18,7 +19,7 @@ func TestCommandBeginCoordinatorEpochCanonicalGoldenAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBeginCoordinatorEpoch: %v", err)
 	}
-	const wantHex = "000154a1513845640fbb39b7c687ed31a68e3652906937d477d56564daca00038cd50001021100000000000000000000000000000000000000000000000000000000000000e4a06a3814b9c809163327ac5929ec01b9d76cd35489ff3f8ed45618f0a5ded50100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
+	const wantHex = "000181b9af9cd06949835c593837159e075c35aa017d490ecfe083df264f3c3f54c900010211000000000000000000000000000000000000000000000000000000000000003315919b26dc7d134a630c944562e32fbd5854a92f111479a28269b7b5fb92f00100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("golden = %s, want %s", got, wantHex)
 	}
@@ -111,6 +112,62 @@ func TestCommandRejectsUnknownZeroMismatchedAndNoncanonicalValues(t *testing.T) 
 	}
 }
 
+func TestCommandValidationPreservesTopLevelAndUnderlyingSentinels(t *testing.T) {
+	valid := validBeginCommand(t, 0, 2, 0x62)
+	marshalCases := []struct {
+		name     string
+		sentinel error
+		mutate   func(*BeginCoordinatorEpoch)
+	}{
+		{name: "schema", sentinel: ErrUnsupportedCommandSchema, mutate: func(command *BeginCoordinatorEpoch) { command.Envelope.SchemaVersion++ }},
+		{name: "fingerprint", sentinel: ErrConsensusFingerprintMismatch, mutate: func(command *BeginCoordinatorEpoch) { command.Envelope.ConsensusFingerprint[0] ^= 1 }},
+		{name: "kind", sentinel: ErrUnknownCommandKind, mutate: func(command *BeginCoordinatorEpoch) { command.Envelope.Kind = 99 }},
+		{name: "digest", sentinel: ErrCommandDigestMismatch, mutate: func(command *BeginCoordinatorEpoch) { command.Envelope.Internal.Digest[0] ^= 1 }},
+		{name: "subject", sentinel: ErrInvalidCommandSubject, mutate: func(command *BeginCoordinatorEpoch) {
+			command.Envelope.Internal.Subject = SubjectKey{Kind: SubjectWorker}
+		}},
+	}
+	for _, test := range marshalCases {
+		t.Run("marshal/"+test.name, func(t *testing.T) {
+			candidate := cloneBegin(valid)
+			test.mutate(&candidate)
+			_, err := MarshalBeginCoordinatorEpoch(candidate)
+			if !errors.Is(err, ErrInvalidCommand) || !errors.Is(err, test.sentinel) {
+				t.Fatalf("Marshal error = %v, want ErrInvalidCommand and %v", err, test.sentinel)
+			}
+		})
+	}
+
+	encoded, err := MarshalBeginCoordinatorEpoch(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// These offsets are independently pinned by the command golden: schema 0,
+	// fingerprint 2, kind 34, digest 69, and subject kind 101.
+	unmarshalCases := []struct {
+		name     string
+		offset   int
+		value    byte
+		sentinel error
+	}{
+		{name: "schema", offset: 1, value: 2, sentinel: ErrUnsupportedCommandSchema},
+		{name: "fingerprint", offset: 2, value: encoded[2] ^ 1, sentinel: ErrConsensusFingerprintMismatch},
+		{name: "kind", offset: 35, value: 99, sentinel: ErrUnknownCommandKind},
+		{name: "digest", offset: 69, value: encoded[69] ^ 1, sentinel: ErrCommandDigestMismatch},
+		{name: "subject", offset: 101, value: 0, sentinel: ErrInvalidCommandSubject},
+	}
+	for _, test := range unmarshalCases {
+		t.Run("unmarshal/"+test.name, func(t *testing.T) {
+			candidate := append([]byte(nil), encoded...)
+			candidate[test.offset] = test.value
+			_, err := UnmarshalBeginCoordinatorEpoch(candidate)
+			if !errors.Is(err, ErrInvalidCommand) || !errors.Is(err, test.sentinel) {
+				t.Fatalf("Unmarshal error = %v, want ErrInvalidCommand and %v", err, test.sentinel)
+			}
+		})
+	}
+}
+
 func TestCommandSubjectKeysValidateCanonicalUnionAndIndependence(t *testing.T) {
 	jobA := model.JobID{1}
 	jobB := model.JobID{2}
@@ -196,6 +253,105 @@ func TestCommandResultRejectsUnknownAndNoncanonicalUnionValues(t *testing.T) {
 	}
 }
 
+func TestCommandResultValidationPreservesMalformedAndSubjectSentinels(t *testing.T) {
+	result := validResultForMatrix(ResultSuccess, SubjectWorker, 1)
+	result.WorkerID = 0
+	if _, err := MarshalCommandResult(result); !errors.Is(err, ErrMalformedCommandResult) || !errors.Is(err, ErrInvalidCommandSubject) {
+		t.Fatalf("MarshalCommandResult error = %v, want malformed-result and subject sentinels", err)
+	}
+
+	valid := validResultForMatrix(ResultSuccess, SubjectWorker, 1)
+	encoded, err := MarshalCommandResult(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded[30] = 0 // worker ID occupies independently pinned bytes 29..30.
+	if _, err := UnmarshalCommandResult(encoded); !errors.Is(err, ErrMalformedCommandResult) || !errors.Is(err, ErrInvalidCommandSubject) {
+		t.Fatalf("UnmarshalCommandResult error = %v, want malformed-result and subject sentinels", err)
+	}
+}
+
+func TestCommandResultExhaustiveLegalMatrixAndCorrelationFields(t *testing.T) {
+	legal := map[ResultCode]map[SubjectKind]bool{
+		ResultSuccess: {
+			SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
+			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
+		},
+		ResultIdentityReuse: {
+			SubjectNone: true, SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
+			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
+		},
+		ResultStaleRequest:   {SubjectNone: true},
+		ResultSkippedRequest: {SubjectNone: true},
+		ResultCapacityExhausted: {
+			SubjectNone: true, SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
+			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
+		},
+		ResultRevisionMismatch: {
+			SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
+			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
+		},
+		ResultStaleEpoch: {SubjectCoordinator: true},
+		ResultResultTooLarge: {
+			SubjectNone: true, SubjectCoordinator: true, SubjectWorker: true, SubjectJobControl: true,
+			SubjectSourceEOF: true, SubjectSourceCheckpoint: true, SubjectResultManifest: true,
+		},
+	}
+
+	for code := ResultSuccess; code <= ResultResultTooLarge; code++ {
+		for subject := SubjectNone; subject <= SubjectResultManifest; subject++ {
+			name := fmt.Sprintf("code_%d/subject_%d", code, subject)
+			t.Run(name, func(t *testing.T) {
+				revision := uint64(0)
+				if code == ResultSuccess || code == ResultStaleEpoch {
+					revision = 1
+				}
+				result := validResultForMatrix(code, subject, revision)
+				_, err := MarshalCommandResult(result)
+				if legal[code][subject] && err != nil {
+					t.Fatalf("legal result rejected: %#v: %v", result, err)
+				}
+				if !legal[code][subject] && err == nil {
+					t.Fatalf("illegal code/subject pair accepted: %#v", result)
+				}
+			})
+		}
+	}
+
+	for code, subjects := range legal {
+		for subject := range subjects {
+			if code == ResultSuccess || code == ResultStaleEpoch {
+				candidate := validResultForMatrix(code, subject, 1)
+				candidate.Revision = 0
+				candidate.Epoch = model.CoordinatorEpoch{}
+				if _, err := MarshalCommandResult(candidate); err == nil {
+					t.Fatalf("code %d subject %d accepted forbidden zero revision: %#v", code, subject, candidate)
+				}
+			}
+			if subject != SubjectNone && code != ResultSuccess && code != ResultStaleEpoch {
+				if _, err := MarshalCommandResult(validResultForMatrix(code, subject, 1)); err != nil {
+					t.Fatalf("code %d subject %d rejected legal nonzero current revision: %v", code, subject, err)
+				}
+			}
+
+			valid := validResultForMatrix(code, subject, func() uint64 {
+				if code == ResultSuccess || code == ResultStaleEpoch {
+					return 1
+				}
+				return 0
+			}())
+			mutations := invalidCorrelationMutations(subject, valid.Revision)
+			for name, mutate := range mutations {
+				candidate := valid
+				mutate(&candidate)
+				if _, err := MarshalCommandResult(candidate); err == nil {
+					t.Fatalf("code %d subject %d accepted invalid %s correlation: %#v", code, subject, name, candidate)
+				}
+			}
+		}
+	}
+}
+
 func TestCommandContractDescriptorMechanicallyMatchesCodecConstantsAndEnums(t *testing.T) {
 	contract := model.StateCommandContractV1()
 	if CommandSchemaVersion != contract.SchemaVersion || commandFixedEnvelopeBytes != contract.FixedEnvelopeBytes || clientEnvelopeBytes != contract.ClientEnvelopeBytes || internalEnvelopeBytes != contract.InternalEnvelopeBytes || subjectKeyBytes != contract.SubjectKeyBytes || beginTargetBytes != contract.BeginTargetBytes || commandResultBytes != contract.CommandResultBytes {
@@ -208,10 +364,13 @@ func TestCommandContractDescriptorMechanicallyMatchesCodecConstantsAndEnums(t *t
 		t.Fatal("state enums drifted from fingerprinted contract")
 	}
 	var subjectValues []string
+	var resultValues []string
 	for _, domain := range contract.EnumDomains {
-		if domain.Name == "SubjectKind" {
+		switch domain.Name {
+		case "SubjectKind":
 			subjectValues = domain.Values
-			break
+		case "ResultCode":
+			resultValues = domain.Values
 		}
 	}
 	wantSubjectValues := []string{
@@ -225,6 +384,70 @@ func TestCommandContractDescriptorMechanicallyMatchesCodecConstantsAndEnums(t *t
 	}
 	if !reflect.DeepEqual(subjectValues, wantSubjectValues) {
 		t.Fatalf("fingerprinted SubjectKind domain = %v, want actual complete domain %v", subjectValues, wantSubjectValues)
+	}
+	wantResultValues := []string{
+		fmt.Sprintf("Success=%d", ResultSuccess),
+		fmt.Sprintf("IdentityReuse=%d", ResultIdentityReuse),
+		fmt.Sprintf("StaleRequest=%d", ResultStaleRequest),
+		fmt.Sprintf("SkippedRequest=%d", ResultSkippedRequest),
+		fmt.Sprintf("CapacityExhausted=%d", ResultCapacityExhausted),
+		fmt.Sprintf("RevisionMismatch=%d", ResultRevisionMismatch),
+		fmt.Sprintf("StaleEpoch=%d", ResultStaleEpoch),
+		fmt.Sprintf("ResultTooLarge=%d", ResultResultTooLarge),
+	}
+	if !reflect.DeepEqual(resultValues, wantResultValues) {
+		t.Fatalf("fingerprinted ResultCode domain = %v, want actual complete domain %v", resultValues, wantResultValues)
+	}
+}
+
+func validResultForMatrix(code ResultCode, subject SubjectKind, revision uint64) CommandResult {
+	result := CommandResult{Code: code, Subject: subject, Revision: revision}
+	switch subject {
+	case SubjectCoordinator:
+		if revision != 0 {
+			result.Epoch = model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
+		}
+	case SubjectWorker:
+		result.WorkerID = 1
+	case SubjectJobControl, SubjectSourceEOF, SubjectSourceCheckpoint, SubjectResultManifest:
+		result.JobID = model.JobID{1}
+	}
+	return result
+}
+
+func invalidCorrelationMutations(subject SubjectKind, revision uint64) map[string]func(*CommandResult) {
+	validEpoch := model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}
+	switch subject {
+	case SubjectNone:
+		return map[string]func(*CommandResult){
+			"revision": func(result *CommandResult) { result.Revision = 1 },
+			"job":      func(result *CommandResult) { result.JobID = model.JobID{1} },
+			"worker":   func(result *CommandResult) { result.WorkerID = 1 },
+			"epoch":    func(result *CommandResult) { result.Epoch = validEpoch },
+		}
+	case SubjectCoordinator:
+		mutations := map[string]func(*CommandResult){
+			"job":    func(result *CommandResult) { result.JobID = model.JobID{1} },
+			"worker": func(result *CommandResult) { result.WorkerID = 1 },
+		}
+		if revision == 0 {
+			mutations["epoch_at_zero_revision"] = func(result *CommandResult) { result.Epoch = validEpoch }
+		} else {
+			mutations["zero_epoch_at_nonzero_revision"] = func(result *CommandResult) { result.Epoch = model.CoordinatorEpoch{} }
+		}
+		return mutations
+	case SubjectWorker:
+		return map[string]func(*CommandResult){
+			"zero_worker": func(result *CommandResult) { result.WorkerID = 0 },
+			"job":         func(result *CommandResult) { result.JobID = model.JobID{1} },
+			"epoch":       func(result *CommandResult) { result.Epoch = validEpoch },
+		}
+	default:
+		return map[string]func(*CommandResult){
+			"zero_job": func(result *CommandResult) { result.JobID = model.JobID{} },
+			"worker":   func(result *CommandResult) { result.WorkerID = 1 },
+			"epoch":    func(result *CommandResult) { result.Epoch = validEpoch },
+		}
 	}
 }
 

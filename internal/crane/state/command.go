@@ -53,22 +53,22 @@ func (key SubjectKey) Validate() error {
 	switch key.Kind {
 	case SubjectCoordinator:
 		if key.JobID != zeroJob || key.TaskID != zeroTask || key.WorkerID != 0 {
-			return errors.New("coordinator subject has nonzero union field")
+			return fmt.Errorf("%w: coordinator subject has nonzero union field", ErrInvalidCommandSubject)
 		}
 	case SubjectWorker:
 		if key.WorkerID == 0 || key.JobID != zeroJob || key.TaskID != zeroTask {
-			return errors.New("worker subject union is noncanonical")
+			return fmt.Errorf("%w: worker subject union is noncanonical", ErrInvalidCommandSubject)
 		}
 	case SubjectJobControl:
 		if key.JobID.Validate() != nil || key.TaskID != zeroTask || key.WorkerID != 0 {
-			return errors.New("job-control subject union is noncanonical")
+			return fmt.Errorf("%w: job-control subject union is noncanonical", ErrInvalidCommandSubject)
 		}
 	case SubjectSourceEOF, SubjectSourceCheckpoint, SubjectResultManifest:
 		if key.JobID.Validate() != nil || key.TaskID.Validate() != nil || key.TaskID.JobID != key.JobID || key.WorkerID != 0 {
-			return errors.New("task subject union is noncanonical")
+			return fmt.Errorf("%w: task subject union is noncanonical", ErrInvalidCommandSubject)
 		}
 	default:
-		return errors.New("unknown subject kind")
+		return fmt.Errorf("%w: unknown subject kind", ErrInvalidCommandSubject)
 	}
 	return nil
 }
@@ -142,7 +142,7 @@ func (command BeginCoordinatorEpoch) Validate() error {
 		return errors.New("begin coordinator epoch requires internal identity")
 	}
 	if command.Envelope.Internal.Subject != (SubjectKey{Kind: SubjectCoordinator}) {
-		return errors.New("begin coordinator epoch requires coordinator subject")
+		return fmt.Errorf("%w: begin coordinator epoch requires coordinator subject", ErrInvalidCommandSubject)
 	}
 	if command.Coordinator == 0 {
 		return errors.New("zero coordinator")
@@ -200,39 +200,56 @@ func (result CommandResult) Validate() error {
 	if result.Code < ResultSuccess || result.Code > ResultResultTooLarge {
 		return errors.New("unknown result code")
 	}
+	rule, ok := model.StateCommandResultRuleV1(uint16(result.Code), uint8(result.Subject))
+	if !ok {
+		return fmt.Errorf("%w: result code %d does not permit subject %d", ErrInvalidCommandSubject, result.Code, result.Subject)
+	}
+	switch rule.Revision {
+	case model.StateCommandRevisionZero:
+		if result.Revision != 0 {
+			return errors.New("result revision must be zero")
+		}
+	case model.StateCommandRevisionNonZero:
+		if result.Revision == 0 {
+			return errors.New("result revision must be nonzero")
+		}
+	case model.StateCommandRevisionAny:
+	default:
+		return errors.New("impossible result revision policy")
+	}
 	zeroJob := model.JobID{}
 	zeroEpoch := model.CoordinatorEpoch{}
-	if result.Subject == SubjectNone {
-		if result.Code == ResultSuccess || result.Revision != 0 || result.JobID != zeroJob || result.WorkerID != 0 || result.Epoch != zeroEpoch {
-			return errors.New("noncanonical unbound result")
-		}
-		return nil
-	}
-	if result.Code == ResultSuccess && result.Revision == 0 {
-		return errors.New("success result has zero revision")
-	}
-	switch result.Subject {
-	case SubjectCoordinator:
+	switch rule.Identity {
+	case model.StateCommandIdentityUnbound, model.StateCommandIdentityCoordinator:
 		if result.JobID != zeroJob || result.WorkerID != 0 {
-			return errors.New("coordinator result has nonzero union field")
+			return fmt.Errorf("%w: unbound/coordinator result has nonzero identity field", ErrInvalidCommandSubject)
 		}
-		if result.Revision == 0 {
-			if result.Epoch != zeroEpoch {
-				return errors.New("zero-revision coordinator result has epoch")
-			}
-		} else if err := result.Epoch.Validate(); err != nil {
-			return fmt.Errorf("coordinator result epoch: %w", err)
+	case model.StateCommandIdentityWorker:
+		if result.WorkerID == 0 || result.JobID != zeroJob {
+			return fmt.Errorf("%w: worker result identity is noncanonical", ErrInvalidCommandSubject)
 		}
-	case SubjectWorker:
-		if result.WorkerID == 0 || result.JobID != zeroJob || result.Epoch != zeroEpoch {
-			return errors.New("worker result union is noncanonical")
-		}
-	case SubjectJobControl, SubjectSourceEOF, SubjectSourceCheckpoint, SubjectResultManifest:
-		if result.JobID.Validate() != nil || result.WorkerID != 0 || result.Epoch != zeroEpoch {
-			return errors.New("job result union is noncanonical")
+	case model.StateCommandIdentityJob:
+		if result.JobID.Validate() != nil || result.WorkerID != 0 {
+			return fmt.Errorf("%w: job result identity is noncanonical", ErrInvalidCommandSubject)
 		}
 	default:
-		return errors.New("unknown result subject")
+		return errors.New("impossible result identity policy")
+	}
+	switch rule.Epoch {
+	case model.StateCommandEpochZero:
+		if result.Epoch != zeroEpoch {
+			return fmt.Errorf("%w: result requires zero coordinator epoch", ErrInvalidCommandSubject)
+		}
+	case model.StateCommandEpochCoordinatorRevision:
+		if result.Revision == 0 {
+			if result.Epoch != zeroEpoch {
+				return fmt.Errorf("%w: zero-revision coordinator result has epoch", ErrInvalidCommandSubject)
+			}
+		} else if err := result.Epoch.Validate(); err != nil {
+			return fmt.Errorf("%w: coordinator result epoch: %v", ErrInvalidCommandSubject, err)
+		}
+	default:
+		return errors.New("impossible result epoch policy")
 	}
 	return nil
 }

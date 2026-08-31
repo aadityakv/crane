@@ -317,7 +317,7 @@ func TestDecodeAppliesTimingDefaults(t *testing.T) {
 "bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
 "introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
 "raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}],
-"crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"54a1513845640fbb39b7c687ed31a68e3652906937d477d56564daca00038cd5"}
+"crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"81b9af9cd06949835c593837159e075c35aa017d490ecfe083df264f3c3f54c9"}
 }`, secret)
 	cfg, err := Decode(bytes.NewBufferString(input))
 	if err != nil {
@@ -335,7 +335,7 @@ func TestDecodeAppliesAndMergesRaftDefaults(t *testing.T) {
 "bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
 "introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
 "raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}],
-"crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"54a1513845640fbb39b7c687ed31a68e3652906937d477d56564daca00038cd5"}`, secret)
+"crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"81b9af9cd06949835c593837159e075c35aa017d490ecfe083df264f3c3f54c9"}`, secret)
 	t.Run("omitted", func(t *testing.T) {
 		cfg, err := Decode(bytes.NewBufferString(base + `}`))
 		if err != nil {

@@ -18,7 +18,7 @@ const (
 // MarshalBeginCoordinatorEpoch emits the sole canonical concrete Task 9 command.
 func MarshalBeginCoordinatorEpoch(command BeginCoordinatorEpoch) ([]byte, error) {
 	if err := command.Validate(); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidCommand, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidCommand, err)
 	}
 	encoded := make([]byte, 0, int(commandFixedEnvelopeBytes+internalEnvelopeBytes+beginTargetBytes))
 	encoded = appendU16(encoded, command.Envelope.SchemaVersion)
@@ -91,7 +91,7 @@ func UnmarshalBeginCoordinatorEpoch(encoded []byte) (BeginCoordinatorEpoch, erro
 		Coordinator: coordinator, Nonce: nonce,
 	}
 	if err := command.Validate(); err != nil {
-		return BeginCoordinatorEpoch{}, fmt.Errorf("%w: %v", ErrInvalidCommand, err)
+		return BeginCoordinatorEpoch{}, fmt.Errorf("%w: %w", ErrInvalidCommand, err)
 	}
 	canonical, err := MarshalBeginCoordinatorEpoch(command)
 	if err != nil || !bytes.Equal(canonical, encoded) {
@@ -103,7 +103,7 @@ func UnmarshalBeginCoordinatorEpoch(encoded []byte) (BeginCoordinatorEpoch, erro
 // MarshalCommandResult emits the fixed, bounded canonical result schema.
 func MarshalCommandResult(result CommandResult) ([]byte, error) {
 	if err := result.Validate(); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMalformedCommandResult, err)
+		return nil, fmt.Errorf("%w: %w", ErrMalformedCommandResult, err)
 	}
 	encoded := make([]byte, 0, int(commandResultBytes))
 	encoded = appendU16(encoded, CommandSchemaVersion)
@@ -143,7 +143,7 @@ func UnmarshalCommandResult(encoded []byte) (CommandResult, error) {
 	nonce, _ := decoder.array16()
 	result := CommandResult{Code: ResultCode(code), Subject: SubjectKind(subject), Revision: revision, JobID: model.JobID(jobBytes), WorkerID: worker, Epoch: model.CoordinatorEpoch{Term: term, BeginIndex: index, Coordinator: coordinator, Nonce: nonce}}
 	if err := result.Validate(); err != nil {
-		return CommandResult{}, fmt.Errorf("%w: %v", ErrMalformedCommandResult, err)
+		return CommandResult{}, fmt.Errorf("%w: %w", ErrMalformedCommandResult, err)
 	}
 	return result, nil
 }
