@@ -39,21 +39,26 @@ type ServiceOptions struct {
 	Gate          *admission.Gate
 	OpenStore     func(string, store.Identity, store.Options) (*store.Store, error)
 	Datagram      transport.SourceDatagram
+	// ArtifactDirectory optionally locates the durable sealed result artifact
+	// store created during Run. Empty keeps artifact receive and leader fetch
+	// fail-closed unavailable, exactly as before this seam existed.
+	ArtifactDirectory string
 }
 
 // Service composes one durable worker owner, one +5 listener, and exactly one
 // shared +7 sender/receiver endpoint.
 type Service struct {
-	configuration config.NodeConfig
-	authenticator wire.Authenticator
-	clock         clock.Clock
-	membership    *membership.Authorizer
-	gate          *admission.Gate
-	openStore     func(string, store.Identity, store.Options) (*store.Store, error)
-	datagram      transport.SourceDatagram
-	clusterID     [16]byte
-	controlBind   config.Endpoint
-	listen        func(string, string) (net.Listener, error)
+	configuration     config.NodeConfig
+	authenticator     wire.Authenticator
+	clock             clock.Clock
+	membership        *membership.Authorizer
+	gate              *admission.Gate
+	openStore         func(string, store.Identity, store.Options) (*store.Store, error)
+	datagram          transport.SourceDatagram
+	artifactDirectory string
+	clusterID         [16]byte
+	controlBind       config.Endpoint
+	listen            func(string, string) (net.Listener, error)
 
 	store      *store.Store
 	repository *serviceRepository
@@ -89,7 +94,8 @@ func NewService(options ServiceOptions) (*Service, error) {
 	return &Service{
 		configuration: configuration, authenticator: options.Authenticator, clock: options.Clock,
 		membership: options.Membership, gate: options.Gate, openStore: options.OpenStore,
-		datagram: options.Datagram, clusterID: clusterID, controlBind: controlBind,
+		datagram: options.Datagram, artifactDirectory: options.ArtifactDirectory,
+		clusterID: clusterID, controlBind: controlBind,
 		listen: net.Listen, ready: make(chan struct{}),
 	}, nil
 }
@@ -149,7 +155,18 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	service.tuple = tuple
-	transfer, err := NewTransferOwner(TransferOptions{Repository: repository})
+	transferOptions := TransferOptions{Repository: repository}
+	if service.artifactDirectory != "" {
+		if err := swim.EnsureStorageDirectory(service.artifactDirectory); err != nil {
+			return fmt.Errorf("prepare Crane artifact directory: %w", err)
+		}
+		artifacts, err := NewArtifactStore(service.artifactDirectory)
+		if err != nil {
+			return fmt.Errorf("open Crane artifact store: %w", err)
+		}
+		transferOptions.Artifacts = artifacts
+	}
+	transfer, err := NewTransferOwner(transferOptions)
 	if err != nil {
 		return err
 	}

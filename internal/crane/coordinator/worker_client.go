@@ -158,6 +158,41 @@ func (client *DialWorkerClient) Checkpoint(ctx context.Context, node uint16, not
 	})
 }
 
+// Fetch performs one authenticated +5 leader result-fetch exchange and
+// returns the source-correlated chunk; the caller validates artifact
+// identity, contiguity, and checksums exactly as the terminal drive requires.
+func (client *DialWorkerClient) Fetch(ctx context.Context, node uint16, request protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error) {
+	var chunk protocol.ResultFetchChunk
+	err := client.command(ctx, node, request, func(response protocol.WorkerMessage) error {
+		result, ok := response.(protocol.ResultFetchChunk)
+		if !ok || result.SourceNodeID != node {
+			return fmt.Errorf("%w: result fetch response mismatch", ErrWorkerUnauthorized)
+		}
+		chunk = result
+		return nil
+	})
+	return chunk, err
+}
+
+// ReceiveArtifact durably installs one sealed artifact chunk on the named
+// worker and returns its acknowledged installation progress; the caller
+// validates the complete ACK correlation.
+func (client *DialWorkerClient) ReceiveArtifact(ctx context.Context, node uint16, chunk protocol.ResultArtifactChunk) (protocol.ResultArtifactAck, error) {
+	var ack protocol.ResultArtifactAck
+	err := client.command(ctx, node, chunk, func(response protocol.WorkerMessage) error {
+		result, ok := response.(protocol.ResultArtifactAck)
+		if !ok || result.NodeID != node {
+			return fmt.Errorf("%w: result artifact acknowledgment mismatch", ErrWorkerUnauthorized)
+		}
+		ack = result
+		return nil
+	})
+	return ack, err
+}
+
+// The production dial client carries the complete terminal-results surface.
+var _ ResultTransferClient = (*DialWorkerClient)(nil)
+
 // command resolves the target member, opens one authenticated session, and
 // performs exactly one request/response exchange validated by check.
 func (client *DialWorkerClient) command(ctx context.Context, node uint16, request protocol.WorkerMessage, check func(protocol.WorkerMessage) error) error {
