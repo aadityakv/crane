@@ -43,6 +43,7 @@ func (WorkerHandshake) MessageType() wire.MessageType { return wire.MessageCrane
 type WorkerHandshakeAck struct {
 	NodeID               uint16
 	WorkerEpoch          model.WorkerEpoch
+	SlotCapacity         uint16
 	ConsensusFingerprint [32]byte
 	RegistryFingerprint  [32]byte
 }
@@ -534,7 +535,13 @@ func validateWorkerMessage(message WorkerMessage) error {
 	case WorkerHandshake:
 		return validateHandshake(m.NodeID, m.WorkerEpoch, m.ConsensusFingerprint, m.RegistryFingerprint)
 	case WorkerHandshakeAck:
-		return validateHandshake(m.NodeID, m.WorkerEpoch, m.ConsensusFingerprint, m.RegistryFingerprint)
+		if err := validateHandshake(m.NodeID, m.WorkerEpoch, m.ConsensusFingerprint, m.RegistryFingerprint); err != nil {
+			return err
+		}
+		if m.SlotCapacity == 0 || uint64(m.SlotCapacity) > model.LimitsV1().MaxWorkerSlots {
+			return errors.New("slot capacity outside bounds")
+		}
+		return nil
 	case FenceRequest:
 		return m.CoordinatorEpoch.Validate()
 	case FenceResponse:

@@ -71,7 +71,7 @@ var workerControlMessageNamesV1 = []string{
 
 var workerControlMessageSchemasV1 = []string{
 	"NodeID:u16,WorkerEpoch:WorkerEpoch,ConsensusFingerprint:sha256,RegistryFingerprint:sha256",
-	"NodeID:u16,WorkerEpoch:WorkerEpoch,ConsensusFingerprint:sha256,RegistryFingerprint:sha256",
+	"NodeID:u16,WorkerEpoch:WorkerEpoch,SlotCapacity:u16,ConsensusFingerprint:sha256,RegistryFingerprint:sha256",
 	"CoordinatorEpoch:CoordinatorEpoch",
 	"NodeID:u16,WorkerEpoch:WorkerEpoch,CoordinatorEpoch:CoordinatorEpoch",
 	"NodeID:u16,WorkerEpoch:WorkerEpoch,SlotCapacity:u16,CoordinatorEpoch:CoordinatorEpoch,ConsensusFingerprint:sha256,RegistryFingerprint:sha256",

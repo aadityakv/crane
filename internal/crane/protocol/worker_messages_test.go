@@ -23,11 +23,11 @@ func TestWorkerMessageTableValidInvalidGoldenTruncationAndOwnership(t *testing.T
 		invalid WorkerMessage
 		golden  string
 	}{
-		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "a38c814079b890cd1308edd083f925cc49e36c681417e658736534a68bafecd5"},
-		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "ba425b5ec24e43d64dc8c38014366b0ae289f901b3ac9ff065c926df5ba757a6"},
+		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "bd2ad51fb1fd3edea03de3d7f25ee57f53df28ad53699c8376e83ca9ef8ed720"},
+		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "b8172747b32edc9913426b7792eb2935705028f9dfb6f08ee7b5795be2fc9ea1"},
 		{"fence_request", 202, fixture.fence, FenceRequest{}, "188908a1e60279df9bdf19b5f3f559c2a3749a3d5637c769a1f4947060cb236a"},
 		{"fence_response", 203, fixture.fenceResponse, FenceResponse{}, "d4b8e6ec7790fa83a009b8944bd2c12889059da4e9bd27ed68ed1ae4f92db417"},
-		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "ddb07f64b38d124f70dfb3b78e187f15d36b40a1f1719b75c1a2b277cf6c167e"},
+		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "419644bb368b88eeca77ad362e117a3dbf3ca6854698c8a99ec3bf50b5ab1b27"},
 		{"register_response", 205, fixture.registerResponse, WorkerRegisterResponse{}, "754be824632090c1ccdc0a08ed2ff6d599c6c461d1f7027618687c691e41a4ad"},
 		{"assignment_install", 206, fixture.install, AssignmentSetInstall{}, "16e239886543b95509ee672c8226a31fb619ca8a37d81889b9967ee625c2eb6c"},
 		{"assignment_ack", 207, fixture.installAck, AssignmentSetInstallAck{}, "6f805e4bea27a0895c250671132928b832197be2d5141b01c29d4edac2a18b4f"},
@@ -114,6 +114,17 @@ func TestWorkerHandshakeRequiresExactCompiledFingerprints(t *testing.T) {
 		mutate(&invalid)
 		if _, err := MarshalWorkerMessage(invalid); err == nil {
 			t.Fatalf("accepted fingerprint mismatch %#v", invalid)
+		}
+	}
+}
+
+func TestWorkerHandshakeAckRequiresBoundedSlotCapacity(t *testing.T) {
+	valid := workerFixture(t).handshakeAck
+	for _, slots := range []uint16{0, uint16(model.LimitsV1().MaxWorkerSlots + 1)} {
+		invalid := valid
+		invalid.SlotCapacity = slots
+		if _, err := MarshalWorkerMessage(invalid); err == nil {
+			t.Fatalf("accepted handshake ACK slot capacity %d", slots)
 		}
 	}
 }
@@ -686,7 +697,7 @@ func makeWorkerFixture() (workerMessageFixture, error) {
 	artifact := ResultArtifact{JobID: job, SinkTask: sink, SpecificationHash: validated.Digest(), RecordCount: 1, TotalLength: uint64(len(artifactBytes)), Checksum: artifactTransfer.Checksum}
 	return workerMessageFixture{
 		handshake:    WorkerHandshake{NodeID: 1, WorkerEpoch: workerEpoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()},
-		handshakeAck: WorkerHandshakeAck{NodeID: 1, WorkerEpoch: workerEpoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()},
+		handshakeAck: WorkerHandshakeAck{NodeID: 1, WorkerEpoch: workerEpoch, SlotCapacity: 2, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()},
 		fence:        FenceRequest{CoordinatorEpoch: epoch}, fenceResponse: FenceResponse{NodeID: 1, WorkerEpoch: workerEpoch, CoordinatorEpoch: epoch},
 		register:         WorkerRegisterRequest{NodeID: 1, WorkerEpoch: workerEpoch, SlotCapacity: 2, CoordinatorEpoch: epoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()},
 		registerResponse: WorkerRegisterResponse{NodeID: 1, WorkerEpoch: workerEpoch, WorkerRevision: 1, CoordinatorEpoch: epoch, Accepted: true},

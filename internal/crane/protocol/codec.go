@@ -468,6 +468,7 @@ func (e *workerEncoder) message(message WorkerMessage) error {
 		e.add(m.RegistryFingerprint[:])
 	case WorkerHandshakeAck:
 		e.worker(m.NodeID, m.WorkerEpoch)
+		e.u16(m.SlotCapacity)
 		e.add(m.ConsensusFingerprint[:])
 		e.add(m.RegistryFingerprint[:])
 	case FenceRequest:
@@ -1232,12 +1233,16 @@ func (d *workerDecoder) message(mt wire.MessageType) (WorkerMessage, error) {
 		if e != nil {
 			return nil, e
 		}
+		slots, e := d.u16()
+		if e != nil {
+			return nil, e
+		}
 		c, e := d.fixed32()
 		if e != nil {
 			return nil, e
 		}
 		r, e := d.fixed32()
-		return WorkerHandshakeAck{n, e1, c, r}, e
+		return WorkerHandshakeAck{n, e1, slots, c, r}, e
 	case wire.MessageCraneWorkerFenceRequest:
 		e, err := d.epoch()
 		return FenceRequest{e}, err
