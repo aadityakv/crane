@@ -25,4 +25,8 @@ var (
 	// whose old assignment authority was intentionally retired after the causal
 	// safe frontier and therefore cannot be authenticated against a replacement.
 	ErrHistoricalAuthorityUnavailable = errors.New("compacted delivery historical authority unavailable")
+	// ErrCheckpointAuthorityUnavailable reports a legacy checkpoint cursor that
+	// recovered without the authority proof required to authenticate a retry or
+	// successor after its original completion event is no longer durable.
+	ErrCheckpointAuthorityUnavailable = errors.New("checkpoint authority proof unavailable")
 )

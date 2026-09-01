@@ -281,6 +281,24 @@ func TestSnapshotEventIdentityIsTransactionBoundedAndCannotWrap(t *testing.T) {
 
 func TestSnapshotRejectsAckedEmptyEventIdentityAheadOfTransactionCount(t *testing.T) {
 	_, _, _, store, _ := populatedSnapshotStore(t)
+	assignment := store.work.Assignments[0]
+	delivery := store.work.Deliveries[0]
+	outputs, outboxes := exactProcessedRecords(t, assignment.Topology, assignment.Assignment, delivery)
+	if err := store.MarkProcessed(delivery.ID, outputs, outboxes); err != nil {
+		t.Fatal(err)
+	}
+	for _, outbox := range outboxes {
+		if err := store.MarkOutboxCompleted(outbox.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkCompleted(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.Assignment.JobID, Source: store.work.Sources[0].Source, Watermark: 2, RaftIndex: 12, Epoch: assignment.CoordinatorEpoch}); err != nil {
+		t.Fatal(err)
+	}
+	replaceAssignmentStateForTest(t, store, assignment.Assignment, assignment.Topology, assignment.JobControlRevision+1, model.Closed, assignment.CoordinatorEpoch)
 	if err := store.AcknowledgeEvents(store.work.NextTransactionID - 1); err != nil {
 		t.Fatal(err)
 	}
@@ -357,6 +375,8 @@ func TestSnapshotEventAccountingUsesDurableDomainRecordCount(t *testing.T) {
 			if _, err := store.Snapshot(); err != nil {
 				t.Fatalf("snapshot batched events=%v", err)
 			}
+			installed := store.work.Assignments[0]
+			replaceAssignmentStateForTest(t, store, assignment, installed.Topology, installed.JobControlRevision+1, model.Closed, epoch)
 			if err := store.AcknowledgeEvents(uint64(count)); err != nil {
 				t.Fatal(err)
 			}
@@ -509,6 +529,8 @@ func TestSnapshotCheckpointEvidenceRequiresRaftIndexAndPinsZeroWatermark(t *test
 	}
 	work.Sources[0].Watermark = 0
 	work.Sources[0].RaftIndex = 0
+	work.Sources[0].CheckpointRevision = 0
+	work.Sources[0].CheckpointAuthority = CheckpointAuthority{}
 	if err := recoverSnapshotImageForTest(t, store.state, work); err != nil {
 		t.Fatalf("initial zero watermark/index rejected: %v", err)
 	}
@@ -1096,7 +1118,12 @@ func populatedSnapshotStore(t *testing.T) (string, Identity, Options, *Store, sn
 	if err := store.MarkCompleted(compacted.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: source.Task, Watermark: 1, RaftIndex: 11, Epoch: epoch}); err != nil {
+	notice := model.CheckpointNotice{JobID: assignment.JobID, Source: source.Task, Watermark: 1, RaftIndex: 11, Epoch: epoch}
+	persistCompletionForCheckpoint(t, store, notice)
+	if err := store.ApplyCheckpoint(notice); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AcknowledgeEvents(1); err != nil {
 		t.Fatal(err)
 	}
 	next := domainDeliverySequence(t, topology, assignment, epoch, 2)
@@ -1111,7 +1138,7 @@ func populatedSnapshotStore(t *testing.T) (string, Identity, Options, *Store, sn
 	if err := store.UpsertRepair(pending); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PersistEvent(domainFailureEvent(store, assignment, epoch, 1)); err != nil {
+	if err := store.PersistEvent(domainFailureEvent(store, assignment, epoch, 2)); err != nil {
 		t.Fatal(err)
 	}
 	completed := pending
@@ -1136,9 +1163,9 @@ func populatedSnapshotStore(t *testing.T) (string, Identity, Options, *Store, sn
 	if err := store.UpsertRepair(completed); err != nil {
 		t.Fatal(err)
 	}
-	report := model.CompletionReport{JobID: assignment.JobID, JobControlRevision: 1, AssignmentRevision: assignment.Revision, Source: source.Task, Token: source, Epoch: epoch, Prior: 1, New: 2, EOF: 8, WorkerTransactionID: 2}
+	report := model.CompletionReport{JobID: assignment.JobID, JobControlRevision: 1, AssignmentRevision: assignment.Revision, Source: source.Task, Token: source, Epoch: epoch, Prior: 1, New: 2, EOF: 8, ExpectedCheckpointRevision: 1, WorkerTransactionID: 3}
 	report.Digest = model.CompletionReportDigest(report)
-	completion := model.WorkerEvent{WorkerID: identity.NodeID, WorkerEpoch: store.WorkerEpoch(), TransactionID: 2, Kind: model.WorkerEventCompletion, Completion: &report}
+	completion := model.WorkerEvent{WorkerID: identity.NodeID, WorkerEpoch: store.WorkerEpoch(), TransactionID: 3, Kind: model.WorkerEventCompletion, Completion: &report}
 	if err := store.PersistEvent(completion); err != nil {
 		t.Fatal(err)
 	}

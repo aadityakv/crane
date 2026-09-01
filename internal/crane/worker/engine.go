@@ -81,6 +81,8 @@ type Engine struct {
 	sendJobs        chan sendJob
 	sendResults     chan sendResult
 	dispatchStarts  chan dispatchStart
+	resultJobs      chan resultJob
+	resultResponses chan resultResponse
 	workers         sync.WaitGroup
 
 	deliveries        map[model.DeliveryID]store.DeliveryRecord
@@ -91,6 +93,8 @@ type Engine struct {
 	failedTasks       map[model.TaskID]struct{}
 	jobs              map[model.JobID]struct{}
 	eventQueue        []model.WorkerEvent
+	completionReports map[model.TaskID]model.WorkerEvent
+	results           map[resultIdentity]*ownedResult
 	nextTransactionID uint64
 	localNode         uint16
 	localEpoch        model.WorkerEpoch
@@ -104,8 +108,8 @@ type assignmentCommand struct {
 // NewEngine validates and retains the caller's exact dependencies without
 // opening resources or starting background work.
 func NewEngine(options EngineOptions) (*Engine, error) {
-	if options.Repository == nil || options.Sender == nil || options.Gate == nil || options.Clock == nil {
-		return nil, errors.New("worker engine requires repository, sender, shared gate, and clock")
+	if options.Repository == nil || options.Sender == nil || options.Replicator == nil || options.Gate == nil || options.Clock == nil {
+		return nil, errors.New("worker engine requires repository, sender, result replicator, shared gate, and clock")
 	}
 	if options.MaxExecutors == 0 {
 		options.MaxExecutors = 1
@@ -143,10 +147,13 @@ func NewEngine(options EngineOptions) (*Engine, error) {
 		executorJobs: make(chan executionJob, options.MaxPendingWork), executorResults: make(chan executionResult, options.MaxPendingWork),
 		sendJobs: make(chan sendJob, options.MaxPendingOutboxes), sendResults: make(chan sendResult, options.MaxPendingOutboxes),
 		dispatchStarts: make(chan dispatchStart, options.MaxPendingOutboxes),
-		deliveries:     make(map[model.DeliveryID]store.DeliveryRecord), outboxes: make(map[model.DeliveryID]*ownedOutbox),
+		resultJobs:     make(chan resultJob, options.MaxPendingWork), resultResponses: make(chan resultResponse, options.MaxPendingWork),
+		deliveries: make(map[model.DeliveryID]store.DeliveryRecord), outboxes: make(map[model.DeliveryID]*ownedOutbox),
 		parents: make(map[model.DeliveryID]map[model.DeliveryID]struct{}), sources: make(map[model.TaskID]store.SourceCursor),
 		executing: make(map[model.DeliveryID]struct{}), failedTasks: make(map[model.TaskID]struct{}),
-		jobs: make(map[model.JobID]struct{}),
+		jobs:              make(map[model.JobID]struct{}),
+		results:           make(map[resultIdentity]*ownedResult),
+		completionReports: make(map[model.TaskID]model.WorkerEvent),
 	}, nil
 }
 
@@ -267,6 +274,10 @@ func (engine *Engine) Run(ctx context.Context) (runErr error) {
 			}
 		case result := <-engine.sendResults:
 			engine.handleSendResult(result)
+		case result := <-engine.resultResponses:
+			if err := engine.handleResultResponse(result); err != nil {
+				return err
+			}
 		case start := <-engine.dispatchStarts:
 			response := engine.handleDispatchStart(start)
 			start.response <- response
@@ -310,8 +321,21 @@ func (engine *Engine) consumeRecovery(work store.RecoveredWork) error {
 		owned := outbox.Clone()
 		engine.outboxes[owned.ID] = &ownedOutbox{record: owned}
 	}
+	for _, stored := range work.Results {
+		owned := &ownedResult{record: stored.Record, provenance: stored.Provenance}
+		for id, delivery := range engine.deliveries {
+			if id.Tuple == stored.Record.TupleID && delivery.Destination.Task == stored.Record.SinkTask {
+				owned.parent = id
+				break
+			}
+		}
+		engine.results[resultID(stored.Record)] = owned
+	}
 	engine.eventQueue = append(engine.eventQueue, work.PendingEvents...)
 	for _, event := range work.PendingEvents {
+		if event.Completion != nil {
+			engine.completionReports[event.Completion.Source] = event
+		}
 		if event.Failure != nil {
 			engine.failedTasks[event.Failure.Task.Task] = struct{}{}
 		}
@@ -326,11 +350,14 @@ func (engine *Engine) startWorkers(ctx context.Context) {
 	}
 	engine.workers.Add(1)
 	go engine.senderWorker(ctx)
+	engine.workers.Add(1)
+	go engine.resultWorker(ctx)
 }
 
 func (engine *Engine) stopWorkers() {
 	close(engine.executorJobs)
 	close(engine.sendJobs)
+	close(engine.resultJobs)
 	engine.workers.Wait()
 }
 
@@ -359,6 +386,10 @@ func (engine *Engine) failPendingCommands(cause error) {
 			case ackCommand:
 				value.response <- cause
 			case assignmentCommand:
+				value.response <- cause
+			case checkpointCommand:
+				value.response <- cause
+			case eventAckCommand:
 				value.response <- cause
 			}
 		default:
@@ -404,6 +435,10 @@ func (engine *Engine) handleCommand(ctx context.Context, command any) {
 			delete(engine.jobs, value.job)
 		}
 		value.response <- nil
+	case checkpointCommand:
+		value.response <- engine.applyCheckpoint(value.notice)
+	case eventAckCommand:
+		value.response <- engine.acknowledgeEvents(value.through)
 	}
 }
 
@@ -412,11 +447,14 @@ func (engine *Engine) reconcile(ctx context.Context, now time.Time) error {
 		return err
 	}
 	engine.scheduleRecoveredExecutions(ctx)
+	if err := engine.reconcileResults(ctx); err != nil {
+		return err
+	}
 	if err := engine.emitSources(ctx); err != nil {
 		return err
 	}
 	engine.scheduleOutboxes(ctx, now)
-	return nil
+	return engine.publishContiguousCompletions()
 }
 
 func (engine *Engine) currentRunning(job model.JobID) (store.InstalledAssignment, bool) {

@@ -20,11 +20,14 @@ import (
 
 func TestEngineRequiresAndPreservesCallerGate(t *testing.T) {
 	repository := newFakeRepository(workerFixture(t))
-	if _, err := NewEngine(EngineOptions{Repository: repository, Sender: &fakeSender{}, Clock: clock.NewManual(time.Unix(0, 0))}); err == nil {
+	if _, err := NewEngine(EngineOptions{Repository: repository, Sender: &fakeSender{}, Replicator: automaticResultReplicator{}, Clock: clock.NewManual(time.Unix(0, 0))}); err == nil {
 		t.Fatal("NewEngine accepted a nil shared gate")
 	}
 	gate := admission.NewGate()
-	minimal, err := NewEngine(EngineOptions{Repository: repository, Sender: &fakeSender{}, Gate: gate, Clock: clock.NewManual(time.Unix(0, 0))})
+	if _, err := NewEngine(EngineOptions{Repository: repository, Sender: &fakeSender{}, Gate: gate, Clock: clock.NewManual(time.Unix(0, 0))}); err == nil {
+		t.Fatal("NewEngine accepted a nil result replicator")
+	}
+	minimal, err := NewEngine(EngineOptions{Repository: repository, Sender: &fakeSender{}, Replicator: automaticResultReplicator{}, Gate: gate, Clock: clock.NewManual(time.Unix(0, 0))})
 	if err != nil || minimal.gate != gate {
 		t.Fatalf("NewEngine defaults = %v, gate preserved=%t", err, minimal != nil && minimal.gate == gate)
 	}
@@ -441,6 +444,7 @@ func testEngineOptions(repository Repository, gate *admission.Gate, sender Sende
 	return EngineOptions{
 		Repository:             repository,
 		Sender:                 sender,
+		Replicator:             automaticResultReplicator{},
 		Gate:                   gate,
 		Clock:                  clock.NewManual(time.Unix(100, 0)),
 		MaxExecutors:           2,
@@ -553,6 +557,8 @@ type fakeRepository struct {
 	assignments           map[model.JobID]store.InstalledAssignment
 	deliveries            map[model.DeliveryID]store.DeliveryRecord
 	outboxes              map[model.DeliveryID]store.OutboxRecord
+	results               []store.StoredResult
+	sources               map[model.TaskID]store.SourceCursor
 	log                   []string
 	recoverCalls          int
 	recoverStarted        chan struct{}
@@ -572,12 +578,14 @@ type fakeRepository struct {
 	advanceSourceBefore   func()
 	outboxCompleteStarted chan struct{}
 	outboxCompleteRelease chan struct{}
+	eventAckStarted       chan struct{}
+	eventAckRelease       chan struct{}
 }
 
 func newFakeRepository(fixture workerTestFixture) *fakeRepository {
 	eof, _ := model.SourceEOF(fixture.topology, fixture.source.Task)
 	work := store.RecoveredWork{Fence: fixture.epoch, Assignments: []store.InstalledAssignment{fixture.assignment}, Sources: []store.SourceCursor{{Source: fixture.source.Task, NextSequence: eof + 1, EOF: eof}}, NextTransactionID: 1}
-	return &fakeRepository{work: work, assignments: map[model.JobID]store.InstalledAssignment{fixture.assignment.Assignment.JobID: fixture.assignment}, deliveries: make(map[model.DeliveryID]store.DeliveryRecord), outboxes: make(map[model.DeliveryID]store.OutboxRecord), localNode: fixture.localNode, localEpoch: fixture.localEpoch}
+	return &fakeRepository{work: work, assignments: map[model.JobID]store.InstalledAssignment{fixture.assignment.Assignment.JobID: fixture.assignment}, deliveries: make(map[model.DeliveryID]store.DeliveryRecord), outboxes: make(map[model.DeliveryID]store.OutboxRecord), results: nil, sources: map[model.TaskID]store.SourceCursor{fixture.source.Task: work.Sources[0]}, localNode: fixture.localNode, localEpoch: fixture.localEpoch}
 }
 
 func (repository *fakeRepository) LocalIdentity() (uint16, model.WorkerEpoch) {
@@ -699,6 +707,7 @@ func (repository *fakeRepository) AdvanceSource(cursor store.SourceCursor, outbo
 	}
 	repository.log = append(repository.log, "source")
 	repository.work.Sources = upsertTestSource(repository.work.Sources, cursor)
+	repository.sources[cursor.Source] = cursor
 	for _, outbox := range outboxes {
 		repository.outboxes[outbox.ID] = outbox
 	}
@@ -763,6 +772,96 @@ func (repository *fakeRepository) PersistEvent(event model.WorkerEvent) error {
 	repository.work.NextTransactionID = event.TransactionID + 1
 	return nil
 }
+func (repository *fakeRepository) UpsertResult(record model.ResultRecord, provenance model.ResultCopyProvenance) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	for _, stored := range repository.results {
+		if stored.Record.SinkTask == record.SinkTask && stored.Record.TupleID == record.TupleID {
+			if stored.Record.Checksum != record.Checksum || stored.Provenance != provenance {
+				return model.ErrIdentityReuse
+			}
+			return nil
+		}
+	}
+	repository.log = append(repository.log, "result")
+	stored := store.StoredResult{Record: record, Provenance: provenance}
+	repository.results = append(repository.results, stored)
+	repository.work.Results = append(repository.work.Results, stored)
+	return nil
+}
+func (repository *fakeRepository) ApplyCheckpoint(notice model.CheckpointNotice) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	cursor, ok := repository.sources[notice.Source]
+	if !ok {
+		return errors.New("unknown source")
+	}
+	if notice.Watermark == cursor.Watermark && notice.RaftIndex == cursor.RaftIndex {
+		return nil
+	}
+	if notice.Watermark <= cursor.Watermark || cursor.CheckpointRevision == ^uint64(0) {
+		return model.ErrIdentityReuse
+	}
+	var report *model.CompletionReport
+	for i := range repository.work.PendingEvents {
+		candidate := repository.work.PendingEvents[i].Completion
+		if candidate != nil && candidate.Source == notice.Source && candidate.New == notice.Watermark {
+			report = candidate
+			break
+		}
+	}
+	if report == nil || report.ExpectedCheckpointRevision != cursor.CheckpointRevision || report.Prior != cursor.Watermark || report.Epoch != notice.Epoch {
+		return errors.New("checkpoint lacks exact durable completion proof")
+	}
+	cursor.Watermark = notice.Watermark
+	cursor.RaftIndex = notice.RaftIndex
+	cursor.CheckpointRevision++
+	cursor.CheckpointAuthority = store.CheckpointAuthority{JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: repository.assignments[notice.JobID].Assignment.Digest, SourceToken: report.Token, CoordinatorEpoch: report.Epoch}
+	repository.sources[notice.Source] = cursor
+	repository.work.Sources = upsertTestSource(repository.work.Sources, cursor)
+	repository.log = append(repository.log, "checkpoint")
+	return nil
+}
+func (repository *fakeRepository) AcknowledgeEvents(through uint64) error {
+	if repository.eventAckStarted != nil {
+		select {
+		case <-repository.eventAckStarted:
+		default:
+			close(repository.eventAckStarted)
+		}
+	}
+	if repository.eventAckRelease != nil {
+		<-repository.eventAckRelease
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	retained := repository.work.PendingEvents[:0]
+	for _, event := range repository.work.PendingEvents {
+		if event.TransactionID > through {
+			retained = append(retained, event)
+			continue
+		}
+		if event.Completion != nil {
+			report := event.Completion
+			cursor, ok := repository.sources[report.Source]
+			applied := ok && report.ExpectedCheckpointRevision != ^uint64(0) && cursor.Watermark == report.New && cursor.CheckpointRevision == report.ExpectedCheckpointRevision+1 && cursor.CheckpointAuthority.SourceToken == report.Token && cursor.CheckpointAuthority.CoordinatorEpoch == report.Epoch
+			assignment, assignmentOK := repository.assignments[report.JobID]
+			current, tokenOK := findAssignmentToken(assignment.Assignment, report.Source)
+			superseded := assignmentOK && tokenOK && assignment.JobControlRevision >= report.JobControlRevision && assignment.Assignment.Revision >= report.AssignmentRevision && (assignment.JobControlRevision > report.JobControlRevision || assignment.Assignment.Revision > report.AssignmentRevision) && (assignment.Assignment.Revision > report.AssignmentRevision && current.AssignmentRevision == assignment.Assignment.Revision || assignment.Assignment.Revision == report.AssignmentRevision && current == report.Token)
+			if !applied && !superseded {
+				return errors.New("completion event acknowledged before checkpoint")
+			}
+		} else {
+			assignment, ok := repository.assignments[event.Failure.JobID]
+			if !ok || assignment.SchedulingState != model.Closed {
+				return errors.New("failure event acknowledged before closure")
+			}
+		}
+	}
+	repository.work.PendingEvents = retained
+	repository.log = append(repository.log, "event-ack")
+	return nil
+}
 
 func cloneTestTuples(input []model.Tuple) []model.Tuple {
 	result := make([]model.Tuple, len(input))
@@ -798,6 +897,16 @@ type fakeSender struct {
 	before     func()
 	notify     chan protocol.TupleDelivery
 	err        error
+}
+
+type automaticResultReplicator struct{}
+
+func (automaticResultReplicator) ReplicateRecord(_ context.Context, record model.ResultRecord, provenance model.ResultCopyProvenance) (ResultReplicationReceipt, error) {
+	encoded, err := model.MarshalResultRecord(record)
+	if err != nil {
+		return ResultReplicationReceipt{}, err
+	}
+	return ResultReplicationReceipt{DestinationNodeID: provenance.ReplicaSet.SecondaryNodeID, DestinationWorkerEpoch: provenance.ReplicaSet.SecondaryEpoch, StreamChecksum: model.ResultRecordStreamChecksum(record), StreamLength: uint64(len(encoded)), CoordinatorEpoch: provenance.CoordinatorEpoch}, nil
 }
 
 func (sender *fakeSender) Send(_ context.Context, delivery protocol.TupleDelivery) error {

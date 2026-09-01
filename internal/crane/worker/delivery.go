@@ -311,6 +311,15 @@ func (engine *Engine) handleExecutionResult(result executionResult) error {
 	if !ok {
 		return errors.New("execution result lost installed assignment")
 	}
+	stage, stageOK := findStage(assignment.Topology, result.job.record.Destination.Task.StageID)
+	if !stageOK {
+		return errors.New("execution result lost installed stage")
+	}
+	if stage.Role == model.StageSink && !engine.currentSinkAuthority(assignment, result.job.record) {
+		// The deterministic output is volatile until MarkProcessed. An authority
+		// change therefore discards it without creating stale result custody.
+		return nil
+	}
 	outboxes, err := deriveOutboxes(assignment, result.job.record, result.outputs)
 	if err != nil {
 		return engine.persistFailure(result.job.record, model.FailureOperator, err)
@@ -332,7 +341,6 @@ func (engine *Engine) handleExecutionResult(result executionResult) error {
 		engine.parents[owned.ID][record.ID] = struct{}{}
 	}
 	engine.deliveries[record.ID] = record
-	stage, _ := findStage(assignment.Topology, record.Destination.Task.StageID)
 	if stage.Role != model.StageSink && len(outboxes) == 0 {
 		if err = engine.repository.MarkCompleted(record.ID); err != nil {
 			return engine.ownerError("complete empty transform", err)

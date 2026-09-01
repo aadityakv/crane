@@ -16,6 +16,7 @@ import (
 const (
 	domainRecordSchema uint16 = 1
 	outboxRecordSchema uint16 = 2
+	sourceRecordSchema uint16 = 2
 )
 
 const (
@@ -127,6 +128,24 @@ type SourceCursor struct {
 	Watermark uint64
 	// RaftIndex is the committed checkpoint notice index.
 	RaftIndex uint64
+	// CheckpointRevision is the exact committed source-checkpoint subject
+	// revision. Zero means no positive checkpoint or a schema-v1 cursor whose
+	// revision must be migrated from its exact pending completion proof.
+	CheckpointRevision uint64
+	// CheckpointAuthority durably binds the exact authority that produced the
+	// last accepted checkpoint. It is zero only before the first checkpoint or
+	// for a recovered schema-v1 cursor whose proof is unavailable.
+	CheckpointAuthority CheckpointAuthority
+}
+
+// CheckpointAuthority is the bounded durable proof for one accepted source
+// checkpoint, independent of whatever assignment is installed later.
+type CheckpointAuthority struct {
+	JobControlRevision uint64
+	AssignmentRevision uint64
+	AssignmentDigest   [32]byte
+	SourceToken        model.AssignmentToken
+	CoordinatorEpoch   model.CoordinatorEpoch
 }
 
 // StoredResult couples immutable logical result bytes to separate copy provenance.
@@ -523,9 +542,15 @@ func applyAssignment(work *RecoveredWork, installed InstalledAssignment) error {
 			return errors.New("stale assignment revision")
 		}
 		if installed.Assignment.Revision == prior.Assignment.Revision {
-			if !equalInstalledAssignment(prior, installed) {
+			if equalInstalledAssignment(prior, installed) {
+				return nil
+			}
+			if installed.Assignment.Digest != prior.Assignment.Digest || !bytes.Equal(installed.SpecificationBytes, prior.SpecificationBytes) || !equalTokens(installed.Assignment.Tasks, prior.Assignment.Tasks) || !equalReplicas(installed.Assignment.ResultReplicas, prior.Assignment.ResultReplicas) || installed.JobControlRevision <= prior.JobControlRevision {
 				return model.ErrIdentityReuse
 			}
+			// Lifecycle fencing changes JobControlRevision independently of the
+			// complete immutable AssignmentSet revision.
+			work.Assignments[index] = cloneInstalled(installed)
 			return nil
 		}
 		if installed.JobControlRevision < prior.JobControlRevision || !bytes.Equal(installed.SpecificationBytes, prior.SpecificationBytes) {
@@ -722,33 +747,81 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 	if err := notice.Validate(); err != nil {
 		return err
 	}
+	index := sourceIndex(work.Sources, notice.Source)
+	if index >= 0 {
+		prior := work.Sources[index]
+		if notice.Watermark == prior.Watermark {
+			if notice.RaftIndex != prior.RaftIndex {
+				return model.ErrIdentityReuse
+			}
+			if prior.CheckpointRevision == 0 {
+				assignment, ok := findAssignment(work, notice.JobID)
+				if !ok {
+					return ErrCheckpointAuthorityUnavailable
+				}
+				report, err := matchingLegacyCompletionReport(work, assignment, notice, prior)
+				if err != nil {
+					return errors.Join(ErrCheckpointAuthorityUnavailable, err)
+				}
+				if report.ExpectedCheckpointRevision == math.MaxUint64 {
+					return ErrCapacity
+				}
+				prior.CheckpointRevision = report.ExpectedCheckpointRevision + 1
+				prior.CheckpointAuthority = checkpointAuthority(assignment, report)
+				work.Sources[index] = prior
+				return nil
+			}
+			if notice.Epoch != prior.CheckpointAuthority.CoordinatorEpoch {
+				return model.ErrIdentityReuse
+			}
+			return nil
+		}
+		if notice.Watermark < prior.Watermark || notice.RaftIndex < prior.RaftIndex {
+			return errors.New("checkpoint regression")
+		}
+		if notice.RaftIndex == prior.RaftIndex {
+			return model.ErrIdentityReuse
+		}
+	}
 	if notice.Epoch != work.Fence {
 		return errors.New("checkpoint coordinator fence mismatch")
 	}
 	assignment, ok := findAssignment(work, notice.JobID)
-	if !ok {
-		return errors.New("checkpoint references unknown assignment")
+	if !ok || assignment.CoordinatorEpoch != notice.Epoch {
+		return errors.New("checkpoint references no current assignment authority")
 	}
 	eof, err := model.SourceEOF(assignment.Topology, notice.Source)
 	if err != nil || notice.Watermark > eof {
 		return errors.New("checkpoint source or watermark is outside installed topology")
 	}
-	index := sourceIndex(work.Sources, notice.Source)
+	prior := SourceCursor{Source: notice.Source, NextSequence: 1, EOF: eof}
 	if index >= 0 {
-		prior := work.Sources[index]
-		if notice.Watermark < prior.Watermark || notice.RaftIndex < prior.RaftIndex {
-			return errors.New("checkpoint regression")
+		prior = work.Sources[index]
+	}
+	if notice.Watermark == 0 || notice.Watermark >= math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences || prior.CheckpointRevision == math.MaxUint64 {
+		return errors.New("checkpoint watermark or revision outside v1 bounds")
+	}
+	report, err := matchingCompletionReport(work, assignment, notice, prior, eof)
+	if err != nil {
+		if prior.Watermark != 0 && prior.CheckpointRevision == 0 {
+			return errors.Join(ErrCheckpointAuthorityUnavailable, err)
 		}
-		if notice.Watermark == prior.Watermark && notice.RaftIndex == prior.RaftIndex {
-			return nil
-		}
-		prior.Watermark, prior.RaftIndex = notice.Watermark, notice.RaftIndex
-		work.Sources[index] = prior
+		return err
+	}
+	updated := prior
+	updated.Watermark, updated.RaftIndex = notice.Watermark, notice.RaftIndex
+	if report.ExpectedCheckpointRevision == math.MaxUint64 {
+		return ErrCapacity
+	}
+	updated.CheckpointRevision = report.ExpectedCheckpointRevision + 1
+	updated.CheckpointAuthority = checkpointAuthority(assignment, report)
+	if updated.NextSequence <= notice.Watermark {
+		updated.NextSequence = notice.Watermark + 1
+	}
+	if index >= 0 {
+		work.Sources[index] = updated
 	} else {
-		if notice.Watermark >= math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences {
-			return errors.New("checkpoint watermark outside v1 bounds")
-		}
-		work.Sources = append(work.Sources, SourceCursor{Source: notice.Source, NextSequence: notice.Watermark + 1, EOF: eof, Watermark: notice.Watermark, RaftIndex: notice.RaftIndex})
+		work.Sources = append(work.Sources, updated)
 	}
 	for i := range work.Deliveries {
 		delivery := work.Deliveries[i]
@@ -773,6 +846,49 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 	}
 	work.Outboxes = kept
 	return nil
+}
+
+func matchingCompletionReport(work *RecoveredWork, assignment InstalledAssignment, notice model.CheckpointNotice, prior SourceCursor, eof uint64) (*model.CompletionReport, error) {
+	source, exists := findToken(assignment.Assignment, notice.Source)
+	if !exists {
+		return nil, errors.New("checkpoint source has no installed token")
+	}
+	for index := range work.PendingEvents {
+		event := &work.PendingEvents[index]
+		report := event.Completion
+		if report == nil || report.JobID != notice.JobID || report.Source != notice.Source || report.New != notice.Watermark {
+			continue
+		}
+		legacyRevision := prior.Watermark != 0 && prior.CheckpointRevision == 0 && prior.CheckpointAuthority == (CheckpointAuthority{})
+		if report.Validate() != nil || report.JobControlRevision != assignment.JobControlRevision || report.AssignmentRevision != assignment.Assignment.Revision || report.Token != source || report.Epoch != notice.Epoch || !legacyRevision && report.ExpectedCheckpointRevision != prior.CheckpointRevision || report.Prior != prior.Watermark || report.EOF != eof || event.WorkerID != source.WorkerID || event.WorkerEpoch != source.WorkerEpoch || event.TransactionID != report.WorkerTransactionID {
+			return nil, errors.New("checkpoint completion event authority mismatch")
+		}
+		return report, nil
+	}
+	return nil, errors.New("checkpoint has no exact durable completion event")
+}
+
+func matchingLegacyCompletionReport(work *RecoveredWork, assignment InstalledAssignment, notice model.CheckpointNotice, prior SourceCursor) (*model.CompletionReport, error) {
+	source, exists := findToken(assignment.Assignment, notice.Source)
+	if !exists {
+		return nil, errors.New("legacy checkpoint source has no installed token")
+	}
+	for index := range work.PendingEvents {
+		event := &work.PendingEvents[index]
+		report := event.Completion
+		if report == nil || report.JobID != notice.JobID || report.Source != notice.Source || report.New != notice.Watermark {
+			continue
+		}
+		if report.Validate() != nil || report.JobControlRevision != assignment.JobControlRevision || report.AssignmentRevision != assignment.Assignment.Revision || report.Token != source || report.Epoch != notice.Epoch || report.New != prior.Watermark || report.EOF != prior.EOF || event.WorkerID != source.WorkerID || event.WorkerEpoch != source.WorkerEpoch || event.TransactionID != report.WorkerTransactionID {
+			return nil, errors.New("legacy checkpoint completion authority mismatch")
+		}
+		return report, nil
+	}
+	return nil, errors.New("legacy checkpoint has no exact durable completion event")
+}
+
+func checkpointAuthority(assignment InstalledAssignment, report *model.CompletionReport) CheckpointAuthority {
+	return CheckpointAuthority{JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: assignment.Assignment.Digest, SourceToken: report.Token, CoordinatorEpoch: report.Epoch}
 }
 
 func applyResult(work *RecoveredWork, result StoredResult) error {
@@ -889,10 +1005,44 @@ func applyEventAck(work *RecoveredWork, through uint64) error {
 	}
 	index := 0
 	for index < len(work.PendingEvents) && work.PendingEvents[index].TransactionID <= through {
+		event := work.PendingEvents[index]
+		if event.Completion != nil {
+			report := event.Completion
+			cursorIndex := sourceIndex(work.Sources, report.Source)
+			applied := false
+			if cursorIndex >= 0 {
+				cursor := work.Sources[cursorIndex]
+				proof := cursor.CheckpointAuthority
+				applied = report.ExpectedCheckpointRevision != math.MaxUint64 && cursor.Watermark == report.New && cursor.CheckpointRevision == report.ExpectedCheckpointRevision+1 && proof.JobControlRevision == report.JobControlRevision && proof.AssignmentRevision == report.AssignmentRevision && proof.SourceToken == report.Token && proof.CoordinatorEpoch == report.Epoch
+			}
+			if !applied && !completionReportSuperseded(work, report) {
+				return errors.New("completion event acknowledged before exact checkpoint authority")
+			}
+		} else {
+			assignment, ok := findAssignment(work, event.Failure.JobID)
+			if !ok || assignment.SchedulingState != model.Closed {
+				return errors.New("failure event acknowledged before durable job closure")
+			}
+		}
 		index++
 	}
 	work.PendingEvents = append([]model.WorkerEvent(nil), work.PendingEvents[index:]...)
 	return nil
+}
+
+func completionReportSuperseded(work *RecoveredWork, report *model.CompletionReport) bool {
+	assignment, ok := findAssignment(work, report.JobID)
+	if !ok || assignment.JobControlRevision < report.JobControlRevision || assignment.Assignment.Revision < report.AssignmentRevision || assignment.JobControlRevision == report.JobControlRevision && assignment.Assignment.Revision == report.AssignmentRevision {
+		return false
+	}
+	current, ok := findToken(assignment.Assignment, report.Source)
+	if !ok {
+		return false
+	}
+	if assignment.Assignment.Revision == report.AssignmentRevision {
+		return current == report.Token
+	}
+	return current.AssignmentRevision == assignment.Assignment.Revision
 }
 
 func applyRepair(work *RecoveredWork, repair ResultRepairRecord) error {
@@ -968,7 +1118,7 @@ func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxReco
 	if err != nil || cursor.EOF != wantEOF {
 		return errors.New("source cursor EOF does not match installed topology")
 	}
-	if cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark > model.LimitsV1().MaxSourceSequences || cursor.EOF > model.LimitsV1().MaxSourceSequences || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark != 0 && cursor.RaftIndex == 0 {
+	if cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark > model.LimitsV1().MaxSourceSequences || cursor.EOF > model.LimitsV1().MaxSourceSequences || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark != 0 && cursor.RaftIndex == 0 || cursor.Watermark == 0 && cursor.CheckpointRevision != 0 || !validCheckpointAuthority(cursor) {
 		return errors.New("source cursor outside bounds")
 	}
 	source, ok := findToken(assignment.Assignment, cursor.Source)
@@ -1021,10 +1171,10 @@ func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxReco
 			}
 			return nil
 		}
-		if cursor.NextSequence <= prior.NextSequence || cursor.NextSequence != prior.NextSequence+1 || cursor.Watermark < prior.Watermark || cursor.RaftIndex < prior.RaftIndex {
+		if cursor.NextSequence <= prior.NextSequence || cursor.NextSequence != prior.NextSequence+1 || cursor.Watermark != prior.Watermark || cursor.RaftIndex != prior.RaftIndex || cursor.CheckpointRevision != prior.CheckpointRevision || cursor.CheckpointAuthority != prior.CheckpointAuthority {
 			return errors.New("source cursor regression or sequence gap")
 		}
-	} else if cursor.NextSequence > 2 || cursor.Watermark != 0 || cursor.RaftIndex != 0 {
+	} else if cursor.NextSequence > 2 || cursor.Watermark != 0 || cursor.RaftIndex != 0 || cursor.CheckpointRevision != 0 || cursor.CheckpointAuthority != (CheckpointAuthority{}) {
 		return errors.New("initial source cursor skips durable sequence or checkpoint state")
 	}
 	for _, outbox := range outboxes {
@@ -1041,6 +1191,14 @@ func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxReco
 		work.Outboxes = append(work.Outboxes, outbox.Clone())
 	}
 	return nil
+}
+
+func validCheckpointAuthority(cursor SourceCursor) bool {
+	proof := cursor.CheckpointAuthority
+	if cursor.CheckpointRevision == 0 {
+		return proof == (CheckpointAuthority{})
+	}
+	return proof.JobControlRevision != 0 && proof.AssignmentRevision != 0 && proof.AssignmentDigest != ([32]byte{}) && proof.SourceToken.Validate() == nil && proof.SourceToken.Task == cursor.Source && proof.SourceToken.AssignmentRevision == proof.AssignmentRevision && proof.CoordinatorEpoch.Validate() == nil
 }
 func applyOutboxAck(work *RecoveredWork, id model.DeliveryID) error {
 	index := outboxIndex(work.Outboxes, id)
@@ -2465,12 +2623,18 @@ func encodeSource(cursor SourceCursor, outboxes []OutboxRecord) ([]byte, error) 
 		return nil, errors.New("too many source outboxes")
 	}
 	w := newRecordWriter()
-	w.u16(domainRecordSchema)
+	w.u16(sourceRecordSchema)
 	w.task(cursor.Source)
 	w.u64(cursor.NextSequence)
 	w.u64(cursor.EOF)
 	w.u64(cursor.Watermark)
 	w.u64(cursor.RaftIndex)
+	w.u64(cursor.CheckpointRevision)
+	w.u64(cursor.CheckpointAuthority.JobControlRevision)
+	w.u64(cursor.CheckpointAuthority.AssignmentRevision)
+	w.fixed32(cursor.CheckpointAuthority.AssignmentDigest)
+	w.token(cursor.CheckpointAuthority.SourceToken)
+	w.epoch(cursor.CheckpointAuthority.CoordinatorEpoch)
 	w.u16(uint16(len(outboxes)))
 	for _, outbox := range outboxes {
 		b, e := encodeOutbox(outbox)
@@ -2483,11 +2647,11 @@ func encodeSource(cursor SourceCursor, outboxes []OutboxRecord) ([]byte, error) 
 }
 func decodeSource(payload []byte) (SourceCursor, []OutboxRecord, error) {
 	r := newRecordReader(payload)
-	if err := r.schema(); err != nil {
-		return SourceCursor{}, nil, err
+	schema, err := r.u16()
+	if err != nil || schema != domainRecordSchema && schema != sourceRecordSchema {
+		return SourceCursor{}, nil, errors.New("unsupported source record schema")
 	}
 	var cursor SourceCursor
-	var err error
 	if cursor.Source, err = r.task(); err != nil {
 		return cursor, nil, err
 	}
@@ -2502,6 +2666,26 @@ func decodeSource(payload []byte) (SourceCursor, []OutboxRecord, error) {
 	}
 	if cursor.RaftIndex, err = r.u64(); err != nil {
 		return cursor, nil, err
+	}
+	if schema == sourceRecordSchema {
+		if cursor.CheckpointRevision, err = r.u64(); err != nil {
+			return cursor, nil, err
+		}
+		if cursor.CheckpointAuthority.JobControlRevision, err = r.u64(); err != nil {
+			return cursor, nil, err
+		}
+		if cursor.CheckpointAuthority.AssignmentRevision, err = r.u64(); err != nil {
+			return cursor, nil, err
+		}
+		if cursor.CheckpointAuthority.AssignmentDigest, err = r.fixed32(); err != nil {
+			return cursor, nil, err
+		}
+		if cursor.CheckpointAuthority.SourceToken, err = r.token(); err != nil {
+			return cursor, nil, err
+		}
+		if cursor.CheckpointAuthority.CoordinatorEpoch, err = r.epoch(); err != nil {
+			return cursor, nil, err
+		}
 	}
 	count, err := r.u16()
 	if err != nil {

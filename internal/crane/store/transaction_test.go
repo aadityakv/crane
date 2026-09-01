@@ -245,6 +245,7 @@ func TestTransactionEventsPaginationAcknowledgmentCheckpointAndRetention(t *test
 	if err != nil || len(page) != 2 || last != 2 || !more {
 		t.Fatalf("page = %d,%d,%v,%v", len(page), last, more, err)
 	}
+	replaceAssignmentStateForTest(t, store, assignment, topology, 2, model.Closed, epoch)
 	if err := store.AcknowledgeEvents(2); err != nil {
 		t.Fatal(err)
 	}
@@ -253,6 +254,7 @@ func TestTransactionEventsPaginationAcknowledgmentCheckpointAndRetention(t *test
 	}
 
 	notice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 9, Epoch: epoch}
+	persistCompletionForCheckpoint(t, store, notice)
 	if err := store.ApplyCheckpoint(notice); err != nil {
 		t.Fatal(err)
 	}
@@ -268,6 +270,14 @@ func TestTransactionEventsPaginationAcknowledgmentCheckpointAndRetention(t *test
 	if err := store.ApplyCheckpoint(older); err == nil {
 		t.Fatal("checkpoint decrease accepted")
 	}
+}
+
+func replaceAssignmentStateForTest(t *testing.T, store *Store, assignment model.AssignmentSet, topology model.ValidatedTopology, jobRevision uint64, state model.SchedulingState, epoch model.CoordinatorEpoch) model.AssignmentSet {
+	t.Helper()
+	if err := store.InstallAssignment(assignment, topology.Spec(), jobRevision, state, epoch); err != nil {
+		t.Fatal(err)
+	}
+	return assignment
 }
 
 func TestTransactionRepairRetryProgressAndEpochFence(t *testing.T) {
@@ -496,7 +506,9 @@ func TestTransactionReviewCompactedDefinitionAndFinalEOFRetirement(t *testing.T)
 	if err := store.MarkCompleted(delivery.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 10, Epoch: epoch}); err != nil {
+	firstNotice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 10, Epoch: epoch}
+	persistCompletionForCheckpoint(t, store, firstNotice)
+	if err := store.ApplyCheckpoint(firstNotice); err != nil {
 		t.Fatal(err)
 	}
 	if state, err := store.Receive(delivery); err != nil || state != Compacted {
@@ -510,7 +522,9 @@ func TestTransactionReviewCompactedDefinitionAndFinalEOFRetirement(t *testing.T)
 	if got := mustRecoverWork(t, store); len(got.Deliveries) != 0 {
 		t.Fatalf("pre-EOF tombstones retained = %+v", got.Deliveries)
 	}
-	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 3, RaftIndex: 11, Epoch: epoch}); err != nil {
+	finalNotice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 3, RaftIndex: 11, Epoch: epoch}
+	persistCompletionForCheckpoint(t, store, finalNotice)
+	if err := store.ApplyCheckpoint(finalNotice); err != nil {
 		t.Fatal(err)
 	}
 	if got := mustRecoverWork(t, store); len(got.Deliveries) != 0 {
@@ -638,7 +652,9 @@ func TestTransactionReviewSourceRetryAndCrossReferences(t *testing.T) {
 	if err := store.Commit(Transaction{Records: []Record{{Type: recordSource, Payload: payload}}}); !errors.Is(err, ErrInvalidTransaction) {
 		t.Fatalf("raw wrong-source record = %v", err)
 	}
-	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: source.Task, Watermark: 1, RaftIndex: 9, Epoch: epoch}); err != nil {
+	notice := model.CheckpointNotice{JobID: assignment.JobID, Source: source.Task, Watermark: 1, RaftIndex: 9, Epoch: epoch}
+	persistCompletionForCheckpoint(t, store, notice)
+	if err := store.ApplyCheckpoint(notice); err != nil {
 		t.Fatal(err)
 	}
 	second := domainSourceOutbox(t, topology, assignment, epoch, source, 2)
@@ -648,7 +664,9 @@ func TestTransactionReviewSourceRetryAndCrossReferences(t *testing.T) {
 	if err := store.AdvanceSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3, Watermark: 1, RaftIndex: 8}, []OutboxRecord{second}); err == nil {
 		t.Fatal("source raft-index regression accepted")
 	}
-	if err := store.AdvanceSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3, Watermark: 1, RaftIndex: 9}, []OutboxRecord{second}); err != nil {
+	advanced := mustRecoverWork(t, store).Sources[0]
+	advanced.NextSequence = 3
+	if err := store.AdvanceSource(advanced, []OutboxRecord{second}); err != nil {
 		t.Fatalf("monotonic source advance = %v", err)
 	}
 }
@@ -681,6 +699,7 @@ func TestTransactionReviewCapacityUsesProspectiveReservations(t *testing.T) {
 			t.Fatal(err)
 		}
 		notice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 8, Epoch: epoch}
+		persistCompletionForCheckpoint(t, store, notice)
 		payload, err := encodeCheckpoint(notice)
 		if err != nil {
 			t.Fatal(err)
@@ -940,7 +959,11 @@ func TestTransactionRound2CheckpointRetiresEveryCoveredTombstone(t *testing.T) {
 			work.Deliveries = append(work.Deliveries, delivery)
 		}
 		source := work.Deliveries[0].ID.Tuple.SourceTask
-		if err := applyCheckpoint(&work, model.CheckpointNotice{JobID: assignment.JobID, Source: source, Watermark: MaxTransactionRecords, RaftIndex: 1, Epoch: epoch}); err != nil {
+		notice := model.CheckpointNotice{JobID: assignment.JobID, Source: source, Watermark: MaxTransactionRecords, RaftIndex: 1, Epoch: epoch}
+		if err := applyEvent(&work, completionEventForCheckpoint(t, work, notice)); err != nil {
+			t.Fatal(err)
+		}
+		if err := applyCheckpoint(&work, notice); err != nil {
 			t.Fatal(err)
 		}
 		if len(work.Deliveries) != 0 {
@@ -982,7 +1005,9 @@ func TestTransactionRound2CheckpointRetiresEveryCoveredTombstone(t *testing.T) {
 		if err := store.MarkCompleted(delivery.ID); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 9, Epoch: epoch}); err != nil {
+		notice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 9, Epoch: epoch}
+		persistCompletionForCheckpoint(t, store, notice)
+		if err := store.ApplyCheckpoint(notice); err != nil {
 			t.Fatal(err)
 		}
 		if got := mustRecoverWork(t, store); len(got.Deliveries) != 0 {
@@ -1152,7 +1177,9 @@ func TestTransactionRound2RejectsRemoteSourceBeforePublication(t *testing.T) {
 		if err := store.MarkOutboxCompleted(outbox.ID); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: local.Task, Watermark: 1, RaftIndex: 2, Epoch: epoch}); err != nil {
+		notice := model.CheckpointNotice{JobID: assignment.JobID, Source: local.Task, Watermark: 1, RaftIndex: 2, Epoch: epoch}
+		persistCompletionForCheckpoint(t, store, notice)
+		if err := store.ApplyCheckpoint(notice); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.Close(); err != nil {
@@ -1635,6 +1662,38 @@ func domainFailureEvent(store *Store, assignment model.AssignmentSet, epoch mode
 	}
 	report := &model.JobFailureReport{JobID: assignment.JobID, JobControlRevision: 1, AssignmentRevision: assignment.Revision, Task: token, Epoch: epoch, TransactionID: id, Code: model.FailureOperator, DetailDigest: [32]byte{1}}
 	return model.WorkerEvent{WorkerID: token.WorkerID, WorkerEpoch: token.WorkerEpoch, TransactionID: id, Kind: model.WorkerEventFailure, Failure: report}
+}
+
+func completionEventForCheckpoint(t *testing.T, work RecoveredWork, notice model.CheckpointNotice) model.WorkerEvent {
+	t.Helper()
+	assignment, ok := findAssignment(&work, notice.JobID)
+	if !ok {
+		t.Fatal("checkpoint fixture has no assignment")
+	}
+	token, ok := findToken(assignment.Assignment, notice.Source)
+	if !ok {
+		t.Fatal("checkpoint fixture has no source token")
+	}
+	prior, revision := uint64(0), uint64(0)
+	if index := sourceIndex(work.Sources, notice.Source); index >= 0 {
+		prior = work.Sources[index].Watermark
+		revision = work.Sources[index].CheckpointRevision
+	}
+	eof, err := model.SourceEOF(assignment.Topology, notice.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := model.CompletionReport{JobID: notice.JobID, JobControlRevision: assignment.JobControlRevision, AssignmentRevision: assignment.Assignment.Revision, Source: notice.Source, Token: token, Epoch: notice.Epoch, ExpectedCheckpointRevision: revision, Prior: prior, New: notice.Watermark, EOF: eof, WorkerTransactionID: work.NextTransactionID}
+	report.Digest = model.CompletionReportDigest(report)
+	return model.WorkerEvent{WorkerID: token.WorkerID, WorkerEpoch: token.WorkerEpoch, TransactionID: work.NextTransactionID, Kind: model.WorkerEventCompletion, Completion: &report}
+}
+
+func persistCompletionForCheckpoint(t *testing.T, store *Store, notice model.CheckpointNotice) {
+	t.Helper()
+	event := completionEventForCheckpoint(t, mustRecoverWork(t, store), notice)
+	if err := store.PersistEvent(event); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func domainRepair(t *testing.T, topology model.ValidatedTopology, assignment model.AssignmentSet, epoch model.CoordinatorEpoch, node uint16, worker model.WorkerEpoch) ResultRepairRecord {

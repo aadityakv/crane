@@ -23,7 +23,10 @@ type Repository interface {
 	MarkOutboxCompleted(model.DeliveryID) error
 	MarkOutboxDispatched(model.DeliveryID, int64) error
 	MarkOutboxAccepted(model.DeliveryID, int64) error
+	UpsertResult(model.ResultRecord, model.ResultCopyProvenance) error
 	PersistEvent(model.WorkerEvent) error
+	AcknowledgeEvents(uint64) error
+	ApplyCheckpoint(model.CheckpointNotice) error
 }
 
 // Sender transmits one already-durable tuple outbox. Network framing and
@@ -32,8 +35,20 @@ type Sender interface {
 	Send(context.Context, protocol.TupleDelivery) error
 }
 
-// ResultReplicator is the slice boundary implemented by result completion in
-// the independently reviewed Task 15 slice B. Slice A never calls it.
+// ResultReplicator durably copies one exact logical result to the provenance-
+// designated replica. Task 16 validates transport chunks/ACKs and returns the
+// transport-independent receipt consumed by this engine.
 type ResultReplicator interface {
-	ReplicateRecord(context.Context, model.ResultRecord, model.ResultCopyProvenance) error
+	ReplicateRecord(context.Context, model.ResultRecord, model.ResultCopyProvenance) (ResultReplicationReceipt, error)
+}
+
+// ResultReplicationReceipt is the transport-independent durable proof returned
+// by Task 16 after it has authenticated and durably acknowledged the exact
+// canonical result stream at the designated secondary incarnation.
+type ResultReplicationReceipt struct {
+	DestinationNodeID      uint16
+	DestinationWorkerEpoch model.WorkerEpoch
+	StreamChecksum         [32]byte
+	StreamLength           uint64
+	CoordinatorEpoch       model.CoordinatorEpoch
 }

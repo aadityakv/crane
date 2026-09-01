@@ -49,7 +49,9 @@ func TestTask15ProbeDeliveryReturnsExactDurableStateAfterFenceAdvance(t *testing
 				}
 			}
 			if test.state == Compacted {
-				if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 11, Epoch: epoch}); err != nil {
+				notice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 11, Epoch: epoch}
+				persistCompletionForCheckpoint(t, store, notice)
+				if err := store.ApplyCheckpoint(notice); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -103,7 +105,9 @@ func TestTask15CompactedProbeFailsClosedAfterAssignmentReplacement(t *testing.T)
 	if err := store.MarkCompleted(delivery.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 11, Epoch: epoch}); err != nil {
+	notice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 11, Epoch: epoch}
+	persistCompletionForCheckpoint(t, store, notice)
+	if err := store.ApplyCheckpoint(notice); err != nil {
 		t.Fatal(err)
 	}
 
@@ -272,6 +276,208 @@ func TestTask15MarkProcessedCompletedIsIdempotentAndExact(t *testing.T) {
 				t.Fatal("changed completed MarkProcessed retry mutated durable work")
 			}
 		})
+	}
+}
+
+func TestTask15CheckpointRequiresDurableCompletionAndAdvancesRevisionOnce(t *testing.T) {
+	newCompleted := func(t *testing.T) (*Store, model.AssignmentSet, model.CoordinatorEpoch, DeliveryRecord, model.AssignmentToken) {
+		t.Helper()
+		store, identity, _ := openDomainStore(t, 16<<20)
+		topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+		if err := store.Fence(epoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+			t.Fatal(err)
+		}
+		delivery := domainDelivery(t, topology, assignment, epoch)
+		if _, err := store.Receive(delivery); err != nil {
+			t.Fatal(err)
+		}
+		outputs, outboxes := exactProcessedRecords(t, topology, assignment, delivery)
+		if err := store.MarkProcessed(delivery.ID, outputs, outboxes); err != nil {
+			t.Fatal(err)
+		}
+		for _, outbox := range outboxes {
+			if err := store.MarkOutboxCompleted(outbox.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.MarkCompleted(delivery.ID); err != nil {
+			t.Fatal(err)
+		}
+		var source model.AssignmentToken
+		for _, token := range assignment.Tasks {
+			if token.Task == delivery.ID.Tuple.SourceTask {
+				source = token
+				break
+			}
+		}
+		return store, assignment, epoch, delivery, source
+	}
+	noticeFor := func(assignment model.AssignmentSet, epoch model.CoordinatorEpoch, delivery DeliveryRecord) model.CheckpointNotice {
+		return model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 11, Epoch: epoch}
+	}
+
+	t.Run("uncorrelated", func(t *testing.T) {
+		store, assignment, epoch, delivery, _ := newCompleted(t)
+		before := mustRecoverWork(t, store)
+		if err := store.ApplyCheckpoint(noticeFor(assignment, epoch, delivery)); err == nil {
+			t.Fatal("checkpoint without durable completion event accepted")
+		}
+		if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, before) {
+			t.Fatal("uncorrelated checkpoint mutated durable work")
+		}
+	})
+
+	t.Run("superseded event", func(t *testing.T) {
+		store, assignment, epoch, delivery, source := newCompleted(t)
+		report := model.CompletionReport{JobID: assignment.JobID, JobControlRevision: 1, AssignmentRevision: assignment.Revision, Source: source.Task, Token: source, Epoch: epoch, ExpectedCheckpointRevision: 0, Prior: 0, New: delivery.ID.Tuple.SourceSequence, EOF: 3, WorkerTransactionID: 1}
+		report.Digest = model.CompletionReportDigest(report)
+		event := model.WorkerEvent{WorkerID: source.WorkerID, WorkerEpoch: source.WorkerEpoch, TransactionID: 1, Kind: model.WorkerEventCompletion, Completion: &report}
+		if err := store.PersistEvent(event); err != nil {
+			t.Fatal(err)
+		}
+		before := mustRecoverWork(t, store)
+		if err := store.AcknowledgeEvents(1); err == nil {
+			t.Fatal("current unapplied completion event acknowledged")
+		}
+		if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, before) {
+			t.Fatal("rejected current completion ack mutated work")
+		}
+		tokens := append([]model.AssignmentToken(nil), assignment.Tasks...)
+		for index := range tokens {
+			tokens[index].AssignmentRevision++
+		}
+		replacement, err := model.NewAssignmentSet(assignment.JobID, assignment.Revision+1, tokens, assignment.ResultReplicas, before.Assignments[0].Topology)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.InstallAssignment(replacement, before.Assignments[0].Topology.Spec(), 2, model.Running, epoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AcknowledgeEvents(1); err != nil {
+			t.Fatalf("strict successor did not prove stale completion: %v", err)
+		}
+		if work := mustRecoverWork(t, store); len(work.PendingEvents) != 0 {
+			t.Fatalf("superseded completion retained: %+v", work.PendingEvents)
+		}
+	})
+
+	t.Run("correlated", func(t *testing.T) {
+		store, assignment, epoch, delivery, source := newCompleted(t)
+		report := model.CompletionReport{JobID: assignment.JobID, JobControlRevision: 1, AssignmentRevision: assignment.Revision, Source: source.Task, Token: source, Epoch: epoch, ExpectedCheckpointRevision: 0, Prior: 0, New: delivery.ID.Tuple.SourceSequence, EOF: 3, WorkerTransactionID: 1}
+		report.Digest = model.CompletionReportDigest(report)
+		event := model.WorkerEvent{WorkerID: source.WorkerID, WorkerEpoch: source.WorkerEpoch, TransactionID: 1, Kind: model.WorkerEventCompletion, Completion: &report}
+		if err := store.PersistEvent(event); err != nil {
+			t.Fatal(err)
+		}
+		notice := noticeFor(assignment, epoch, delivery)
+		beforeEarlyAck := mustRecoverWork(t, store)
+		if err := store.AcknowledgeEvents(1); err == nil {
+			t.Fatal("completion event acknowledged before checkpoint")
+		}
+		if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, beforeEarlyAck) {
+			t.Fatal("early completion acknowledgment mutated durable work")
+		}
+		if err := store.ApplyCheckpoint(notice); err != nil {
+			t.Fatal(err)
+		}
+		work := mustRecoverWork(t, store)
+		if len(work.Sources) != 1 || work.Sources[0].CheckpointRevision != 1 || work.Sources[0].Watermark != 1 || work.Sources[0].RaftIndex != 11 {
+			t.Fatalf("checkpoint cursor = %+v", work.Sources)
+		}
+		wantAuthority := CheckpointAuthority{JobControlRevision: 1, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, SourceToken: source, CoordinatorEpoch: epoch}
+		if work.Sources[0].CheckpointAuthority != wantAuthority {
+			t.Fatalf("checkpoint authority=%+v want=%+v", work.Sources[0].CheckpointAuthority, wantAuthority)
+		}
+		if len(work.Deliveries) != 0 || len(work.Outboxes) != 0 || len(work.PendingEvents) != 1 {
+			t.Fatalf("checkpoint compaction/event retention = %+v", work)
+		}
+		beforeDuplicate := work.Clone()
+		if err := store.ApplyCheckpoint(notice); err != nil {
+			t.Fatalf("exact checkpoint retry = %v", err)
+		}
+		if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, beforeDuplicate) {
+			t.Fatal("exact checkpoint retry changed durable work")
+		}
+		changed := notice
+		changed.RaftIndex++
+		if err := store.ApplyCheckpoint(changed); err == nil {
+			t.Fatal("same checkpoint watermark with changed Raft identity accepted")
+		}
+		if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, beforeDuplicate) {
+			t.Fatal("changed checkpoint retry mutated durable work")
+		}
+		legacy := beforeDuplicate.Clone()
+		legacy.Sources[0].CheckpointRevision = 0
+		legacy.Sources[0].CheckpointAuthority = CheckpointAuthority{}
+		if err := applyCheckpoint(&legacy, notice); err != nil {
+			t.Fatalf("legacy checkpoint did not migrate from pending proof: %v", err)
+		}
+		if legacy.Sources[0].CheckpointRevision != 1 || legacy.Sources[0].CheckpointAuthority != wantAuthority {
+			t.Fatalf("legacy checkpoint migration=%+v", legacy.Sources[0])
+		}
+		legacy = beforeDuplicate.Clone()
+		legacy.Sources[0].CheckpointRevision = 0
+		legacy.Sources[0].CheckpointAuthority = CheckpointAuthority{}
+		legacy.PendingEvents = nil
+		if err := applyCheckpoint(&legacy, notice); !errors.Is(err, ErrCheckpointAuthorityUnavailable) {
+			t.Fatalf("legacy checkpoint without proof=%v", err)
+		}
+
+		if err := store.AcknowledgeEvents(1); err != nil {
+			t.Fatal(err)
+		}
+		newEpoch := epoch
+		newEpoch.Term++
+		newEpoch.BeginIndex++
+		newEpoch.Nonce[0]++
+		if err := store.Fence(newEpoch); err != nil {
+			t.Fatal(err)
+		}
+		tokens := append([]model.AssignmentToken(nil), assignment.Tasks...)
+		for index := range tokens {
+			tokens[index].AssignmentRevision++
+		}
+		replacement, err := model.NewAssignmentSet(assignment.JobID, assignment.Revision+1, tokens, assignment.ResultReplicas, work.Assignments[0].Topology)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.InstallAssignment(replacement, work.Assignments[0].Topology.Spec(), 2, model.Running, newEpoch); err != nil {
+			t.Fatal(err)
+		}
+		beforeHistoricalRetry := mustRecoverWork(t, store)
+		if err := store.ApplyCheckpoint(notice); err != nil {
+			t.Fatalf("exact prior accepted notice after event ack/reassignment=%v", err)
+		}
+		if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, beforeHistoricalRetry) {
+			t.Fatal("historical exact checkpoint retry mutated durable work")
+		}
+		changedEpoch := notice
+		changedEpoch.Epoch = newEpoch
+		if err := store.ApplyCheckpoint(changedEpoch); !errors.Is(err, model.ErrIdentityReuse) {
+			t.Fatalf("same checkpoint identity with changed epoch=%v", err)
+		}
+	})
+}
+
+func TestTask15LegacySourceSchemaDefaultsCheckpointProofFailClosed(t *testing.T) {
+	w := newRecordWriter()
+	w.u16(domainRecordSchema)
+	source := model.TaskID{JobID: model.JobID{1}, StageID: 1}
+	w.task(source)
+	w.u64(2)
+	w.u64(3)
+	w.u64(1)
+	w.u64(9)
+	w.u16(0)
+	cursor, outboxes, err := decodeSource(w.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outboxes) != 0 || cursor.Source != source || cursor.Watermark != 1 || cursor.RaftIndex != 9 || cursor.CheckpointRevision != 0 || cursor.CheckpointAuthority != (CheckpointAuthority{}) {
+		t.Fatalf("legacy cursor=%+v outboxes=%+v", cursor, outboxes)
 	}
 }
 

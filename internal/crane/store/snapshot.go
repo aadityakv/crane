@@ -756,7 +756,16 @@ func (decoder *snapshotDecoder) preflightNested(kind snapshotRecordKind, payload
 		}
 	case snapshotSource:
 		reader := snapshotPayloadReader{data: payload}
-		if err := reader.schema(); err != nil || reader.skip(20+4*8) != nil {
+		schema, err := reader.u16()
+		if err != nil || schema != domainRecordSchema && schema != sourceRecordSchema {
+			return errors.New("invalid snapshot source schema")
+		}
+		fixed := 20 + 4*8
+		if schema == sourceRecordSchema {
+			// checkpoint revision + job/assignment revisions + digest + token + epoch
+			fixed += 8 + 8 + 8 + 32 + 86 + 34
+		}
+		if reader.skip(fixed) != nil {
 			return errors.New("invalid snapshot source prefix")
 		}
 		outboxes, err := reader.u16()
@@ -1035,7 +1044,7 @@ func validateSnapshotWork(work RecoveredWork, nodeID uint16, workerEpoch model.W
 		assignment, ok := findAssignment(&work, cursor.Source.JobID)
 		token, tokenOK := findToken(assignment.Assignment, cursor.Source)
 		eof, eofErr := model.SourceEOF(assignment.Topology, cursor.Source)
-		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch || eofErr != nil || eof != cursor.EOF || cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark > cursor.EOF || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark != 0 && cursor.RaftIndex == 0 {
+		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch || eofErr != nil || eof != cursor.EOF || cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark > cursor.EOF || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark != 0 && cursor.RaftIndex == 0 || cursor.Watermark == 0 && cursor.CheckpointRevision != 0 || !validCheckpointAuthority(cursor) {
 			return errors.New("invalid snapshot source cursor")
 		}
 	}
