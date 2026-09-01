@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"sync"
 	"testing"
 
@@ -726,4 +727,202 @@ func indexOf(values []string, value string) int {
 		}
 	}
 	return -1
+}
+
+func TestSealResultPartitionBuildsCanonicalSortedArtifact(t *testing.T) {
+	fixture := newTransferFixture(t)
+	reversed := []model.ResultRecord{fixture.records[1], fixture.records[0]}
+	artifact, stream, err := SealResultPartition(fixture.assignment.Assignment.JobID, fixture.replica.SinkTask, fixture.assignment.Topology.Digest(), reversed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.JobID != fixture.assignment.Assignment.JobID || artifact.SinkTask != fixture.replica.SinkTask ||
+		artifact.SpecificationHash != fixture.assignment.Topology.Digest() || artifact.RecordCount != 2 {
+		t.Fatalf("artifact identity=%+v", artifact)
+	}
+	want := make([]byte, 0)
+	for _, record := range fixture.records {
+		entry, err := protocol.EncodedResultPageRecordBytes(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, entry...)
+	}
+	if !bytes.Equal(stream, want) {
+		t.Fatalf("stream=%x want=%x", stream, want)
+	}
+	if artifact.TotalLength != uint64(len(want)) || artifact.Checksum != sha256.Sum256(want) {
+		t.Fatalf("artifact length/checksum=%d/%x want=%d/%x", artifact.TotalLength, artifact.Checksum, len(want), sha256.Sum256(want))
+	}
+	emptyIdentity, _, err := SealResultPartition(fixture.assignment.Assignment.JobID, fixture.replica.SinkTask, fixture.assignment.Topology.Digest(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := protocol.MarshalWorkerMessage(protocol.ResultArtifactChunk{Transfer: protocol.TransferChunk{TransferID: [16]byte{1}, JobID: artifact.JobID, TotalLength: artifact.TotalLength, Checksum: artifact.Checksum, Data: append([]byte(nil), stream...), Final: true}, Artifact: artifact, DestinationNodeID: fixture.replica.SecondaryNodeID, DestinationWorkerEpoch: fixture.replica.SecondaryEpoch, CoordinatorEpoch: fixture.epoch})
+	if err != nil {
+		t.Fatalf("sealed artifact violates the protocol schema: %v", err)
+	}
+	if len(wire) == 0 {
+		t.Fatal("empty artifact encoding")
+	}
+	emptyWire, err := protocol.MarshalWorkerMessage(protocol.ResultArtifactChunk{Transfer: protocol.TransferChunk{TransferID: [16]byte{2}, JobID: emptyIdentity.JobID, Checksum: emptyIdentity.Checksum, Final: true}, Artifact: emptyIdentity, DestinationNodeID: fixture.replica.SecondaryNodeID, DestinationWorkerEpoch: fixture.replica.SecondaryEpoch, CoordinatorEpoch: fixture.epoch})
+	if err != nil {
+		t.Fatalf("empty sealed artifact violates the protocol schema: %v", err)
+	}
+	if len(emptyWire) == 0 {
+		t.Fatal("empty artifact encoding")
+	}
+}
+
+func TestSealResultPartitionRejectsDuplicatesForeignSinksAndBuildsEmptyArtifact(t *testing.T) {
+	fixture := newTransferFixture(t)
+	duplicate := fixture.records[0]
+	if _, _, err := SealResultPartition(fixture.assignment.Assignment.JobID, fixture.replica.SinkTask, fixture.assignment.Topology.Digest(), []model.ResultRecord{fixture.records[0], duplicate}); err == nil {
+		t.Fatal("duplicate tuple sealed")
+	}
+	foreign := fixture.records[0]
+	foreign.SinkTask.Partition++
+	if _, _, err := SealResultPartition(fixture.assignment.Assignment.JobID, fixture.replica.SinkTask, fixture.assignment.Topology.Digest(), []model.ResultRecord{foreign}); err == nil {
+		t.Fatal("foreign sink sealed")
+	}
+	empty, stream, err := SealResultPartition(fixture.assignment.Assignment.JobID, fixture.replica.SinkTask, fixture.assignment.Topology.Digest(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.RecordCount != 0 || empty.TotalLength != 0 || len(stream) != 0 || empty.Checksum != sha256.Sum256(nil) {
+		t.Fatalf("empty artifact=%+v stream=%x", empty, stream)
+	}
+}
+
+func TestArtifactStoreSealIsDurableIdempotentAndRejectsMismatchedBytes(t *testing.T) {
+	fixture := newTransferFixture(t)
+	artifact, stream, err := SealResultPartition(fixture.assignment.Assignment.JobID, fixture.replica.SinkTask, fixture.assignment.Topology.Digest(), fixture.records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := NewArtifactStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := artifacts.Sealed(artifact)
+	if err != nil || sealed {
+		t.Fatalf("unknown artifact reported sealed=%t err=%v", sealed, err)
+	}
+	if err := artifacts.Seal(artifact, stream); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if sealed, err = artifacts.Sealed(artifact); err != nil || !sealed {
+		t.Fatalf("sealed artifact not durable=%t err=%v", sealed, err)
+	}
+	if err := artifacts.Seal(artifact, stream); err != nil {
+		t.Fatalf("idempotent re-seal: %v", err)
+	}
+	changed := append([]byte(nil), stream...)
+	changed[0] ^= 0xff
+	if err := artifacts.Seal(artifact, changed); err == nil {
+		t.Fatal("mismatched re-seal accepted")
+	}
+	if sealed, err = artifacts.Sealed(artifact); err != nil || !sealed {
+		t.Fatalf("sealed artifact lost=%t err=%v", sealed, err)
+	}
+	if data, _, readErr := artifacts.Read(artifact, 0, artifact.TotalLength); readErr != nil || !bytes.Equal(data, stream) {
+		t.Fatalf("sealed bytes changed=%x err=%v", data, readErr)
+	}
+	data, more, err := artifacts.Read(artifact, 0, uint64(len(stream)))
+	if err != nil || more || !bytes.Equal(data, stream) {
+		t.Fatalf("read=%x more=%t err=%v", data, more, err)
+	}
+	partial, more, err := artifacts.Read(artifact, 0, 3)
+	if err != nil || !more || len(partial) != 3 || !bytes.Equal(partial, stream[:3]) {
+		t.Fatalf("partial read=%x more=%t err=%v", partial, more, err)
+	}
+	unknown := artifact
+	unknown.Checksum[0] ^= 1
+	if _, _, err := artifacts.Read(unknown, 0, 4); err == nil {
+		t.Fatal("unknown artifact read")
+	}
+	sealed, err = artifacts.Sealed(unknown)
+	if err != nil || sealed {
+		t.Fatalf("unknown sealed=%t err=%v", sealed, err)
+	}
+}
+
+func TestArtifactStoreInstallResumesAcrossRestartAndVerifiesFinalChecksum(t *testing.T) {
+	fixture := newTransferFixture(t)
+	artifact, stream, err := SealResultPartition(fixture.assignment.Assignment.JobID, fixture.replica.SinkTask, fixture.assignment.Topology.Digest(), fixture.records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	split := len(stream) / 2
+	first := protocol.TransferChunk{TransferID: [16]byte{1}, JobID: artifact.JobID, TotalLength: artifact.TotalLength, Checksum: artifact.Checksum, Offset: 0, Data: append([]byte(nil), stream[:split]...)}
+	second := protocol.TransferChunk{TransferID: [16]byte{2}, JobID: artifact.JobID, TotalLength: artifact.TotalLength, Checksum: artifact.Checksum, Offset: uint64(split), Data: append([]byte(nil), stream[split:]...), Final: true}
+
+	dir := t.TempDir()
+	artifacts, err := NewArtifactStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, complete, err := artifacts.Install(artifact, first)
+	if err != nil || complete || next != uint64(split) {
+		t.Fatalf("first install next=%d complete=%t err=%v", next, complete, err)
+	}
+	if nextAgain, _, err := artifacts.Install(artifact, first); err != nil || nextAgain != uint64(split) {
+		t.Fatalf("duplicate install next=%d err=%v", nextAgain, err)
+	}
+	changed := protocol.TransferChunk{TransferID: first.TransferID, JobID: first.JobID, TotalLength: first.TotalLength, Checksum: first.Checksum, Offset: first.Offset, Data: append([]byte(nil), first.Data...)}
+	changed.Data[0] ^= 0xff
+	if _, _, err := artifacts.Install(artifact, changed); err == nil {
+		t.Fatal("changed overlap accepted")
+	}
+	gap := protocol.TransferChunk{TransferID: [16]byte{3}, JobID: artifact.JobID, TotalLength: artifact.TotalLength, Checksum: artifact.Checksum, Offset: uint64(split + 7), Data: []byte{1}}
+	if _, _, err := artifacts.Install(artifact, gap); err == nil {
+		t.Fatal("gap accepted")
+	}
+
+	restarted, err := NewArtifactStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, complete, err = restarted.Install(artifact, second)
+	if err != nil || !complete || next != artifact.TotalLength {
+		t.Fatalf("final install next=%d complete=%t err=%v", next, complete, err)
+	}
+	if sealed, err := restarted.Sealed(artifact); err != nil || !sealed {
+		t.Fatalf("completed install not sealed=%t err=%v", sealed, err)
+	}
+	data, _, err := restarted.Read(artifact, 0, artifact.TotalLength)
+	if err != nil || !bytes.Equal(data, stream) {
+		t.Fatalf("installed bytes=%x err=%v", data, err)
+	}
+	if nextAgain, completeAgain, err := restarted.Install(artifact, second); err != nil || !completeAgain || nextAgain != artifact.TotalLength {
+		t.Fatalf("duplicate final install next=%d complete=%t err=%v", nextAgain, completeAgain, err)
+	}
+
+	corrupt := artifact
+	corrupt.Checksum[0] ^= 1
+	fresh, err := NewArtifactStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	badFirst := protocol.TransferChunk{TransferID: [16]byte{4}, JobID: corrupt.JobID, TotalLength: corrupt.TotalLength, Checksum: corrupt.Checksum, Offset: 0, Data: append([]byte(nil), stream[:split]...)}
+	badSecond := protocol.TransferChunk{TransferID: [16]byte{5}, JobID: corrupt.JobID, TotalLength: corrupt.TotalLength, Checksum: corrupt.Checksum, Offset: uint64(split), Data: append([]byte(nil), stream[split:]...), Final: true}
+	if _, _, err := fresh.Install(corrupt, badFirst); err != nil {
+		t.Fatalf("corrupt artifact prefix: %v", err)
+	}
+	if _, _, err := fresh.Install(corrupt, badSecond); err == nil {
+		t.Fatal("checksum mismatch completed")
+	}
+	if sealed, err := fresh.Sealed(corrupt); err != nil || sealed {
+		t.Fatalf("corrupt artifact sealed=%t err=%v", sealed, err)
+	}
+
+	empty, emptyStream, err := SealResultPartition(artifact.JobID, fixture.replica.SinkTask, artifact.SpecificationHash, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyChunk := protocol.TransferChunk{TransferID: [16]byte{9}, JobID: empty.JobID, TotalLength: 0, Checksum: empty.Checksum, Offset: 0, Final: true}
+	next, complete, err = fresh.Install(empty, emptyChunk)
+	if err != nil || !complete || next != 0 || len(emptyStream) != 0 {
+		t.Fatalf("empty install next=%d complete=%t err=%v", next, complete, err)
+	}
 }

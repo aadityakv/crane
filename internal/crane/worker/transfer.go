@@ -70,6 +70,9 @@ type TransferOptions struct {
 	MaxPerPeer    int
 	MaxActive     int
 	MaxQueuedWork int
+	// Artifacts optionally supplies the durable sealed-artifact store; without
+	// it artifact receive and leader fetch stay fail-closed.
+	Artifacts *ArtifactStore
 }
 
 // TransferOwner validates authority and serializes durability transitions. It
@@ -78,6 +81,7 @@ type TransferOwner struct {
 	repository TransferRepository
 	localNode  uint16
 	localEpoch model.WorkerEpoch
+	artifacts  *ArtifactStore
 	maxPerPeer int
 	maxActive  int
 	maxQueued  int
@@ -120,7 +124,7 @@ func NewTransferOwner(options TransferOptions) (*TransferOwner, error) {
 	if _, err := options.Repository.RecoverWork(); err != nil {
 		return nil, err
 	}
-	return &TransferOwner{repository: options.Repository, localNode: node, localEpoch: epoch, maxPerPeer: options.MaxPerPeer, maxActive: options.MaxActive, maxQueued: options.MaxQueuedWork, perPeer: make(map[transferPeerIdentity]int), changed: make(chan struct{}), repairs: make(map[[16]byte]chan struct{})}, nil
+	return &TransferOwner{repository: options.Repository, localNode: node, localEpoch: epoch, artifacts: options.Artifacts, maxPerPeer: options.MaxPerPeer, maxActive: options.MaxActive, maxQueued: options.MaxQueuedWork, perPeer: make(map[transferPeerIdentity]int), changed: make(chan struct{}), repairs: make(map[[16]byte]chan struct{})}, nil
 }
 
 // DeriveResultRecordTransferID binds a record transfer to its complete role,
@@ -342,14 +346,212 @@ func (owner *TransferOwner) RecoveredRepairs() ([]store.ResultRepairRecord, erro
 	return result, nil
 }
 
-// ReceiveResultArtifact is a fail-closed Task20 extension seam.
-func (owner *TransferOwner) ReceiveResultArtifact(context.Context, TransferPeer, protocol.ResultArtifactChunk) (protocol.ResultArtifactAck, error) {
-	return protocol.ResultArtifactAck{}, ErrResultArtifactUnavailable
+// DeriveResultArtifactTransferID binds one artifact transfer to its complete
+// role, artifact identity, replica endpoint, offset span, and coordinator
+// fence. The artifact checksum authenticates the exact logical record set, so
+// the derived identity survives leader changes unchanged.
+func DeriveResultArtifactTransferID(role TransferRole, artifact protocol.ResultArtifact, replicaNode uint16, replicaEpoch model.WorkerEpoch, offset, length uint64, epoch model.CoordinatorEpoch) (protocol.TransferID, error) {
+	if err := validateSealedArtifact(artifact); err != nil {
+		return protocol.TransferID{}, err
+	}
+	if replicaNode == 0 || replicaEpoch.Validate() != nil {
+		return protocol.TransferID{}, errors.New("invalid artifact replica endpoint")
+	}
+	if role != TransferNormalReplication && role != TransferLeaderFetch {
+		return protocol.TransferID{}, errors.New("role cannot carry a result artifact")
+	}
+	if err := epoch.Validate(); err != nil {
+		return protocol.TransferID{}, err
+	}
+	encoded := []byte("crane-result-artifact-transfer-id-v1\x00")
+	encoded = append(encoded, byte(role))
+	encoded = appendUint16Transfer(encoded, replicaNode)
+	encoded = append(encoded, replicaEpoch[:]...)
+	encoded = append(encoded, artifact.JobID[:]...)
+	encoded = appendTaskTransfer(encoded, artifact.SinkTask)
+	encoded = append(encoded, artifact.SpecificationHash[:]...)
+	encoded = appendUint64Transfer(encoded, artifact.RecordCount)
+	encoded = appendUint64Transfer(encoded, artifact.TotalLength)
+	encoded = append(encoded, artifact.Checksum[:]...)
+	encoded = appendUint64Transfer(encoded, offset)
+	encoded = appendUint64Transfer(encoded, length)
+	encoded = appendEpochTransfer(encoded, epoch)
+	sum := sha256.Sum256(encoded)
+	var id protocol.TransferID
+	copy(id[:], sum[:16])
+	if id == (protocol.TransferID{}) {
+		sum = sha256.Sum256(append(encoded, 1))
+		copy(id[:], sum[:16])
+		if id == (protocol.TransferID{}) {
+			id[15] = 1
+		}
+	}
+	return id, nil
 }
 
-// OpenResultFetch is a fail-closed Task20 extension seam.
-func (owner *TransferOwner) OpenResultFetch(context.Context, TransferPeer, protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error) {
-	return protocol.ResultFetchChunk{}, ErrResultFetchUnavailable
+// ReceiveResultArtifact validates one authenticated artifact chunk and
+// advances the durable resumable receive, answering only with the exact
+// durable next offset. The chunk's fence must equal the durable coordinator
+// fence, the destination must be this exact worker incarnation as one endpoint
+// of the artifact's current replica set under a terminal (Draining/Closed)
+// installed assignment, and the sender must be either the fence-owning
+// coordinator or the other current replica endpoint.
+func (owner *TransferOwner) ReceiveResultArtifact(ctx context.Context, peer TransferPeer, chunk protocol.ResultArtifactChunk) (protocol.ResultArtifactAck, error) {
+	release, err := owner.begin(ctx, peer)
+	if err != nil {
+		return protocol.ResultArtifactAck{}, err
+	}
+	defer release()
+	if owner.artifacts == nil {
+		return protocol.ResultArtifactAck{}, ErrResultArtifactUnavailable
+	}
+	if peer.Role != TransferNormalReplication {
+		return protocol.ResultArtifactAck{}, ErrTransferUnauthorized
+	}
+	if err := validateSealedArtifact(chunk.Artifact); err != nil {
+		return protocol.ResultArtifactAck{}, err
+	}
+	if chunk.Transfer.TransferID == ([16]byte{}) || chunk.Transfer.JobID != chunk.Artifact.JobID ||
+		chunk.Transfer.TotalLength != chunk.Artifact.TotalLength || chunk.Transfer.Checksum != chunk.Artifact.Checksum {
+		return protocol.ResultArtifactAck{}, errors.New("artifact chunk does not bind its artifact")
+	}
+	fence := owner.repository.CurrentFence()
+	if chunk.CoordinatorEpoch != fence {
+		return protocol.ResultArtifactAck{}, ErrTransferStaleAuthority
+	}
+	assignment, ok := owner.repository.InstalledAssignment(chunk.Artifact.JobID)
+	if !ok || assignment.CoordinatorEpoch != fence {
+		return protocol.ResultArtifactAck{}, ErrTransferStaleAuthority
+	}
+	if assignment.SchedulingState != model.Draining && assignment.SchedulingState != model.Closed {
+		return protocol.ResultArtifactAck{}, ErrTransferUnauthorized
+	}
+	if assignment.Topology.Digest() != chunk.Artifact.SpecificationHash {
+		return protocol.ResultArtifactAck{}, ErrTransferUnauthorized
+	}
+	replica, ok := findResultReplica(assignment.Assignment, chunk.Artifact.SinkTask)
+	if !ok {
+		return protocol.ResultArtifactAck{}, ErrTransferUnauthorized
+	}
+	if chunk.DestinationNodeID != owner.localNode || chunk.DestinationWorkerEpoch != owner.localEpoch {
+		return protocol.ResultArtifactAck{}, ErrTransferUnauthorized
+	}
+	otherNode, otherEpoch := replica.SecondaryNodeID, replica.SecondaryEpoch
+	if owner.localNode == replica.SecondaryNodeID && owner.localEpoch == replica.SecondaryEpoch {
+		otherNode, otherEpoch = replica.PrimaryNodeID, replica.PrimaryEpoch
+	} else if owner.localNode != replica.PrimaryNodeID || owner.localEpoch != replica.PrimaryEpoch {
+		return protocol.ResultArtifactAck{}, ErrTransferUnauthorized
+	}
+	if peer.NodeID != chunk.CoordinatorEpoch.Coordinator && !(peer.NodeID == otherNode && peer.WorkerEpoch == otherEpoch) {
+		return protocol.ResultArtifactAck{}, ErrTransferUnauthorized
+	}
+	id, err := DeriveResultArtifactTransferID(TransferNormalReplication, chunk.Artifact, chunk.DestinationNodeID, chunk.DestinationWorkerEpoch, chunk.Transfer.Offset, uint64(len(chunk.Transfer.Data)), chunk.CoordinatorEpoch)
+	if err != nil || id != chunk.Transfer.TransferID {
+		return protocol.ResultArtifactAck{}, ErrTransferIdentityReuse
+	}
+	next, complete, err := owner.artifacts.Install(chunk.Artifact, chunk.Transfer)
+	if err != nil {
+		return protocol.ResultArtifactAck{}, err
+	}
+	return protocol.ResultArtifactAck{TransferID: chunk.Transfer.TransferID, NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, Artifact: chunk.Artifact, NextOffset: next, Complete: complete, CoordinatorEpoch: fence}, nil
+}
+
+// OpenResultFetch answers one authenticated leader fetch with the exact next
+// bounded slice of one sealed artifact. The peer must be the fence-owning
+// coordinator, the named replica must be this exact worker incarnation under a
+// terminal installed assignment, and an unsealed partition is sealed on demand
+// from this worker's checkpoint-covered retained records — but only when every
+// source's final watermark is durably provable. The response always carries
+// the true sealed artifact identity, whose checksum the caller verifies
+// against the assembled stream.
+func (owner *TransferOwner) OpenResultFetch(ctx context.Context, peer TransferPeer, request protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error) {
+	release, err := owner.begin(ctx, peer)
+	if err != nil {
+		return protocol.ResultFetchChunk{}, err
+	}
+	defer release()
+	if owner.artifacts == nil {
+		return protocol.ResultFetchChunk{}, ErrResultFetchUnavailable
+	}
+	if peer.Role != TransferLeaderFetch {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	if err := validateSealedArtifact(request.Artifact); err != nil {
+		return protocol.ResultFetchChunk{}, err
+	}
+	if request.ReplicaNodeID == 0 || request.ReplicaWorkerEpoch.Validate() != nil {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	if request.Offset > request.Artifact.TotalLength || request.Artifact.TotalLength > 0 && request.Offset == request.Artifact.TotalLength {
+		return protocol.ResultFetchChunk{}, ErrTransferIdentityReuse
+	}
+	fence := owner.repository.CurrentFence()
+	if request.CoordinatorEpoch != fence || peer.NodeID != request.CoordinatorEpoch.Coordinator {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	assignment, ok := owner.repository.InstalledAssignment(request.Artifact.JobID)
+	if !ok || assignment.CoordinatorEpoch != fence {
+		return protocol.ResultFetchChunk{}, ErrTransferStaleAuthority
+	}
+	if assignment.SchedulingState != model.Draining && assignment.SchedulingState != model.Closed {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	if assignment.Topology.Digest() != request.Artifact.SpecificationHash {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	replica, ok := findResultReplica(assignment.Assignment, request.Artifact.SinkTask)
+	if !ok {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	if request.ReplicaNodeID != owner.localNode || request.ReplicaWorkerEpoch != owner.localEpoch {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	if !(owner.localNode == replica.PrimaryNodeID && owner.localEpoch == replica.PrimaryEpoch ||
+		owner.localNode == replica.SecondaryNodeID && owner.localEpoch == replica.SecondaryEpoch) {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
+	artifact := request.Artifact
+	sealed, err := owner.artifacts.Sealed(artifact)
+	if err != nil {
+		return protocol.ResultFetchChunk{}, err
+	}
+	if !sealed {
+		work, recoverErr := owner.repository.RecoverWork()
+		if recoverErr != nil {
+			return protocol.ResultFetchChunk{}, recoverErr
+		}
+		vector, final := FinalCheckpointVector(work, assignment)
+		if !final {
+			return protocol.ResultFetchChunk{}, ErrResultFetchUnavailable
+		}
+		records, sealErr := SealingRecords(work, assignment, request.Artifact.SinkTask, vector)
+		if sealErr != nil {
+			return protocol.ResultFetchChunk{}, sealErr
+		}
+		derived, stream, sealErr := SealResultPartition(assignment.Assignment.JobID, request.Artifact.SinkTask, assignment.Topology.Digest(), records)
+		if sealErr != nil {
+			return protocol.ResultFetchChunk{}, sealErr
+		}
+		if derived.RecordCount != request.Artifact.RecordCount || derived.TotalLength != request.Artifact.TotalLength {
+			return protocol.ResultFetchChunk{}, ErrTransferIdentityReuse
+		}
+		if sealErr := owner.artifacts.Seal(derived, stream); sealErr != nil {
+			return protocol.ResultFetchChunk{}, sealErr
+		}
+		artifact = derived
+	}
+	data, more, err := owner.artifacts.Read(artifact, request.Offset, uint64(protocol.MaxTransferChunkBytes))
+	if err != nil {
+		return protocol.ResultFetchChunk{}, err
+	}
+	id, err := DeriveResultArtifactTransferID(TransferLeaderFetch, artifact, request.ReplicaNodeID, request.ReplicaWorkerEpoch, request.Offset, uint64(len(data)), fence)
+	if err != nil {
+		return protocol.ResultFetchChunk{}, err
+	}
+	return protocol.ResultFetchChunk{
+		Transfer: protocol.TransferChunk{TransferID: id, JobID: artifact.JobID, TotalLength: artifact.TotalLength, Checksum: artifact.Checksum, Offset: request.Offset, Data: data, Final: !more},
+		Artifact: artifact, SourceNodeID: owner.localNode, SourceWorkerEpoch: owner.localEpoch, CoordinatorEpoch: fence,
+	}, nil
 }
 
 func (owner *TransferOwner) receiveRepair(ctx context.Context, peer TransferPeer, chunk protocol.ResultRecordChunk) error {

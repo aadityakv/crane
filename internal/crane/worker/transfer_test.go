@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -859,4 +860,365 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// setTransferScheduling re-installs the fixture assignment at one scheduling
+// state on both fake repositories.
+func (f *transferFixture) setTransferScheduling(t *testing.T, state model.SchedulingState) {
+	t.Helper()
+	f.assignment.SchedulingState = state
+	for _, repository := range []*transferRepository{f.source, f.destination} {
+		repository.mu.Lock()
+		repository.assignments[f.assignment.Assignment.JobID] = f.assignment
+		repository.work.Assignments = []store.InstalledAssignment{f.assignment}
+		repository.mu.Unlock()
+	}
+}
+
+// seedFinalObservations records durable final committed-checkpoint
+// observations for every source task of the fixture assignment.
+func (f *transferFixture) seedFinalObservations(t *testing.T, raftIndex uint64) {
+	t.Helper()
+	observations := make([]store.CommittedCheckpoint, 0)
+	for _, token := range f.assignment.Assignment.Tasks {
+		stage, ok := findStage(f.assignment.Topology, token.Task.StageID)
+		if !ok || stage.Role != model.StageSource {
+			continue
+		}
+		eof, err := model.SourceEOF(f.assignment.Topology, token.Task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observations = append(observations, store.CommittedCheckpoint{
+			Notice:             model.CheckpointNotice{JobID: f.assignment.Assignment.JobID, Source: token.Task, Watermark: eof, RaftIndex: raftIndex, Epoch: f.epoch},
+			JobControlRevision: f.assignment.JobControlRevision, AssignmentRevision: f.assignment.Assignment.Revision, AssignmentDigest: f.assignment.Assignment.Digest,
+		})
+	}
+	if len(observations) == 0 {
+		t.Fatal("fixture has no source tasks")
+	}
+	for _, repository := range []*transferRepository{f.source, f.destination} {
+		repository.mu.Lock()
+		repository.work.Checkpoints = append([]store.CommittedCheckpoint(nil), observations...)
+		repository.mu.Unlock()
+	}
+}
+
+// installPrimaryRecords retains the fixture records on the primary under the
+// current primary-copy provenance.
+func (f *transferFixture) installPrimaryRecords(t *testing.T) {
+	t.Helper()
+	provenance := f.provenance()
+	provenance.DestinationRole = model.PrimaryReplica
+	f.source.mu.Lock()
+	f.source.results = []store.StoredResult{{Record: f.records[1], Provenance: provenance}, {Record: f.records[0], Provenance: provenance}}
+	f.source.work.Results = append([]store.StoredResult(nil), f.source.results...)
+	f.source.mu.Unlock()
+}
+
+func (f transferFixture) leaderPeer() TransferPeer {
+	return TransferPeer{NodeID: f.epoch.Coordinator, Role: TransferLeaderFetch}
+}
+
+func (f transferFixture) coordinatorArtifactPeer() TransferPeer {
+	return TransferPeer{NodeID: f.epoch.Coordinator, WorkerEpoch: model.WorkerEpoch{5}, Role: TransferNormalReplication}
+}
+
+// sealedFixtureArtifact derives the canonical sealed artifact of the fixture's
+// covered record set.
+func sealedFixtureArtifact(t *testing.T, f transferFixture) (protocol.ResultArtifact, []byte) {
+	t.Helper()
+	artifact, stream, err := SealResultPartition(f.assignment.Assignment.JobID, f.replica.SinkTask, f.assignment.Topology.Digest(), f.records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return artifact, stream
+}
+
+// artifactChunkFor builds one authenticated artifact chunk over the stream slice.
+func artifactChunkFor(t *testing.T, artifact protocol.ResultArtifact, stream []byte, offset, length uint64, destination uint16, destinationEpoch model.WorkerEpoch, peer TransferPeer, epoch model.CoordinatorEpoch) protocol.ResultArtifactChunk {
+	t.Helper()
+	end := offset + length
+	chunk := protocol.ResultArtifactChunk{
+		Transfer: protocol.TransferChunk{JobID: artifact.JobID, TotalLength: artifact.TotalLength, Checksum: artifact.Checksum, Offset: offset, Data: append([]byte(nil), stream[offset:end]...), Final: end == artifact.TotalLength},
+		Artifact: artifact, DestinationNodeID: destination, DestinationWorkerEpoch: destinationEpoch, CoordinatorEpoch: epoch,
+	}
+	id, err := DeriveResultArtifactTransferID(TransferNormalReplication, artifact, destination, destinationEpoch, offset, length, epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk.Transfer.TransferID = id
+	if peer.Role != TransferNormalReplication {
+		t.Fatalf("artifact chunk peer role %d", peer.Role)
+	}
+	return chunk
+}
+
+func TestOpenResultFetchSealsOnDemandFromRetainedRecordsAndStreamsExactSlices(t *testing.T) {
+	fixture := newTransferFixture(t)
+	fixture.setTransferScheduling(t, model.Draining)
+	fixture.seedFinalObservations(t, 11)
+	fixture.installPrimaryRecords(t)
+	artifacts, err := NewArtifactStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := mustArtifactTransferOwner(t, fixture.source, artifacts)
+	artifact, stream := sealedFixtureArtifact(t, fixture)
+
+	request := protocol.ResultFetchRequest{Artifact: artifact, ReplicaNodeID: fixture.replica.PrimaryNodeID, ReplicaWorkerEpoch: fixture.replica.PrimaryEpoch, Offset: 0, CoordinatorEpoch: fixture.epoch}
+	chunk, err := owner.OpenResultFetch(context.Background(), fixture.leaderPeer(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEnd := uint64(protocol.MaxTransferChunkBytes)
+	if wantEnd > artifact.TotalLength {
+		wantEnd = artifact.TotalLength
+	}
+	if !bytes.Equal(chunk.Transfer.Data, stream[:wantEnd]) || chunk.Transfer.Offset != 0 || chunk.Transfer.Final != (wantEnd == artifact.TotalLength) ||
+		chunk.Transfer.TotalLength != artifact.TotalLength || chunk.Transfer.Checksum != artifact.Checksum || chunk.Artifact != artifact ||
+		chunk.SourceNodeID != fixture.replica.PrimaryNodeID || chunk.SourceWorkerEpoch != fixture.replica.PrimaryEpoch || chunk.CoordinatorEpoch != fixture.epoch {
+		t.Fatalf("first fetch chunk=%+v", chunk)
+	}
+	if sealed, sealErr := artifacts.Sealed(artifact); sealErr != nil || !sealed {
+		t.Fatalf("fetch did not durably seal=%t err=%v", sealed, sealErr)
+	}
+
+	middle := protocol.ResultFetchRequest{Artifact: artifact, ReplicaNodeID: fixture.replica.PrimaryNodeID, ReplicaWorkerEpoch: fixture.replica.PrimaryEpoch, Offset: 1, CoordinatorEpoch: fixture.epoch}
+	rest, err := owner.OpenResultFetch(context.Background(), fixture.leaderPeer(), middle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rest.Transfer.Data, stream[1:]) || rest.Transfer.Offset != 1 || !rest.Transfer.Final {
+		t.Fatalf("tail fetch chunk offset=%d final=%t bytes=%x", rest.Transfer.Offset, rest.Transfer.Final, rest.Transfer.Data)
+	}
+
+	// A restarted owner serves the already sealed artifact even after every
+	// retained record copy vanished (sealed bytes are the authority).
+	fixture.source.mu.Lock()
+	fixture.source.results = nil
+	fixture.source.work.Results = nil
+	fixture.source.mu.Unlock()
+	restarted := mustArtifactTransferOwner(t, fixture.source, artifacts)
+	tail, err := restarted.OpenResultFetch(context.Background(), fixture.leaderPeer(), middle)
+	if err != nil || !bytes.Equal(tail.Transfer.Data, stream[1:]) {
+		t.Fatalf("restart fetch err=%v bytes=%x", err, tail.Transfer.Data)
+	}
+}
+
+func TestOpenResultFetchSealsRetainedOldProvenanceRecordsUnderCurrentEnvelope(t *testing.T) {
+	fixture := newTransferFixture(t)
+	fixture.setTransferScheduling(t, model.Draining)
+	fixture.seedFinalObservations(t, 12)
+	fixture.installPrimaryRecords(t)
+	old := model.WorkerEpoch{99}
+	fixture.source.mu.Lock()
+	for index := range fixture.source.results {
+		fixture.source.results[index].Provenance.ReplicaSet.PrimaryEpoch = old
+		fixture.source.work.Results[index].Provenance.ReplicaSet.PrimaryEpoch = old
+	}
+	fixture.source.mu.Unlock()
+	artifacts, err := NewArtifactStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := mustArtifactTransferOwner(t, fixture.source, artifacts)
+	artifact, stream := sealedFixtureArtifact(t, fixture)
+
+	request := protocol.ResultFetchRequest{Artifact: artifact, ReplicaNodeID: fixture.replica.PrimaryNodeID, ReplicaWorkerEpoch: fixture.replica.PrimaryEpoch, Offset: 0, CoordinatorEpoch: fixture.epoch}
+	chunk, err := owner.OpenResultFetch(context.Background(), fixture.leaderPeer(), request)
+	if err != nil {
+		t.Fatalf("retained old provenance record rejected instead of re-enveloped: %v", err)
+	}
+	if !bytes.Equal(chunk.Transfer.Data, stream[:uint64(len(chunk.Transfer.Data))]) || chunk.Artifact != artifact {
+		t.Fatalf("re-enveloped chunk=%+v", chunk)
+	}
+	// The logical checkpoint-covered record itself stays retained untouched.
+	fixture.source.mu.Lock()
+	records := append([]model.ResultRecord(nil), fixture.source.results[0].Record, fixture.source.results[1].Record)
+	fixture.source.mu.Unlock()
+	for _, record := range records {
+		if record.Validate() != nil {
+			t.Fatalf("logical record rejected: %+v", record)
+		}
+	}
+}
+
+func TestOpenResultFetchFailsClosedWithoutTerminalAuthority(t *testing.T) {
+	fixture := newTransferFixture(t)
+	fixture.installPrimaryRecords(t)
+	artifacts, err := NewArtifactStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, _ := sealedFixtureArtifact(t, fixture)
+	request := protocol.ResultFetchRequest{Artifact: artifact, ReplicaNodeID: fixture.replica.PrimaryNodeID, ReplicaWorkerEpoch: fixture.replica.PrimaryEpoch, CoordinatorEpoch: fixture.epoch}
+
+	running := mustArtifactTransferOwner(t, fixture.source, artifacts)
+	if _, err := running.OpenResultFetch(context.Background(), fixture.leaderPeer(), request); err == nil {
+		t.Fatal("running assignment served result fetch")
+	}
+
+	fixture.setTransferScheduling(t, model.Draining)
+	noStore := mustTransferOwner(t, fixture.source)
+	if _, err := noStore.OpenResultFetch(context.Background(), fixture.leaderPeer(), request); !errors.Is(err, ErrResultFetchUnavailable) {
+		t.Fatalf("missing artifact store err=%v", err)
+	}
+
+	unproven := mustArtifactTransferOwner(t, fixture.source, artifacts)
+	if _, err := unproven.OpenResultFetch(context.Background(), fixture.leaderPeer(), request); !errors.Is(err, ErrResultFetchUnavailable) {
+		t.Fatalf("unprovable final vector err=%v", err)
+	}
+
+	fixture.seedFinalObservations(t, 14)
+	owner := mustArtifactTransferOwner(t, fixture.source, artifacts)
+	if _, err := owner.OpenResultFetch(context.Background(), fixture.sourcePeer(), request); err == nil {
+		t.Fatal("non-leader peer served result fetch")
+	}
+	foreign := request
+	foreign.ReplicaNodeID = fixture.replica.SecondaryNodeID
+	foreign.ReplicaWorkerEpoch = fixture.replica.SecondaryEpoch
+	if _, err := owner.OpenResultFetch(context.Background(), fixture.leaderPeer(), foreign); err == nil {
+		t.Fatal("foreign replica destination served")
+	}
+	stale := request
+	stale.CoordinatorEpoch.Term++
+	if _, err := owner.OpenResultFetch(context.Background(), TransferPeer{NodeID: fixture.epoch.Coordinator, Role: TransferLeaderFetch}, stale); err == nil {
+		t.Fatal("stale fence served result fetch")
+	}
+	notLeader := request
+	if _, err := owner.OpenResultFetch(context.Background(), TransferPeer{NodeID: fixture.replica.SecondaryNodeID, Role: TransferLeaderFetch}, notLeader); err == nil {
+		t.Fatal("non-coordinator leader-fetch peer served")
+	}
+	if sealed, sealErr := artifacts.Sealed(artifact); sealErr != nil || sealed {
+		t.Fatalf("rejected fetches sealed nothing sealed=%t err=%v", sealed, sealErr)
+	}
+}
+
+func TestReceiveResultArtifactInstallsResumablyWithExactDurableAcks(t *testing.T) {
+	fixture := newTransferFixture(t)
+	fixture.setTransferScheduling(t, model.Draining)
+	artifacts, err := NewArtifactStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := mustArtifactTransferOwner(t, fixture.destination, artifacts)
+	artifact, stream := sealedFixtureArtifact(t, fixture)
+	destination := fixture.coordinatorArtifactPeer()
+
+	split := uint64(len(stream) / 2)
+	first := artifactChunkFor(t, artifact, stream, 0, split, fixture.replica.SecondaryNodeID, fixture.replica.SecondaryEpoch, destination, fixture.epoch)
+	ack, err := owner.ReceiveResultArtifact(context.Background(), destination, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.TransferID != first.Transfer.TransferID || ack.NodeID != fixture.replica.SecondaryNodeID || ack.WorkerEpoch != fixture.replica.SecondaryEpoch ||
+		ack.Artifact != artifact || ack.NextOffset != split || ack.Complete || ack.CoordinatorEpoch != fixture.epoch {
+		t.Fatalf("partial install ack=%+v", ack)
+	}
+	duplicate, err := owner.ReceiveResultArtifact(context.Background(), destination, first)
+	if err != nil || duplicate.NextOffset != split || duplicate.Complete {
+		t.Fatalf("duplicate install ack=%+v err=%v", duplicate, err)
+	}
+
+	second := artifactChunkFor(t, artifact, stream, split, artifact.TotalLength-split, fixture.replica.SecondaryNodeID, fixture.replica.SecondaryEpoch, destination, fixture.epoch)
+	finalAck, err := owner.ReceiveResultArtifact(context.Background(), destination, second)
+	if err != nil || !finalAck.Complete || finalAck.NextOffset != artifact.TotalLength {
+		t.Fatalf("final install ack=%+v err=%v", finalAck, err)
+	}
+	if sealed, sealErr := artifacts.Sealed(artifact); sealErr != nil || !sealed {
+		t.Fatalf("artifact not durable=%t err=%v", sealed, sealErr)
+	}
+	again, err := owner.ReceiveResultArtifact(context.Background(), destination, second)
+	if err != nil || !again.Complete || again.NextOffset != artifact.TotalLength {
+		t.Fatalf("idempotent final ack=%+v err=%v", again, err)
+	}
+
+	// A worker-to-worker sender (the other current replica endpoint) is an
+	// equally authorized source for a fresh destination copy.
+	otherDir := t.TempDir()
+	otherArtifacts, err := NewArtifactStore(otherDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerOwner := mustArtifactTransferOwner(t, fixture.source, otherArtifacts)
+	peerFirst := artifactChunkFor(t, artifact, stream, 0, split, fixture.replica.PrimaryNodeID, fixture.replica.PrimaryEpoch, fixture.sourcePeer(), fixture.epoch)
+	peerAck, err := peerOwner.ReceiveResultArtifact(context.Background(), fixture.sourcePeer(), peerFirst)
+	if err != nil || peerAck.NodeID != fixture.replica.PrimaryNodeID || peerAck.NextOffset != split {
+		t.Fatalf("worker-to-worker artifact ack=%+v err=%v", peerAck, err)
+	}
+}
+
+func TestReceiveResultArtifactRejectsUnauthorizedSendersTargetsAndStaleAuthority(t *testing.T) {
+	fixture := newTransferFixture(t)
+	artifacts, err := NewArtifactStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := mustArtifactTransferOwner(t, fixture.destination, artifacts)
+	artifact, stream := sealedFixtureArtifact(t, fixture)
+	destination := fixture.coordinatorArtifactPeer()
+
+	mutators := map[string]func(*transferFixture, *protocol.ResultArtifactChunk, *TransferPeer){
+		"running scheduling": func(f *transferFixture, _ *protocol.ResultArtifactChunk, _ *TransferPeer) {
+			f.setTransferScheduling(t, model.Running)
+		},
+		"stale fence": func(_ *transferFixture, chunk *protocol.ResultArtifactChunk, _ *TransferPeer) {
+			chunk.CoordinatorEpoch.Term++
+		},
+		"foreign destination": func(_ *transferFixture, chunk *protocol.ResultArtifactChunk, _ *TransferPeer) {
+			chunk.DestinationNodeID = fixture.replica.PrimaryNodeID
+			chunk.DestinationWorkerEpoch = fixture.replica.PrimaryEpoch
+		},
+		"unknown sender": func(_ *transferFixture, _ *protocol.ResultArtifactChunk, peer *TransferPeer) {
+			peer.NodeID = 77
+			peer.WorkerEpoch = model.WorkerEpoch{7}
+		},
+		"corrupt transfer ID": func(_ *transferFixture, chunk *protocol.ResultArtifactChunk, _ *TransferPeer) {
+			chunk.Transfer.TransferID[0] ^= 1
+		},
+		"mutated payload": func(_ *transferFixture, chunk *protocol.ResultArtifactChunk, _ *TransferPeer) {
+			chunk.Transfer.Data[0] ^= 0xff
+		},
+		"stale worker epoch": func(_ *transferFixture, chunk *protocol.ResultArtifactChunk, _ *TransferPeer) {
+			chunk.DestinationWorkerEpoch[0]++
+		},
+		"coordinator role": func(_ *transferFixture, _ *protocol.ResultArtifactChunk, peer *TransferPeer) {
+			peer.Role = TransferCoordinatorCommand
+		},
+		"historical repair role": func(_ *transferFixture, _ *protocol.ResultArtifactChunk, peer *TransferPeer) {
+			peer.Role = TransferHistoricalRepair
+		},
+	}
+	fixture.setTransferScheduling(t, model.Draining)
+	for name, mutate := range mutators {
+		t.Run(name, func(t *testing.T) {
+			fixture.setTransferScheduling(t, model.Draining)
+			chunk := artifactChunkFor(t, artifact, stream, 0, uint64(len(stream)), fixture.replica.SecondaryNodeID, fixture.replica.SecondaryEpoch, destination, fixture.epoch)
+			peer := destination
+			mutate(&fixture, &chunk, &peer)
+			if _, err := owner.ReceiveResultArtifact(context.Background(), peer, chunk); err == nil {
+				t.Fatal("unauthorized artifact accepted")
+			}
+		})
+	}
+	if sealed, sealErr := artifacts.Sealed(artifact); sealErr != nil || sealed {
+		t.Fatalf("rejected transfers sealed nothing sealed=%t err=%v", sealed, sealErr)
+	}
+	// After every rejection the exact authorized chunk still installs.
+	fixture.setTransferScheduling(t, model.Draining)
+	good := artifactChunkFor(t, artifact, stream, 0, uint64(len(stream)), fixture.replica.SecondaryNodeID, fixture.replica.SecondaryEpoch, fixture.coordinatorArtifactPeer(), fixture.epoch)
+	ack, err := owner.ReceiveResultArtifact(context.Background(), fixture.coordinatorArtifactPeer(), good)
+	if err != nil || !ack.Complete || ack.NextOffset != artifact.TotalLength {
+		t.Fatalf("authorized install after rejections ack=%+v err=%v", ack, err)
+	}
+}
+
+func mustArtifactTransferOwner(t *testing.T, repository TransferRepository, artifacts *ArtifactStore) *TransferOwner {
+	t.Helper()
+	owner, err := NewTransferOwner(TransferOptions{Repository: repository, Artifacts: artifacts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner
 }
