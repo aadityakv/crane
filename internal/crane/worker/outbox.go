@@ -29,7 +29,19 @@ type sendResult struct {
 type dispatchStart struct {
 	id       model.DeliveryID
 	started  time.Time
-	response chan error
+	response chan dispatchResponse
+}
+
+type dispatchDisposition uint8
+
+const (
+	dispatchSend dispatchDisposition = iota + 1
+	dispatchSkip
+)
+
+type dispatchResponse struct {
+	disposition dispatchDisposition
+	err         error
 }
 
 func (engine *Engine) scheduleOutboxes(ctx context.Context, now time.Time) {
@@ -58,7 +70,7 @@ func (engine *Engine) senderWorker(ctx context.Context) {
 		if ctx.Err() != nil {
 			continue
 		}
-		response := make(chan error, 1)
+		response := make(chan dispatchResponse, 1)
 		start := dispatchStart{id: job.record.ID, started: engine.clock.Now(), response: response}
 		select {
 		case engine.dispatchStarts <- start:
@@ -66,8 +78,8 @@ func (engine *Engine) senderWorker(ctx context.Context) {
 			continue
 		}
 		select {
-		case err := <-response:
-			if err != nil {
+		case decision := <-response:
+			if decision.err != nil || decision.disposition != dispatchSend {
 				continue
 			}
 		case <-ctx.Done():
@@ -82,10 +94,19 @@ func (engine *Engine) senderWorker(ctx context.Context) {
 	}
 }
 
-func (engine *Engine) handleDispatchStart(start dispatchStart) error {
+func (engine *Engine) handleDispatchStart(start dispatchStart) dispatchResponse {
 	outbox, ok := engine.outboxes[start.id]
-	if !ok || !outbox.sending || outbox.record.Completed {
-		return errors.New("sender dispatched unknown or inactive outbox")
+	if !ok {
+		return dispatchResponse{err: errors.New("sender dispatched unknown outbox")}
+	}
+	if outbox.record.Completed {
+		// A Completed ACK may overtake a sender handshake that was already
+		// queued. Completion owns the durable outcome, so this stale dispatch
+		// is a benign no-send rather than an owner-fatal invariant violation.
+		return dispatchResponse{disposition: dispatchSkip}
+	}
+	if !outbox.sending {
+		return dispatchResponse{err: errors.New("sender dispatched inactive outbox")}
 	}
 	interval := engine.acceptedRetry
 	if outbox.record.Accepted {
@@ -93,13 +114,13 @@ func (engine *Engine) handleDispatchStart(start dispatchStart) error {
 	}
 	deadline, err := retryDeadline(start.started, interval)
 	if err != nil {
-		return err
+		return dispatchResponse{err: err}
 	}
 	if err = engine.repository.MarkOutboxDispatched(start.id, deadline); err != nil {
-		return engine.ownerError("persist outbox dispatch", err)
+		return dispatchResponse{err: engine.ownerError("persist outbox dispatch", err)}
 	}
 	outbox.record.RetryDeadlineUnixNano = deadline
-	return nil
+	return dispatchResponse{disposition: dispatchSend}
 }
 
 func (engine *Engine) handleSendResult(result sendResult) {

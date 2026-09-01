@@ -21,4 +21,8 @@ var (
 	ErrClosed = errors.New("worker store closed")
 	// ErrUnavailable reports a Store poisoned by an ambiguous persistence failure.
 	ErrUnavailable = errors.New("worker store unavailable after failed persistence")
+	// ErrHistoricalAuthorityUnavailable reports a checkpoint-compacted delivery
+	// whose old assignment authority was intentionally retired after the causal
+	// safe frontier and therefore cannot be authenticated against a replacement.
+	ErrHistoricalAuthorityUnavailable = errors.New("compacted delivery historical authority unavailable")
 )

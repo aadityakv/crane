@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"math"
 	"sync"
 	"testing"
@@ -468,6 +469,86 @@ func TestOutboxRetryDeadlineStartsAtActualSerialSenderDispatch(t *testing.T) {
 	<-done
 }
 
+func TestOutboxCompletedACKCancelsAStaleQueuedDispatch(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	first, err := deriveSourceOutboxes(fixture.assignment, fixture.source, 1, mustSourceTuple(t, fixture, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := deriveSourceOutboxes(fixture.assignment, fixture.source, 2, mustSourceTuple(t, fixture, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxes := append(first, second...)
+	if len(outboxes) != 2 {
+		t.Fatalf("fixture outboxes = %d", len(outboxes))
+	}
+	repository.work.Outboxes = outboxes
+	for _, outbox := range outboxes {
+		repository.outboxes[outbox.ID] = outbox
+	}
+	repository.outboxCompleteStarted = make(chan struct{})
+	repository.outboxCompleteRelease = make(chan struct{})
+	manual := clock.NewManual(time.Unix(0, 1))
+	sender := &serialBlockingSender{clock: manual, firstStarted: make(chan struct{}), firstRelease: make(chan struct{})}
+	gate := admission.NewGate()
+	if err = gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	options := testEngineOptions(repository, gate, sender)
+	options.Clock = manual
+	options.MaxPendingOutboxes = 2
+	engine, err := NewEngine(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	<-sender.firstStarted
+	waitFor(t, func() bool { return len(engine.sendJobs) == 1 })
+	blockedID := sender.firstID()
+	queued := outboxes[0]
+	if queued.ID == blockedID {
+		queued = outboxes[1]
+	}
+	if got := sender.countFor(queued.ID); got != 0 {
+		t.Fatalf("queued outbox was already sent before ACK race: %d", got)
+	}
+
+	completed := protocol.TupleACK{DeliveryID: queued.ID, Destination: queued.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: fixture.assignment.Assignment.JobID, Revision: fixture.assignment.Assignment.Revision, Digest: fixture.assignment.Assignment.Digest}, Coordinator: fixture.epoch, Status: protocol.TupleCompleted}
+	ackDone := make(chan error, 1)
+	go func() { ackDone <- engine.HandleACK(ctx, completed) }()
+	<-repository.outboxCompleteStarted
+	close(sender.firstRelease)
+	waitFor(t, func() bool { return len(engine.dispatchStarts) == 1 })
+	if got := sender.countFor(queued.ID); got != 0 {
+		t.Fatalf("queued outbox sent while completion was blocked: %d", got)
+	}
+	close(repository.outboxCompleteRelease)
+	if err = <-ackDone; err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(engine.dispatchStarts) == 0 })
+	if err = engine.ReconcileAssignment(ctx, fixture.assignment.Assignment.JobID); err != nil {
+		t.Fatalf("stale completed dispatch terminated owner: %v", err)
+	}
+	if got := sender.countFor(queued.ID); got != 0 {
+		t.Fatalf("completed queued outbox sequence %d (blocked %d) was sent %d times", queued.ID.Tuple.SourceSequence, blockedID.Tuple.SourceSequence, got)
+	}
+	repository.mu.Lock()
+	completedRecord := repository.outboxes[queued.ID]
+	repository.mu.Unlock()
+	if !completedRecord.Completed || completedRecord.RetryDeadlineUnixNano != 0 {
+		t.Fatalf("completed queued outbox mutated by stale dispatch: %+v", completedRecord)
+	}
+	cancel()
+	if err = <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run cancellation = %v", err)
+	}
+}
+
 func mustSourceTuple(t *testing.T, fixture workerTestFixture, sequence uint64) model.Tuple {
 	t.Helper()
 	tuple, exists, err := model.SourceTuple(fixture.topology, fixture.source.Task, sequence)
@@ -513,6 +594,12 @@ func (sender *serialBlockingSender) countFor(id model.DeliveryID) int {
 		}
 	}
 	return count
+}
+
+func (sender *serialBlockingSender) firstID() model.DeliveryID {
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	return sender.ids[0]
 }
 
 func advanceManualUntil(t *testing.T, manual *clock.Manual, condition func() bool) {

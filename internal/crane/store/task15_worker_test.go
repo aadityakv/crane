@@ -78,6 +78,145 @@ func TestTask15ProbeDeliveryReturnsExactDurableStateAfterFenceAdvance(t *testing
 	}
 }
 
+func TestTask15CompactedProbeFailsClosedAfterAssignmentReplacement(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 16<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	delivery := domainDelivery(t, topology, assignment, epoch)
+	if _, err := store.Receive(delivery); err != nil {
+		t.Fatal(err)
+	}
+	outputs, outboxes := exactProcessedRecords(t, topology, assignment, delivery)
+	if err := store.MarkProcessed(delivery.ID, outputs, outboxes); err != nil {
+		t.Fatal(err)
+	}
+	for _, outbox := range outboxes {
+		if err := store.MarkOutboxCompleted(outbox.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkCompleted(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 11, Epoch: epoch}); err != nil {
+		t.Fatal(err)
+	}
+
+	newer := epoch
+	newer.Term++
+	newer.BeginIndex++
+	newer.Nonce[0]++
+	if err := store.Fence(newer); err != nil {
+		t.Fatal(err)
+	}
+	tokens := append([]model.AssignmentToken(nil), assignment.Tasks...)
+	for index := range tokens {
+		tokens[index].AssignmentRevision++
+	}
+	replacement, err := model.NewAssignmentSet(assignment.JobID, assignment.Revision+1, tokens, assignment.ResultReplicas, topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.InstallAssignment(replacement, topology.Spec(), 2, model.Running, newer); err != nil {
+		t.Fatal(err)
+	}
+
+	before := mustRecoverWork(t, store)
+	if state, found, probeErr := store.ProbeDelivery(delivery); state != 0 || !found || !errors.Is(probeErr, ErrHistoricalAuthorityUnavailable) {
+		t.Fatalf("old exact compacted authority = %v,%v,%v", state, found, probeErr)
+	}
+	changed := delivery.Clone()
+	changed.Tuple.Fields[0].Value.Int64++
+	if _, found, probeErr := store.ProbeDelivery(changed); !found || !errors.Is(probeErr, model.ErrIdentityReuse) {
+		t.Fatalf("changed compacted logical bytes = found %v, error %v", found, probeErr)
+	}
+	if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, before) {
+		t.Fatal("post-frontier compacted probes mutated durable work")
+	}
+}
+
+func TestTask15ProcessedReplayRejectsMutableOutboxPhase(t *testing.T) {
+	mutations := []struct {
+		name   string
+		mutate func(*OutboxRecord)
+	}{
+		{name: "accepted", mutate: func(outbox *OutboxRecord) {
+			outbox.Accepted = true
+			outbox.RetryDeadlineUnixNano = 17
+		}},
+		{name: "dispatch deadline", mutate: func(outbox *OutboxRecord) {
+			outbox.RetryDeadlineUnixNano = 17
+		}},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			for _, rawCompleted := range []bool{false, true} {
+				name := "processed"
+				if rawCompleted {
+					name = "completed"
+				}
+				t.Run(name, func(t *testing.T) {
+					store, identity, _ := openDomainStore(t, 16<<20)
+					topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+					if err := store.Fence(epoch); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+						t.Fatal(err)
+					}
+					delivery := domainDelivery(t, topology, assignment, epoch)
+					if _, err := store.Receive(delivery); err != nil {
+						t.Fatal(err)
+					}
+					outputs, outboxes := exactProcessedRecords(t, topology, assignment, delivery)
+					if err := store.MarkProcessed(delivery.ID, outputs, outboxes); err != nil {
+						t.Fatal(err)
+					}
+					altered := make([]OutboxRecord, len(outboxes))
+					for index := range outboxes {
+						altered[index] = outboxes[index].Clone()
+					}
+					mutation.mutate(&altered[0])
+					before := mustRecoverWork(t, store)
+					if !rawCompleted {
+						if err := store.MarkProcessed(delivery.ID, outputs, altered); !errors.Is(err, model.ErrIdentityReuse) {
+							t.Fatalf("API replay with mutable phase = %v", err)
+						}
+					} else {
+						for _, outbox := range outboxes {
+							if err := store.MarkOutboxCompleted(outbox.ID); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if err := store.MarkCompleted(delivery.ID); err != nil {
+							t.Fatal(err)
+						}
+						before = mustRecoverWork(t, store)
+					}
+					replay := delivery.Clone()
+					replay.State = Processed
+					replay.Outputs = cloneTuples(outputs)
+					payload, err := encodeDeliveryRecord(replay, altered)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err = store.Commit(Transaction{Records: []Record{{Type: recordDeliveryProcessed, Payload: payload}}}); !errors.Is(err, ErrInvalidTransaction) {
+						t.Fatalf("raw replay with mutable phase = %v", err)
+					}
+					if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, before) {
+						t.Fatal("mutable processed replay changed durable work")
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestTask15OutboxRetryPhaseAndDeadlineSurviveSnapshotReopen(t *testing.T) {
 	path := t.TempDir() + "/worker"
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}

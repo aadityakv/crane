@@ -600,7 +600,7 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 		}
 		for outboxIndexInRecord, outbox := range outboxes {
 			stored := outboxIndex(work.Outboxes, prior.OutboxIDs[outboxIndexInRecord])
-			if outbox.Completed || stored < 0 || outbox.ID != prior.OutboxIDs[outboxIndexInRecord] || !equalOutboxDefinition(work.Outboxes[stored], outbox) {
+			if outbox.Completed || outbox.Accepted || outbox.RetryDeadlineUnixNano != 0 || stored < 0 || outbox.ID != prior.OutboxIDs[outboxIndexInRecord] || !equalOutboxDefinition(work.Outboxes[stored], outbox) {
 				return model.ErrIdentityReuse
 			}
 		}
@@ -1515,6 +1515,16 @@ func probeDelivery(work *RecoveredWork, record DeliveryRecord) (DeliveryState, b
 	if !exists {
 		return 0, false, nil
 	}
+	if !equalCompactedLogicalDefinition(expected, record) {
+		return 0, true, model.ErrIdentityReuse
+	}
+	if record.AssignmentRevision < expected.AssignmentRevision {
+		// A committed checkpoint proves every upstream outbox completion was
+		// already durable, so no correct sender depends on an ACK beyond this
+		// causal-safe frontier. Once assignment replacement retires the old
+		// tokens, fail closed instead of accepting unverifiable authority.
+		return 0, true, ErrHistoricalAuthorityUnavailable
+	}
 	if !equalDeliveryDefinition(expected, record) {
 		return 0, true, model.ErrIdentityReuse
 	}
@@ -1552,7 +1562,8 @@ func (store *Store) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, ou
 		}
 		for outIndex, id := range stored.OutboxIDs {
 			storedIndex := outboxIndex(store.work.Outboxes, id)
-			if storedIndex < 0 || !equalOutboxDefinition(store.work.Outboxes[storedIndex], outboxes[outIndex]) {
+			candidate := outboxes[outIndex]
+			if candidate.Completed || candidate.Accepted || candidate.RetryDeadlineUnixNano != 0 || storedIndex < 0 || !equalOutboxDefinition(store.work.Outboxes[storedIndex], candidate) {
 				return model.ErrIdentityReuse
 			}
 		}
@@ -3353,6 +3364,18 @@ func equalDeliveryDefinition(a, b DeliveryRecord) bool {
 	aa, _ := model.MarshalTuple(a.Tuple)
 	bb, _ := model.MarshalTuple(b.Tuple)
 	return bytes.Equal(aa, bb)
+}
+
+func equalCompactedLogicalDefinition(a, b DeliveryRecord) bool {
+	if a.ID != b.ID || a.Producer.Task != b.Producer.Task || a.Destination.Task != b.Destination.Task || a.Producer.SpecificationHash != b.Producer.SpecificationHash || a.Destination.SpecificationHash != b.Destination.SpecificationHash || a.Reservation != b.Reservation {
+		return false
+	}
+	aa, err := model.MarshalTuple(a.Tuple)
+	if err != nil {
+		return false
+	}
+	bb, err := model.MarshalTuple(b.Tuple)
+	return err == nil && bytes.Equal(aa, bb)
 }
 func equalTuples(a, b []model.Tuple) bool {
 	if len(a) != len(b) {

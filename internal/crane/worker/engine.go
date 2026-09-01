@@ -268,10 +268,10 @@ func (engine *Engine) Run(ctx context.Context) (runErr error) {
 		case result := <-engine.sendResults:
 			engine.handleSendResult(result)
 		case start := <-engine.dispatchStarts:
-			err := engine.handleDispatchStart(start)
-			start.response <- err
-			if err != nil {
-				return err
+			response := engine.handleDispatchStart(start)
+			start.response <- response
+			if response.err != nil {
+				return response.err
 			}
 		case eventOutput <- nextEvent:
 			engine.eventQueue = engine.eventQueue[1:]
