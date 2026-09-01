@@ -217,6 +217,75 @@ func TestTask15ProcessedReplayRejectsMutableOutboxPhase(t *testing.T) {
 	}
 }
 
+func TestTask15MarkProcessedCompletedIsIdempotentAndExact(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 16<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	delivery := domainDelivery(t, topology, assignment, epoch)
+	if _, err := store.Receive(delivery); err != nil {
+		t.Fatal(err)
+	}
+	outputs, outboxes := exactProcessedRecords(t, topology, assignment, delivery)
+	if err := store.MarkProcessed(delivery.ID, outputs, outboxes); err != nil {
+		t.Fatal(err)
+	}
+	for _, outbox := range outboxes {
+		if err := store.MarkOutboxCompleted(outbox.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkCompleted(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	baseline := mustRecoverWork(t, store)
+	if err := store.MarkProcessed(delivery.ID, cloneTuples(outputs), cloneZeroPhaseOutboxes(outboxes)); err != nil {
+		t.Fatalf("exact completed MarkProcessed retry = %v", err)
+	}
+	if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, baseline) {
+		t.Fatal("exact completed MarkProcessed retry mutated durable work")
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func([]model.Tuple, []OutboxRecord)
+	}{
+		{name: "completed phase", mutate: func(_ []model.Tuple, outboxes []OutboxRecord) { outboxes[0].Completed = true }},
+		{name: "accepted phase", mutate: func(_ []model.Tuple, outboxes []OutboxRecord) { outboxes[0].Accepted = true }},
+		{name: "retry deadline", mutate: func(_ []model.Tuple, outboxes []OutboxRecord) { outboxes[0].RetryDeadlineUnixNano = 17 }},
+		{name: "immutable outbox", mutate: func(_ []model.Tuple, outboxes []OutboxRecord) { outboxes[0].Tuple.Fields[0].Value.Int64++ }},
+		{name: "output", mutate: func(outputs []model.Tuple, _ []OutboxRecord) { outputs[0].Fields[0].Value.Int64++ }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			candidateOutputs := cloneTuples(outputs)
+			candidateOutboxes := cloneZeroPhaseOutboxes(outboxes)
+			mutation.mutate(candidateOutputs, candidateOutboxes)
+			if err := store.MarkProcessed(delivery.ID, candidateOutputs, candidateOutboxes); !errors.Is(err, model.ErrIdentityReuse) {
+				t.Fatalf("completed MarkProcessed changed retry = %v", err)
+			}
+			if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, baseline) {
+				t.Fatal("changed completed MarkProcessed retry mutated durable work")
+			}
+		})
+	}
+}
+
+func cloneZeroPhaseOutboxes(outboxes []OutboxRecord) []OutboxRecord {
+	cloned := make([]OutboxRecord, len(outboxes))
+	for index := range outboxes {
+		cloned[index] = outboxes[index].Clone()
+		cloned[index].Completed = false
+		cloned[index].Accepted = false
+		cloned[index].RetryDeadlineUnixNano = 0
+	}
+	return cloned
+}
+
 func TestTask15OutboxRetryPhaseAndDeadlineSurviveSnapshotReopen(t *testing.T) {
 	path := t.TempDir() + "/worker"
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}

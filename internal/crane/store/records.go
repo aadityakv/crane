@@ -1556,7 +1556,7 @@ func (store *Store) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, ou
 		return err
 	}
 	stored := store.work.Deliveries[index]
-	if stored.State == Processed {
+	if stored.State == Processed || stored.State == Completed {
 		if !equalTuples(stored.Outputs, outputs) || len(stored.OutboxIDs) != len(outboxes) {
 			return model.ErrIdentityReuse
 		}
