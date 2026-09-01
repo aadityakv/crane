@@ -35,6 +35,7 @@ const (
 	recordSource
 	recordOutboxAck
 	recordOutboxRetry
+	recordCheckpointObservation
 )
 
 // DeliveryState is the durable receiver state returned for duplicate custody.
@@ -150,6 +151,15 @@ type CheckpointAuthority struct {
 	CoordinatorEpoch   model.CoordinatorEpoch
 }
 
+// CommittedCheckpoint is one durable committed-checkpoint observation retained
+// by a participating worker that does not own the source cursor.
+type CommittedCheckpoint struct {
+	Notice             model.CheckpointNotice
+	JobControlRevision uint64
+	AssignmentRevision uint64
+	AssignmentDigest   [32]byte
+}
+
 // StoredResult couples immutable logical result bytes to separate copy provenance.
 type StoredResult struct {
 	// Record is immutable logical collect output.
@@ -231,6 +241,8 @@ type RecoveredWork struct {
 	Assignments []InstalledAssignment
 	// Sources are durable source and checkpoint cursors.
 	Sources []SourceCursor
+	// Checkpoints are durable committed observations for assignment participants.
+	Checkpoints []CommittedCheckpoint
 	// Deliveries are live custody records and compact tombstones.
 	Deliveries []DeliveryRecord
 	// Outboxes are durable downstream replay records.
@@ -278,6 +290,7 @@ func (work RecoveredWork) Clone() RecoveredWork {
 		}
 	}
 	result.Sources = append([]SourceCursor(nil), work.Sources...)
+	result.Checkpoints = append([]CommittedCheckpoint(nil), work.Checkpoints...)
 	result.Deliveries = make([]DeliveryRecord, len(work.Deliveries))
 	for i := range work.Deliveries {
 		result.Deliveries[i] = work.Deliveries[i].Clone()
@@ -323,7 +336,7 @@ type workReducer struct {
 	current, transaction RecoveredWork
 	inTransaction        bool
 	allowLegacy          bool
-	prepared             [recordOutboxRetry + 1]bool
+	prepared             [recordCheckpointObservation + 1]bool
 }
 
 func newRecoveredWork() RecoveredWork {
@@ -340,7 +353,7 @@ func (r *workReducer) BeginTransaction(uint32) error {
 		return errors.New("nested transaction")
 	}
 	r.transaction = r.current
-	r.prepared = [recordOutboxRetry + 1]bool{}
+	r.prepared = [recordCheckpointObservation + 1]bool{}
 	r.inTransaction = true
 	return nil
 }
@@ -414,6 +427,10 @@ func (r *workReducer) prepare(recordType RecordType) {
 	case recordOutboxAck, recordOutboxRetry:
 		if clone(recordOutboxAck) {
 			r.transaction.Outboxes = append([]OutboxRecord(nil), r.transaction.Outboxes...)
+		}
+	case recordCheckpointObservation:
+		if clone(recordCheckpointObservation) {
+			r.transaction.Checkpoints = append([]CommittedCheckpoint(nil), r.transaction.Checkpoints...)
 		}
 	}
 }
@@ -519,6 +536,12 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) err
 			return err
 		}
 		return applyOutboxRetry(work, update)
+	case recordCheckpointObservation:
+		observation, err := decodeCheckpointObservation(record.Payload)
+		if err != nil {
+			return err
+		}
+		return applyCheckpointObservation(work, observation)
 	default:
 		return fmt.Errorf("unknown domain record type %d", record.Type)
 	}
@@ -867,6 +890,54 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 		}
 	}
 	work.Outboxes = kept
+	return nil
+}
+
+func applyCheckpointObservation(work *RecoveredWork, observation CommittedCheckpoint) error {
+	if err := validateCheckpointObservation(observation); err != nil {
+		return err
+	}
+	assignment, ok := findAssignment(work, observation.Notice.JobID)
+	if !ok || assignment.CoordinatorEpoch != work.Fence || observation.Notice.Epoch != work.Fence || observation.JobControlRevision != assignment.JobControlRevision || observation.AssignmentRevision != assignment.Assignment.Revision || observation.AssignmentDigest != assignment.Assignment.Digest {
+		return errors.New("checkpoint observation authority mismatch")
+	}
+	stage, ok := findStage(assignment.Topology, observation.Notice.Source.StageID)
+	if !ok || stage.Role != model.StageSource {
+		return errors.New("checkpoint observation source is not a source stage")
+	}
+	index := checkpointObservationIndex(work.Checkpoints, observation.Notice.Source)
+	if index >= 0 {
+		prior := work.Checkpoints[index]
+		if prior.Notice.RaftIndex == observation.Notice.RaftIndex {
+			if prior == observation {
+				return nil
+			}
+			return model.ErrIdentityReuse
+		}
+		if observation.Notice.RaftIndex < prior.Notice.RaftIndex || observation.Notice.Watermark < prior.Notice.Watermark {
+			return errors.New("stale checkpoint observation")
+		}
+		work.Checkpoints[index] = observation
+		return nil
+	}
+	maxCheckpoints := model.LimitsV1().MaxRetainedJobs * model.LimitsV1().MaxTasksPerJob
+	if uint64(len(work.Checkpoints)) >= maxCheckpoints {
+		return ErrCapacity
+	}
+	work.Checkpoints = append(work.Checkpoints, observation)
+	sort.Slice(work.Checkpoints, func(i, j int) bool {
+		return taskLess(work.Checkpoints[i].Notice.Source, work.Checkpoints[j].Notice.Source)
+	})
+	return nil
+}
+
+func validateCheckpointObservation(observation CommittedCheckpoint) error {
+	if err := observation.Notice.Validate(); err != nil {
+		return err
+	}
+	if observation.JobControlRevision == 0 || observation.AssignmentRevision == 0 || observation.AssignmentDigest == ([32]byte{}) {
+		return errors.New("invalid checkpoint observation assignment fence")
+	}
 	return nil
 }
 
@@ -1892,6 +1963,17 @@ func (store *Store) ApplyCheckpoint(notice model.CheckpointNotice) error {
 	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordCheckpoint, Payload: payload}}}, 0)
 }
 
+// ObserveCheckpoint durably records one authenticated committed checkpoint for
+// a local participant that does not own the source cursor.
+func (store *Store) ObserveCheckpoint(notice protocol.CheckpointNotice) error {
+	observation := CommittedCheckpoint{Notice: notice.Notice, JobControlRevision: notice.JobControlRevision, AssignmentRevision: notice.AssignmentRevision, AssignmentDigest: notice.AssignmentDigest}
+	payload, err := encodeCheckpointObservation(observation)
+	if err != nil {
+		return err
+	}
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordCheckpointObservation, Payload: payload}}}, 0)
+}
+
 // UpsertResult idempotently persists one logical record and exact current-copy provenance.
 func (store *Store) UpsertResult(record model.ResultRecord, provenance model.ResultCopyProvenance) error {
 	store.mu.Lock()
@@ -2148,7 +2230,7 @@ func validateRegisteredTransaction(transaction Transaction) error {
 		return err
 	}
 	for index, record := range transaction.Records {
-		if record.Type < recordFence || record.Type > recordOutboxRetry {
+		if record.Type < recordFence || record.Type > recordCheckpointObservation {
 			return fmt.Errorf("%w: record %d has unregistered type %d", ErrInvalidTransaction, index, record.Type)
 		}
 	}
@@ -2172,6 +2254,12 @@ func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch m
 		eof, eofErr := model.SourceEOF(assignment.Topology, cursor.Source)
 		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch || eofErr != nil || cursor.EOF != eof {
 			return errors.New("recovered source cursor is not the current local assigned source")
+		}
+	}
+	for _, observation := range work.Checkpoints {
+		assignment, ok := findAssignment(&work, observation.Notice.JobID)
+		if !ok || !assignmentTargetsWorker(assignment.Assignment, nodeID, workerEpoch) {
+			return errors.New("recovered checkpoint observation is not local assignment participation")
 		}
 	}
 	for _, delivery := range work.Deliveries {
@@ -2550,6 +2638,57 @@ func decodeCheckpoint(payload []byte) (model.CheckpointNotice, error) {
 		return n, errors.New("invalid checkpoint record")
 	}
 	return n, n.Validate()
+}
+
+func encodeCheckpointObservation(observation CommittedCheckpoint) ([]byte, error) {
+	if err := validateCheckpointObservation(observation); err != nil {
+		return nil, err
+	}
+	w := newRecordWriter()
+	w.u16(domainRecordSchema)
+	w.job(observation.Notice.JobID)
+	w.task(observation.Notice.Source)
+	w.u64(observation.Notice.Watermark)
+	w.u64(observation.Notice.RaftIndex)
+	w.epoch(observation.Notice.Epoch)
+	w.u64(observation.JobControlRevision)
+	w.u64(observation.AssignmentRevision)
+	w.fixed32(observation.AssignmentDigest)
+	return w.bytes(), nil
+}
+
+func decodeCheckpointObservation(payload []byte) (CommittedCheckpoint, error) {
+	r := newRecordReader(payload)
+	if err := r.schema(); err != nil {
+		return CommittedCheckpoint{}, err
+	}
+	var observation CommittedCheckpoint
+	var err error
+	if observation.Notice.JobID, err = r.job(); err != nil {
+		return observation, err
+	}
+	if observation.Notice.Source, err = r.task(); err != nil {
+		return observation, err
+	}
+	if observation.Notice.Watermark, err = r.u64(); err != nil {
+		return observation, err
+	}
+	if observation.Notice.RaftIndex, err = r.u64(); err != nil {
+		return observation, err
+	}
+	if observation.Notice.Epoch, err = r.epoch(); err != nil {
+		return observation, err
+	}
+	if observation.JobControlRevision, err = r.u64(); err != nil {
+		return observation, err
+	}
+	if observation.AssignmentRevision, err = r.u64(); err != nil {
+		return observation, err
+	}
+	if observation.AssignmentDigest, err = r.fixed32(); err != nil || !r.done() {
+		return observation, errors.New("invalid checkpoint observation record")
+	}
+	return observation, validateCheckpointObservation(observation)
 }
 
 func encodeStoredResult(result StoredResult) ([]byte, error) {
@@ -3381,6 +3520,29 @@ func sourceIndex(v []SourceCursor, id model.TaskID) int {
 		}
 	}
 	return -1
+}
+
+func checkpointObservationIndex(v []CommittedCheckpoint, id model.TaskID) int {
+	for i := range v {
+		if v[i].Notice.Source == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func assignmentTargetsWorker(assignment model.AssignmentSet, nodeID uint16, workerEpoch model.WorkerEpoch) bool {
+	for _, token := range assignment.Tasks {
+		if token.WorkerID == nodeID && token.WorkerEpoch == workerEpoch {
+			return true
+		}
+	}
+	for _, replica := range assignment.ResultReplicas {
+		if replica.PrimaryNodeID == nodeID && replica.PrimaryEpoch == workerEpoch || replica.SecondaryNodeID == nodeID && replica.SecondaryEpoch == workerEpoch {
+			return true
+		}
+	}
+	return false
 }
 func ensureWorkIndexes(work *RecoveredWork) error {
 	if work.indexes != nil {

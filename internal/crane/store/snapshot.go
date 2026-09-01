@@ -45,6 +45,7 @@ const (
 	snapshotResult
 	snapshotRepair
 	snapshotEvent
+	snapshotCheckpointObservation
 )
 
 // Snapshot identifies one committed complete high-level worker-state image.
@@ -206,7 +207,7 @@ func snapshotMetadataWithSourceSchemas(state RecoveredState, work RecoveredWork,
 }
 
 func encodeSnapshotFrame(kind snapshotRecordKind, payload []byte) ([]byte, error) {
-	if kind < snapshotFence || kind > snapshotEvent || len(payload) > MaxRecordPayloadBytes {
+	if kind < snapshotFence || kind > snapshotCheckpointObservation || len(payload) > MaxRecordPayloadBytes {
 		return nil, fmt.Errorf("%w: invalid snapshot frame", ErrInvalidTransaction)
 	}
 	frame := make([]byte, snapshotFrameOverhead+len(payload))
@@ -256,6 +257,17 @@ func visitSnapshotRecordsWithSourceSchemas(work RecoveredWork, sourceSchemas map
 			return err
 		}
 		if err := visit(snapshotSource, payload); err != nil {
+			return err
+		}
+	}
+	checkpoints := append([]CommittedCheckpoint(nil), work.Checkpoints...)
+	sort.Slice(checkpoints, func(i, j int) bool { return taskLess(checkpoints[i].Notice.Source, checkpoints[j].Notice.Source) })
+	for _, checkpoint := range checkpoints {
+		payload, err := encodeCheckpointObservation(checkpoint)
+		if err != nil {
+			return err
+		}
+		if err := visit(snapshotCheckpointObservation, payload); err != nil {
 			return err
 		}
 	}
@@ -452,7 +464,7 @@ func scanSnapshotFrames(reader io.ReaderAt, start int64, bodyBytes, count uint64
 		kind := snapshotRecordKind(binary.BigEndian.Uint16(header[:2]))
 		length := uint64(binary.BigEndian.Uint32(header[2:6]))
 		frameBytes := uint64(snapshotFrameOverhead) + length
-		if kind < snapshotFence || kind > snapshotEvent || length < snapshotMinimumPayload(kind) || length > MaxRecordPayloadBytes || frameBytes > uint64(end-offset) {
+		if kind < snapshotFence || kind > snapshotCheckpointObservation || length < snapshotMinimumPayload(kind) || length > MaxRecordPayloadBytes || frameBytes > uint64(end-offset) {
 			return fmt.Errorf("%w: snapshot frame bounds", ErrCorrupt)
 		}
 		if decoder != nil {
@@ -499,6 +511,8 @@ func snapshotMinimumPayload(kind snapshotRecordKind) uint64 {
 		return 410 // zero-checkpoint repair definition and fixed progress
 	case snapshotEvent:
 		return 223 // fixed event prefix plus the smaller failure body
+	case snapshotCheckpointObservation:
+		return 136 // schema, notice, revisions and assignment digest
 	default:
 		return math.MaxUint64
 	}
@@ -541,6 +555,7 @@ type snapshotDecoder struct {
 	fences        uint64
 	assignments   uint64
 	sources       uint64
+	checkpoints   uint64
 	deliveries    uint64
 	outboxes      uint64
 	results       uint64
@@ -576,6 +591,7 @@ func (decoder *snapshotDecoder) initializeCounts() error {
 	}
 	decoder.assignments = uint64(len(decoder.work.Assignments))
 	decoder.sources = uint64(len(decoder.work.Sources))
+	decoder.checkpoints = uint64(len(decoder.work.Checkpoints))
 	decoder.deliveries = uint64(len(decoder.work.Deliveries))
 	decoder.outboxes = uint64(len(decoder.work.Outboxes))
 	decoder.repairs = uint64(len(decoder.work.Repairs))
@@ -629,6 +645,8 @@ func (decoder *snapshotDecoder) reserveFrame(kind snapshotRecordKind, length uin
 		return reserveSnapshotCount(&decoder.assignments, limits.MaxRetainedJobs)
 	case snapshotSource:
 		return reserveSnapshotCount(&decoder.sources, maxSources)
+	case snapshotCheckpointObservation:
+		return reserveSnapshotCount(&decoder.checkpoints, maxSources)
 	case snapshotDelivery:
 		return reserveSnapshotCount(&decoder.deliveries, MaxTransactionRecords)
 	case snapshotOutbox:
@@ -676,6 +694,12 @@ func (decoder *snapshotDecoder) consumeReserved(kind snapshotRecordKind, payload
 		decoder.sourceSchemas[cursor.Source] = binary.BigEndian.Uint16(payload[:2])
 		decoder.work.Sources = append(decoder.work.Sources, cursor)
 		return nil
+	case snapshotCheckpointObservation:
+		checkpoint, err := decodeCheckpointObservation(payload)
+		if err != nil {
+			return err
+		}
+		return applySnapshotCheckpointObservation(&decoder.work, checkpoint)
 	case snapshotDelivery:
 		delivery, outboxes, err := decodeDeliveryRecord(payload)
 		if err != nil || !outboxesCanonical(outboxes) {
@@ -898,6 +922,28 @@ func applySnapshotAssignment(work *RecoveredWork, installed InstalledAssignment)
 	return nil
 }
 
+func applySnapshotCheckpointObservation(work *RecoveredWork, observation CommittedCheckpoint) error {
+	if err := validateCheckpointObservation(observation); err != nil {
+		return err
+	}
+	assignment, ok := findAssignment(work, observation.Notice.JobID)
+	if !ok || observation.AssignmentRevision > assignment.Assignment.Revision || observation.JobControlRevision > assignment.JobControlRevision || !snapshotEpochAtOrBefore(observation.Notice.Epoch, work.Fence) {
+		return errors.New("snapshot checkpoint observation authority mismatch")
+	}
+	if observation.AssignmentRevision == assignment.Assignment.Revision && observation.AssignmentDigest != assignment.Assignment.Digest {
+		return errors.New("snapshot checkpoint observation assignment digest mismatch")
+	}
+	stage, ok := findStage(assignment.Topology, observation.Notice.Source.StageID)
+	if !ok || stage.Role != model.StageSource {
+		return errors.New("snapshot checkpoint observation source is not a source stage")
+	}
+	if checkpointObservationIndex(work.Checkpoints, observation.Notice.Source) >= 0 {
+		return errors.New("duplicate snapshot checkpoint observation")
+	}
+	work.Checkpoints = append(work.Checkpoints, observation)
+	return nil
+}
+
 func validateSnapshotAssignment(installed InstalledAssignment, fence model.CoordinatorEpoch) (model.ValidatedTopology, error) {
 	decoded, err := model.DecodeTopology(installed.SpecificationBytes)
 	if err != nil {
@@ -1058,6 +1104,25 @@ func validateSnapshotWork(work RecoveredWork, nodeID uint16, workerEpoch model.W
 		eof, eofErr := model.SourceEOF(assignment.Topology, cursor.Source)
 		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch || eofErr != nil || eof != cursor.EOF || cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark > cursor.EOF || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark != 0 && cursor.RaftIndex == 0 || cursor.Watermark == 0 && cursor.CheckpointRevision != 0 || !validCheckpointAuthority(cursor) {
 			return errors.New("invalid snapshot source cursor")
+		}
+	}
+	if uint64(len(work.Checkpoints)) > maxSources {
+		return errors.New("snapshot checkpoint observation collection exceeds domain bounds")
+	}
+	for index, observation := range work.Checkpoints {
+		if index > 0 && !taskLess(work.Checkpoints[index-1].Notice.Source, observation.Notice.Source) {
+			return errors.New("snapshot checkpoint observations are not canonical")
+		}
+		assignment, ok := findAssignment(&work, observation.Notice.JobID)
+		if !ok || observation.AssignmentRevision > assignment.Assignment.Revision || observation.JobControlRevision > assignment.JobControlRevision || !snapshotEpochAtOrBefore(observation.Notice.Epoch, work.Fence) {
+			return errors.New("invalid snapshot checkpoint observation authority")
+		}
+		if observation.AssignmentRevision == assignment.Assignment.Revision && observation.AssignmentDigest != assignment.Assignment.Digest {
+			return errors.New("invalid snapshot checkpoint observation digest")
+		}
+		stage, exists := findStage(assignment.Topology, observation.Notice.Source.StageID)
+		if validateCheckpointObservation(observation) != nil || !exists || stage.Role != model.StageSource {
+			return errors.New("invalid snapshot checkpoint observation")
 		}
 	}
 	seenDeliveries := make(map[model.DeliveryID]struct{}, len(work.Deliveries))
@@ -1230,6 +1295,12 @@ func validateSnapshotWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch mo
 		token, tokenOK := findToken(assignment.Assignment, cursor.Source)
 		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch {
 			return errors.New("snapshot source cursor is not current local custody")
+		}
+	}
+	for _, observation := range work.Checkpoints {
+		assignment, ok := findAssignment(&work, observation.Notice.JobID)
+		if !ok || !assignmentTargetsWorker(assignment.Assignment, nodeID, workerEpoch) {
+			return errors.New("snapshot checkpoint observation is not local assignment participation")
 		}
 	}
 	for _, delivery := range work.Deliveries {
