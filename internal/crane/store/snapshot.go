@@ -934,7 +934,8 @@ func applySnapshotCheckpointObservation(work *RecoveredWork, observation Committ
 		return errors.New("snapshot checkpoint observation assignment digest mismatch")
 	}
 	stage, ok := findStage(assignment.Topology, observation.Notice.Source.StageID)
-	if !ok || stage.Role != model.StageSource {
+	eof, eofErr := model.SourceEOF(assignment.Topology, observation.Notice.Source)
+	if !ok || stage.Role != model.StageSource || eofErr != nil || observation.Notice.Watermark > eof {
 		return errors.New("snapshot checkpoint observation source is not a source stage")
 	}
 	if checkpointObservationIndex(work.Checkpoints, observation.Notice.Source) >= 0 {
@@ -1121,7 +1122,8 @@ func validateSnapshotWork(work RecoveredWork, nodeID uint16, workerEpoch model.W
 			return errors.New("invalid snapshot checkpoint observation digest")
 		}
 		stage, exists := findStage(assignment.Topology, observation.Notice.Source.StageID)
-		if validateCheckpointObservation(observation) != nil || !exists || stage.Role != model.StageSource {
+		eof, eofErr := model.SourceEOF(assignment.Topology, observation.Notice.Source)
+		if validateCheckpointObservation(observation) != nil || !exists || stage.Role != model.StageSource || eofErr != nil || observation.Notice.Watermark > eof {
 			return errors.New("invalid snapshot checkpoint observation")
 		}
 	}

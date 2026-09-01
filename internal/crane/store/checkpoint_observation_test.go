@@ -36,6 +36,17 @@ func TestCommittedCheckpointObservationIsAtomicOwnedAndSurvivesSnapshotReopen(t 
 		t.Fatal("fixture has no remote source")
 	}
 	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: assignment.JobID, Source: remoteSource, Watermark: 2, RaftIndex: 11, Epoch: epoch}, JobControlRevision: 3, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest}
+	eof, err := model.SourceEOF(topology, remoteSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notice.Notice.Watermark = eof
+	outOfRange := notice
+	outOfRange.Notice.Watermark = eof + 1
+	beforeInvalid := workerStore.Recovered()
+	if err := workerStore.ObserveCheckpoint(outOfRange); err == nil || workerStore.Recovered() != beforeInvalid {
+		t.Fatalf("out-of-range observation error/state = %v/%+v", err, workerStore.Recovered())
+	}
 	if err := workerStore.ObserveCheckpoint(notice); err != nil {
 		t.Fatal(err)
 	}

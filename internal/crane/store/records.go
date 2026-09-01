@@ -902,7 +902,8 @@ func applyCheckpointObservation(work *RecoveredWork, observation CommittedCheckp
 		return errors.New("checkpoint observation authority mismatch")
 	}
 	stage, ok := findStage(assignment.Topology, observation.Notice.Source.StageID)
-	if !ok || stage.Role != model.StageSource {
+	eof, eofErr := model.SourceEOF(assignment.Topology, observation.Notice.Source)
+	if !ok || stage.Role != model.StageSource || eofErr != nil || observation.Notice.Watermark > eof {
 		return errors.New("checkpoint observation source is not a source stage")
 	}
 	index := checkpointObservationIndex(work.Checkpoints, observation.Notice.Source)

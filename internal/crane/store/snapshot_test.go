@@ -1018,7 +1018,7 @@ func TestSnapshotCapacityAccountsForSnapshotWALAndReservations(t *testing.T) {
 }
 
 func TestSnapshotRecoveryRejectsCommittedCorruptionForEveryDomainRecordKind(t *testing.T) {
-	for _, kind := range []RecordType{recordFence, recordAssignment, recordDelivery, recordDeliveryProcessed, recordDeliveryCompleted, recordCheckpoint, recordResult, recordEvent, recordEventAck, recordRepair, recordSource, recordOutboxAck, recordOutboxRetry} {
+	for _, kind := range []RecordType{recordFence, recordAssignment, recordDelivery, recordDeliveryProcessed, recordDeliveryCompleted, recordCheckpoint, recordResult, recordEvent, recordEventAck, recordRepair, recordSource, recordOutboxAck, recordOutboxRetry, recordCheckpointObservation} {
 		t.Run(domainRecordName(kind), func(t *testing.T) {
 			path, identity, options, store, fixture := populatedSnapshotStore(t)
 			if _, err := store.Snapshot(); err != nil {
@@ -1137,6 +1137,7 @@ func domainRecordName(kind RecordType) string {
 		recordDeliveryProcessed: "processed", recordDeliveryCompleted: "completed", recordCheckpoint: "checkpoint",
 		recordResult: "result", recordEvent: "event", recordEventAck: "event-ack", recordRepair: "repair",
 		recordSource: "source", recordOutboxAck: "outbox-ack", recordOutboxRetry: "outbox-retry",
+		recordCheckpointObservation: "checkpoint-observation",
 	}
 	return names[kind]
 }
@@ -1195,6 +1196,10 @@ func corruptPostSnapshotRecord(t *testing.T, store *Store, fixture snapshotFixtu
 		return encode(encodeDeliveryIDPayload(fixture.next.ID))
 	case recordOutboxRetry:
 		return encode(encodeOutboxRetry(outboxRetryUpdate{ID: fixture.next.ID, DeadlineUnixNano: 1}))
+	case recordCheckpointObservation:
+		observation := CommittedCheckpoint{Notice: model.CheckpointNotice{JobID: fixture.assignment.JobID, Source: work.Sources[0].Source, Watermark: 1, RaftIndex: 12, Epoch: fixture.epoch}, JobControlRevision: work.Assignments[0].JobControlRevision, AssignmentRevision: fixture.assignment.Revision, AssignmentDigest: fixture.assignment.Digest}
+		observation.AssignmentDigest[0]++
+		return encode(encodeCheckpointObservation(observation))
 	default:
 		t.Fatalf("unknown kind %d", kind)
 		return Record{}
