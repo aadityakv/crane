@@ -123,7 +123,7 @@ func openWithOperations(path string, identity Identity, options Options, operati
 			return nil, err
 		}
 		store.state = RecoveredState{Identity: identity, WorkerEpoch: epoch, LastSequence: 1, WALBytes: uint64(len(encoded))}
-		store.work = RecoveredWork{NextTransactionID: 1}
+		store.work = newRecoveredWork()
 		return store, nil
 	}
 	wal, err := openWAL(root, WorkerWALFilename, false)
@@ -221,19 +221,7 @@ func (store *Store) Commit(transaction Transaction) error {
 	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTransaction, err)
 	}
-	before, err := reservedBytes(store.work)
-	if err != nil {
-		return err
-	}
-	after, err := reservedBytes(prospective)
-	if err != nil {
-		return err
-	}
-	additional := uint64(0)
-	if after > before {
-		additional = after - before
-	}
-	return store.commitWorkLocked(transaction, prospective, additional)
+	return store.commitWorkLocked(transaction, prospective)
 }
 
 func (store *Store) commitLocked(transaction Transaction) error {

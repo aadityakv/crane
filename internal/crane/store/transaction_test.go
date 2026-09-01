@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 )
 
 func TestTransactionFenceAssignmentDeliveryAndRecovery(t *testing.T) {
@@ -311,7 +313,14 @@ func TestTransactionSourceOutboxCompletionAndBothEventKinds(t *testing.T) {
 		t.Fatal(err)
 	}
 	delivery := domainDelivery(t, topology, assignment, epoch)
-	outbox := domainOutbox(t, delivery, delivery.Tuple, assignment, topology)
+	var source model.AssignmentToken
+	for _, token := range assignment.Tasks {
+		if token.Task.StageID == 1 && token.WorkerID == identity.NodeID {
+			source = token
+			break
+		}
+	}
+	outbox := domainSourceOutbox(t, topology, assignment, epoch, source, 1)
 	cursor := SourceCursor{Source: delivery.ID.Tuple.SourceTask, NextSequence: 2, EOF: 3}
 	if err := store.AdvanceSource(cursor, []OutboxRecord{outbox}); err != nil {
 		t.Fatal(err)
@@ -451,6 +460,479 @@ func TestTransactionConcurrentRecoveryAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestTransactionReviewCompactedDefinitionAndFinalEOFRetirement(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 8<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	delivery := domainDelivery(t, topology, assignment, epoch)
+	if _, err := store.Receive(delivery); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProcessed(delivery.ID, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkCompleted(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 10, Epoch: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := store.Receive(delivery); err != nil || state != Compacted {
+		t.Fatalf("exact compact retry = %v,%v", state, err)
+	}
+	changed := delivery.Clone()
+	changed.Tuple.Fields[0].Value.Int64++
+	if _, err := store.Receive(changed); !errors.Is(err, model.ErrIdentityReuse) {
+		t.Fatalf("changed compact retry = %v", err)
+	}
+	if got := mustRecoverWork(t, store); len(got.Deliveries) != 1 || got.Deliveries[0].State != Compacted {
+		t.Fatalf("pre-EOF tombstones = %+v", got.Deliveries)
+	}
+	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 3, RaftIndex: 11, Epoch: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRecoverWork(t, store); len(got.Deliveries) != 0 {
+		t.Fatalf("final-EOF tombstones retained = %d", len(got.Deliveries))
+	}
+	if state, err := store.Receive(delivery); err != nil || state != Compacted {
+		t.Fatalf("final checkpoint late retry = %v,%v", state, err)
+	}
+	if _, err := store.Receive(changed); !errors.Is(err, model.ErrIdentityReuse) {
+		t.Fatalf("changed late retry after tombstone retirement = %v", err)
+	}
+}
+
+func TestTransactionReviewProcessedRequiresExactDerivedOutboxes(t *testing.T) {
+	newStore := func(t *testing.T) (*Store, Identity, model.ValidatedTopology, model.AssignmentSet, model.CoordinatorEpoch, DeliveryRecord) {
+		t.Helper()
+		store, identity, _ := openDomainStore(t, 8<<20)
+		topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+		if err := store.Fence(epoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+			t.Fatal(err)
+		}
+		delivery := domainDelivery(t, topology, assignment, epoch)
+		if _, err := store.Receive(delivery); err != nil {
+			t.Fatal(err)
+		}
+		return store, identity, topology, assignment, epoch, delivery
+	}
+	t.Run("missing", func(t *testing.T) {
+		store, _, _, _, _, delivery := newStore(t)
+		outputs := []model.Tuple{{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: 6}}}}}
+		if err := store.MarkProcessed(delivery.ID, outputs, nil); err == nil {
+			t.Fatal("missing derived outbox accepted")
+		}
+		if mustRecoverWork(t, store).Deliveries[0].State != Received {
+			t.Fatal("missing outbox mutated delivery")
+		}
+	})
+	t.Run("completed initial", func(t *testing.T) {
+		store, _, topology, assignment, _, delivery := newStore(t)
+		output := model.Tuple{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: 6}}}}
+		outbox := domainOutbox(t, delivery, output, assignment, topology)
+		outbox.Completed = true
+		if err := store.MarkProcessed(delivery.ID, []model.Tuple{output}, []OutboxRecord{outbox}); err == nil {
+			t.Fatal("pre-completed outbox accepted")
+		}
+	})
+	t.Run("extra and duplicate", func(t *testing.T) {
+		store, _, topology, assignment, _, delivery := newStore(t)
+		output := model.Tuple{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: 6}}}}
+		outbox := domainOutbox(t, delivery, output, assignment, topology)
+		extra := outbox.Clone()
+		extra.ID.Tuple = model.DeriveChildTupleID(delivery.ID.Tuple, delivery.Destination.Task, extra.ID.EdgeID, 1)
+		if err := store.MarkProcessed(delivery.ID, []model.Tuple{output}, []OutboxRecord{outbox, extra}); err == nil {
+			t.Fatal("extra topology outbox accepted")
+		}
+		if err := store.MarkProcessed(delivery.ID, []model.Tuple{output}, []OutboxRecord{outbox, outbox}); err == nil {
+			t.Fatal("duplicate topology outbox accepted")
+		}
+	})
+	t.Run("raw registered", func(t *testing.T) {
+		store, _, _, _, _, delivery := newStore(t)
+		delivery.State = Processed
+		delivery.Outputs = []model.Tuple{{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: 6}}}}}
+		payload, err := encodeDeliveryRecord(delivery, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Commit(Transaction{Records: []Record{{Type: recordDeliveryProcessed, Payload: payload}}}); !errors.Is(err, ErrInvalidTransaction) {
+			t.Fatalf("raw incomplete processed record = %v", err)
+		}
+	})
+}
+
+func TestTransactionReviewSourceRetryAndCrossReferences(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 8<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	var source model.AssignmentToken
+	for _, token := range assignment.Tasks {
+		if token.Task.StageID == 1 && token.WorkerID == identity.NodeID {
+			source = token
+			break
+		}
+	}
+	outbox := domainSourceOutbox(t, topology, assignment, epoch, source, 1)
+	cursor := SourceCursor{Source: source.Task, NextSequence: 2, EOF: 3}
+	if err := store.AdvanceSource(cursor, []OutboxRecord{outbox}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceSource(cursor, []OutboxRecord{outbox}); err != nil {
+		t.Fatalf("exact source retry = %v", err)
+	}
+	changed := outbox.Clone()
+	changed.Tuple.Fields[0].Value.Int64++
+	if err := store.AdvanceSource(cursor, []OutboxRecord{changed}); !errors.Is(err, model.ErrIdentityReuse) {
+		t.Fatalf("changed source retry = %v", err)
+	}
+	regressed := cursor
+	regressed.NextSequence = 1
+	if err := store.AdvanceSource(regressed, nil); err == nil {
+		t.Fatal("source sequence regression accepted")
+	}
+	if err := store.AdvanceSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3}, []OutboxRecord{outbox, outbox}); err == nil {
+		t.Fatal("within-transaction duplicate outboxes accepted")
+	}
+	precompleted := domainSourceOutbox(t, topology, assignment, epoch, source, 2)
+	precompleted.Completed = true
+	if err := store.AdvanceSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3}, []OutboxRecord{precompleted}); err == nil {
+		t.Fatal("pre-completed source outbox accepted")
+	}
+	wrong := domainSourceOutbox(t, topology, assignment, epoch, source, 2)
+	wrong.Producer = assignment.Tasks[1]
+	payload, err := encodeSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3}, []OutboxRecord{wrong})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(Transaction{Records: []Record{{Type: recordSource, Payload: payload}}}); !errors.Is(err, ErrInvalidTransaction) {
+		t.Fatalf("raw wrong-source record = %v", err)
+	}
+	if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: source.Task, Watermark: 1, RaftIndex: 9, Epoch: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	second := domainSourceOutbox(t, topology, assignment, epoch, source, 2)
+	if err := store.AdvanceSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3, Watermark: 0, RaftIndex: 9}, []OutboxRecord{second}); err == nil {
+		t.Fatal("source watermark regression accepted")
+	}
+	if err := store.AdvanceSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3, Watermark: 1, RaftIndex: 8}, []OutboxRecord{second}); err == nil {
+		t.Fatal("source raft-index regression accepted")
+	}
+	if err := store.AdvanceSource(SourceCursor{Source: source.Task, NextSequence: 3, EOF: 3, Watermark: 1, RaftIndex: 9}, []OutboxRecord{second}); err != nil {
+		t.Fatalf("monotonic source advance = %v", err)
+	}
+}
+
+func TestTransactionReviewCapacityUsesProspectiveReservations(t *testing.T) {
+	setup := func(t *testing.T) (*Store, model.AssignmentSet, model.CoordinatorEpoch, DeliveryRecord, Transaction) {
+		t.Helper()
+		store, identity, _ := openDomainStore(t, 8<<20)
+		topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+		if err := store.Fence(epoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+			t.Fatal(err)
+		}
+		delivery := domainDelivery(t, topology, assignment, epoch)
+		if _, err := store.Receive(delivery); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkProcessed(delivery.ID, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkCompleted(delivery.ID); err != nil {
+			t.Fatal(err)
+		}
+		notice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 8, Epoch: epoch}
+		payload, err := encodeCheckpoint(notice)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store, assignment, epoch, delivery, Transaction{Records: []Record{{Type: recordCheckpoint, Payload: payload}}}
+	}
+	t.Run("release admits", func(t *testing.T) {
+		store, assignment, epoch, _, tx := setup(t)
+		size, err := transactionEncodedSize(tx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.options.MaxBytes = store.state.WALBytes + size
+		if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: assignment.Tasks[0].Task, Watermark: 1, RaftIndex: 8, Epoch: epoch}); err != nil {
+			t.Fatalf("prospective release checkpoint = %v", err)
+		}
+	})
+	t.Run("true rejection", func(t *testing.T) {
+		store, assignment, epoch, _, tx := setup(t)
+		size, err := transactionEncodedSize(tx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fault := &testFault{point: FaultBeforeAppend, err: errors.New("must not run")}
+		store.options.Faults = fault
+		store.options.MaxBytes = store.state.WALBytes + size - 1
+		before := mustRecoverWork(t, store)
+		if err := store.ApplyCheckpoint(model.CheckpointNotice{JobID: assignment.JobID, Source: assignment.Tasks[0].Task, Watermark: 1, RaftIndex: 8, Epoch: epoch}); !errors.Is(err, ErrCapacity) {
+			t.Fatalf("capacity = %v", err)
+		}
+		if fault.calls != 0 || !reflect.DeepEqual(before, mustRecoverWork(t, store)) {
+			t.Fatal("true rejection injected fault or mutated")
+		}
+	})
+}
+
+func TestTransactionReviewResultKeyIncludesSinkTask(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 8<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	first, p0 := domainResult(t, topology, assignment, epoch, 0)
+	_, p1 := domainResult(t, topology, assignment, epoch, 1)
+	value, err := model.MarshalTuple(model.Tuple{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: 7}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := model.NewResultRecord(first.TupleID, assignment.ResultReplicas[1].SinkTask, topology.Digest(), value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertResult(first, p0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertResult(second, p1); err != nil {
+		t.Fatalf("same tuple in distinct sink key = %v", err)
+	}
+	changedValue, err := model.MarshalTuple(model.Tuple{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: 8}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := model.NewResultRecord(first.TupleID, second.SinkTask, topology.Digest(), changedValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertResult(changed, p1); !errors.Is(err, model.ErrIdentityReuse) {
+		t.Fatalf("same complete key changed bytes = %v", err)
+	}
+	results := mustRecoverWork(t, store).Results
+	if len(results) != 2 || !taskLess(results[0].Record.SinkTask, results[1].Record.SinkTask) {
+		t.Fatalf("result buckets = %+v", results)
+	}
+}
+
+func TestTransactionReviewRepairRequiresCurrentReplicaAuthorizationAndBounds(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 8<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	valid := domainRepair(t, topology, assignment, epoch, identity.NodeID, store.WorkerEpoch())
+	if err := store.UpsertRepair(valid); err != nil {
+		t.Fatalf("valid repair = %v", err)
+	}
+	cases := map[string]func(*ResultRepairRecord){
+		"assignment digest": func(r *ResultRepairRecord) { r.Instruction.AssignmentDigest[0] ^= 1 },
+		"specification":     func(r *ResultRepairRecord) { r.Instruction.SpecificationHash[0] ^= 1 },
+		"sink":              func(r *ResultRepairRecord) { r.Instruction.SinkTask.StageID = 2 },
+		"stale fence":       func(r *ResultRepairRecord) { r.Instruction.CoordinatorEpoch.Term-- },
+		"stale worker epoch": func(r *ResultRepairRecord) {
+			r.Instruction.SourceWorkerEpoch[0] ^= 1
+		},
+		"wrong local role": func(r *ResultRepairRecord) {
+			if r.Role == RepairSource {
+				r.Role = RepairDestination
+			} else {
+				r.Role = RepairSource
+			}
+		},
+		"remote endpoint": func(r *ResultRepairRecord) {
+			if r.Instruction.DestinationNodeID == 2 {
+				r.Instruction.DestinationNodeID = 3
+			} else {
+				r.Instruction.DestinationNodeID = 2
+			}
+			r.Instruction.DestinationWorkerEpoch = model.WorkerEpoch{99}
+		},
+		"noncanonical checkpoints": func(r *ResultRepairRecord) {
+			source := assignment.Tasks[0].Task
+			r.Instruction.Checkpoints = []model.SourceCheckpoint{{Source: source, Watermark: 1}, {Source: source, Watermark: 1}}
+		},
+		"zero nonempty digest": func(r *ResultRepairRecord) { r.Instruction.ExpectedContentDigest = [32]byte{} },
+		"oversized total": func(r *ResultRepairRecord) {
+			r.Instruction.ExpectedRecordCount = 1
+			r.Instruction.ExpectedTotalBytes = (64 << 20) + 1
+			r.Instruction.ExpectedContentDigest = [32]byte{2}
+		},
+		"impossible aggregate": func(r *ResultRepairRecord) {
+			r.Instruction.ExpectedRecordCount = 1
+			r.Instruction.ExpectedTotalBytes = 1
+			r.Instruction.ExpectedContentDigest = [32]byte{2}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			candidate := cloneRepair(valid)
+			mutate(&candidate)
+			rebindRepair(&candidate)
+			if err := store.UpsertRepair(candidate); err == nil {
+				t.Fatal("unauthorized/impossible repair accepted")
+			}
+		})
+	}
+}
+
+func TestTransactionReviewDecodersBoundDeclaredCollectionsBeforeAllocation(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 8<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	delivery := domainDelivery(t, topology, assignment, epoch)
+	delivery.State = Processed
+	delivery.Outputs = make([]model.Tuple, model.LimitsV1().MaxOperatorOutputs+1)
+	if _, err := encodeDeliveryRecord(delivery, nil); err == nil {
+		t.Fatal("external excess outputs reached encoding")
+	}
+	message := protocol.TupleDelivery{DeliveryID: delivery.ID, Tuple: delivery.Tuple, Producer: delivery.Producer, Destination: delivery.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: delivery.ID.Tuple.JobID, Revision: delivery.AssignmentRevision, Digest: delivery.AssignmentDigest}, Coordinator: delivery.CoordinatorEpoch}
+	encodedDelivery, err := protocol.MarshalTupleDelivery(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryWriter := newRecordWriter()
+	deliveryWriter.u16(domainRecordSchema)
+	deliveryWriter.u8(uint8(Processed))
+	deliveryWriter.u64(delivery.Reservation)
+	deliveryWriter.blob(encodedDelivery)
+	deliveryWriter.u16(uint16(model.LimitsV1().MaxOperatorOutputs + 1))
+	malformedDelivery := deliveryWriter.bytes()
+	deliveryAllocated := allocatedBytesForTest(func() { _, _, _ = decodeDeliveryRecord(malformedDelivery) }, 8)
+	if deliveryAllocated > 2<<20 {
+		t.Fatalf("declared output count allocated %d bytes before validation", deliveryAllocated)
+	}
+	var source model.AssignmentToken
+	for _, token := range assignment.Tasks {
+		if token.Task.StageID == 1 && token.WorkerID == identity.NodeID {
+			source = token
+			break
+		}
+	}
+	w := newRecordWriter()
+	w.u16(domainRecordSchema)
+	w.task(source.Task)
+	w.u64(2)
+	w.u64(3)
+	w.u64(0)
+	w.u64(0)
+	w.u16(uint16(model.LimitsV1().MaxDerivedDeliveries))
+	malformed := w.bytes()
+	allocated := allocatedBytesForTest(func() { _, _, _ = decodeSource(malformed) }, 8)
+	if allocated > 2<<20 {
+		t.Fatalf("declared outbox count allocated %d bytes before minimum-byte validation", allocated)
+	}
+}
+
+func TestTransactionReviewProspectiveStateCopiesOnlyAffectedCollections(t *testing.T) {
+	store, identity, _ := openDomainStore(t, 32<<20)
+	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	for sequence := uint64(1); sequence <= 128; sequence++ {
+		record, provenance := domainResultSequence(t, topology, assignment, epoch, 0, sequence)
+		if err := store.UpsertResult(record, provenance); err != nil {
+			t.Fatal(err)
+		}
+	}
+	beforeRoot := store.work.indexes.results
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if store.work.indexes.results != beforeRoot {
+		t.Fatal("unaffected result index was copied by a fence transaction")
+	}
+	record, provenance := domainResultSequence(t, topology, assignment, epoch, 0, 129)
+	if err := store.UpsertResult(record, provenance); err != nil {
+		t.Fatal(err)
+	}
+	if shared := sharedResultNodeCount(beforeRoot, store.work.indexes.results); shared < 100 {
+		t.Fatalf("result insertion rebuilt unrelated state: shared nodes = %d", shared)
+	}
+	large := store.work
+	small := RecoveredWork{Fence: epoch, NextTransactionID: 1}
+	measure := func(work RecoveredWork) float64 {
+		return testing.AllocsPerRun(20, func() {
+			reducer := &workReducer{current: work}
+			if err := reducer.BeginTransaction(1); err != nil {
+				panic(err)
+			}
+			payload, _ := encodeFence(epoch)
+			if err := reducer.ConsumeRecord(Record{Type: recordFence, Payload: payload}); err != nil {
+				panic(err)
+			}
+			if err := reducer.CommitTransaction(); err != nil {
+				panic(err)
+			}
+		})
+	}
+	smallAllocs, largeAllocs := measure(small), measure(large)
+	if largeAllocs > smallAllocs+5 {
+		t.Fatalf("fence allocations scale with unrelated results: small=%f large=%f", smallAllocs, largeAllocs)
+	}
+}
+
+func sharedResultNodeCount(left, right *resultNode) int {
+	seen := make(map[*resultNode]struct{})
+	var collect func(*resultNode)
+	collect = func(node *resultNode) {
+		if node == nil {
+			return
+		}
+		seen[node] = struct{}{}
+		collect(node.left)
+		collect(node.right)
+	}
+	collect(left)
+	count := 0
+	var visit func(*resultNode)
+	visit = func(node *resultNode) {
+		if node == nil {
+			return
+		}
+		if _, ok := seen[node]; ok {
+			count++
+		}
+		visit(node.left)
+		visit(node.right)
+	}
+	visit(right)
+	return count
+}
+
 func openDomainStore(t *testing.T, max uint64) (*Store, Identity, Options) {
 	t.Helper()
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
@@ -518,8 +1000,11 @@ func domainDelivery(t *testing.T, topology model.ValidatedTopology, assignment m
 		t.Skip("rendezvous did not place sink locally")
 	}
 	producer := assignment.Tasks[0]
-	tuple := model.Tuple{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: 3}}}}
-	tupleID := model.TupleID{JobID: assignment.JobID, SourceTask: producer.Task, SourceSequence: 1, PathDigest: [32]byte{4}}
+	tuple, exists, err := model.SourceTuple(topology, producer.Task, 1)
+	if err != nil || !exists {
+		t.Fatalf("SourceTuple = %+v,%v,%v", tuple, exists, err)
+	}
+	tupleID := model.DeriveSourceTupleID(assignment.JobID, producer.Task, 1)
 	id := model.DeliveryID{Tuple: tupleID, EdgeID: 1, DestinationTask: destination.Task}
 	reservation, err := topology.WorstCaseCustodyBytes(destination.Task)
 	if err != nil {
@@ -532,6 +1017,7 @@ func domainOutbox(t *testing.T, parent DeliveryRecord, tuple model.Tuple, assign
 	t.Helper()
 	child := parent.ID
 	child.EdgeID = 2
+	child.Tuple = model.DeriveChildTupleID(parent.ID.Tuple, parent.Destination.Task, child.EdgeID, 0)
 	routes, err := model.Route(topology, topology.Spec().Edges[1], child.Tuple, tuple)
 	if err != nil {
 		t.Fatal(err)
@@ -564,6 +1050,45 @@ func domainResult(t *testing.T, topology model.ValidatedTopology, assignment mod
 	return record, model.ResultCopyProvenance{AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, ReplicaSet: replica, DestinationRole: role, CoordinatorEpoch: epoch}
 }
 
+func domainResultSequence(t *testing.T, topology model.ValidatedTopology, assignment model.AssignmentSet, epoch model.CoordinatorEpoch, partition uint16, sequence uint64) (model.ResultRecord, model.ResultCopyProvenance) {
+	t.Helper()
+	record, provenance := domainResult(t, topology, assignment, epoch, partition)
+	record.TupleID.SourceSequence = sequence
+	record.TupleID.PathDigest[0] = byte(sequence)
+	value, err := model.MarshalTuple(model.Tuple{Fields: []model.Field{{Name: "value", Value: model.Value{Type: model.ValueInt64, Int64: int64(sequence)}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = model.NewResultRecord(record.TupleID, record.SinkTask, record.SpecificationHash, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record, provenance
+}
+
+func domainSourceOutbox(t *testing.T, topology model.ValidatedTopology, assignment model.AssignmentSet, epoch model.CoordinatorEpoch, source model.AssignmentToken, sequence uint64) OutboxRecord {
+	t.Helper()
+	tuple, ok, err := model.SourceTuple(topology, source.Task, sequence)
+	if err != nil || !ok {
+		t.Fatalf("SourceTuple = %+v,%v,%v", tuple, ok, err)
+	}
+	tupleID := model.DeriveSourceTupleID(assignment.JobID, source.Task, sequence)
+	edge := topology.Spec().Edges[0]
+	partitions, err := model.Route(topology, edge, tupleID, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationTask := model.TaskID{JobID: assignment.JobID, StageID: edge.DestinationStageID, Partition: partitions[0]}
+	var destination model.AssignmentToken
+	for _, token := range assignment.Tasks {
+		if token.Task == destinationTask {
+			destination = token
+			break
+		}
+	}
+	return OutboxRecord{ID: model.DeliveryID{Tuple: tupleID, EdgeID: edge.EdgeID, DestinationTask: destinationTask}, Tuple: tuple, Producer: source, Destination: destination, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, CoordinatorEpoch: epoch}
+}
+
 func domainFailureEvent(store *Store, assignment model.AssignmentSet, epoch model.CoordinatorEpoch, id uint64) model.WorkerEvent {
 	var token model.AssignmentToken
 	for _, candidate := range assignment.Tasks {
@@ -578,11 +1103,35 @@ func domainFailureEvent(store *Store, assignment model.AssignmentSet, epoch mode
 
 func domainRepair(t *testing.T, topology model.ValidatedTopology, assignment model.AssignmentSet, epoch model.CoordinatorEpoch, node uint16, worker model.WorkerEpoch) ResultRepairRecord {
 	t.Helper()
-	def := model.RepairResultPartitionDefinition{CoordinatorEpoch: epoch, JobID: assignment.JobID, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, SourceNodeID: node, SourceWorkerEpoch: worker, DestinationNodeID: 2, DestinationWorkerEpoch: model.WorkerEpoch{8}, SinkTask: assignment.ResultReplicas[0].SinkTask, SpecificationHash: topology.Digest(), ExpectedRecordCount: 4, ExpectedTotalBytes: 100, ExpectedContentDigest: [32]byte{1}}
+	replica := assignment.ResultReplicas[0]
+	sourceNode, sourceEpoch, destinationNode, destinationEpoch := replica.PrimaryNodeID, replica.PrimaryEpoch, replica.SecondaryNodeID, replica.SecondaryEpoch
+	role := RepairSource
+	if sourceNode != node || sourceEpoch != worker {
+		sourceNode, sourceEpoch, destinationNode, destinationEpoch = replica.SecondaryNodeID, replica.SecondaryEpoch, replica.PrimaryNodeID, replica.PrimaryEpoch
+	}
+	def := model.RepairResultPartitionDefinition{CoordinatorEpoch: epoch, JobID: assignment.JobID, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, SourceNodeID: sourceNode, SourceWorkerEpoch: sourceEpoch, DestinationNodeID: destinationNode, DestinationWorkerEpoch: destinationEpoch, SinkTask: replica.SinkTask, SpecificationHash: topology.Digest(), ExpectedRecordCount: 4, ExpectedTotalBytes: 1000, ExpectedContentDigest: [32]byte{1}}
 	def.CheckpointDigest = model.CheckpointVectorDigest(nil)
 	def.InventoryQueryDigest = model.ResultInventoryQueryDigest(model.ResultInventoryQueryDefinition{JobID: def.JobID, SinkTask: def.SinkTask, SpecificationHash: def.SpecificationHash, AssignmentRevision: def.AssignmentRevision, AssignmentDigest: def.AssignmentDigest, Checkpoints: def.Checkpoints, CheckpointDigest: def.CheckpointDigest})
 	def.RepairID = model.DeriveRepairID(def)
-	return ResultRepairRecord{Instruction: def, InstructionDigest: model.RepairInstructionDigest(def), Role: RepairSource, State: RepairPending}
+	return ResultRepairRecord{Instruction: def, InstructionDigest: model.RepairInstructionDigest(def), Role: role, State: RepairPending}
+}
+
+func rebindRepair(repair *ResultRepairRecord) {
+	repair.Instruction.CheckpointDigest = model.CheckpointVectorDigest(repair.Instruction.Checkpoints)
+	repair.Instruction.InventoryQueryDigest = model.ResultInventoryQueryDigest(model.ResultInventoryQueryDefinition{JobID: repair.Instruction.JobID, SinkTask: repair.Instruction.SinkTask, SpecificationHash: repair.Instruction.SpecificationHash, AssignmentRevision: repair.Instruction.AssignmentRevision, AssignmentDigest: repair.Instruction.AssignmentDigest, Checkpoints: repair.Instruction.Checkpoints, CheckpointDigest: repair.Instruction.CheckpointDigest})
+	repair.Instruction.RepairID = model.DeriveRepairID(repair.Instruction)
+	repair.InstructionDigest = model.RepairInstructionDigest(repair.Instruction)
+}
+
+func allocatedBytesForTest(operation func(), repetitions int) uint64 {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for i := 0; i < repetitions; i++ {
+		operation()
+	}
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 func commitRawForTest(store *Store, transaction Transaction) error {

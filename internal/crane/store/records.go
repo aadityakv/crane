@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -66,7 +67,8 @@ type DeliveryRecord struct {
 	// Outputs are owned deterministic processed tuples.
 	Outputs []model.Tuple
 	// OutboxIDs bind processed output to its atomic downstream outboxes.
-	OutboxIDs []model.DeliveryID
+	OutboxIDs        []model.DeliveryID
+	definitionDigest [32]byte
 }
 
 // Clone returns an independently owned delivery.
@@ -123,6 +125,7 @@ type StoredResult struct {
 	Record model.ResultRecord
 	// Provenance separately fences this physical copy.
 	Provenance model.ResultCopyProvenance
+	canonical  []byte
 }
 
 // RepairEndpointRole identifies which endpoint owns local repair progress.
@@ -209,6 +212,25 @@ type RecoveredWork struct {
 	PendingEvents []model.WorkerEvent
 	// NextTransactionID is the next durable worker event identity.
 	NextTransactionID uint64
+	indexes           *workIndexes
+}
+
+type resultKey struct {
+	SinkTask model.TaskID
+	TupleID  model.TupleID
+}
+
+type workIndexes struct {
+	results          *resultNode
+	resultBytesByJob map[model.JobID]uint64
+}
+
+type resultNode struct {
+	key      resultKey
+	value    StoredResult
+	priority uint64
+	left     *resultNode
+	right    *resultNode
 }
 
 // Clone returns a deeply owned high-level state.
@@ -233,10 +255,15 @@ func (work RecoveredWork) Clone() RecoveredWork {
 	for i := range work.Outboxes {
 		result.Outboxes[i] = work.Outboxes[i].Clone()
 	}
-	result.Results = make([]StoredResult, len(work.Results))
-	for i := range work.Results {
-		result.Results[i] = work.Results[i]
-		result.Results[i].Record.Value = append([]byte(nil), work.Results[i].Record.Value...)
+	result.Results = nil
+	appendOwnedResults(work.indexes, &result.Results)
+	if work.indexes == nil {
+		for i := range work.Results {
+			owned := work.Results[i]
+			owned.Record.Value = append([]byte(nil), owned.Record.Value...)
+			owned.canonical = nil
+			result.Results = append(result.Results, owned)
+		}
 	}
 	result.Repairs = make([]ResultRepairRecord, len(work.Repairs))
 	copy(result.Repairs, work.Repairs)
@@ -250,22 +277,36 @@ func (work RecoveredWork) Clone() RecoveredWork {
 	if result.NextTransactionID == 0 {
 		result.NextTransactionID = 1
 	}
+	result.indexes = nil
+	sort.Slice(result.Results, func(i, j int) bool {
+		a, b := result.Results[i].Record, result.Results[j].Record
+		if a.SinkTask != b.SinkTask {
+			return taskLess(a.SinkTask, b.SinkTask)
+		}
+		return tupleLess(a.TupleID, b.TupleID)
+	})
 	return result
 }
 
 type workReducer struct {
 	current, transaction RecoveredWork
 	inTransaction        bool
+	prepared             [recordOutboxAck + 1]bool
 }
 
-func newWorkReducer() *workReducer { return &workReducer{current: RecoveredWork{NextTransactionID: 1}} }
+func newRecoveredWork() RecoveredWork {
+	return RecoveredWork{NextTransactionID: 1, indexes: &workIndexes{resultBytesByJob: make(map[model.JobID]uint64)}}
+}
+
+func newWorkReducer() *workReducer { return &workReducer{current: newRecoveredWork()} }
 
 // BeginTransaction starts one prospective atomic high-level reduction.
 func (r *workReducer) BeginTransaction(uint32) error {
 	if r.inTransaction {
 		return errors.New("nested transaction")
 	}
-	r.transaction = r.current.Clone()
+	r.transaction = r.current
+	r.prepared = [recordOutboxAck + 1]bool{}
 	r.inTransaction = true
 	return nil
 }
@@ -275,7 +316,72 @@ func (r *workReducer) ConsumeRecord(record Record) error {
 	if !r.inTransaction {
 		return errors.New("record outside transaction")
 	}
+	r.prepare(record.Type)
 	return applyDomainRecord(&r.transaction, record)
+}
+
+func (r *workReducer) prepare(recordType RecordType) {
+	clone := func(kind RecordType) bool {
+		if r.prepared[kind] {
+			return false
+		}
+		r.prepared[kind] = true
+		return true
+	}
+	switch recordType {
+	case recordAssignment:
+		if clone(recordAssignment) {
+			r.transaction.Assignments = append([]InstalledAssignment(nil), r.transaction.Assignments...)
+		}
+	case recordDelivery:
+		if clone(recordDelivery) {
+			r.transaction.Deliveries = append([]DeliveryRecord(nil), r.transaction.Deliveries...)
+		}
+	case recordDeliveryProcessed:
+		if clone(recordDelivery) {
+			r.transaction.Deliveries = append([]DeliveryRecord(nil), r.transaction.Deliveries...)
+		}
+		if clone(recordOutboxAck) {
+			r.transaction.Outboxes = append([]OutboxRecord(nil), r.transaction.Outboxes...)
+		}
+	case recordDeliveryCompleted:
+		if clone(recordDelivery) {
+			r.transaction.Deliveries = append([]DeliveryRecord(nil), r.transaction.Deliveries...)
+		}
+	case recordCheckpoint:
+		if clone(recordSource) {
+			r.transaction.Sources = append([]SourceCursor(nil), r.transaction.Sources...)
+		}
+		if clone(recordDelivery) {
+			r.transaction.Deliveries = append([]DeliveryRecord(nil), r.transaction.Deliveries...)
+		}
+		if clone(recordOutboxAck) {
+			r.transaction.Outboxes = append([]OutboxRecord(nil), r.transaction.Outboxes...)
+		}
+	case recordResult:
+		if clone(recordResult) {
+			r.transaction.indexes = cloneWorkIndexes(r.transaction.indexes)
+		}
+	case recordEvent, recordEventAck:
+		if clone(recordEvent) {
+			r.transaction.PendingEvents = append([]model.WorkerEvent(nil), r.transaction.PendingEvents...)
+		}
+	case recordRepair:
+		if clone(recordRepair) {
+			r.transaction.Repairs = append([]ResultRepairRecord(nil), r.transaction.Repairs...)
+		}
+	case recordSource:
+		if clone(recordSource) {
+			r.transaction.Sources = append([]SourceCursor(nil), r.transaction.Sources...)
+		}
+		if clone(recordOutboxAck) {
+			r.transaction.Outboxes = append([]OutboxRecord(nil), r.transaction.Outboxes...)
+		}
+	case recordOutboxAck:
+		if clone(recordOutboxAck) {
+			r.transaction.Outboxes = append([]OutboxRecord(nil), r.transaction.Outboxes...)
+		}
+	}
 }
 
 // CommitTransaction publishes one completely validated prospective transaction.
@@ -434,6 +540,9 @@ func applyAssignment(work *RecoveredWork, installed InstalledAssignment) error {
 }
 
 func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []OutboxRecord, processed bool) error {
+	if uint64(len(delivery.Outputs)) > model.LimitsV1().MaxOperatorOutputs || uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
+		return errors.New("processed output/outbox count exceeds v1 bounds")
+	}
 	assignment, ok := findAssignment(work, delivery.ID.Tuple.JobID)
 	if !ok {
 		return errors.New("delivery references unknown assignment")
@@ -441,6 +550,11 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 	if err := validateDelivery(delivery, assignment, work.Fence); err != nil {
 		return err
 	}
+	digest, err := deliveryDefinitionDigest(delivery)
+	if err != nil {
+		return err
+	}
+	delivery.definitionDigest = digest
 	index := deliveryIndex(work.Deliveries, delivery.ID)
 	if !processed {
 		if delivery.State != Received || len(outboxes) != 0 || len(delivery.Outputs) != 0 || len(delivery.OutboxIDs) != 0 {
@@ -458,11 +572,34 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 		work.Deliveries = append(work.Deliveries, delivery.Clone())
 		return nil
 	}
+	if index >= 0 && (work.Deliveries[index].State == Processed || work.Deliveries[index].State == Completed) {
+		prior := work.Deliveries[index]
+		if !equalDeliveryDefinition(prior, delivery) || !equalTuples(prior.Outputs, delivery.Outputs) || len(prior.OutboxIDs) != len(outboxes) {
+			return model.ErrIdentityReuse
+		}
+		for outboxIndexInRecord, outbox := range outboxes {
+			stored := outboxIndex(work.Outboxes, prior.OutboxIDs[outboxIndexInRecord])
+			if outbox.Completed || stored < 0 || outbox.ID != prior.OutboxIDs[outboxIndexInRecord] || !equalOutboxDefinition(work.Outboxes[stored], outbox) {
+				return model.ErrIdentityReuse
+			}
+		}
+		return nil
+	}
 	if index < 0 || work.Deliveries[index].State != Received {
 		return errors.New("processed delivery has no received predecessor")
 	}
 	if delivery.State != Processed || !equalDeliveryDefinition(work.Deliveries[index], delivery) {
 		return errors.New("processed delivery identity changed")
+	}
+	expected, err := expectedProcessedOutboxes(delivery, assignment)
+	if err != nil {
+		return err
+	}
+	if len(outboxes) != len(expected) {
+		return errors.New("processed outboxes are not the complete topology-derived set")
+	}
+	if !outboxesCanonical(outboxes) {
+		return errors.New("processed outboxes are not in canonical identity order")
 	}
 	seen := make(map[model.DeliveryID]struct{}, len(outboxes))
 	for _, outbox := range outboxes {
@@ -470,11 +607,18 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 			return errors.New("duplicate outbox")
 		}
 		seen[outbox.ID] = struct{}{}
+		if outbox.Completed {
+			return errors.New("new processed outbox is already completed")
+		}
 		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
 			return err
 		}
 		if outbox.Producer != delivery.Destination {
 			return errors.New("outbox producer is not processed destination")
+		}
+		want, exists := expected[outbox.ID]
+		if !exists || !equalOutboxDefinition(want, outbox) {
+			return errors.New("processed outbox does not match topology-derived definition")
 		}
 		if outboxIndex(work.Outboxes, outbox.ID) >= 0 {
 			return errors.New("outbox identity already exists")
@@ -540,7 +684,7 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 		if notice.Watermark >= math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences {
 			return errors.New("checkpoint watermark outside v1 bounds")
 		}
-		work.Sources = append(work.Sources, SourceCursor{Source: notice.Source, NextSequence: notice.Watermark + 1, Watermark: notice.Watermark, RaftIndex: notice.RaftIndex})
+		work.Sources = append(work.Sources, SourceCursor{Source: notice.Source, NextSequence: notice.Watermark + 1, EOF: eof, Watermark: notice.Watermark, RaftIndex: notice.RaftIndex})
 	}
 	for i := range work.Deliveries {
 		delivery := &work.Deliveries[i]
@@ -548,9 +692,24 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 			if delivery.State != Completed && delivery.State != Compacted {
 				return errors.New("checkpoint covers incomplete delivery")
 			}
+			if delivery.definitionDigest == ([32]byte{}) {
+				delivery.definitionDigest, err = deliveryDefinitionDigest(*delivery)
+				if err != nil {
+					return err
+				}
+			}
 			delivery.State, delivery.Reservation, delivery.Outputs, delivery.OutboxIDs = Compacted, 0, nil, nil
 			delivery.Tuple = model.Tuple{}
 		}
+	}
+	if notice.Watermark == eof {
+		keptDeliveries := work.Deliveries[:0]
+		for _, delivery := range work.Deliveries {
+			if delivery.ID.Tuple.SourceTask != notice.Source || delivery.State != Compacted {
+				keptDeliveries = append(keptDeliveries, delivery)
+			}
+		}
+		work.Deliveries = keptDeliveries
 	}
 	kept := work.Outboxes[:0]
 	for _, outbox := range work.Outboxes {
@@ -577,43 +736,31 @@ func applyResult(work *RecoveredWork, result StoredResult) error {
 	if !ok || want != result.Provenance.ReplicaSet {
 		return errors.New("result replica set mismatch")
 	}
-	index := resultIndex(work.Results, result.Record.TupleID)
-	if index >= 0 {
-		if !equalStoredResult(work.Results[index], result) {
+	if result.canonical == nil {
+		encoded, err := model.MarshalResultRecord(result.Record)
+		if err != nil {
+			return err
+		}
+		result.canonical = encoded
+	}
+	if err := ensureWorkIndexes(work); err != nil {
+		return err
+	}
+	key := resultKey{SinkTask: result.Record.SinkTask, TupleID: result.Record.TupleID}
+	priorResult := findResultNode(work.indexes.results, key)
+	if priorResult != nil {
+		if !equalStoredResult(priorResult.value, result) {
 			return model.ErrIdentityReuse
 		}
 		return nil
 	}
-	var jobBytes uint64
-	for _, existing := range work.Results {
-		if existing.Record.TupleID.JobID != result.Record.TupleID.JobID {
-			continue
-		}
-		encoded, err := model.MarshalResultRecord(existing.Record)
-		if err != nil {
-			return err
-		}
-		if jobBytes > math.MaxUint64-uint64(len(encoded)) {
-			return ErrCapacity
-		}
-		jobBytes += uint64(len(encoded))
-	}
-	encoded, err := model.MarshalResultRecord(result.Record)
-	if err != nil {
-		return err
-	}
-	if jobBytes > model.LimitsV1().MaxResultRecordsBytesPerJob || uint64(len(encoded)) > model.LimitsV1().MaxResultRecordsBytesPerJob-jobBytes {
+	jobBytes := work.indexes.resultBytesByJob[result.Record.TupleID.JobID]
+	if jobBytes > model.LimitsV1().MaxResultRecordsBytesPerJob || uint64(len(result.canonical)) > model.LimitsV1().MaxResultRecordsBytesPerJob-jobBytes {
 		return ErrCapacity
 	}
 	result.Record.Value = append([]byte(nil), result.Record.Value...)
-	work.Results = append(work.Results, result)
-	sort.Slice(work.Results, func(i, j int) bool {
-		a, b := work.Results[i].Record, work.Results[j].Record
-		if a.SinkTask != b.SinkTask {
-			return taskLess(a.SinkTask, b.SinkTask)
-		}
-		return bytes.Compare(tupleKey(a.TupleID), tupleKey(b.TupleID)) < 0
-	})
+	work.indexes.results = insertResultNode(work.indexes.results, &resultNode{key: key, value: result, priority: resultPriority(key)})
+	work.indexes.resultBytesByJob[result.Record.TupleID.JobID] = jobBytes + uint64(len(result.canonical))
 	return nil
 }
 
@@ -690,6 +837,32 @@ func applyRepair(work *RecoveredWork, repair ResultRepairRecord) error {
 	if repair.Instruction.CoordinatorEpoch != work.Fence {
 		return errors.New("repair coordinator fence mismatch")
 	}
+	assignment, ok := findAssignment(work, repair.Instruction.JobID)
+	if !ok || repair.Instruction.AssignmentRevision != assignment.Assignment.Revision || repair.Instruction.AssignmentDigest != assignment.Assignment.Digest || repair.Instruction.SpecificationHash != assignment.Topology.Digest() {
+		return errors.New("repair references stale or unknown assignment")
+	}
+	replica, ok := findReplica(assignment.Assignment, repair.Instruction.SinkTask)
+	if !ok {
+		return errors.New("repair sink has no installed replica set")
+	}
+	d := repair.Instruction
+	forward := d.SourceNodeID == replica.PrimaryNodeID && d.SourceWorkerEpoch == replica.PrimaryEpoch && d.DestinationNodeID == replica.SecondaryNodeID && d.DestinationWorkerEpoch == replica.SecondaryEpoch
+	reverse := d.SourceNodeID == replica.SecondaryNodeID && d.SourceWorkerEpoch == replica.SecondaryEpoch && d.DestinationNodeID == replica.PrimaryNodeID && d.DestinationWorkerEpoch == replica.PrimaryEpoch
+	if !forward && !reverse {
+		return errors.New("repair endpoints are not the current assigned replica pair")
+	}
+	for index, checkpoint := range d.Checkpoints {
+		if checkpoint.Source.JobID != d.JobID {
+			return errors.New("repair checkpoint references another job")
+		}
+		if index > 0 && !taskLess(d.Checkpoints[index-1].Source, checkpoint.Source) {
+			return errors.New("repair checkpoints are not canonical and unique")
+		}
+		eof, err := model.SourceEOF(assignment.Topology, checkpoint.Source)
+		if err != nil || checkpoint.Watermark > eof {
+			return errors.New("repair checkpoint is outside installed topology")
+		}
+	}
 	if index < 0 {
 		if len(work.Repairs) >= 64 {
 			return ErrCapacity
@@ -712,6 +885,9 @@ func applyRepair(work *RecoveredWork, repair ResultRepairRecord) error {
 }
 
 func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxRecord) error {
+	if uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
+		return errors.New("source outbox count exceeds v1 bounds")
+	}
 	if err := cursor.Source.Validate(); err != nil {
 		return err
 	}
@@ -726,16 +902,65 @@ func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxReco
 	if cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark > model.LimitsV1().MaxSourceSequences || cursor.EOF > model.LimitsV1().MaxSourceSequences || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark >= cursor.NextSequence {
 		return errors.New("source cursor outside bounds")
 	}
-	index := sourceIndex(work.Sources, cursor.Source)
-	if index >= 0 && cursor.NextSequence < work.Sources[index].NextSequence {
-		return errors.New("source cursor regression")
+	source, ok := findToken(assignment.Assignment, cursor.Source)
+	if !ok {
+		return errors.New("source cursor has no installed assignment token")
 	}
+	expected, err := expectedSourceOutboxes(cursor, source, assignment)
+	if err != nil {
+		return err
+	}
+	index := sourceIndex(work.Sources, cursor.Source)
+	exactRetry := index >= 0 && cursor == work.Sources[index]
+	if len(outboxes) != len(expected) {
+		if exactRetry {
+			return model.ErrIdentityReuse
+		}
+		return errors.New("source outboxes are not the complete topology-derived set")
+	}
+	if !outboxesCanonical(outboxes) {
+		if exactRetry {
+			return model.ErrIdentityReuse
+		}
+		return errors.New("source outboxes are not in canonical identity order")
+	}
+	seen := make(map[model.DeliveryID]struct{}, len(outboxes))
 	for _, outbox := range outboxes {
+		if _, duplicate := seen[outbox.ID]; duplicate {
+			return errors.New("duplicate source outbox")
+		}
+		seen[outbox.ID] = struct{}{}
+		want, exists := expected[outbox.ID]
+		if !exists || outbox.Completed || !equalOutboxDefinition(want, outbox) {
+			if exactRetry {
+				return model.ErrIdentityReuse
+			}
+			return errors.New("source outbox does not match immutable source route")
+		}
 		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
 			return err
 		}
+	}
+	if index >= 0 {
+		prior := work.Sources[index]
+		if cursor == prior {
+			for _, outbox := range outboxes {
+				stored := outboxIndex(work.Outboxes, outbox.ID)
+				if stored < 0 || !equalOutboxDefinition(work.Outboxes[stored], outbox) {
+					return model.ErrIdentityReuse
+				}
+			}
+			return nil
+		}
+		if cursor.NextSequence <= prior.NextSequence || cursor.NextSequence != prior.NextSequence+1 || cursor.Watermark < prior.Watermark || cursor.RaftIndex < prior.RaftIndex {
+			return errors.New("source cursor regression or sequence gap")
+		}
+	} else if cursor.NextSequence > 2 || cursor.Watermark != 0 || cursor.RaftIndex != 0 {
+		return errors.New("initial source cursor skips durable sequence or checkpoint state")
+	}
+	for _, outbox := range outboxes {
 		if outboxIndex(work.Outboxes, outbox.ID) >= 0 {
-			return errors.New("duplicate source outbox")
+			return model.ErrIdentityReuse
 		}
 	}
 	if index < 0 {
@@ -784,6 +1009,13 @@ func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fen
 	if record.Reservation != want {
 		return errors.New("delivery reservation does not match topology worst case")
 	}
+	derived, exists, err := deriveDeliveryDefinition(assignment, fence, record.ID)
+	if err != nil {
+		return err
+	}
+	if !exists || !equalDeliveryDefinition(derived, record) {
+		return errors.New("delivery definition does not match deterministic source path")
+	}
 	return nil
 }
 
@@ -830,8 +1062,179 @@ func validateRoute(topology model.ValidatedTopology, id model.DeliveryID, tuple 
 	return errors.New("delivery destination partition does not match deterministic route")
 }
 
+func deliveryDefinitionDigest(record DeliveryRecord) ([32]byte, error) {
+	message := protocol.TupleDelivery{DeliveryID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: record.ID.Tuple.JobID, Revision: record.AssignmentRevision, Digest: record.AssignmentDigest}, Coordinator: record.CoordinatorEpoch}
+	encoded, err := protocol.MarshalTupleDelivery(message)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	var reservation [8]byte
+	binary.BigEndian.PutUint64(reservation[:], record.Reservation)
+	return sha256.Sum256(append(encoded, reservation[:]...)), nil
+}
+
+func expectedProcessedOutboxes(delivery DeliveryRecord, assignment InstalledAssignment) (map[model.DeliveryID]OutboxRecord, error) {
+	result := make(map[model.DeliveryID]OutboxRecord)
+	for outputIndex, tuple := range delivery.Outputs {
+		for _, edge := range assignment.Topology.Spec().Edges {
+			if edge.SourceStageID != delivery.Destination.Task.StageID {
+				continue
+			}
+			if outputIndex > math.MaxUint16 {
+				return nil, errors.New("output ordinal exceeds v1 identity")
+			}
+			child := model.DeriveChildTupleID(delivery.ID.Tuple, delivery.Destination.Task, edge.EdgeID, uint16(outputIndex))
+			partitions, err := model.Route(assignment.Topology, edge, child, tuple)
+			if err != nil {
+				return nil, err
+			}
+			for _, partition := range partitions {
+				task := model.TaskID{JobID: delivery.ID.Tuple.JobID, StageID: edge.DestinationStageID, Partition: partition}
+				destination, ok := findToken(assignment.Assignment, task)
+				if !ok {
+					return nil, errors.New("derived outbox destination has no assignment token")
+				}
+				id := model.DeliveryID{Tuple: child, EdgeID: edge.EdgeID, DestinationTask: task}
+				if _, duplicate := result[id]; duplicate {
+					return nil, errors.New("topology derived duplicate outbox identity")
+				}
+				result[id] = OutboxRecord{ID: id, Tuple: cloneTuple(tuple), Producer: delivery.Destination, Destination: destination, AssignmentRevision: delivery.AssignmentRevision, AssignmentDigest: delivery.AssignmentDigest, CoordinatorEpoch: delivery.CoordinatorEpoch}
+			}
+		}
+	}
+	if uint64(len(result)) > model.LimitsV1().MaxDerivedDeliveries {
+		return nil, errors.New("topology-derived outboxes exceed v1 bound")
+	}
+	return result, nil
+}
+
+func expectedSourceOutboxes(cursor SourceCursor, source model.AssignmentToken, assignment InstalledAssignment) (map[model.DeliveryID]OutboxRecord, error) {
+	result := make(map[model.DeliveryID]OutboxRecord)
+	if cursor.NextSequence <= 1 {
+		return result, nil
+	}
+	sequence := cursor.NextSequence - 1
+	tuple, exists, err := model.SourceTuple(assignment.Topology, cursor.Source, sequence)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, errors.New("source cursor advances beyond immutable EOF")
+	}
+	tupleID := model.DeriveSourceTupleID(cursor.Source.JobID, cursor.Source, sequence)
+	for _, edge := range assignment.Topology.Spec().Edges {
+		if edge.SourceStageID != cursor.Source.StageID {
+			continue
+		}
+		partitions, err := model.Route(assignment.Topology, edge, tupleID, tuple)
+		if err != nil {
+			return nil, err
+		}
+		for _, partition := range partitions {
+			task := model.TaskID{JobID: cursor.Source.JobID, StageID: edge.DestinationStageID, Partition: partition}
+			destination, ok := findToken(assignment.Assignment, task)
+			if !ok {
+				return nil, errors.New("source outbox destination has no assignment token")
+			}
+			id := model.DeliveryID{Tuple: tupleID, EdgeID: edge.EdgeID, DestinationTask: task}
+			if _, duplicate := result[id]; duplicate {
+				return nil, errors.New("source route derived duplicate outbox")
+			}
+			result[id] = OutboxRecord{ID: id, Tuple: cloneTuple(tuple), Producer: source, Destination: destination, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, CoordinatorEpoch: assignment.CoordinatorEpoch}
+		}
+	}
+	return result, nil
+}
+
+func deriveDeliveryDefinition(assignment InstalledAssignment, fence model.CoordinatorEpoch, target model.DeliveryID) (DeliveryRecord, bool, error) {
+	if err := target.Validate(); err != nil {
+		return DeliveryRecord{}, false, nil
+	}
+	if assignment.CoordinatorEpoch != fence {
+		return DeliveryRecord{}, false, nil
+	}
+	source, ok := findToken(assignment.Assignment, target.Tuple.SourceTask)
+	if !ok {
+		return DeliveryRecord{}, false, nil
+	}
+	eof, err := model.SourceEOF(assignment.Topology, target.Tuple.SourceTask)
+	if err != nil || target.Tuple.SourceSequence == 0 || target.Tuple.SourceSequence > eof {
+		return DeliveryRecord{}, false, nil
+	}
+	initial, err := expectedSourceOutboxes(SourceCursor{Source: target.Tuple.SourceTask, NextSequence: target.Tuple.SourceSequence + 1, EOF: eof}, source, assignment)
+	if err != nil {
+		return DeliveryRecord{}, false, err
+	}
+	queue := make([]DeliveryRecord, 0, len(initial))
+	for _, outbox := range initial {
+		delivery, err := deliveryFromOutbox(outbox, assignment.Topology)
+		if err != nil {
+			return DeliveryRecord{}, false, err
+		}
+		queue = append(queue, delivery)
+	}
+	seen := make(map[model.DeliveryID]struct{})
+	for len(queue) != 0 {
+		delivery := queue[0]
+		queue = queue[1:]
+		if _, duplicate := seen[delivery.ID]; duplicate {
+			continue
+		}
+		seen[delivery.ID] = struct{}{}
+		if delivery.ID == target {
+			return delivery, true, nil
+		}
+		if uint64(len(seen)) >= model.LimitsV1().MaxDerivedDeliveries {
+			break
+		}
+		stage, ok := findStage(assignment.Topology, delivery.Destination.Task.StageID)
+		if !ok {
+			return DeliveryRecord{}, false, errors.New("derived delivery stage is absent")
+		}
+		outputs, err := model.ExecuteOperator(stage.Operator, delivery.Tuple)
+		if err != nil {
+			return DeliveryRecord{}, false, err
+		}
+		delivery.State, delivery.Outputs = Processed, outputs
+		next, err := expectedProcessedOutboxes(delivery, assignment)
+		if err != nil {
+			return DeliveryRecord{}, false, err
+		}
+		for _, outbox := range next {
+			child, err := deliveryFromOutbox(outbox, assignment.Topology)
+			if err != nil {
+				return DeliveryRecord{}, false, err
+			}
+			queue = append(queue, child)
+		}
+	}
+	return DeliveryRecord{}, false, nil
+}
+
+func deliveryFromOutbox(outbox OutboxRecord, topology model.ValidatedTopology) (DeliveryRecord, error) {
+	reservation, err := topology.WorstCaseCustodyBytes(outbox.Destination.Task)
+	if err != nil {
+		return DeliveryRecord{}, err
+	}
+	record := DeliveryRecord{ID: outbox.ID, Tuple: cloneTuple(outbox.Tuple), Producer: outbox.Producer, Destination: outbox.Destination, AssignmentRevision: outbox.AssignmentRevision, AssignmentDigest: outbox.AssignmentDigest, CoordinatorEpoch: outbox.CoordinatorEpoch, State: Received, Reservation: reservation}
+	record.definitionDigest, err = deliveryDefinitionDigest(record)
+	return record, err
+}
+
+func findStage(topology model.ValidatedTopology, id uint16) (model.StageSpec, bool) {
+	for _, stage := range topology.Spec().Stages {
+		if stage.StageID == id {
+			return stage, true
+		}
+	}
+	return model.StageSpec{}, false
+}
+
 func validateRepair(repair ResultRepairRecord) error {
 	d := repair.Instruction
+	if len(d.Checkpoints) > int(model.WorkerControlMaxCheckpointsV1) {
+		return errors.New("repair checkpoints exceed bound")
+	}
 	if d.RepairID == ([16]byte{}) || d.RepairID != model.DeriveRepairID(d) || repair.InstructionDigest == ([32]byte{}) || repair.InstructionDigest != model.RepairInstructionDigest(d) {
 		return errors.New("repair identity or digest mismatch")
 	}
@@ -859,6 +1262,20 @@ func validateRepair(repair ResultRepairRecord) error {
 	}
 	if d.ExpectedRecordCount == 0 && d.ExpectedContentDigest != model.EmptyResultInventoryDigest(d.InventoryQueryDigest) {
 		return errors.New("repair empty content digest mismatch")
+	}
+	if d.ExpectedRecordCount > model.ResultArtifactMaxRecordCountV1 || d.ExpectedTotalBytes > model.LimitsV1().MaxResultRecordsBytesPerJob {
+		return errors.New("repair expected inventory exceeds v1 bounds")
+	}
+	if d.ExpectedRecordCount != 0 {
+		if d.ExpectedContentDigest == ([32]byte{}) {
+			return errors.New("repair nonempty inventory has zero digest")
+		}
+		if d.ExpectedRecordCount > math.MaxUint64/model.ResultArtifactMinRecordBytesV1 || d.ExpectedTotalBytes < d.ExpectedRecordCount*model.ResultArtifactMinRecordBytesV1 {
+			return errors.New("repair inventory is smaller than its declared record count")
+		}
+		if d.ExpectedRecordCount <= math.MaxUint64/model.ResultArtifactMaxRecordBytesV1 && d.ExpectedTotalBytes > d.ExpectedRecordCount*model.ResultArtifactMaxRecordBytesV1 {
+			return errors.New("repair inventory is larger than its declared record count")
+		}
 	}
 	if repair.Role < RepairSource || repair.Role > RepairDestination || repair.State < RepairPending || repair.State > RepairFailed {
 		return errors.New("invalid repair state")
@@ -917,12 +1334,36 @@ func (store *Store) Receive(record DeliveryRecord) (DeliveryState, error) {
 	if index := deliveryIndex(store.work.Deliveries, record.ID); index >= 0 {
 		prior := store.work.Deliveries[index]
 		if prior.State == Compacted {
+			digest, err := deliveryDefinitionDigest(record)
+			if err != nil {
+				return 0, err
+			}
+			if digest != prior.definitionDigest {
+				return 0, model.ErrIdentityReuse
+			}
 			return Compacted, nil
 		}
 		if !equalDeliveryDefinition(prior, record) {
 			return 0, model.ErrIdentityReuse
 		}
 		return prior.State, nil
+	}
+	if cursor := sourceIndex(store.work.Sources, record.ID.Tuple.SourceTask); cursor >= 0 {
+		checkpoint := store.work.Sources[cursor]
+		if checkpoint.EOF != 0 && checkpoint.Watermark == checkpoint.EOF && record.ID.Tuple.SourceSequence <= checkpoint.Watermark {
+			assignment, ok := findAssignment(&store.work, record.ID.Tuple.JobID)
+			if !ok {
+				return 0, model.ErrIdentityReuse
+			}
+			expected, ok, err := deriveDeliveryDefinition(assignment, store.work.Fence, record.ID)
+			if err != nil {
+				return 0, err
+			}
+			if !ok || !equalDeliveryDefinition(expected, record) {
+				return 0, model.ErrIdentityReuse
+			}
+			return Compacted, nil
+		}
 	}
 	payload, err := encodeDeliveryRecord(record, nil)
 	if err != nil {
@@ -933,7 +1374,7 @@ func (store *Store) Receive(record DeliveryRecord) (DeliveryState, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err = store.commitWorkLocked(tx, prospective, record.Reservation); err != nil {
+	if err = store.commitWorkLocked(tx, prospective); err != nil {
 		return 0, err
 	}
 	return Received, nil
@@ -983,7 +1424,10 @@ func (store *Store) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, ou
 	if err != nil {
 		return err
 	}
-	return store.commitWorkLocked(tx, prospective, 0)
+	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
+		return err
+	}
+	return store.commitWorkLocked(tx, prospective)
 }
 
 // MarkCompleted durably closes a processed delivery.
@@ -1027,7 +1471,7 @@ func (store *Store) UpsertResult(record model.ResultRecord, provenance model.Res
 	tx := Transaction{Records: []Record{{Type: recordResult, Payload: payload}}}
 	prospective, err := store.reduceWorkLocked(tx)
 	if err == nil {
-		err = store.commitWorkLocked(tx, prospective, 0)
+		err = store.commitWorkLocked(tx, prospective)
 	}
 	store.mu.Unlock()
 	return err
@@ -1056,7 +1500,7 @@ func (store *Store) PersistEvent(event model.WorkerEvent) error {
 	tx := Transaction{Records: []Record{{Type: recordEvent, Payload: payload}}}
 	prospective, err := store.reduceWorkLocked(tx)
 	if err == nil {
-		err = store.commitWorkLocked(tx, prospective, 0)
+		err = store.commitWorkLocked(tx, prospective)
 	}
 	store.mu.Unlock()
 	return err
@@ -1120,7 +1564,7 @@ func (store *Store) UpsertRepair(repair ResultRepairRecord) error {
 	tx := Transaction{Records: []Record{{Type: recordRepair, Payload: payload}}}
 	prospective, err := store.reduceWorkLocked(tx)
 	if err == nil {
-		err = store.commitWorkLocked(tx, prospective, 0)
+		err = store.commitWorkLocked(tx, prospective)
 	}
 	store.mu.Unlock()
 	return err
@@ -1157,7 +1601,7 @@ func (store *Store) RecoverWork() (RecoveredWork, error) {
 	return store.work.Clone(), nil
 }
 
-func (store *Store) applyWorkTransaction(tx Transaction, reservation uint64) error {
+func (store *Store) applyWorkTransaction(tx Transaction, _ uint64) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.closed {
@@ -1170,10 +1614,10 @@ func (store *Store) applyWorkTransaction(tx Transaction, reservation uint64) err
 	if err != nil {
 		return err
 	}
-	return store.commitWorkLocked(tx, prospective, reservation)
+	return store.commitWorkLocked(tx, prospective)
 }
 func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
-	reducer := &workReducer{current: store.work.Clone()}
+	reducer := &workReducer{current: store.work}
 	if err := reducer.BeginTransaction(uint32(len(tx.Records))); err != nil {
 		return RecoveredWork{}, err
 	}
@@ -1187,19 +1631,15 @@ func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
 	}
 	return reducer.current, nil
 }
-func (store *Store) commitWorkLocked(tx Transaction, prospective RecoveredWork, reservation uint64) error {
+func (store *Store) commitWorkLocked(tx Transaction, prospective RecoveredWork) error {
 	encodedBytes, err := transactionEncodedSize(tx)
 	if err != nil {
 		return err
 	}
-	reserved, err := reservedBytes(store.work)
+	reserved, err := reservedBytes(prospective)
 	if err != nil {
 		return err
 	}
-	if reserved > math.MaxUint64-reservation {
-		return ErrCapacity
-	}
-	reserved += reservation
 	if store.state.WALBytes > store.options.MaxBytes || encodedBytes > store.options.MaxBytes-store.state.WALBytes || reserved > store.options.MaxBytes-store.state.WALBytes-encodedBytes {
 		return ErrCapacity
 	}
@@ -1233,15 +1673,38 @@ func reservedBytes(work RecoveredWork) (uint64, error) {
 }
 
 func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch model.WorkerEpoch) error {
+	for _, cursor := range work.Sources {
+		assignment, ok := findAssignment(&work, cursor.Source.JobID)
+		token, tokenOK := findToken(assignment.Assignment, cursor.Source)
+		eof, eofErr := model.SourceEOF(assignment.Topology, cursor.Source)
+		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch || eofErr != nil || cursor.EOF != eof {
+			return errors.New("recovered source cursor is not the current local assigned source")
+		}
+	}
 	for _, delivery := range work.Deliveries {
 		if delivery.Destination.WorkerID != nodeID || delivery.Destination.WorkerEpoch != workerEpoch {
 			return errors.New("recovered delivery targets another worker incarnation")
 		}
 	}
-	for _, result := range work.Results {
-		if !provenanceTargets(result.Provenance, nodeID, workerEpoch) {
-			return errors.New("recovered result provenance targets another worker incarnation")
+	for _, outbox := range work.Outboxes {
+		assignment, ok := findAssignment(&work, outbox.ID.Tuple.JobID)
+		if !ok || outbox.Producer.WorkerID != nodeID || outbox.Producer.WorkerEpoch != workerEpoch {
+			return errors.New("recovered outbox producer is not this worker incarnation")
 		}
+		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
+			return fmt.Errorf("recovered outbox cross-reference: %w", err)
+		}
+	}
+	var resultTargetErr error
+	visitResults(work, func(result StoredResult) bool {
+		if !provenanceTargets(result.Provenance, nodeID, workerEpoch) {
+			resultTargetErr = errors.New("recovered result provenance targets another worker incarnation")
+			return false
+		}
+		return true
+	})
+	if resultTargetErr != nil {
+		return resultTargetErr
 	}
 	for _, event := range work.PendingEvents {
 		if event.WorkerID != nodeID || event.WorkerEpoch != workerEpoch {
@@ -1349,7 +1812,7 @@ func encodeDeliveryRecord(record DeliveryRecord, outboxes []OutboxRecord) ([]byt
 	w.u8(uint8(record.State))
 	w.u64(record.Reservation)
 	w.blob(encoded)
-	if len(record.Outputs) > math.MaxUint16 || len(outboxes) > math.MaxUint16 {
+	if uint64(len(record.Outputs)) > model.LimitsV1().MaxOperatorOutputs || uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
 		return nil, errors.New("delivery collections exceed bounds")
 	}
 	w.u16(uint16(len(record.Outputs)))
@@ -1396,7 +1859,10 @@ func decodeDeliveryRecord(payload []byte) (DeliveryRecord, []OutboxRecord, error
 	if err != nil {
 		return DeliveryRecord{}, nil, err
 	}
-	record.Outputs = make([]model.Tuple, count)
+	if uint64(count) > model.LimitsV1().MaxOperatorOutputs || r.remaining() < int(count)*4+2 {
+		return DeliveryRecord{}, nil, errors.New("delivery output collection exceeds bounds or remaining bytes")
+	}
+	record.Outputs = make([]model.Tuple, int(count))
 	for i := range record.Outputs {
 		b, e := r.blob(model.LimitsV1().MaxTuplePayloadBytes)
 		if e != nil {
@@ -1411,7 +1877,11 @@ func decodeDeliveryRecord(payload []byte) (DeliveryRecord, []OutboxRecord, error
 	if err != nil {
 		return DeliveryRecord{}, nil, err
 	}
-	outboxes := make([]OutboxRecord, outCount)
+	if uint64(outCount) > model.LimitsV1().MaxDerivedDeliveries || r.remaining() < int(outCount)*4 {
+		return DeliveryRecord{}, nil, errors.New("delivery outbox collection exceeds bounds or remaining bytes")
+	}
+	outboxes := make([]OutboxRecord, int(outCount))
+	record.OutboxIDs = make([]model.DeliveryID, 0, int(outCount))
 	for i := range outboxes {
 		b, e := r.blob(MaxRecordPayloadBytes)
 		if e != nil {
@@ -1568,7 +2038,7 @@ func decodeStoredResult(payload []byte) (StoredResult, error) {
 	if p.CoordinatorEpoch, err = r.epoch(); err != nil || !r.done() {
 		return StoredResult{}, errors.New("invalid result record")
 	}
-	return StoredResult{Record: record, Provenance: p}, p.Validate(record)
+	return StoredResult{Record: record, Provenance: p, canonical: logical}, p.Validate(record)
 }
 
 func encodeEvent(event model.WorkerEvent) ([]byte, error) {
@@ -1719,7 +2189,7 @@ func encodeSource(cursor SourceCursor, outboxes []OutboxRecord) ([]byte, error) 
 	if err := cursor.Source.Validate(); err != nil {
 		return nil, err
 	}
-	if len(outboxes) > math.MaxUint16 {
+	if uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
 		return nil, errors.New("too many source outboxes")
 	}
 	w := newRecordWriter()
@@ -1765,7 +2235,10 @@ func decodeSource(payload []byte) (SourceCursor, []OutboxRecord, error) {
 	if err != nil {
 		return cursor, nil, err
 	}
-	outboxes := make([]OutboxRecord, count)
+	if uint64(count) > model.LimitsV1().MaxDerivedDeliveries || r.remaining() < int(count)*4 {
+		return cursor, nil, errors.New("source outbox collection exceeds bounds or remaining bytes")
+	}
+	outboxes := make([]OutboxRecord, int(count))
 	for i := range outboxes {
 		b, e := r.blob(MaxRecordPayloadBytes)
 		if e != nil {
@@ -2180,7 +2653,10 @@ func (r *recordReader) repairDefinition() (model.RepairResultPartitionDefinition
 	if count > model.WorkerControlMaxCheckpointsV1 {
 		return v, errors.New("repair checkpoints exceed bound")
 	}
-	v.Checkpoints = make([]model.SourceCheckpoint, count)
+	if r.remaining() < int(count)*28+112 {
+		return v, errors.New("repair checkpoints exceed remaining bytes")
+	}
+	v.Checkpoints = make([]model.SourceCheckpoint, int(count))
 	for i := range v.Checkpoints {
 		if v.Checkpoints[i].Source, e = r.task(); e != nil {
 			return v, e
@@ -2297,13 +2773,155 @@ func sourceIndex(v []SourceCursor, id model.TaskID) int {
 	}
 	return -1
 }
-func resultIndex(v []StoredResult, id model.TupleID) int {
-	for i := range v {
-		if v[i].Record.TupleID == id {
-			return i
+func ensureWorkIndexes(work *RecoveredWork) error {
+	if work.indexes != nil {
+		return nil
+	}
+	indexes := &workIndexes{resultBytesByJob: make(map[model.JobID]uint64)}
+	for index := range work.Results {
+		result := &work.Results[index]
+		if result.canonical == nil {
+			encoded, err := model.MarshalResultRecord(result.Record)
+			if err != nil {
+				return err
+			}
+			result.canonical = encoded
+		}
+		key := resultKey{SinkTask: result.Record.SinkTask, TupleID: result.Record.TupleID}
+		if findResultNode(indexes.results, key) != nil {
+			return model.ErrIdentityReuse
+		}
+		indexes.results = insertResultNode(indexes.results, &resultNode{key: key, value: *result, priority: resultPriority(key)})
+		prior := indexes.resultBytesByJob[result.Record.TupleID.JobID]
+		if prior > math.MaxUint64-uint64(len(result.canonical)) {
+			return ErrCapacity
+		}
+		indexes.resultBytesByJob[result.Record.TupleID.JobID] = prior + uint64(len(result.canonical))
+	}
+	work.Results = nil
+	work.indexes = indexes
+	return nil
+}
+
+func cloneWorkIndexes(indexes *workIndexes) *workIndexes {
+	if indexes == nil {
+		return nil
+	}
+	result := &workIndexes{results: indexes.results, resultBytesByJob: make(map[model.JobID]uint64, len(indexes.resultBytesByJob))}
+	for job, total := range indexes.resultBytesByJob {
+		result.resultBytesByJob[job] = total
+	}
+	return result
+}
+
+func compareResultKey(a, b resultKey) int {
+	if a.SinkTask != b.SinkTask {
+		if taskLess(a.SinkTask, b.SinkTask) {
+			return -1
+		}
+		return 1
+	}
+	if a.TupleID == b.TupleID {
+		return 0
+	}
+	if tupleLess(a.TupleID, b.TupleID) {
+		return -1
+	}
+	return 1
+}
+
+func findResultNode(root *resultNode, key resultKey) *resultNode {
+	for root != nil {
+		switch comparison := compareResultKey(key, root.key); {
+		case comparison < 0:
+			root = root.left
+		case comparison > 0:
+			root = root.right
+		default:
+			return root
 		}
 	}
-	return -1
+	return nil
+}
+
+func insertResultNode(root, inserted *resultNode) *resultNode {
+	if root == nil {
+		return inserted
+	}
+	copyRoot := *root
+	if compareResultKey(inserted.key, root.key) < 0 {
+		copyRoot.left = insertResultNode(root.left, inserted)
+		if copyRoot.left.priority < copyRoot.priority {
+			left := *copyRoot.left
+			copyRoot.left = left.right
+			left.right = &copyRoot
+			return &left
+		}
+	} else {
+		copyRoot.right = insertResultNode(root.right, inserted)
+		if copyRoot.right.priority < copyRoot.priority {
+			right := *copyRoot.right
+			copyRoot.right = right.left
+			right.left = &copyRoot
+			return &right
+		}
+	}
+	return &copyRoot
+}
+
+func resultPriority(key resultKey) uint64 {
+	var encoded [100]byte
+	offset := copy(encoded[:], key.SinkTask.JobID[:])
+	binary.BigEndian.PutUint16(encoded[offset:], key.SinkTask.StageID)
+	offset += 2
+	binary.BigEndian.PutUint16(encoded[offset:], key.SinkTask.Partition)
+	offset += 2
+	offset += copy(encoded[offset:], key.TupleID.JobID[:])
+	offset += copy(encoded[offset:], key.TupleID.SourceTask.JobID[:])
+	binary.BigEndian.PutUint16(encoded[offset:], key.TupleID.SourceTask.StageID)
+	offset += 2
+	binary.BigEndian.PutUint16(encoded[offset:], key.TupleID.SourceTask.Partition)
+	offset += 2
+	binary.BigEndian.PutUint64(encoded[offset:], key.TupleID.SourceSequence)
+	offset += 8
+	copy(encoded[offset:], key.TupleID.PathDigest[:])
+	digest := sha256.Sum256(encoded[:])
+	return binary.BigEndian.Uint64(digest[:8])
+}
+
+func appendOwnedResults(indexes *workIndexes, destination *[]StoredResult) {
+	if indexes == nil {
+		return
+	}
+	var visit func(*resultNode)
+	visit = func(node *resultNode) {
+		if node == nil {
+			return
+		}
+		visit(node.left)
+		owned := node.value
+		owned.Record.Value = append([]byte(nil), owned.Record.Value...)
+		owned.canonical = nil
+		*destination = append(*destination, owned)
+		visit(node.right)
+	}
+	visit(indexes.results)
+}
+
+func visitResults(work RecoveredWork, visit func(StoredResult) bool) bool {
+	if work.indexes == nil {
+		for _, result := range work.Results {
+			if !visit(result) {
+				return false
+			}
+		}
+		return true
+	}
+	var walk func(*resultNode) bool
+	walk = func(node *resultNode) bool {
+		return node == nil || walk(node.left) && visit(node.value) && walk(node.right)
+	}
+	return walk(work.indexes.results)
 }
 func repairIndex(v []ResultRepairRecord, id [16]byte) int {
 	for i := range v {
@@ -2328,6 +2946,14 @@ func findReplica(set model.AssignmentSet, task model.TaskID) (model.ResultReplic
 		}
 	}
 	return model.ResultReplicaSet{}, false
+}
+func findToken(set model.AssignmentSet, task model.TaskID) (model.AssignmentToken, bool) {
+	for _, token := range set.Tasks {
+		if token.Task == task {
+			return token, true
+		}
+	}
+	return model.AssignmentToken{}, false
 }
 func equalInstalledAssignment(a, b InstalledAssignment) bool {
 	return a.Assignment.JobID == b.Assignment.JobID && a.Assignment.Revision == b.Assignment.Revision && a.Assignment.Digest == b.Assignment.Digest && a.JobControlRevision == b.JobControlRevision && a.SchedulingState == b.SchedulingState && a.CoordinatorEpoch == b.CoordinatorEpoch && bytes.Equal(a.SpecificationBytes, b.SpecificationBytes) && equalTokens(a.Assignment.Tasks, b.Assignment.Tasks) && equalReplicas(a.Assignment.ResultReplicas, b.Assignment.ResultReplicas)
@@ -2355,6 +2981,13 @@ func equalReplicas(a, b []model.ResultReplicaSet) bool {
 	return true
 }
 func equalDeliveryDefinition(a, b DeliveryRecord) bool {
+	if a.definitionDigest != ([32]byte{}) {
+		digest := b.definitionDigest
+		if digest == ([32]byte{}) {
+			digest, _ = deliveryDefinitionDigest(b)
+		}
+		return digest == a.definitionDigest
+	}
 	if a.ID != b.ID || a.Producer != b.Producer || a.Destination != b.Destination || a.AssignmentRevision != b.AssignmentRevision || a.AssignmentDigest != b.AssignmentDigest || a.CoordinatorEpoch != b.CoordinatorEpoch || a.Reservation != b.Reservation {
 		return false
 	}
@@ -2384,8 +3017,14 @@ func equalOutboxDefinition(a, b OutboxRecord) bool {
 	return bytes.Equal(aa, bb)
 }
 func equalStoredResult(a, b StoredResult) bool {
-	aa, _ := model.MarshalResultRecord(a.Record)
-	bb, _ := model.MarshalResultRecord(b.Record)
+	aa := a.canonical
+	if aa == nil {
+		aa, _ = model.MarshalResultRecord(a.Record)
+	}
+	bb := b.canonical
+	if bb == nil {
+		bb, _ = model.MarshalResultRecord(b.Record)
+	}
 	return bytes.Equal(aa, bb) && a.Provenance == b.Provenance
 }
 func equalRepairInstruction(a, b ResultRepairRecord) bool {
@@ -2409,7 +3048,35 @@ func taskLess(a, b model.TaskID) bool {
 	}
 	return a.Partition < b.Partition
 }
-func tupleKey(v model.TupleID) []byte { w := newRecordWriter(); w.tupleID(v); return w.data }
+func tupleLess(a, b model.TupleID) bool {
+	if c := bytes.Compare(a.JobID[:], b.JobID[:]); c != 0 {
+		return c < 0
+	}
+	if a.SourceTask != b.SourceTask {
+		return taskLess(a.SourceTask, b.SourceTask)
+	}
+	if a.SourceSequence != b.SourceSequence {
+		return a.SourceSequence < b.SourceSequence
+	}
+	return bytes.Compare(a.PathDigest[:], b.PathDigest[:]) < 0
+}
+func deliveryIDLess(a, b model.DeliveryID) bool {
+	if a.Tuple != b.Tuple {
+		return tupleLess(a.Tuple, b.Tuple)
+	}
+	if a.EdgeID != b.EdgeID {
+		return a.EdgeID < b.EdgeID
+	}
+	return taskLess(a.DestinationTask, b.DestinationTask)
+}
+func outboxesCanonical(outboxes []OutboxRecord) bool {
+	for index := 1; index < len(outboxes); index++ {
+		if !deliveryIDLess(outboxes[index-1].ID, outboxes[index].ID) {
+			return false
+		}
+	}
+	return true
+}
 func boolByte(v bool) uint8 {
 	if v {
 		return 1
