@@ -331,7 +331,7 @@ func TestControlQueuedCommandRevalidatesClosedSessionAndMembershipUnderMutationL
 		change func(*controlFixture, *ControlSession)
 	}{
 		{name: "session closed", change: func(_ *controlFixture, session *ControlSession) { _ = session.Close() }},
-		{name: "membership incarnation changed", change: func(fixture *controlFixture, _ *ControlSession) { fixture.members.view.Members[1].Incarnation++ }},
+		{name: "membership incarnation changed", change: func(fixture *controlFixture, _ *ControlSession) { fixture.members.incrementIncarnation(1) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newControlFixture(t)
@@ -771,12 +771,20 @@ func (transfer *controlTestTransfer) OpenResultFetch(context.Context, TransferPe
 }
 
 type controlTestMembership struct {
+	mu           sync.RWMutex
 	view         membership.View
 	authorizeErr error
 }
 
 func (members *controlTestMembership) View() membership.View {
+	members.mu.RLock()
+	defer members.mu.RUnlock()
 	return membership.View{Revision: members.view.Revision, Members: append([]swim.Member(nil), members.view.Members...)}
+}
+func (members *controlTestMembership) incrementIncarnation(index int) {
+	members.mu.Lock()
+	defer members.mu.Unlock()
+	members.view.Members[index].Incarnation++
 }
 func (members *controlTestMembership) AuthorizeTCP(uint16, net.Addr) error {
 	return members.authorizeErr
