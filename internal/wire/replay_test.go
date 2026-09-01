@@ -154,3 +154,37 @@ func TestReplayGuardPreflightRejectsTimestampWithoutRecording(t *testing.T) {
 		t.Fatalf("stale preflight recorded state: seen=%d invalid=%d", len(guard.seen), len(guard.invalid))
 	}
 }
+
+func TestReplayGuardStrictInvalidCapacityRetainsLiveIDsAndReclaimsExpiry(t *testing.T) {
+	now := time.Unix(1400, 0)
+	manual := clock.NewManual(now)
+	guard := NewReplayGuard(manual, time.Minute, 30*time.Second, 1)
+	first := RequestID{1}
+	second := RequestID{2}
+	if err := guard.PreflightInvalid(4, first, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.CommitInvalid(4, first, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.PreflightInvalid(4, second, now); !errors.Is(err, ErrReplayCacheFull) {
+		t.Fatalf("second invalid preflight = %v, want ErrReplayCacheFull", err)
+	}
+	if err := guard.CommitInvalid(4, second, now); !errors.Is(err, ErrReplayCacheFull) {
+		t.Fatalf("second invalid commit = %v, want ErrReplayCacheFull", err)
+	}
+	if err := guard.Preflight(4, first, now); !errors.Is(err, ErrReplay) {
+		t.Fatalf("first live invalid ID = %v, want ErrReplay", err)
+	}
+	if err := guard.Commit(4, RequestID{3}, now); err != nil {
+		t.Fatalf("strict invalid entry consumed accepted capacity: %v", err)
+	}
+
+	manual.Advance(time.Minute)
+	if err := guard.PreflightInvalid(4, second, manual.Now()); err != nil {
+		t.Fatalf("invalid preflight after expiry = %v", err)
+	}
+	if err := guard.CommitInvalid(4, second, manual.Now()); err != nil {
+		t.Fatalf("invalid commit after expiry = %v", err)
+	}
+}

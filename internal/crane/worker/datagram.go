@@ -49,6 +49,7 @@ type tuplePeerAuthorizer interface {
 }
 
 type tupleReplay struct {
+	mu          sync.Mutex
 	clock       clock.Clock
 	window      time.Duration
 	futureSkew  time.Duration
@@ -66,6 +67,8 @@ func (replay *tupleReplay) preflight(sender uint16, request wire.RequestID, time
 	if replay == nil || replay.global == nil {
 		return wire.ErrReplayConfiguration
 	}
+	replay.mu.Lock()
+	defer replay.mu.Unlock()
 	if err := replay.global.Preflight(sender, request, timestamp); err != nil {
 		return err
 	}
@@ -82,6 +85,8 @@ func (replay *tupleReplay) commit(sender uint16, request wire.RequestID, timesta
 	if replay == nil || replay.global == nil {
 		return wire.ErrReplayConfiguration
 	}
+	replay.mu.Lock()
+	defer replay.mu.Unlock()
 	if err := replay.global.Commit(sender, request, timestamp); err != nil {
 		return err
 	}
@@ -93,14 +98,50 @@ func (replay *tupleReplay) commit(sender uint16, request wire.RequestID, timesta
 	return guard.Commit(sender, request, timestamp)
 }
 
-func (replay *tupleReplay) recordInvalid(sender uint16, request wire.RequestID, timestamp time.Time) {
+func (replay *tupleReplay) preflightInvalid(sender uint16, request wire.RequestID, timestamp time.Time) error {
 	if replay == nil || replay.global == nil {
-		return
+		return wire.ErrReplayConfiguration
 	}
-	replay.global.RecordInvalid(sender, request, timestamp)
+	replay.mu.Lock()
+	defer replay.mu.Unlock()
+	return replay.preflightInvalidLocked(sender, request, timestamp)
+}
+
+func (replay *tupleReplay) preflightInvalidLocked(sender uint16, request wire.RequestID, timestamp time.Time) error {
+	if err := replay.global.PreflightInvalid(sender, request, timestamp); err != nil {
+		return err
+	}
 	if guard := replay.perSender[sender]; guard != nil {
-		guard.RecordInvalid(sender, request, timestamp)
+		return guard.PreflightInvalid(sender, request, timestamp)
 	}
+	if len(replay.perSender) >= replay.globalLimit {
+		return wire.ErrReplayCacheFull
+	}
+	return nil
+}
+
+func (replay *tupleReplay) commitInvalid(sender uint16, request wire.RequestID, timestamp time.Time) error {
+	if replay == nil || replay.global == nil {
+		return wire.ErrReplayConfiguration
+	}
+	replay.mu.Lock()
+	defer replay.mu.Unlock()
+	if err := replay.preflightInvalidLocked(sender, request, timestamp); err != nil {
+		return err
+	}
+	if err := replay.global.CommitInvalid(sender, request, timestamp); err != nil {
+		return err
+	}
+	guard := replay.perSender[sender]
+	if guard == nil {
+		guard = wire.NewReplayGuard(replay.clock, replay.window, replay.futureSkew, replay.perLimit)
+		replay.perSender[sender] = guard
+	}
+	return guard.CommitInvalid(sender, request, timestamp)
+}
+
+func (replay *tupleReplay) recordInvalid(sender uint16, request wire.RequestID, timestamp time.Time) {
+	_ = replay.commitInvalid(sender, request, timestamp)
 }
 
 // TupleEndpointOptions fixes the local +7 identity, authentication, clock,

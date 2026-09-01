@@ -114,27 +114,29 @@ func (service *TupleService) Run(ctx context.Context) (runErr error) {
 			}
 			return fmt.Errorf("receive Crane +7 datagram: %w", receiveErr)
 		case packet := <-packets:
-			service.process(ctx, datagram, packet)
+			if processErr := service.process(ctx, datagram, packet); processErr != nil {
+				return processErr
+			}
 		}
 	}
 }
 
-func (service *TupleService) process(ctx context.Context, datagram transport.SourceDatagram, packet transport.Packet) {
+func (service *TupleService) process(ctx context.Context, datagram transport.SourceDatagram, packet transport.Packet) error {
 	if packet.Truncated || len(packet.Data) == 0 || len(packet.Data) > tupleDatagramMaximumBytes {
-		return
+		return nil
 	}
 	frame, err := wire.Decode(packet.Data, service.endpoint.authenticator, wire.Limits{ExpectedClusterID: &service.endpoint.clusterID})
 	if err != nil {
-		return
+		return nil
 	}
 	timestamp := time.UnixMilli(frame.Header.TimestampMillis)
 	if err = service.replay.preflight(frame.Header.SenderID, frame.Header.RequestID, timestamp); err != nil {
-		return
+		return nil
 	}
 	remoteIP := net.ParseIP(packet.From.Host)
 	if remoteIP == nil || packet.From.Port == 0 || service.endpoint.peers.AuthorizeUDP(frame.Header.SenderID, &net.UDPAddr{IP: remoteIP, Port: int(packet.From.Port)}, config.ServiceCraneTupleACK) != nil {
 		service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
-		return
+		return nil
 	}
 
 	switch frame.Header.Message {
@@ -142,37 +144,52 @@ func (service *TupleService) process(ctx context.Context, datagram transport.Sou
 		delivery, decodeErr := protocol.UnmarshalTupleDelivery(frame.Payload)
 		if decodeErr != nil || delivery.Producer.WorkerID != frame.Header.SenderID || delivery.Destination.WorkerID != service.endpoint.configuration.NodeID {
 			service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
-			return
-		}
-		if service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
-			return
+			return nil
 		}
 		ack, handleErr := service.engine.HandleDelivery(ctx, delivery)
 		if handleErr != nil {
+			if fatalTupleStoreError(ctx, handleErr) {
+				return fmt.Errorf("handle Crane tuple delivery: %w", handleErr)
+			}
+			if service.replay.commitInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
+				return nil
+			}
 			_ = service.sendNACK(ctx, datagram, packet.From, delivery, tupleNACKCode(handleErr))
-			return
+			return nil
+		}
+		if service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
+			return nil
 		}
 		_ = service.sendACK(ctx, datagram, packet.From, ack)
 	case wire.MessageCraneTupleDeliveryAck:
 		ack, decodeErr := protocol.UnmarshalTupleACK(frame.Payload)
 		if decodeErr != nil || ack.Destination.WorkerID != frame.Header.SenderID {
 			service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
-			return
+			return nil
 		}
-		if service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
-			return
+		if handleErr := service.engine.HandleACK(ctx, ack); handleErr != nil {
+			if fatalTupleStoreError(ctx, handleErr) {
+				return fmt.Errorf("handle Crane tuple ACK: %w", handleErr)
+			}
+			_ = service.replay.commitInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+			return nil
 		}
-		_ = service.engine.HandleACK(ctx, ack)
+		_ = service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 	case wire.MessageCraneTupleDeliveryNack:
 		nack, decodeErr := protocol.UnmarshalTupleNACK(frame.Payload)
 		if decodeErr != nil || nack.Destination.WorkerID != frame.Header.SenderID {
 			service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
-			return
+			return nil
 		}
 		_ = service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 	default:
 		service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 	}
+	return nil
+}
+
+func fatalTupleStoreError(ctx context.Context, err error) bool {
+	return errors.Is(err, store.ErrUnavailable) || errors.Is(err, store.ErrClosed) && ctx.Err() == nil
 }
 
 func (service *TupleService) sendACK(ctx context.Context, datagram transport.SourceDatagram, destination config.Endpoint, ack protocol.TupleACK) error {

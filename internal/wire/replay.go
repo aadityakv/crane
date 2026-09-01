@@ -86,6 +86,18 @@ func (g *ReplayGuard) Preflight(senderID uint16, requestID RequestID, timestamp 
 	return g.preflightLocked(senderID, requestID, timestamp, g.clock.Now())
 }
 
+// PreflightInvalid reserves no state but verifies that a semantically invalid
+// request can be retained without evicting any live invalid replay identity.
+// Invalid and accepted entries have separate capacities.
+func (g *ReplayGuard) PreflightInvalid(senderID uint16, requestID RequestID, timestamp time.Time) error {
+	if g == nil || g.clock == nil {
+		return ErrReplayConfiguration
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.preflightInvalidLocked(senderID, requestID, timestamp, g.clock.Now())
+}
+
 func (g *ReplayGuard) preflightLocked(senderID uint16, requestID RequestID, timestamp, now time.Time) error {
 	if timestamp.After(now.Add(g.maxFutureSkew)) || !timestamp.Add(g.window).After(now) {
 		return fmt.Errorf("%w: message %s, local %s", ErrTimestamp, timestamp, now)
@@ -101,6 +113,26 @@ func (g *ReplayGuard) preflightLocked(senderID uint16, requestID RequestID, time
 		return ErrReplay
 	}
 	if len(g.seen) >= g.maxEntries {
+		return ErrReplayCacheFull
+	}
+	return nil
+}
+
+func (g *ReplayGuard) preflightInvalidLocked(senderID uint16, requestID RequestID, timestamp, now time.Time) error {
+	if timestamp.After(now.Add(g.maxFutureSkew)) || !timestamp.Add(g.window).After(now) {
+		return fmt.Errorf("%w: message %s, local %s", ErrTimestamp, timestamp, now)
+	}
+
+	g.purgeExpired(now)
+	g.purgeInvalidExpired(now)
+	key := replayKey{senderID: senderID, requestID: requestID}
+	if _, exists := g.seen[key]; exists {
+		return ErrReplay
+	}
+	if _, exists := g.invalid[key]; exists {
+		return ErrReplay
+	}
+	if len(g.invalid) >= g.maxEntries {
 		return ErrReplayCacheFull
 	}
 	return nil
@@ -123,6 +155,26 @@ func (g *ReplayGuard) Commit(senderID uint16, requestID RequestID, timestamp tim
 	expiresAt := timestamp.Add(g.window)
 	g.seen[key] = expiresAt
 	heap.Push(&g.expirations, replayExpiry{key: key, expiresAt: expiresAt})
+	return nil
+}
+
+// CommitInvalid records a preflighted semantically invalid request without
+// evicting another live invalid identity or consuming accepted capacity.
+func (g *ReplayGuard) CommitInvalid(senderID uint16, requestID RequestID, timestamp time.Time) error {
+	if g == nil || g.clock == nil {
+		return ErrReplayConfiguration
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := g.clock.Now()
+	if err := g.preflightInvalidLocked(senderID, requestID, timestamp, now); err != nil {
+		return err
+	}
+	key := replayKey{senderID: senderID, requestID: requestID}
+	expiresAt := timestamp.Add(g.window)
+	g.invalid[key] = expiresAt
+	heap.Push(&g.invalidExpiry, replayExpiry{key: key, expiresAt: expiresAt})
 	return nil
 }
 

@@ -96,6 +96,32 @@ func TestCraneDatagramReplayBoundsPerSenderAndSenderGuardMapWithoutEviction(t *t
 	}
 }
 
+func TestCraneDatagramStrictInvalidPreflightsPerSenderBeforeGlobalCommit(t *testing.T) {
+	manual := clock.NewManual(time.Unix(1_700_000_000, 0))
+	replay := newTupleReplay(manual, time.Minute, time.Second, 2, 1)
+	first := wire.RequestID{1}
+	if err := replay.preflightInvalid(1, first, manual.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := replay.commitInvalid(1, first, manual.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := replay.preflightInvalid(1, wire.RequestID{2}, manual.Now()); !errors.Is(err, wire.ErrReplayCacheFull) {
+		t.Fatalf("per-sender invalid capacity = %v, want ErrReplayCacheFull", err)
+	}
+	// The rejected second ID must not partially consume global invalid capacity;
+	// another sender can still use the remaining global slot.
+	if err := replay.preflightInvalid(2, wire.RequestID{3}, manual.Now()); err != nil {
+		t.Fatalf("independent sender invalid preflight = %v", err)
+	}
+	if err := replay.commitInvalid(2, wire.RequestID{3}, manual.Now()); err != nil {
+		t.Fatalf("independent sender invalid commit = %v", err)
+	}
+	if err := replay.preflight(1, wire.RequestID{4}, manual.Now()); err != nil {
+		t.Fatalf("invalid entries consumed accepted capacity: %v", err)
+	}
+}
+
 func TestCraneDatagramUsesExactPlusSevenSourceFreshRequestIDsAndRejectsOversizeBeforeSend(t *testing.T) {
 	configuration := tupleTestConfig(t)
 	authenticator := wire.NewHMACAuthenticator(bytes.Repeat([]byte{0xa5}, 32))

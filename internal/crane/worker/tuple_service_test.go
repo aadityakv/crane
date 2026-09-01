@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"testing"
@@ -157,6 +158,105 @@ func TestTupleServiceReplayCapacityRejectsBeforeEngineMutationWithoutEviction(t 
 	}
 }
 
+func TestTupleServiceSemanticInvalidReplayDoesNotConsumeAcceptedCapacity(t *testing.T) {
+	seams := newTupleServiceTestSeams(t)
+	defer seams.stop(t)
+	seams.service.replay = newTupleReplay(seams.clock, time.Minute, time.Second, 1, 1)
+
+	stale := seams.fixture.message(t, 1)
+	stale.Coordinator.Term++
+	seams.inject(t, stale, wire.RequestID{0x61})
+	first := seams.nextSend(t)
+	firstFrame, err := wire.Decode(first.payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || firstFrame.Header.Message != wire.MessageCraneTupleDeliveryNack {
+		t.Fatalf("stale delivery response = %d,%v, want NACK", firstFrame.Header.Message, err)
+	}
+
+	seams.inject(t, seams.fixture.message(t, 1), wire.RequestID{0x62})
+	valid := seams.nextSend(t)
+	validFrame, err := wire.Decode(valid.payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || validFrame.Header.Message != wire.MessageCraneTupleDeliveryAck {
+		t.Fatalf("valid delivery after semantic invalid = %d,%v, want ACK", validFrame.Header.Message, err)
+	}
+
+	// The strict one-entry invalid cache rejects a new invalid ID while retaining
+	// the old live ID. Neither request receives another response.
+	seams.inject(t, stale, wire.RequestID{0x63})
+	seams.inject(t, stale, wire.RequestID{0x61})
+	seams.expectNoSend(t)
+	seams.clock.Advance(time.Minute)
+	seams.inject(t, stale, wire.RequestID{0x63})
+	expired := seams.nextSend(t)
+	expiredFrame, err := wire.Decode(expired.payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || expiredFrame.Header.Message != wire.MessageCraneTupleDeliveryNack {
+		t.Fatalf("invalid delivery after replay expiry = %d,%v, want NACK", expiredFrame.Header.Message, err)
+	}
+}
+
+func TestTupleServiceFiveHundredTwelveFreshStaleDeliveriesCannotConsumeAcceptedCapacity(t *testing.T) {
+	seams := newTupleServiceTestSeams(t)
+	defer seams.stop(t)
+	stale := seams.fixture.message(t, 1)
+	stale.Coordinator.Term++
+	for sequence := uint64(1); sequence <= uint64(tupleReplayEntriesPerSender+1); sequence++ {
+		seams.inject(t, stale, tupleRequestID(sequence))
+	}
+	// Replaying the oldest strict-invalid identity must not evict it.
+	seams.inject(t, stale, tupleRequestID(1))
+	seams.inject(t, seams.fixture.message(t, 1), tupleRequestID(uint64(tupleReplayEntriesPerSender+2)))
+	waitFor(t, func() bool { return len(seams.datagram.sentPackets()) >= tupleReplayEntriesPerSender+1 })
+	sends := seams.datagram.sentPackets()
+	if got := len(sends); got != tupleReplayEntriesPerSender+1 {
+		t.Fatalf("responses after invalid pressure = %d, want 512 NACKs plus one valid ACK", got)
+	}
+	last, err := wire.Decode(sends[len(sends)-1].payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || last.Header.Message != wire.MessageCraneTupleDeliveryAck {
+		t.Fatalf("valid delivery after 513 stale deliveries = %d,%v, want ACK", last.Header.Message, err)
+	}
+	seams.repository.mu.Lock()
+	receiveCalls := seams.repository.receiveCalls
+	seams.repository.mu.Unlock()
+	if receiveCalls != 1 {
+		t.Fatalf("stale delivery pressure performed %d durable Receive calls, want only the valid delivery", receiveCalls)
+	}
+}
+
+func TestTupleServiceAuthenticatedWrongSourceInvalidCacheRetainsOldAndReclaimsExpiry(t *testing.T) {
+	seams := newTupleServiceTestSeams(t)
+	defer seams.stop(t)
+	seams.service.replay = newTupleReplay(seams.clock, time.Minute, time.Second, 2, 2)
+	message := seams.fixture.message(t, 1)
+	for _, id := range []wire.RequestID{{0x71}, {0x72}, {0x73}, {0x71}} {
+		packet := seams.deliveryPacket(t, message, id)
+		packet.From.Port++
+		seams.datagram.packets <- packet
+	}
+	seams.inject(t, message, wire.RequestID{0x74})
+	_ = seams.nextSend(t) // The valid sentinel proves every prior packet ran.
+	if err := seams.service.replay.preflight(1, wire.RequestID{0x71}, seams.clock.Now()); !errors.Is(err, wire.ErrReplay) {
+		t.Fatalf("old live wrong-source ID = %v, want ErrReplay", err)
+	}
+	if err := seams.service.replay.preflight(1, wire.RequestID{0x73}, seams.clock.Now()); err != nil {
+		t.Fatalf("new wrong-source ID was recorded after strict capacity rejection: %v", err)
+	}
+
+	seams.clock.Advance(time.Minute)
+	packet := seams.deliveryPacket(t, message, wire.RequestID{0x73})
+	packet.From.Port++
+	seams.datagram.packets <- packet
+	seams.inject(t, message, wire.RequestID{0x75})
+	_ = seams.nextSend(t)
+	if err := seams.service.replay.preflight(1, wire.RequestID{0x73}, seams.clock.Now()); !errors.Is(err, wire.ErrReplay) {
+		t.Fatalf("wrong-source ID after expiry admission = %v, want ErrReplay", err)
+	}
+}
+
+func tupleRequestID(sequence uint64) wire.RequestID {
+	var id wire.RequestID
+	binary.BigEndian.PutUint64(id[8:], sequence)
+	return id
+}
+
 func TestTupleServiceCancellationClosesSocketAndJoinsBlockingReceive(t *testing.T) {
 	configuration := tupleTestConfig(t)
 	datagram := newCloseOnlyTupleDatagram()
@@ -196,6 +296,132 @@ func TestTupleServiceCancellationClosesSocketAndJoinsBlockingReceive(t *testing.
 	default:
 		t.Fatal("Run returned before its receive loop joined")
 	}
+}
+
+func TestTupleServiceFatalDeliveryStorePoisonClosesAndJoinsSocket(t *testing.T) {
+	seams := newTupleServiceTestSeams(t)
+	seams.repository.mu.Lock()
+	seams.repository.receiveErr = store.ErrUnavailable
+	seams.repository.mu.Unlock()
+	seams.inject(t, seams.fixture.message(t, 1), wire.RequestID{0x81})
+	select {
+	case err := <-seams.serviceDone:
+		if !errors.Is(err, store.ErrUnavailable) {
+			t.Fatalf("delivery poison Run error = %v, want store.ErrUnavailable", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TupleService swallowed fatal delivery store poison")
+	}
+	select {
+	case <-seams.datagram.closed:
+	default:
+		t.Fatal("TupleService returned poison before closing and joining its socket")
+	}
+	seams.cancelEngine()
+	if err := <-seams.engineDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Engine stop = %v", err)
+	}
+}
+
+func TestTupleServicePostCustodyReplayCommitFailureWithholdsACKAndFreshRetryIsIdempotent(t *testing.T) {
+	seams := newTupleServiceTestSeams(t)
+	defer seams.stop(t)
+	seams.repository.receiveStarted = make(chan struct{})
+	seams.repository.receiveRelease = make(chan struct{})
+	message := seams.fixture.message(t, 1)
+	seams.inject(t, message, wire.RequestID{0x83})
+	select {
+	case <-seams.repository.receiveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("delivery did not reach durable custody")
+	}
+	seams.clock.Advance(time.Duration(seams.configuration.Timing.ReplayWindow))
+	close(seams.repository.receiveRelease)
+	seams.expectNoSend(t)
+
+	seams.inject(t, message, wire.RequestID{0x84})
+	retry := seams.nextSend(t)
+	frame, err := wire.Decode(retry.payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || frame.Header.Message != wire.MessageCraneTupleDeliveryAck {
+		t.Fatalf("fresh logical retry after post-custody replay failure = %d,%v, want ACK", frame.Header.Message, err)
+	}
+	seams.repository.mu.Lock()
+	receiveCalls := seams.repository.receiveCalls
+	seams.repository.mu.Unlock()
+	if receiveCalls != 1 {
+		t.Fatalf("fresh logical retry repeated durable custody %d times, want 1", receiveCalls)
+	}
+}
+
+func TestTupleServiceFatalACKStorePoisonClosesAndJoinsSocket(t *testing.T) {
+	fixture := workerFixture(t)
+	baseRepository := newFakeRepository(fixture)
+	delivery := fixture.delivery(t, 1)
+	outbox := store.OutboxRecord{ID: delivery.ID, Tuple: delivery.Tuple, Producer: delivery.Producer, Destination: delivery.Destination, AssignmentRevision: delivery.AssignmentRevision, AssignmentDigest: delivery.AssignmentDigest, CoordinatorEpoch: delivery.CoordinatorEpoch}
+	baseRepository.work.Outboxes = []store.OutboxRecord{outbox}
+	baseRepository.outboxes[outbox.ID] = outbox
+	repository := &unavailableOutboxRepository{fakeRepository: baseRepository}
+
+	configuration := tupleTestConfig(t)
+	authenticator := wire.NewHMACAuthenticator(bytes.Repeat([]byte{0xa5}, 32))
+	manual := clock.NewManual(time.Unix(100, 0))
+	datagram := newTupleTestDatagram()
+	endpoint, err := NewTupleEndpoint(TupleEndpointOptions{Config: configuration, Authenticator: authenticator, Clock: manual, Membership: &membership.Authorizer{}, Datagram: datagram})
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, _ := configuration.BindEndpoint(config.ServiceCraneTupleACK)
+	endpoint.peers = tupleTestMembership{members: []swim.Member{{NodeID: 1, Host: configuration.AdvertiseHost, BasePort: configuration.BasePort, Incarnation: 1, Status: swim.Alive}}, auth: func(nodeID uint16, source config.Endpoint, service config.Service) error {
+		if nodeID == 1 && source == local && service == config.ServiceCraneTupleACK {
+			return nil
+		}
+		return membership.ErrUnauthorized
+	}}
+	options := testEngineOptions(repository, admissionGateForTupleTest(t, fixture), endpoint)
+	options.Clock = manual
+	engine, err := NewEngine(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewTupleService(TupleServiceOptions{Endpoint: endpoint, Engine: engine})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceContext, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	serviceDone := make(chan error, 1)
+	go func() { serviceDone <- service.Run(serviceContext) }()
+	<-service.Ready()
+	engineContext, cancelEngine := context.WithCancel(context.Background())
+	engineDone := runEngine(t, engineContext, engine)
+	<-engine.Ready()
+
+	message := deliveryMessageForOutbox(outbox)
+	ack := protocol.TupleACK{DeliveryID: message.DeliveryID, Destination: message.Destination, Assignment: message.Assignment, Coordinator: message.Coordinator, Status: protocol.TupleCompleted}
+	injectTupleACK(t, datagram, endpoint, authenticator, manual, local, ack, wire.RequestID{0x82})
+	select {
+	case err := <-serviceDone:
+		if !errors.Is(err, store.ErrUnavailable) {
+			t.Fatalf("ACK poison Run error = %v, want store.ErrUnavailable", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TupleService swallowed fatal ACK store poison")
+	}
+	select {
+	case <-datagram.closed:
+	default:
+		t.Fatal("TupleService returned ACK poison before closing and joining its socket")
+	}
+	cancelEngine()
+	if err := <-engineDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Engine stop = %v", err)
+	}
+}
+
+type unavailableOutboxRepository struct{ *fakeRepository }
+
+func (repository *unavailableOutboxRepository) MarkOutboxCompleted(model.DeliveryID) error {
+	return store.ErrUnavailable
 }
 
 func TestTupleRetrySurvivesLostDeliveryAndReorderedCompletedAcceptedACKs(t *testing.T) {
