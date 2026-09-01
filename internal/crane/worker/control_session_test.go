@@ -212,6 +212,26 @@ func TestControlStatusPagesDeepOwnedDataAndRejectsUncommittedInventoryVector(t *
 	}
 }
 
+func TestControlStatusHasMoreIsRelativeToRequestedCursor(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+	base := workerFixture(t)
+	fixture.repository.work.PendingEvents = []model.WorkerEvent{base.failureEvent(1), base.failureEvent(2)}
+	fixture.repository.work.NextTransactionID = 3
+	fixture.repository.transactionID = 3
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, AfterTransactionID: 1, MaxEvents: 1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := response.(protocol.WorkerStatus)
+	if len(status.Events) != 1 || status.Events[0].TransactionID != 2 || status.LastTransactionID != 2 || status.HasMore {
+		t.Fatalf("cursor-relative page = %#v", status)
+	}
+}
+
 func TestControlRepairPersistsBeforeStatusAndResultChunkBindsExactSessionPeer(t *testing.T) {
 	fixture := newControlFixture(t)
 	fixture.repository.work.Fence = fixture.epoch
@@ -704,7 +724,14 @@ func (repository *controlTestRepository) PendingEvents(after uint64, max uint16)
 	if len(result) > 0 {
 		last = result[len(result)-1].TransactionID
 	}
-	return result, last, len(result) < len(repository.work.PendingEvents), nil
+	more := false
+	for _, event := range repository.work.PendingEvents {
+		if event.TransactionID > last {
+			more = true
+			break
+		}
+	}
+	return result, last, more, nil
 }
 func (repository *controlTestRepository) UpsertRepair(repair store.ResultRepairRecord) error {
 	repository.mu.Lock()
