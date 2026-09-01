@@ -792,8 +792,12 @@ func applyResult(work *RecoveredWork, result StoredResult) error {
 		}
 		return nil
 	}
+	entryBytes, err := resultArtifactEntryBytes(uint64(len(result.canonical)))
+	if err != nil {
+		return err
+	}
 	jobBytes := work.indexes.resultBytesByJob[result.Record.TupleID.JobID]
-	if jobBytes > model.LimitsV1().MaxResultRecordsBytesPerJob || uint64(len(result.canonical)) > model.LimitsV1().MaxResultRecordsBytesPerJob-jobBytes {
+	if jobBytes > model.LimitsV1().MaxResultRecordsBytesPerJob || entryBytes > model.LimitsV1().MaxResultRecordsBytesPerJob-jobBytes {
 		return ErrCapacity
 	}
 	if work.indexes.resultCount >= maxStoredResultCount() {
@@ -805,7 +809,7 @@ func applyResult(work *RecoveredWork, result StoredResult) error {
 		return err
 	}
 	work.indexes.results = inserted
-	work.indexes.resultBytesByJob[result.Record.TupleID.JobID] = jobBytes + uint64(len(result.canonical))
+	work.indexes.resultBytesByJob[result.Record.TupleID.JobID] = jobBytes + entryBytes
 	work.indexes.resultCount++
 	return nil
 }
@@ -2868,11 +2872,15 @@ func ensureWorkIndexes(work *RecoveredWork) error {
 		}
 		indexes.results = inserted
 		indexes.resultCount++
+		entryBytes, err := resultArtifactEntryBytes(uint64(len(result.canonical)))
+		if err != nil {
+			return err
+		}
 		prior := indexes.resultBytesByJob[result.Record.TupleID.JobID]
-		if prior > math.MaxUint64-uint64(len(result.canonical)) {
+		if prior > math.MaxUint64-entryBytes {
 			return ErrCapacity
 		}
-		indexes.resultBytesByJob[result.Record.TupleID.JobID] = prior + uint64(len(result.canonical))
+		indexes.resultBytesByJob[result.Record.TupleID.JobID] = prior + entryBytes
 	}
 	work.Results = nil
 	work.indexes = indexes
@@ -3028,6 +3036,16 @@ func maxStoredResultCount() uint64 {
 		return math.MaxUint64
 	}
 	return jobs * model.ResultArtifactMaxRecordCountV1
+}
+
+const resultArtifactEntryPrefixBytes uint64 = 4
+
+func resultArtifactEntryBytes(logicalBytes uint64) (uint64, error) {
+	entryBytes, ok := checkedAdd(logicalBytes, resultArtifactEntryPrefixBytes)
+	if !ok || entryBytes < model.ResultArtifactMinRecordBytesV1 || entryBytes > model.ResultArtifactMaxRecordBytesV1 {
+		return 0, errors.New("result logical bytes outside artifact entry bounds")
+	}
+	return entryBytes, nil
 }
 
 func appendOwnedResults(indexes *workIndexes, destination *[]StoredResult) {

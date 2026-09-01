@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"math"
 	"os"
@@ -287,12 +288,215 @@ func TestSnapshotRejectsAckedEmptyEventIdentityAheadOfTransactionCount(t *testin
 		t.Fatal("event fixture was not fully acknowledged")
 	}
 	work := store.work
-	work.NextTransactionID = store.state.TransactionCount + 1
-	if err := recoverSnapshotImageWithNextForTest(t, store.state, work, store.state.TransactionCount+2); !errors.Is(err, ErrCorrupt) {
+	domainRecords := store.state.LastSequence - 1 - 2*store.state.TransactionCount
+	work.NextTransactionID = domainRecords + 1
+	if err := recoverSnapshotImageWithNextForTest(t, store.state, work, domainRecords+2); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("acked-empty oversized next transaction recovered: %v", err)
 	}
 	if err := recoverSnapshotImageForTest(t, store.state, work); err != nil {
 		t.Fatalf("exact acked-empty event boundary rejected: %v", err)
+	}
+}
+
+func TestSnapshotEventAccountingUsesDurableDomainRecordCount(t *testing.T) {
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+	epoch := model.WorkerEpoch{7}
+	for _, test := range []struct {
+		name               string
+		base, transactions uint64
+		next               uint64
+		valid              bool
+	}{
+		{name: "empty", base: 1, next: 1, valid: true},
+		{name: "minimum one-record transaction exact", base: 4, transactions: 1, next: 2, valid: true},
+		{name: "minimum one-record transaction plus one", base: 4, transactions: 1, next: 3},
+		{name: "two events in one transaction exact", base: 5, transactions: 1, next: 3, valid: true},
+		{name: "two events in one transaction plus one", base: 5, transactions: 1, next: 4},
+		{name: "maximum record transaction exact", base: MaxTransactionRecords + 3, transactions: 1, next: MaxTransactionRecords + 1, valid: true},
+		{name: "maximum record transaction plus one", base: MaxTransactionRecords + 3, transactions: 1, next: MaxTransactionRecords + 2},
+		{name: "zero next", base: 4, transactions: 1},
+		{name: "subtraction edge", base: 3, transactions: 1, next: 1},
+		{name: "multiplication edge", base: math.MaxUint64, transactions: math.MaxUint64/3 + 1, next: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			work := newRecoveredWork()
+			work.NextTransactionID = test.next
+			state := RecoveredState{Identity: identity, WorkerEpoch: epoch, LastSequence: test.base, TransactionCount: test.transactions}
+			_, _, snapshotErr := snapshotMetadata(state, work, 1)
+			current := currentGeneration{Identity: identity, WorkerEpoch: epoch, Generation: 1, BaseSequence: test.base, TransactionCount: test.transactions, SnapshotBytes: snapshotHeaderBytes + snapshotFooterBytes, SnapshotDigest: [32]byte{1}}
+			_, currentErr := encodeCurrentGeneration(current)
+			_, anchorErr := encodeSnapshotAnchor(walSnapshotAnchor{Identity: identity, WorkerEpoch: epoch, Generation: 1, BaseSequence: test.base, TransactionCount: test.transactions, SnapshotDigest: [32]byte{1}})
+			if (snapshotErr == nil) != test.valid {
+				t.Fatalf("snapshot metadata=%v valid=%v", snapshotErr, test.valid)
+			}
+			metadataValid := validSnapshotTransactionMetadata(test.base, test.transactions)
+			if (currentErr == nil) != metadataValid || (anchorErr == nil) != metadataValid {
+				t.Fatalf("marker=%v anchor=%v metadataValid=%v", currentErr, anchorErr, metadataValid)
+			}
+		})
+	}
+
+	for _, count := range []int{2, MaxTransactionRecords} {
+		t.Run(fmt.Sprintf("raw batch %d", count), func(t *testing.T) {
+			path, identity, options, store, assignment, epoch := eventBatchSnapshotStore(t)
+			records := make([]Record, count)
+			for index := range records {
+				event := domainFailureEvent(store, assignment, epoch, uint64(index+1))
+				payload, err := encodeEvent(event)
+				if err != nil {
+					t.Fatal(err)
+				}
+				records[index] = Record{Type: recordEvent, Payload: payload}
+			}
+			if err := store.Commit(Transaction{Records: records}); err != nil {
+				t.Fatalf("sequential event batch=%v", err)
+			}
+			if got := store.work.NextTransactionID; got != uint64(count)+1 {
+				t.Fatalf("next event ID=%d want=%d", got, count+1)
+			}
+			if _, err := store.Snapshot(); err != nil {
+				t.Fatalf("snapshot batched events=%v", err)
+			}
+			if err := store.AcknowledgeEvents(uint64(count)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Snapshot(); err != nil {
+				t.Fatalf("snapshot acknowledged-empty events=%v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := Open(path, identity, Options{MaxBytes: options.MaxBytes})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			work, err := reopened.RecoverWork()
+			if err != nil || len(work.PendingEvents) != 0 || work.NextTransactionID != uint64(count)+1 {
+				t.Fatalf("recovered acknowledged events=%d next=%d err=%v", len(work.PendingEvents), work.NextTransactionID, err)
+			}
+		})
+	}
+}
+
+func TestSnapshotResultPreflightUsesArtifactEntryBounds(t *testing.T) {
+	path, identity, options, store, fixture := populatedSnapshotStore(t)
+	makeResult := func(sequence uint64, tuple []byte) (model.ResultRecord, model.ResultCopyProvenance) {
+		record, provenance := domainResultSequence(t, fixture.topology, fixture.assignment, fixture.epoch, 0, sequence)
+		var err error
+		record, err = model.NewResultRecord(record.TupleID, record.SinkTask, record.SpecificationHash, tuple)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record, provenance
+	}
+	emptyTuple, err := model.MarshalTuple(model.Tuple{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxTuple, err := model.MarshalTuple(model.Tuple{Fields: []model.Field{{Name: "x", Value: model.Value{Type: model.ValueBytes, Bytes: make([]byte, 504)}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	minimum, minProvenance := makeResult(50, emptyTuple)
+	maximum, maxProvenance := makeResult(51, maxTuple)
+	minLogical, err := model.MarshalResultRecord(minimum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxLogical, err := model.MarshalResultRecord(maximum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(minLogical) != 166 || len(maxLogical) != 676 || uint64(len(minLogical)+4) != model.ResultArtifactMinRecordBytesV1 || uint64(len(maxLogical)+4) != model.ResultArtifactMaxRecordBytesV1 {
+		t.Fatalf("logical/artifact boundaries min=%d/%d max=%d/%d", len(minLogical), len(minLogical)+4, len(maxLogical), len(maxLogical)+4)
+	}
+	minPayload, err := encodeStoredResult(StoredResult{Record: minimum, Provenance: minProvenance})
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxPayload, err := encodeStoredResult(StoredResult{Record: maximum, Provenance: maxProvenance})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		payload []byte
+		valid   bool
+	}{
+		{name: "minimum", payload: minPayload, valid: true},
+		{name: "maximum", payload: maxPayload, valid: true},
+		{name: "below minimum", payload: resultPayloadWithDeclaredLogicalLength(t, minPayload, 165)},
+		{name: "above maximum", payload: resultPayloadWithDeclaredLogicalLength(t, maxPayload, 677)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			work := newRecoveredWork()
+			work.Fence = fixture.epoch
+			work.Assignments = append(work.Assignments, store.work.Assignments[0])
+			decoder := snapshotDecoder{work: work}
+			err := decoder.consume(snapshotResult, test.payload)
+			if (err == nil) != test.valid {
+				t.Fatalf("result preflight=%v valid=%v", err, test.valid)
+			}
+		})
+	}
+
+	entryBytes := uint64(len(minLogical) + 4)
+	for _, test := range []struct {
+		name  string
+		prior uint64
+		valid bool
+	}{
+		{name: "aggregate exact", prior: model.LimitsV1().MaxResultRecordsBytesPerJob - entryBytes, valid: true},
+		{name: "aggregate over", prior: model.LimitsV1().MaxResultRecordsBytesPerJob - entryBytes + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			work := newRecoveredWork()
+			work.Fence = fixture.epoch
+			work.Assignments = append(work.Assignments, store.work.Assignments[0])
+			work.indexes.resultBytesByJob[minimum.TupleID.JobID] = test.prior
+			decoder := snapshotDecoder{work: work}
+			err := decoder.consume(snapshotResult, minPayload)
+			if (err == nil) != test.valid {
+				t.Fatalf("aggregate preflight=%v valid=%v", err, test.valid)
+			}
+			if test.valid && decoder.work.indexes.resultBytesByJob[minimum.TupleID.JobID] != model.LimitsV1().MaxResultRecordsBytesPerJob {
+				t.Fatalf("aggregate bytes=%d", decoder.work.indexes.resultBytesByJob[minimum.TupleID.JobID])
+			}
+		})
+	}
+
+	if err := store.UpsertResult(minimum, minProvenance); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertResult(maximum, maxProvenance); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Snapshot(); err != nil {
+		t.Fatalf("snapshot legal result boundaries=%v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, identity, Options{MaxBytes: options.MaxBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	work, err := reopened.RecoverWork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[int]bool{}
+	for _, result := range work.Results {
+		logical, marshalErr := model.MarshalResultRecord(result.Record)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		found[len(logical)] = true
+	}
+	if !found[166] || !found[676] {
+		t.Fatalf("recovered result logical sizes=%v", found)
 	}
 }
 
@@ -937,4 +1141,38 @@ func populatedSnapshotStore(t *testing.T) (string, Identity, Options, *Store, sn
 		t.Fatal(err)
 	}
 	return path, identity, options, store, snapshotFixture{topology: topology, assignment: assignment, epoch: epoch, compacted: compacted, next: domainDeliverySequence(t, topology, assignment, epoch, 3)}
+}
+
+func eventBatchSnapshotStore(t *testing.T) (string, Identity, Options, *Store, model.AssignmentSet, model.CoordinatorEpoch) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "event-batch-worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+	options := Options{MaxBytes: 32 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }}
+	store, err := Open(path, identity, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	topology, assignment, epoch := domainAssignmentWithRange(t, store.WorkerEpoch(), identity.NodeID, 8)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	return path, identity, options, store, assignment, epoch
+}
+
+func resultPayloadWithDeclaredLogicalLength(t *testing.T, payload []byte, declared uint32) []byte {
+	t.Helper()
+	if len(payload) < 6 {
+		t.Fatal("result payload is too short")
+	}
+	actual := binary.BigEndian.Uint32(payload[2:6])
+	result := append([]byte(nil), payload...)
+	if declared > actual {
+		result = append(result[:6+actual], append(make([]byte, int(declared-actual)), result[6+actual:]...)...)
+	}
+	binary.BigEndian.PutUint32(result[2:6], declared)
+	return result
 }

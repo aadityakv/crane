@@ -155,7 +155,7 @@ func writeSnapshotChunk(file *os.File, data []byte, write func(*os.File, []byte)
 }
 
 func snapshotMetadata(state RecoveredState, work RecoveredWork, generation uint64) (Snapshot, []byte, error) {
-	if generation == 0 || !validSnapshotTransactionMetadata(state.LastSequence, state.TransactionCount) || !validSnapshotEventMetadata(work.NextTransactionID, state.TransactionCount) || state.WorkerEpoch.Validate() != nil || state.Identity.Validate() != nil {
+	if generation == 0 || !validSnapshotTransactionMetadata(state.LastSequence, state.TransactionCount) || !validSnapshotEventMetadata(work.NextTransactionID, state.LastSequence, state.TransactionCount) || state.WorkerEpoch.Validate() != nil || state.Identity.Validate() != nil {
 		return Snapshot{}, nil, fmt.Errorf("%w: invalid snapshot metadata", ErrInvalidTransaction)
 	}
 	var count, body uint64
@@ -418,7 +418,7 @@ func decodeSnapshotHeader(header []byte, size int64, expected Identity, current 
 		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot header count", ErrCorrupt)
 	}
 	minimumBody := count * snapshotFrameOverhead
-	if body < minimumBody || body > uint64(size)-snapshotHeaderBytes-snapshotFooterBytes || total != uint64(size) || total != uint64(snapshotHeaderBytes+snapshotFooterBytes)+body || generation == 0 || !validSnapshotEventMetadata(nextTransactionID, transactions) {
+	if body < minimumBody || body > uint64(size)-snapshotHeaderBytes-snapshotFooterBytes || total != uint64(size) || total != uint64(snapshotHeaderBytes+snapshotFooterBytes)+body || generation == 0 || !validSnapshotEventMetadata(nextTransactionID, baseSequence, transactions) {
 		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot header bounds", ErrCorrupt)
 	}
 	if current.Identity != identity || current.WorkerEpoch != epoch || current.Generation != generation || current.BaseSequence != baseSequence || current.TransactionCount != transactions || current.SnapshotBytes != total || !validSnapshotTransactionMetadata(baseSequence, transactions) {
@@ -777,16 +777,17 @@ func (decoder *snapshotDecoder) preflightNested(kind snapshotRecordKind, payload
 			return err
 		}
 		logical, err := reader.blobBytes(MaxRecordPayloadBytes)
-		if err != nil || uint64(len(logical)) < model.ResultArtifactMinRecordBytesV1 || uint64(len(logical)) > model.ResultArtifactMaxRecordBytesV1 {
+		entryBytes, sizeErr := resultArtifactEntryBytes(uint64(len(logical)))
+		if err != nil || sizeErr != nil {
 			return errors.New("snapshot result logical bytes exceed bounds")
 		}
 		var job model.JobID
 		copy(job[:], logical[2:18])
 		prior := decoder.resultBytes[job]
-		if prior > model.LimitsV1().MaxResultRecordsBytesPerJob || uint64(len(logical)) > model.LimitsV1().MaxResultRecordsBytesPerJob-prior {
+		if prior > model.LimitsV1().MaxResultRecordsBytesPerJob || entryBytes > model.LimitsV1().MaxResultRecordsBytesPerJob-prior {
 			return ErrCapacity
 		}
-		decoder.resultBytes[job] = prior + uint64(len(logical))
+		decoder.resultBytes[job] = prior + entryBytes
 	case snapshotRepair:
 		// Through SpecificationHash in RepairResultPartitionDefinition.
 		const checkpointCountOffset = 2 + 16 + 34 + 16 + 8 + 32 + 2 + 16 + 2 + 16 + 20 + 32
@@ -909,8 +910,12 @@ func applySnapshotResult(work *RecoveredWork, result StoredResult) error {
 	if findResultNode(work.indexes.results, key) != nil {
 		return model.ErrIdentityReuse
 	}
+	entryBytes, err := resultArtifactEntryBytes(uint64(len(result.canonical)))
+	if err != nil {
+		return err
+	}
 	jobBytes := work.indexes.resultBytesByJob[result.Record.TupleID.JobID]
-	if jobBytes > model.LimitsV1().MaxResultRecordsBytesPerJob || uint64(len(result.canonical)) > model.LimitsV1().MaxResultRecordsBytesPerJob-jobBytes || work.indexes.resultCount >= maxStoredResultCount() {
+	if jobBytes > model.LimitsV1().MaxResultRecordsBytesPerJob || entryBytes > model.LimitsV1().MaxResultRecordsBytesPerJob-jobBytes || work.indexes.resultCount >= maxStoredResultCount() {
 		return ErrCapacity
 	}
 	result.Record.Value = append([]byte(nil), result.Record.Value...)
@@ -919,7 +924,7 @@ func applySnapshotResult(work *RecoveredWork, result StoredResult) error {
 		return err
 	}
 	work.indexes.results = inserted
-	work.indexes.resultBytesByJob[result.Record.TupleID.JobID] = jobBytes + uint64(len(result.canonical))
+	work.indexes.resultBytesByJob[result.Record.TupleID.JobID] = jobBytes + entryBytes
 	work.indexes.resultCount++
 	return nil
 }
@@ -1398,8 +1403,20 @@ func validSnapshotTransactionMetadata(baseSequence, transactionCount uint64) boo
 	return true
 }
 
-func validSnapshotEventMetadata(nextTransactionID, transactionCount uint64) bool {
-	return nextTransactionID != 0 && nextTransactionID-1 <= transactionCount
+func snapshotDomainRecordCount(baseSequence, transactionCount uint64) (uint64, bool) {
+	if !validSnapshotTransactionMetadata(baseSequence, transactionCount) || transactionCount > math.MaxUint64/2 {
+		return 0, false
+	}
+	overhead := 2 * transactionCount
+	if baseSequence == 0 || baseSequence-1 < overhead {
+		return 0, false
+	}
+	return baseSequence - 1 - overhead, true
+}
+
+func validSnapshotEventMetadata(nextTransactionID, baseSequence, transactionCount uint64) bool {
+	domainRecords, ok := snapshotDomainRecordCount(baseSequence, transactionCount)
+	return ok && nextTransactionID != 0 && nextTransactionID-1 <= domainRecords
 }
 
 func (store *Store) recoverExisting(identity Identity) error {
