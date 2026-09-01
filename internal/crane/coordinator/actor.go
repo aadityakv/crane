@@ -105,6 +105,10 @@ type ActorOptions struct {
 	Clock       clock.Clock     // Clock supplies time and rescan timers.
 	Nonces      NonceSource     // Nonces yields the stable per-leadership epoch nonce.
 	Gate        *admission.Gate // Gate is the caller-owned process admission gate.
+	// Results optionally supplies the authenticated +5 result-artifact
+	// transfer surface; without it the terminal seal workflow stays disabled
+	// and terminal jobs simply remain Draining.
+	Results ResultTransferClient
 
 	// FailureGracePeriod overrides DefaultFailureGracePeriod when positive.
 	FailureGracePeriod time.Duration
@@ -306,6 +310,7 @@ func (actor *Actor) runLeader(ctx context.Context) {
 		if actor.reconcile(ctx, epoch, session) {
 			_ = actor.options.Gate.Open(epoch)
 		}
+		actor.driveTerminalResults(ctx, epoch)
 		if !actor.awaitTrigger(ctx, session) {
 			return
 		}

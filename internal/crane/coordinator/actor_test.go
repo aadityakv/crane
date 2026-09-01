@@ -1,7 +1,9 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -14,6 +16,7 @@ import (
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 	"github.com/aaditya/cs425mp3/internal/crane/state"
+	"github.com/aaditya/cs425mp3/internal/crane/worker"
 	"github.com/aaditya/cs425mp3/internal/raft"
 	"github.com/aaditya/cs425mp3/internal/swim"
 )
@@ -122,6 +125,7 @@ type fakeRaft struct {
 	index         uint64
 	term          uint64
 	barrierErr    error
+	commands      []any
 	// proposeHook may suppress application or inject a transport error after
 	// application, simulating an ambiguous proposal outcome.
 	proposeHook func(command any) (apply bool, err error)
@@ -153,6 +157,7 @@ func (r *fakeRaft) Propose(_ context.Context, encoded []byte) (raft.ProposalResu
 	if err != nil {
 		return raft.ProposalResult{}, err
 	}
+	r.commands = append(r.commands, decoded)
 	r.log.add("propose:" + commandName(decoded))
 	apply, injected := true, error(nil)
 	if r.proposeHook != nil {
@@ -184,6 +189,13 @@ func (r *fakeRaft) setTerm(term uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.term = term
+}
+
+// capturedCommands returns one owned copy of every proposed command.
+func (r *fakeRaft) capturedCommands() []any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]any(nil), r.commands...)
 }
 
 func (r *fakeRaft) setProposeHook(hook func(command any) (bool, error)) {
@@ -344,6 +356,28 @@ type workerScript struct {
 	pageSize       int
 	inventory      func(query protocol.ResultInventoryQuery) (protocol.ResultInventorySummary, error)
 	repair         func(grant protocol.RepairGrant) (protocol.ResultRepairStatus, error)
+	// results models this worker's durable result records and sealed
+	// artifacts for the terminal workflow.
+	results *fakeResultState
+}
+
+// fakeResultState models one worker's retained result records and sealed
+// artifacts, mirroring the reviewed worker transfer semantics: fetch seals
+// on demand from covered records, artifact receives resume from the durable
+// next offset, and only checksum-verified complete artifacts count.
+type fakeResultState struct {
+	mu               sync.Mutex
+	records          []model.ResultRecord
+	sealed           map[[32]byte]protocol.ResultArtifact
+	sealedStream     map[[32]byte][]byte
+	partial          map[[32]byte][]byte
+	inventoryBlocked map[model.TaskID]bool
+	fetchErrs        int
+	artifactErrs     int
+}
+
+func newFakeResultState() *fakeResultState {
+	return &fakeResultState{sealed: make(map[[32]byte]protocol.ResultArtifact), sealedStream: make(map[[32]byte][]byte), partial: make(map[[32]byte][]byte), inventoryBlocked: make(map[model.TaskID]bool)}
 }
 
 type recordedInstall struct {
@@ -574,6 +608,117 @@ func (w *fakeWorkers) installsFor(node uint16, scheduling model.SchedulingState)
 	return result
 }
 
+// Fetch models the authenticated leader result fetch: an unsealed partition
+// is sealed on demand from this worker's retained covered records and every
+// response carries the true sealed artifact identity.
+func (w *fakeWorkers) Fetch(_ context.Context, node uint16, request protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error) {
+	w.log.add(fmt.Sprintf("fetch:%d", node))
+	w.mu.Lock()
+	script, ok := w.scripts[node]
+	w.mu.Unlock()
+	if !ok || script.results == nil {
+		return protocol.ResultFetchChunk{}, errors.New("no scripted worker results")
+	}
+	state := script.results
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.fetchErrs > 0 {
+		state.fetchErrs--
+		return protocol.ResultFetchChunk{}, errors.New("injected fetch failure")
+	}
+	artifact := request.Artifact
+	stream, sealed := state.sealedStream[artifact.Checksum]
+	if !sealed {
+		covered := make([]model.ResultRecord, 0)
+		for _, record := range state.records {
+			if record.TupleID.JobID == artifact.JobID && record.SinkTask == artifact.SinkTask && record.SpecificationHash == artifact.SpecificationHash {
+				covered = append(covered, record)
+			}
+		}
+		derived, derivedStream, err := worker.SealResultPartition(artifact.JobID, artifact.SinkTask, artifact.SpecificationHash, covered)
+		if err != nil {
+			return protocol.ResultFetchChunk{}, err
+		}
+		if derived.RecordCount != artifact.RecordCount || derived.TotalLength != artifact.TotalLength {
+			return protocol.ResultFetchChunk{}, errors.New("retained records do not match the requested artifact")
+		}
+		artifact, stream = derived, derivedStream
+		state.sealed[artifact.Checksum] = artifact
+		state.sealedStream[artifact.Checksum] = stream
+	} else {
+		artifact = state.sealed[artifact.Checksum]
+	}
+	end := request.Offset + uint64(protocol.MaxTransferChunkBytes)
+	if end > artifact.TotalLength {
+		end = artifact.TotalLength
+	}
+	data := append([]byte(nil), stream[request.Offset:end]...)
+	id, err := worker.DeriveResultArtifactTransferID(worker.TransferLeaderFetch, artifact, request.ReplicaNodeID, request.ReplicaWorkerEpoch, request.Offset, uint64(len(data)), request.CoordinatorEpoch)
+	if err != nil {
+		return protocol.ResultFetchChunk{}, err
+	}
+	return protocol.ResultFetchChunk{Transfer: protocol.TransferChunk{TransferID: id, JobID: artifact.JobID, TotalLength: artifact.TotalLength, Checksum: artifact.Checksum, Offset: request.Offset, Data: data, Final: end == artifact.TotalLength}, Artifact: artifact, SourceNodeID: node, SourceWorkerEpoch: script.identity.WorkerEpoch, CoordinatorEpoch: request.CoordinatorEpoch}, nil
+}
+
+// ReceiveArtifact models one resumable durable artifact install that
+// acknowledges only the exact durable next offset.
+func (w *fakeWorkers) ReceiveArtifact(_ context.Context, node uint16, chunk protocol.ResultArtifactChunk) (protocol.ResultArtifactAck, error) {
+	w.log.add(fmt.Sprintf("artifact:%d", node))
+	w.mu.Lock()
+	script, ok := w.scripts[node]
+	identity := script.identity
+	w.mu.Unlock()
+	if !ok || script.results == nil {
+		return protocol.ResultArtifactAck{}, errors.New("no scripted worker results")
+	}
+	state := script.results
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.artifactErrs > 0 {
+		state.artifactErrs--
+		return protocol.ResultArtifactAck{}, errors.New("injected artifact failure")
+	}
+	artifact := chunk.Artifact
+	if _, sealed := state.sealedStream[artifact.Checksum]; sealed {
+		if sealedArtifact := state.sealed[artifact.Checksum]; sealedArtifact != artifact {
+			return protocol.ResultArtifactAck{}, model.ErrIdentityReuse
+		}
+		return protocol.ResultArtifactAck{TransferID: chunk.Transfer.TransferID, NodeID: node, WorkerEpoch: identity.WorkerEpoch, Artifact: artifact, NextOffset: artifact.TotalLength, Complete: true, CoordinatorEpoch: chunk.CoordinatorEpoch}, nil
+	}
+	if chunk.DestinationNodeID != node || chunk.DestinationWorkerEpoch != identity.WorkerEpoch {
+		return protocol.ResultArtifactAck{}, errors.New("artifact destination mismatch")
+	}
+	partial := state.partial[artifact.Checksum]
+	next := uint64(len(partial))
+	end := chunk.Transfer.Offset + uint64(len(chunk.Transfer.Data))
+	if chunk.Transfer.Offset > next || chunk.Transfer.Offset+uint64(len(chunk.Transfer.Data)) > artifact.TotalLength {
+		return protocol.ResultArtifactAck{}, errors.New("artifact chunk gap")
+	}
+	overlapEnd := next
+	if end < next {
+		overlapEnd = end
+	}
+	if overlapEnd > chunk.Transfer.Offset && !bytes.Equal(partial[chunk.Transfer.Offset:overlapEnd], chunk.Transfer.Data[:overlapEnd-chunk.Transfer.Offset]) {
+		return protocol.ResultArtifactAck{}, model.ErrIdentityReuse
+	}
+	if end > next {
+		partial = append(partial, chunk.Transfer.Data[next-chunk.Transfer.Offset:]...)
+		state.partial[artifact.Checksum] = partial
+		next = end
+	}
+	complete := next == artifact.TotalLength
+	if complete {
+		if sha256.Sum256(partial) != artifact.Checksum {
+			delete(state.partial, artifact.Checksum)
+			return protocol.ResultArtifactAck{}, errors.New("artifact checksum mismatch")
+		}
+		state.sealed[artifact.Checksum] = artifact
+		state.sealedStream[artifact.Checksum] = partial
+		delete(state.partial, artifact.Checksum)
+	}
+	return protocol.ResultArtifactAck{TransferID: chunk.Transfer.TransferID, NodeID: node, WorkerEpoch: identity.WorkerEpoch, Artifact: artifact, NextOffset: next, Complete: complete, CoordinatorEpoch: chunk.CoordinatorEpoch}, nil
+}
+
 func (w *fakeWorkers) lastAck(node uint16) uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -632,7 +777,7 @@ func newHarness(t *testing.T) *harness {
 	actor, err := NewActor(ActorOptions{
 		NodeID: 1, Raft: h.raft, Machine: machine, WorkerReady: h.workerReady,
 		Membership: h.members, Workers: h.workers, Clock: h.clk,
-		Nonces: &scriptedNonces{}, Gate: h.gate,
+		Nonces: &scriptedNonces{}, Gate: h.gate, Results: h.workers,
 		FailureGracePeriod: 100 * time.Millisecond, RescanInterval: time.Second,
 	})
 	if err != nil {
