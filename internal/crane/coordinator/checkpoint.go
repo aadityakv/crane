@@ -92,6 +92,13 @@ func (cursors *eventCursors) rewind(node uint16, epoch model.WorkerEpoch) {
 // worker requires proof for. A lost status response is retried once from the
 // zero cursor before the worker is reported unavailable.
 func (actor *Actor) PollWorkerEvents(ctx context.Context, node uint16) error {
+	return actor.pollWorkerEvents(ctx, node, nil)
+}
+
+// pollWorkerEvents performs one worker's bounded event drain and records the
+// worker's reported process admission epoch into the leadership session so
+// per-job convergence derives from worker-observed state.
+func (actor *Actor) pollWorkerEvents(ctx context.Context, node uint16, session *sessionState) error {
 	if ctx == nil {
 		return errors.New("poll worker events: nil context")
 	}
@@ -129,6 +136,9 @@ func (actor *Actor) PollWorkerEvents(ctx context.Context, node uint16) error {
 		}
 		if !validWorkerStatusPage(node, record.Epoch, cursor.transaction, status) {
 			return fmt.Errorf("%w: node %d after transaction %d", ErrInvalidStatusPage, node, cursor.transaction)
+		}
+		if session != nil {
+			session.admission[node] = status.AdmissionEpoch
 		}
 		for _, event := range status.Events {
 			if err := actor.HandleWorkerEvent(ctx, event); err != nil {
@@ -209,10 +219,15 @@ func (actor *Actor) HandleWorkerEvent(ctx context.Context, event model.WorkerEve
 }
 
 // handleCompletionEvent commits one completion report and then announces the
-// committed watermark. A deterministic rejection is resolved by the retained
-// replicated tombstone: when the committed watermark already covers the
-// report, the committed notice is still redelivered so the originating worker
-// gains its deletion proof.
+// committed watermark. A deterministic rejection is classified by re-reading
+// the committed View: when the job is gone or terminal, or the report's token
+// no longer matches the current assignment, the event is permanently stale
+// and resolves as handled without any state mutation; when the committed
+// watermark already covers the report, the committed notice is still
+// redelivered so the originating worker gains its deletion proof; every other
+// rejection on a live current assignment was transiently false (for example
+// an apply-time Offline worker) and stays a retryable error with the cursor
+// pinned.
 func (actor *Actor) handleCompletionEvent(ctx context.Context, epoch model.CoordinatorEpoch, report model.CompletionReport) error {
 	subject := state.SubjectKey{Kind: state.SubjectSourceCheckpoint, JobID: report.JobID, TaskID: report.Source}
 	id := internalCommandID(state.CommandAdvanceCheckpoint, epoch, subject, report.ExpectedCheckpointRevision, report.Digest[:], uint64Bytes(report.WorkerTransactionID))
@@ -237,6 +252,11 @@ func (actor *Actor) handleCompletionEvent(ctx context.Context, epoch model.Coord
 			// the committed watermark exists to announce.
 			return nil
 		}
+		if current, currentOK := currentAssignmentToken(record, report.Source); !currentOK || current != report.Token {
+			// The re-read committed View proves the event can never apply:
+			// its assignment was replaced under a new token.
+			return nil
+		}
 		committed := record.Checkpoints[report.Source]
 		if result.Code == state.ResultSuccess && committed.Watermark < report.New {
 			return fmt.Errorf("%w: committed advance not visible", ErrCheckpointNotCommitted)
@@ -244,9 +264,11 @@ func (actor *Actor) handleCompletionEvent(ctx context.Context, epoch model.Coord
 		if committed.Watermark >= report.New {
 			return actor.ApplyCommittedCheckpoint(ctx, report.JobID, report.Source, committed.Watermark, view.AppliedIndex)
 		}
-		// The machine deterministically refused progress it never committed;
-		// the event resolves without any announced effect.
-		return nil
+		// The job is live under the report's exact token, so the deterministic
+		// rejection was transiently false and the retained event stays
+		// retryable until it commits, its assignment is replaced, or the job
+		// turns terminal.
+		return fmt.Errorf("completion proposal for a current assignment rejected with code %d", result.Code)
 	default:
 		return fmt.Errorf("completion proposal rejected with code %d", result.Code)
 	}
@@ -255,7 +277,11 @@ func (actor *Actor) handleCompletionEvent(ctx context.Context, epoch model.Coord
 // handleFailureEvent commits one FailJob under a stable command identity and
 // then installs the exact committed Closed terminal state on every assigned
 // active worker. The originating event stays durable — the cursor never
-// advances — until that terminal installation succeeded.
+// advances — until that terminal installation succeeded. A deterministic
+// rejection against a live job is classified by re-reading the committed
+// View: the event is permanently stale and resolves as handled exactly when
+// its task's token no longer matches the current assignment; a live current
+// assignment leaves the rejection transiently false and retryable.
 func (actor *Actor) handleFailureEvent(ctx context.Context, epoch model.CoordinatorEpoch, report model.JobFailureReport) error {
 	subject := state.SubjectKey{Kind: state.SubjectJobControl, JobID: report.JobID}
 	id := internalCommandID(state.CommandFailJob, epoch, subject, report.JobControlRevision, report.DetailDigest[:], uint64Bytes(report.TransactionID))
@@ -276,21 +302,45 @@ func (actor *Actor) handleFailureEvent(ctx context.Context, epoch model.Coordina
 		if !ok {
 			return nil
 		}
-		if !terminalLifecycle(record.Lifecycle) {
-			// A deterministically rejected stale failure leaves the job live;
-			// there is no terminal state to install.
+		if terminalLifecycle(record.Lifecycle) {
+			if record.Assignment == nil {
+				return nil
+			}
+			if !actor.installAssignment(ctx, epoch, record, model.Closed, false, 0) {
+				return errors.New("terminal Closed installation incomplete for failed job")
+			}
 			return nil
 		}
 		if record.Assignment == nil {
 			return nil
 		}
-		if !actor.installAssignment(ctx, epoch, record, model.Closed, false, 0) {
-			return errors.New("terminal Closed installation incomplete for failed job")
+		if current, currentOK := currentAssignmentToken(record, report.Task.Task); !currentOK || current != report.Task {
+			// The re-read committed View proves the failure can never apply:
+			// its assignment was replaced under a new token.
+			return nil
 		}
-		return nil
+		// The job is live under the report's exact token, so the
+		// deterministic rejection was transiently false (an apply-time
+		// Offline worker, a reassignment-marker window, or a fence the job
+		// will outgrow) and the retained event stays retryable.
+		return fmt.Errorf("failure proposal for a current assignment rejected with code %d", result.Code)
 	default:
 		return fmt.Errorf("failure proposal rejected with code %d", result.Code)
 	}
+}
+
+// currentAssignmentToken mirrors the replicated current-token lookup for one
+// task of one job's committed assignment.
+func currentAssignmentToken(record state.JobRecord, task model.TaskID) (model.AssignmentToken, bool) {
+	if record.Assignment == nil {
+		return model.AssignmentToken{}, false
+	}
+	for _, token := range record.Assignment.Tasks {
+		if token.Task == task {
+			return token, true
+		}
+	}
+	return model.AssignmentToken{}, false
 }
 
 // ApplyCommittedCheckpoint validates one committed source checkpoint against

@@ -499,3 +499,186 @@ func TestRescanDrivesCheckpointProgressWithoutWakeHint(t *testing.T) {
 		t.Fatal("impossible")
 	}
 }
+
+// seedFailJob commits one terminal FailJob under the current fence.
+func seedFailJob(t *testing.T, h *harness, job model.JobID, token model.AssignmentToken) {
+	t.Helper()
+	view := h.view()
+	record, ok := h.job(job)
+	if !ok {
+		t.Fatal("job missing")
+	}
+	failure := model.JobFailureReport{
+		JobID: job, JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision,
+		Task: token, Epoch: view.CoordinatorEpoch, TransactionID: 9,
+		Code: model.FailureOperator, DetailDigest: sha256.Sum256([]byte("terminal-before-poll")),
+	}
+	fail, err := state.NewFailJob(testCommandID("seed-stale-fail", job[:]), record.JobControlRevision, failure, view.CoordinatorEpoch)
+	if err != nil {
+		t.Fatalf("seed fail: %v", err)
+	}
+	h.raft.applySeed(t, fail)
+}
+
+func TestReconcileResolvesPermanentlyStaleCompletionEventAndOpensGate(t *testing.T) {
+	h, job, _, assignment := runningHarness(t)
+	token := sourceToken(t, assignment)
+	node := token.WorkerID
+	script := h.workers.script(node)
+	h.workers.mu.Lock()
+	script.events = []model.WorkerEvent{completionEvent(t, h, job, token, 1, 0, 0, 1, 4)}
+	h.workers.mu.Unlock()
+	// The job failed while the worker durably retained its completion event:
+	// the repolled event is deterministically rejected forever, and only the
+	// committed View proves that staleness.
+	seedFailJob(t, h, job, token)
+	record, _ := h.job(job)
+	failedRevision := record.JobControlRevision
+
+	h.start()
+	h.markReady()
+	h.lead(2)
+	h.waitGateOpen()
+
+	record, _ = h.job(job)
+	if record.Lifecycle != state.JobFailed || record.JobControlRevision != failedRevision {
+		t.Fatalf("stale event mutated terminal job: %#v", record)
+	}
+	if got := committedWatermark(h, job, token.Task); got != 0 {
+		t.Fatalf("stale event committed watermark %d", got)
+	}
+	if len(checkpointNoticesFor(h, node, token.Task)) != 0 {
+		t.Fatalf("stale event announced a checkpoint: %v", checkpointNoticesFor(h, node, token.Task))
+	}
+	// The per-WorkerEpoch cursor advances past the resolved event and the
+	// worker gains its deletion proof.
+	h.actor.Wake()
+	h.waitFor(func() bool { return h.workers.lastAck(node) == 1 }, "stale event acknowledged")
+}
+
+func TestPollWorkerEventsKeepsTransientlyRejectedCompletionRetryable(t *testing.T) {
+	h, job, _, assignment := runningHarness(t)
+	token := sourceToken(t, assignment)
+	node := token.WorkerID
+	other := uint16(3)
+	if token.WorkerID == 3 {
+		other = 2
+	}
+	script := h.workers.script(node)
+	h.workers.mu.Lock()
+	script.events = []model.WorkerEvent{completionEvent(t, h, job, token, 1, 0, 0, 1, 4)}
+	h.workers.mu.Unlock()
+	// Deactivate the other assigned worker: the live job carries reassignment
+	// markers, so the completion is deterministically rejected while its job
+	// stays live and its token still matches — a transiently-false rejection
+	// that must stay retryable with the cursor pinned.
+	view := h.view()
+	record, ok := h.workerRecord(other)
+	if !ok || record.State != state.WorkerEligible {
+		t.Fatalf("other worker = %#v", record)
+	}
+	deactivate, err := state.NewDeactivateWorker(
+		testCommandID("seed-deactivate", []byte{byte(other)}), record.Revision, other, record.Epoch,
+		affectedForWorker(view, other, record.Epoch), view.CoordinatorEpoch,
+	)
+	if err != nil {
+		t.Fatalf("seed deactivate: %v", err)
+	}
+	h.raft.applySeed(t, deactivate)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := h.actor.PollWorkerEvents(context.Background(), node); err == nil {
+			t.Fatal("transiently rejected completion reported handled")
+		}
+	}
+	if got := h.workers.lastAck(node); got != 0 {
+		t.Fatalf("cursor advanced past a transient rejection: %d", got)
+	}
+	jobRecord, _ := h.job(job)
+	if jobRecord.Lifecycle != state.JobRunning || len(jobRecord.Checkpoints) != 0 {
+		t.Fatalf("rejected event mutated the live job: %#v", jobRecord)
+	}
+}
+
+// staleTokenCompletionEvent builds one retained completion event whose token
+// predates the current committed assignment (an older attempt of the same
+// worker's duty).
+func staleTokenCompletionEvent(t *testing.T, h *harness, job model.JobID, token model.AssignmentToken) model.WorkerEvent {
+	t.Helper()
+	event := completionEvent(t, h, job, token, 1, 0, 0, 1, 4)
+	report := *event.Completion
+	report.Token.Attempt++
+	report.Digest = model.CompletionReportDigest(report)
+	return model.WorkerEvent{
+		WorkerID: token.WorkerID, WorkerEpoch: token.WorkerEpoch, TransactionID: 1,
+		Kind: model.WorkerEventCompletion, Completion: &report,
+	}
+}
+
+func TestPollWorkerEventsResolvesCompletionEventWithReplacedToken(t *testing.T) {
+	h, job, _, assignment := runningHarness(t)
+	token := sourceToken(t, assignment)
+	node := token.WorkerID
+	script := h.workers.script(node)
+	h.workers.mu.Lock()
+	script.events = []model.WorkerEvent{staleTokenCompletionEvent(t, h, job, token)}
+	h.workers.mu.Unlock()
+
+	// The live job replaced the reported task's token before the poll: the
+	// re-read committed View proves the retained event permanently stale and
+	// it resolves as handled without any state mutation.
+	if err := h.actor.PollWorkerEvents(context.Background(), node); err != nil {
+		t.Fatalf("permanently stale completion after token replacement: %v", err)
+	}
+	record, _ := h.job(job)
+	if record.Lifecycle != state.JobRunning || len(record.Checkpoints) != 0 {
+		t.Fatalf("stale token event mutated the live job: %#v", record)
+	}
+	if err := h.actor.PollWorkerEvents(context.Background(), node); err != nil {
+		t.Fatalf("ack poll: %v", err)
+	}
+	if got := h.workers.lastAck(node); got != 1 {
+		t.Fatalf("cursor = %d", got)
+	}
+}
+
+func TestPollWorkerEventsKeepsTransientlyRejectedFailureRetryable(t *testing.T) {
+	h, job, _, assignment := runningHarness(t)
+	token := sourceToken(t, assignment)
+	node := token.WorkerID
+	other := uint16(3)
+	if token.WorkerID == 3 {
+		other = 2
+	}
+	script := h.workers.script(node)
+	h.workers.mu.Lock()
+	script.events = []model.WorkerEvent{failureWorkerEvent(t, h, job, token, 1)}
+	h.workers.mu.Unlock()
+	// Deactivate the other assigned worker first: the failure report then
+	// carries a fence the live job has outgrown, while its token still
+	// matches — a transiently-false rejection that must stay retryable.
+	view := h.view()
+	record, ok := h.workerRecord(other)
+	if !ok || record.State != state.WorkerEligible {
+		t.Fatalf("other worker = %#v", record)
+	}
+	deactivate, err := state.NewDeactivateWorker(
+		testCommandID("seed-deactivate-failure", []byte{byte(other)}), record.Revision, other, record.Epoch,
+		affectedForWorker(view, other, record.Epoch), view.CoordinatorEpoch,
+	)
+	if err != nil {
+		t.Fatalf("seed deactivate: %v", err)
+	}
+	h.raft.applySeed(t, deactivate)
+
+	if err := h.actor.PollWorkerEvents(context.Background(), node); err == nil {
+		t.Fatal("transiently rejected failure reported handled")
+	}
+	if got := h.workers.lastAck(node); got != 0 {
+		t.Fatalf("cursor advanced past a transient rejection: %d", got)
+	}
+	jobRecord, _ := h.job(job)
+	if jobRecord.Lifecycle != state.JobRunning {
+		t.Fatalf("rejected failure mutated the live job: %#v", jobRecord)
+	}
+}
