@@ -591,6 +591,12 @@ func applyAssignment(work *RecoveredWork, installed InstalledAssignment) error {
 			if equalInstalledAssignment(prior, installed) {
 				return nil
 			}
+			if equalInstalledAssignmentContent(prior, installed) && compareEpochOrder(installed.CoordinatorEpoch, prior.CoordinatorEpoch) > 0 {
+				// Leadership rebind: identical content under strictly newer
+				// committed authority durably rebinds the fence owner.
+				work.Assignments[index] = cloneInstalled(installed)
+				return nil
+			}
 			if installed.Assignment.Digest != prior.Assignment.Digest || !bytes.Equal(installed.SpecificationBytes, prior.SpecificationBytes) || !equalTokens(installed.Assignment.Tasks, prior.Assignment.Tasks) || !equalReplicas(installed.Assignment.ResultReplicas, prior.Assignment.ResultReplicas) || installed.JobControlRevision <= prior.JobControlRevision {
 				return model.ErrIdentityReuse
 			}
@@ -3861,7 +3867,10 @@ func findToken(set model.AssignmentSet, task model.TaskID) (model.AssignmentToke
 	return model.AssignmentToken{}, false
 }
 func equalInstalledAssignment(a, b InstalledAssignment) bool {
-	return a.Assignment.JobID == b.Assignment.JobID && a.Assignment.Revision == b.Assignment.Revision && a.Assignment.Digest == b.Assignment.Digest && a.JobControlRevision == b.JobControlRevision && a.SchedulingState == b.SchedulingState && a.CoordinatorEpoch == b.CoordinatorEpoch && bytes.Equal(a.SpecificationBytes, b.SpecificationBytes) && equalTokens(a.Assignment.Tasks, b.Assignment.Tasks) && equalReplicas(a.Assignment.ResultReplicas, b.Assignment.ResultReplicas)
+	return equalInstalledAssignmentContent(a, b) && a.CoordinatorEpoch == b.CoordinatorEpoch
+}
+func equalInstalledAssignmentContent(a, b InstalledAssignment) bool {
+	return a.Assignment.JobID == b.Assignment.JobID && a.Assignment.Revision == b.Assignment.Revision && a.Assignment.Digest == b.Assignment.Digest && a.JobControlRevision == b.JobControlRevision && a.SchedulingState == b.SchedulingState && bytes.Equal(a.SpecificationBytes, b.SpecificationBytes) && equalTokens(a.Assignment.Tasks, b.Assignment.Tasks) && equalReplicas(a.Assignment.ResultReplicas, b.Assignment.ResultReplicas)
 }
 func equalTokens(a, b []model.AssignmentToken) bool {
 	if len(a) != len(b) {
