@@ -46,6 +46,7 @@ func TestControlHandshakeFailsClosedForFingerprintMembershipReplayAndChange(t *t
 		mutate func(*controlFixture, *protocol.WorkerHandshake)
 	}{
 		{name: "unknown member", mutate: func(f *controlFixture, _ *protocol.WorkerHandshake) { f.members.view.Members = nil }},
+		{name: "payload identity", mutate: func(_ *controlFixture, h *protocol.WorkerHandshake) { h.NodeID++ }},
 		{name: "wrong ip", mutate: func(f *controlFixture, _ *protocol.WorkerHandshake) {
 			f.members.authorizeErr = membership.ErrUnauthorized
 		}},
@@ -74,6 +75,54 @@ func TestControlHandshakeFailsClosedForFingerprintMembershipReplayAndChange(t *t
 	fixture.members.view.Members[1].Incarnation++
 	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.FenceRequest{CoordinatorEpoch: fixture.epoch})); !errors.Is(err, ErrControlUnauthorized) {
 		t.Fatalf("changed membership error = %v", err)
+	}
+}
+
+func TestControlSessionBoundsArePerPeerAndGlobalAndReleaseOnClose(t *testing.T) {
+	fixture := newControlFixture(t)
+	var sessions []*ControlSession
+	for index := 0; index < 2; index++ {
+		session, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 40000 + index}, func() error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := session.authenticate(2, fixture.handshake(2)); err != nil {
+			t.Fatal(err)
+		}
+		sessions = append(sessions, session)
+	}
+	overPeer, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 40003}, func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := overPeer.authenticate(2, fixture.handshake(2)); !errors.Is(err, ErrControlCapacity) {
+		t.Fatalf("per-peer session bound error=%v", err)
+	}
+	if err := overPeer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for node := 3; len(sessions) < 8; node++ {
+		session, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0." + string(rune('0'+node))), Port: 40000}, func() error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessions = append(sessions, session)
+	}
+	if _, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.9"), Port: 40000}, func() error { return nil }); !errors.Is(err, ErrControlCapacity) {
+		t.Fatalf("global session bound error=%v", err)
+	}
+	if err := sessions[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.9"), Port: 40000}, func() error { return nil })
+	if err != nil {
+		t.Fatalf("closed session did not release capacity: %v", err)
+	}
+	sessions = append(sessions[1:], replacement)
+	for _, session := range sessions {
+		if err := session.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -989,6 +1038,48 @@ func TestControlResultRecordRequiresExactSharedGatePermit(t *testing.T) {
 		t.Fatalf("open-gate 212: %v", err)
 	} else if _, ok := response.(protocol.ResultRecordAck); !ok {
 		t.Fatalf("open-gate 212 response = %#v", response)
+	}
+}
+
+func TestControlResultRecordRejectsAuthenticatedPayloadWorkerEpochMismatchBeforeStore(t *testing.T) {
+	fixture := newControlFixture(t)
+	chunk := validControlResultChunk(t, fixture)
+	durable, err := store.Open(filepath.Join(t.TempDir(), "worker"), store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	if err := durable.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.InstallAssignment(fixture.assignment.Assignment, fixture.assignment.Topology.Spec(), fixture.assignment.JobControlRevision, model.Running, fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	repository := &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}
+	transfer, err := NewTransferOwner(TransferOptions{Repository: repository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := NewControlOwner(ControlOptions{Config: fixture.configuration, ClusterID: fixture.cluster, Repository: repository, Engine: &controlNoopEngine{}, Transfer: transfer, Gate: fixture.gate, Membership: fixture.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner = owner
+	session := fixture.session(t, 2)
+	wrongEpoch := fixture.handshake(2)
+	wrongEpoch.WorkerEpoch[0]++
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 1, wrongEpoch)); err != nil {
+		t.Fatalf("nonzero session epoch handshake: %v", err)
+	}
+	if err := fixture.gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, chunk)); !errors.Is(err, ErrTransferUnauthorized) {
+		t.Fatalf("payload/session worker epoch mismatch error=%v", err)
+	}
+	work, err := durable.RecoverWork()
+	if err != nil || len(work.Results) != 0 {
+		t.Fatalf("epoch mismatch mutated result Store: results=%d err=%v", len(work.Results), err)
 	}
 }
 

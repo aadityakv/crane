@@ -360,7 +360,7 @@ func (service *Service) controlError(message wire.MessageType, err error) protoc
 		code, detail = protocol.WorkerErrorStaleAssignment, "stale assignment"
 	case errors.Is(err, ErrControlCapacity), errors.Is(err, ErrTransferCapacity), errors.Is(err, store.ErrCapacity):
 		code, retryable, detail = protocol.WorkerErrorCapacity, true, "worker capacity exhausted"
-	case errors.Is(err, store.ErrUnavailable), errors.Is(err, store.ErrClosed):
+	case errors.Is(err, store.ErrUnavailable), errors.Is(err, store.ErrClosed), errors.Is(err, admission.ErrClosed):
 		code, retryable, detail = protocol.WorkerErrorUnavailable, true, "worker store unavailable"
 	case errors.Is(err, ErrResultArtifactUnavailable), errors.Is(err, ErrResultFetchUnavailable):
 		code, retryable, detail = protocol.WorkerErrorUnavailable, true, "result storage unavailable"

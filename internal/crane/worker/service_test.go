@@ -364,6 +364,140 @@ func TestWorkerControlWireTypesArtifactAndFetchUnavailableAndRejectsResponses(t 
 	}
 }
 
+func TestWorkerControlWireResultRecordClosedSuccessCancellationAndCorrelation(t *testing.T) {
+	fixture := newControlFixture(t)
+	chunk := validControlResultChunk(t, fixture)
+	authenticator := wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901"))
+	durable, err := store.Open(filepath.Join(t.TempDir(), "worker"), store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	if err := durable.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	repository := &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}
+	service := &Service{configuration: fixture.configuration, authenticator: authenticator, clock: clock.NewManual(time.Unix(100, 0)), clusterID: fixture.cluster, store: durable, repository: repository}
+	client, server := net.Pipe()
+	session, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 40000}, server.Close)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.handleControlConnection(ctx, server, session) }()
+	limits := wire.DefaultLimits()
+	limits.MaxFrameSize = int(model.WorkerControlMaxFrameBytesV1)
+	limits.ExpectedClusterID = &fixture.cluster
+	stream := wire.NewTCPFrameStream(client, authenticator, limits, time.Second)
+	write := func(id byte, message protocol.WorkerMessage) {
+		t.Helper()
+		frame := fixture.frame(t, 2, id, message)
+		if err := stream.WriteFrame(context.Background(), frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(id byte) protocol.WorkerMessage {
+		t.Helper()
+		frame, err := stream.ReadFrame(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.Header.RequestID != (wire.RequestID{id}) || frame.Header.SenderID != fixture.configuration.NodeID {
+			t.Fatalf("response correlation header=%#v", frame.Header)
+		}
+		message, err := protocol.UnmarshalWorkerMessage(frame.Header.Message, frame.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return message
+	}
+	write(1, fixture.handshake(2))
+	if _, ok := read(1).(protocol.WorkerHandshakeAck); !ok {
+		t.Fatal("handshake did not succeed")
+	}
+	write(2, chunk)
+	closed, ok := read(2).(protocol.WorkerError)
+	if !ok || closed.Code != protocol.WorkerErrorUnavailable || !closed.Retryable || closed.RelatedMessage != wire.MessageCraneResultRecordChunk || closed.CoordinatorEpoch != fixture.epoch {
+		t.Fatalf("closed-gate response=%#v", closed)
+	}
+	if fixture.transfer.calls != 0 {
+		t.Fatal("closed gate reached transfer owner")
+	}
+	if err := fixture.gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	fixture.transfer.ack = protocol.ResultRecordAck{TransferID: chunk.Transfer.TransferID, NodeID: chunk.DestinationNodeID, WorkerEpoch: chunk.DestinationWorkerEpoch, NextOffset: chunk.Transfer.TotalLength, TotalLength: chunk.Transfer.TotalLength, Checksum: chunk.Transfer.Checksum, Complete: true, CoordinatorEpoch: chunk.Provenance.CoordinatorEpoch}
+	write(3, chunk)
+	if ack, ok := read(3).(protocol.ResultRecordAck); !ok || ack != fixture.transfer.ack {
+		t.Fatalf("successful 212/213 response=%#v", ack)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	fixture.owner.beforeMutation = func(kind string) {
+		if kind == "result-record" {
+			close(entered)
+			<-release
+		}
+	}
+	write(4, chunk)
+	<-entered
+	cancel()
+	close(release)
+	readCtx, readCancel := context.WithTimeout(context.Background(), time.Second)
+	defer readCancel()
+	if _, err := stream.ReadFrame(readCtx); err == nil {
+		t.Fatal("canceled in-flight 212 produced a response")
+	}
+	_ = stream.Close()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("canceled connection error=%v", err)
+	}
+	if fixture.transfer.calls != 1 {
+		t.Fatalf("canceled 212 reached transfer owner: calls=%d", fixture.transfer.calls)
+	}
+}
+
+func TestWorkerControlWireRejectsBadMACAndWrongClusterBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		auth        wire.Authenticator
+		mutateFrame func(*wire.Frame)
+	}{
+		{name: "bad MAC", auth: wire.NewHMACAuthenticator([]byte("abcdef0123456789abcdef0123456789")), mutateFrame: func(*wire.Frame) {}},
+		{name: "wrong cluster", auth: wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901")), mutateFrame: func(frame *wire.Frame) { frame.Header.ClusterID[0]++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newControlFixture(t)
+			authenticator := wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901"))
+			durable, err := store.Open(filepath.Join(t.TempDir(), "worker"), store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer durable.Close()
+			repository := &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}
+			service := &Service{configuration: fixture.configuration, authenticator: authenticator, clock: clock.NewManual(time.Unix(100, 0)), clusterID: fixture.cluster, store: durable, repository: repository}
+			client, server := net.Pipe()
+			session, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 40000}, server.Close)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- service.handleControlConnection(context.Background(), server, session) }()
+			stream := wire.NewTCPFrameStream(client, test.auth, wire.DefaultLimits(), time.Second)
+			frame := fixture.frame(t, 2, 1, fixture.handshake(2))
+			test.mutateFrame(&frame)
+			_ = stream.WriteFrame(context.Background(), frame)
+			if err := <-done; err == nil {
+				t.Fatal("invalid frame kept control connection alive")
+			}
+			_ = stream.Close()
+			if fixture.repository.fenceCalls != 0 || fixture.repository.installCalls != 0 || fixture.repository.observeCalls != 0 || fixture.transfer.calls != 0 {
+				t.Fatal("invalid authenticated framing reached control mutation")
+			}
+		})
+	}
+}
+
 func TestWorkerServiceStoreAuthorityFailureIsFatal(t *testing.T) {
 	fixture := newWorkerServiceFixture(t, false)
 	service, err := NewService(fixture.options())
