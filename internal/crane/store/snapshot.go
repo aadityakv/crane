@@ -21,7 +21,8 @@ import (
 const (
 	currentFilename          = "worker.current"
 	currentTempFilename      = ".worker.current.tmp"
-	snapshotSchemaVersion    = uint16(1)
+	snapshotSchemaVersionV1  = uint16(1)
+	snapshotSchemaVersion    = uint16(2)
 	snapshotHeaderBytes      = 104
 	snapshotFooterBytes      = sha256.Size
 	snapshotFrameHeaderBytes = 6
@@ -160,11 +161,15 @@ func snapshotMetadata(state RecoveredState, work RecoveredWork, generation uint6
 }
 
 func snapshotMetadataWithSourceSchemas(state RecoveredState, work RecoveredWork, generation uint64, sourceSchemas map[model.TaskID]uint16) (Snapshot, []byte, error) {
+	return snapshotMetadataVersion(state, work, generation, sourceSchemas, snapshotSchemaVersion)
+}
+
+func snapshotMetadataVersion(state RecoveredState, work RecoveredWork, generation uint64, sourceSchemas map[model.TaskID]uint16, version uint16) (Snapshot, []byte, error) {
 	if generation == 0 || !validSnapshotTransactionMetadata(state.LastSequence, state.TransactionCount) || !validSnapshotEventMetadata(work.NextTransactionID, state.LastSequence, state.TransactionCount) || state.WorkerEpoch.Validate() != nil || state.Identity.Validate() != nil {
 		return Snapshot{}, nil, fmt.Errorf("%w: invalid snapshot metadata", ErrInvalidTransaction)
 	}
 	var count, body uint64
-	err := visitSnapshotRecordsWithSourceSchemas(work, sourceSchemas, func(_ snapshotRecordKind, payload []byte) error {
+	err := visitSnapshotRecordsVersion(work, sourceSchemas, version, func(_ snapshotRecordKind, payload []byte) error {
 		if len(payload) > MaxRecordPayloadBytes {
 			return fmt.Errorf("%w: snapshot record exceeds bound", ErrCapacity)
 		}
@@ -189,7 +194,7 @@ func snapshotMetadataWithSourceSchemas(state RecoveredState, work RecoveredWork,
 	total := base + body
 	header := make([]byte, snapshotHeaderBytes)
 	copy(header[:4], snapshotMagic[:])
-	binary.BigEndian.PutUint16(header[4:6], snapshotSchemaVersion)
+	binary.BigEndian.PutUint16(header[4:6], version)
 	binary.BigEndian.PutUint16(header[6:8], snapshotHeaderBytes)
 	binary.BigEndian.PutUint64(header[8:16], total)
 	copy(header[16:32], state.Identity.ClusterID[:])
@@ -223,6 +228,10 @@ func visitSnapshotRecords(work RecoveredWork, visit func(snapshotRecordKind, []b
 }
 
 func visitSnapshotRecordsWithSourceSchemas(work RecoveredWork, sourceSchemas map[model.TaskID]uint16, visit func(snapshotRecordKind, []byte) error) error {
+	return visitSnapshotRecordsVersion(work, sourceSchemas, snapshotSchemaVersion, visit)
+}
+
+func visitSnapshotRecordsVersion(work RecoveredWork, sourceSchemas map[model.TaskID]uint16, version uint16, visit func(snapshotRecordKind, []byte) error) error {
 	if work.Fence != (model.CoordinatorEpoch{}) {
 		payload, err := encodeFence(work.Fence)
 		if err != nil {
@@ -259,6 +268,9 @@ func visitSnapshotRecordsWithSourceSchemas(work RecoveredWork, sourceSchemas map
 		if err := visit(snapshotSource, payload); err != nil {
 			return err
 		}
+	}
+	if version == snapshotSchemaVersionV1 && len(work.Checkpoints) != 0 {
+		return errors.New("snapshot v1 cannot encode checkpoint observations")
 	}
 	checkpoints := append([]CommittedCheckpoint(nil), work.Checkpoints...)
 	sort.Slice(checkpoints, func(i, j int) bool { return taskLess(checkpoints[i].Notice.Source, checkpoints[j].Notice.Source) })
@@ -362,7 +374,7 @@ func recoverSnapshotReader(reader io.ReaderAt, size int64, expected Identity, cu
 	if err := readAtFull(reader, header, 0); err != nil {
 		return RecoveredWork{}, Snapshot{}, fmt.Errorf("%w: snapshot header: %v", ErrCorrupt, err)
 	}
-	metadata, nextTransactionID, count, body, err := decodeSnapshotHeader(header, size, expected, current)
+	metadata, nextTransactionID, count, body, version, err := decodeSnapshotHeader(header, size, expected, current)
 	if err != nil {
 		return RecoveredWork{}, Snapshot{}, err
 	}
@@ -388,25 +400,25 @@ func recoverSnapshotReader(reader io.ReaderAt, size int64, expected Identity, cu
 	if digest == ([32]byte{}) || !bytes.Equal(digest[:], wantDigest) || digest != current.SnapshotDigest {
 		return RecoveredWork{}, Snapshot{}, fmt.Errorf("%w: snapshot digest mismatch", ErrCorrupt)
 	}
-	if err := scanSnapshotFrames(reader, snapshotHeaderBytes, body, count, nil); err != nil {
+	if err := scanSnapshotFrames(reader, snapshotHeaderBytes, body, count, version, nil); err != nil {
 		return RecoveredWork{}, Snapshot{}, err
 	}
 	decoder := newSnapshotDecoder(newRecoveredWork(), body)
 	decoder.work.NextTransactionID = nextTransactionID
-	if err := scanSnapshotFrames(reader, snapshotHeaderBytes, body, count, decoder); err != nil {
+	if err := scanSnapshotFrames(reader, snapshotHeaderBytes, body, count, version, decoder); err != nil {
 		return RecoveredWork{}, Snapshot{}, err
 	}
 	if err := validateSnapshotWork(decoder.work, expected.NodeID, current.WorkerEpoch); err != nil {
 		return RecoveredWork{}, Snapshot{}, fmt.Errorf("%w: snapshot state: %v", ErrCorrupt, err)
 	}
 	canonicalState := RecoveredState{Identity: expected, WorkerEpoch: current.WorkerEpoch, LastSequence: metadata.BaseSequence, TransactionCount: metadata.TransactionCount}
-	canonical, canonicalHeader, err := snapshotMetadataWithSourceSchemas(canonicalState, decoder.work, metadata.Generation, decoder.sourceSchemas)
+	canonical, canonicalHeader, err := snapshotMetadataVersion(canonicalState, decoder.work, metadata.Generation, decoder.sourceSchemas, version)
 	if err != nil || canonical != metadata {
 		return RecoveredWork{}, Snapshot{}, fmt.Errorf("%w: noncanonical snapshot metadata", ErrCorrupt)
 	}
 	canonicalHasher := sha256.New()
 	_, _ = canonicalHasher.Write(canonicalHeader)
-	err = visitSnapshotRecordsWithSourceSchemas(decoder.work, decoder.sourceSchemas, func(kind snapshotRecordKind, payload []byte) error {
+	err = visitSnapshotRecordsVersion(decoder.work, decoder.sourceSchemas, version, func(kind snapshotRecordKind, payload []byte) error {
 		frame, frameErr := encodeSnapshotFrame(kind, payload)
 		if frameErr == nil {
 			_, _ = canonicalHasher.Write(frame)
@@ -419,9 +431,13 @@ func recoverSnapshotReader(reader io.ReaderAt, size int64, expected Identity, cu
 	return decoder.work, metadata, nil
 }
 
-func decodeSnapshotHeader(header []byte, size int64, expected Identity, current currentGeneration) (Snapshot, uint64, uint64, uint64, error) {
-	if len(header) != snapshotHeaderBytes || !bytes.Equal(header[:4], snapshotMagic[:]) || binary.BigEndian.Uint16(header[4:6]) != snapshotSchemaVersion || binary.BigEndian.Uint16(header[6:8]) != snapshotHeaderBytes || header[98] != 0 || header[99] != 0 || crc32.Checksum(header[:100], walCRC) != binary.BigEndian.Uint32(header[100:104]) {
-		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot header schema/checksum", ErrCorrupt)
+func decodeSnapshotHeader(header []byte, size int64, expected Identity, current currentGeneration) (Snapshot, uint64, uint64, uint64, uint16, error) {
+	if len(header) != snapshotHeaderBytes {
+		return Snapshot{}, 0, 0, 0, 0, fmt.Errorf("%w: snapshot header schema/checksum", ErrCorrupt)
+	}
+	version := binary.BigEndian.Uint16(header[4:6])
+	if !bytes.Equal(header[:4], snapshotMagic[:]) || version != snapshotSchemaVersionV1 && version != snapshotSchemaVersion || binary.BigEndian.Uint16(header[6:8]) != snapshotHeaderBytes || header[98] != 0 || header[99] != 0 || crc32.Checksum(header[:100], walCRC) != binary.BigEndian.Uint32(header[100:104]) {
+		return Snapshot{}, 0, 0, 0, 0, fmt.Errorf("%w: snapshot header schema/checksum", ErrCorrupt)
 	}
 	var identity Identity
 	copy(identity.ClusterID[:], header[16:32])
@@ -429,7 +445,7 @@ func decodeSnapshotHeader(header []byte, size int64, expected Identity, current 
 	var epoch model.WorkerEpoch
 	copy(epoch[:], header[34:50])
 	if identity != expected {
-		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot identity", ErrIdentityMismatch)
+		return Snapshot{}, 0, 0, 0, 0, fmt.Errorf("%w: snapshot identity", ErrIdentityMismatch)
 	}
 	total := binary.BigEndian.Uint64(header[8:16])
 	generation := binary.BigEndian.Uint64(header[50:58])
@@ -439,20 +455,24 @@ func decodeSnapshotHeader(header []byte, size int64, expected Identity, current 
 	count := binary.BigEndian.Uint64(header[82:90])
 	body := binary.BigEndian.Uint64(header[90:98])
 	if count > math.MaxUint64/snapshotFrameOverhead {
-		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot header count", ErrCorrupt)
+		return Snapshot{}, 0, 0, 0, 0, fmt.Errorf("%w: snapshot header count", ErrCorrupt)
 	}
 	minimumBody := count * snapshotFrameOverhead
 	if body < minimumBody || body > uint64(size)-snapshotHeaderBytes-snapshotFooterBytes || total != uint64(size) || total != uint64(snapshotHeaderBytes+snapshotFooterBytes)+body || generation == 0 || !validSnapshotEventMetadata(nextTransactionID, baseSequence, transactions) {
-		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot header bounds", ErrCorrupt)
+		return Snapshot{}, 0, 0, 0, 0, fmt.Errorf("%w: snapshot header bounds", ErrCorrupt)
 	}
 	if current.Identity != identity || current.WorkerEpoch != epoch || current.Generation != generation || current.BaseSequence != baseSequence || current.TransactionCount != transactions || current.SnapshotBytes != total || !validSnapshotTransactionMetadata(baseSequence, transactions) {
-		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot/current marker mismatch", ErrCorrupt)
+		return Snapshot{}, 0, 0, 0, 0, fmt.Errorf("%w: snapshot/current marker mismatch", ErrCorrupt)
 	}
-	return Snapshot{Generation: generation, BaseSequence: baseSequence, TransactionCount: transactions, Bytes: total}, nextTransactionID, count, body, nil
+	return Snapshot{Generation: generation, BaseSequence: baseSequence, TransactionCount: transactions, Bytes: total}, nextTransactionID, count, body, version, nil
 }
 
-func scanSnapshotFrames(reader io.ReaderAt, start int64, bodyBytes, count uint64, decoder *snapshotDecoder) error {
+func scanSnapshotFrames(reader io.ReaderAt, start int64, bodyBytes, count uint64, version uint16, decoder *snapshotDecoder) error {
 	offset, end := start, start+int64(bodyBytes)
+	maximumKind := snapshotCheckpointObservation
+	if version == snapshotSchemaVersionV1 {
+		maximumKind = snapshotEvent
+	}
 	for index := uint64(0); index < count; index++ {
 		if end-offset < snapshotFrameOverhead {
 			return fmt.Errorf("%w: truncated snapshot frame header", ErrCorrupt)
@@ -464,7 +484,7 @@ func scanSnapshotFrames(reader io.ReaderAt, start int64, bodyBytes, count uint64
 		kind := snapshotRecordKind(binary.BigEndian.Uint16(header[:2]))
 		length := uint64(binary.BigEndian.Uint32(header[2:6]))
 		frameBytes := uint64(snapshotFrameOverhead) + length
-		if kind < snapshotFence || kind > snapshotCheckpointObservation || length < snapshotMinimumPayload(kind) || length > MaxRecordPayloadBytes || frameBytes > uint64(end-offset) {
+		if kind < snapshotFence || kind > maximumKind || length < snapshotMinimumPayload(kind) || length > MaxRecordPayloadBytes || frameBytes > uint64(end-offset) {
 			return fmt.Errorf("%w: snapshot frame bounds", ErrCorrupt)
 		}
 		if decoder != nil {

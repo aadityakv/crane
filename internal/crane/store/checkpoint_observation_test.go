@@ -1,7 +1,9 @@
 package store
 
 import (
+	"encoding/binary"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -50,6 +52,16 @@ func TestCommittedCheckpointObservationIsAtomicOwnedAndSurvivesSnapshotReopen(t 
 	if err := workerStore.ObserveCheckpoint(notice); err != nil {
 		t.Fatal(err)
 	}
+	payload, err := encodeCheckpointObservation(CommittedCheckpoint{Notice: notice.Notice, JobControlRevision: notice.JobControlRevision, AssignmentRevision: notice.AssignmentRevision, AssignmentDigest: notice.AssignmentDigest})
+	if err != nil || binary.BigEndian.Uint16(payload[:2]) != model.WorkerStoreContractV1().WriteDomainRegistryVersion {
+		t.Fatalf("checkpoint observation payload registry = %d, %v", binary.BigEndian.Uint16(payload[:2]), err)
+	}
+	legacyRegistry := append([]byte(nil), payload...)
+	binary.BigEndian.PutUint16(legacyRegistry[:2], 1)
+	beforeLegacy := workerStore.Recovered()
+	if err := workerStore.Commit(Transaction{Records: []Record{{Type: recordCheckpointObservation, Payload: legacyRegistry}}}); err == nil || workerStore.Recovered() != beforeLegacy {
+		t.Fatalf("v1 domain registry admitted v2 record: %v", err)
+	}
 	before, err := workerStore.RecoverWork()
 	beforeState := workerStore.Recovered()
 	if err != nil || len(before.Checkpoints) != 1 || before.Checkpoints[0].Notice != notice.Notice {
@@ -70,8 +82,13 @@ func TestCommittedCheckpointObservationIsAtomicOwnedAndSurvivesSnapshotReopen(t 
 	if !reflect.DeepEqual(after, before) {
 		t.Fatal("rejected observation mutated state")
 	}
-	if _, err := workerStore.Snapshot(); err != nil {
+	snapshot, err := workerStore.Snapshot()
+	if err != nil {
 		t.Fatal(err)
+	}
+	image, err := os.ReadFile(filepath.Join(path, snapshotFilename(snapshot.Generation)))
+	if err != nil || binary.BigEndian.Uint16(image[4:6]) != model.WorkerStoreContractV1().WriteSnapshotVersion {
+		t.Fatalf("snapshot write version = %d, %v", binary.BigEndian.Uint16(image[4:6]), err)
 	}
 	if err := workerStore.Close(); err != nil {
 		t.Fatal(err)

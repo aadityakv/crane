@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	domainRecordSchema     uint16 = 1
-	outboxRecordSchema     uint16 = 2
-	sourceRecordSchema     uint16 = 2
-	checkpointRecordSchema uint16 = 2
-	eventAckRecordSchema   uint16 = 2
+	domainRecordSchema                uint16 = 1
+	outboxRecordSchema                uint16 = 2
+	sourceRecordSchema                uint16 = 2
+	checkpointRecordSchema            uint16 = 2
+	eventAckRecordSchema              uint16 = 2
+	checkpointObservationRecordSchema uint16 = 2
 )
 
 const (
@@ -2665,7 +2666,7 @@ func encodeCheckpointObservation(observation CommittedCheckpoint) ([]byte, error
 		return nil, err
 	}
 	w := newRecordWriter()
-	w.u16(domainRecordSchema)
+	w.u16(checkpointObservationRecordSchema)
 	w.job(observation.Notice.JobID)
 	w.task(observation.Notice.Source)
 	w.u64(observation.Notice.Watermark)
@@ -2679,11 +2680,11 @@ func encodeCheckpointObservation(observation CommittedCheckpoint) ([]byte, error
 
 func decodeCheckpointObservation(payload []byte) (CommittedCheckpoint, error) {
 	r := newRecordReader(payload)
-	if err := r.schema(); err != nil {
-		return CommittedCheckpoint{}, err
+	schema, err := r.u16()
+	if err != nil || schema != checkpointObservationRecordSchema {
+		return CommittedCheckpoint{}, errors.New("unsupported checkpoint observation record schema")
 	}
 	var observation CommittedCheckpoint
-	var err error
 	if observation.Notice.JobID, err = r.job(); err != nil {
 		return observation, err
 	}

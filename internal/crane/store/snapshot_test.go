@@ -213,7 +213,7 @@ func TestSnapshotSchemaIsDeterministicChecksummedAndOwned(t *testing.T) {
 	if firstSnapshot.Bytes != uint64(len(first)) || firstSnapshot.Generation != 1 {
 		t.Fatalf("snapshot metadata=%+v bytes=%d", firstSnapshot, len(first))
 	}
-	if string(first[:4]) != "CWSS" || binary.BigEndian.Uint16(first[4:6]) != 1 || binary.BigEndian.Uint16(first[6:8]) != snapshotHeaderBytes || binary.BigEndian.Uint64(first[8:16]) != uint64(len(first)) {
+	if string(first[:4]) != "CWSS" || binary.BigEndian.Uint16(first[4:6]) != model.WorkerStoreContractV1().WriteSnapshotVersion || binary.BigEndian.Uint16(first[6:8]) != snapshotHeaderBytes || binary.BigEndian.Uint64(first[8:16]) != uint64(len(first)) {
 		t.Fatalf("snapshot header=%x", first[:16])
 	}
 	wantDigest := sha256.Sum256(first[:len(first)-snapshotFooterBytes])
@@ -268,6 +268,28 @@ func TestSnapshotSchemaIsDeterministicChecksummedAndOwned(t *testing.T) {
 	}
 	if _, err := Open(path, identity, Options{MaxBytes: options.MaxBytes}); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("corrupt snapshot open=%v", err)
+	}
+}
+
+func TestWorkerStoreSnapshotReadsCanonicalV1AndRejectsV1CheckpointKind(t *testing.T) {
+	_, identity, _, workerStore, _ := populatedSnapshotStore(t)
+	work := workerStore.work.Clone()
+	v1, snapshot, digest := snapshotImageVersionForTest(t, workerStore.state, work, 1, snapshotSchemaVersionV1)
+	current := currentGeneration{Identity: identity, WorkerEpoch: workerStore.state.WorkerEpoch, Generation: 1, BaseSequence: snapshot.BaseSequence, TransactionCount: snapshot.TransactionCount, SnapshotBytes: snapshot.Bytes, SnapshotDigest: digest}
+	if _, _, err := recoverSnapshotReader(bytes.NewReader(v1), int64(len(v1)), identity, current, uint64(len(v1))); err != nil {
+		t.Fatalf("canonical v1 snapshot: %v", err)
+	}
+	assignment := work.Assignments[0]
+	source := work.Sources[0]
+	work.Checkpoints = []CommittedCheckpoint{{Notice: model.CheckpointNotice{JobID: assignment.Assignment.JobID, Source: source.Source, Watermark: source.Watermark, RaftIndex: 12, Epoch: assignment.CoordinatorEpoch}, JobControlRevision: assignment.JobControlRevision, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest}}
+	v2, v2Snapshot, _ := snapshotImageVersionForTest(t, workerStore.state, work, 1, snapshotSchemaVersion)
+	binary.BigEndian.PutUint16(v2[4:6], snapshotSchemaVersionV1)
+	binary.BigEndian.PutUint32(v2[100:104], crc32.Checksum(v2[:100], walCRC))
+	v1Digest := sha256.Sum256(v2[:len(v2)-snapshotFooterBytes])
+	copy(v2[len(v2)-snapshotFooterBytes:], v1Digest[:])
+	current.SnapshotBytes, current.SnapshotDigest = v2Snapshot.Bytes, v1Digest
+	if _, _, err := recoverSnapshotReader(bytes.NewReader(v2), int64(len(v2)), identity, current, uint64(len(v2))); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("v1 snapshot admitted checkpoint-observation kind: %v", err)
 	}
 }
 
@@ -1096,6 +1118,26 @@ func snapshotImageForTest(t *testing.T, state RecoveredState, work RecoveredWork
 		t.Fatal(err)
 	}
 	return data, snapshot, digest
+}
+
+func snapshotImageVersionForTest(t *testing.T, state RecoveredState, work RecoveredWork, generation uint64, version uint16) ([]byte, Snapshot, [32]byte) {
+	t.Helper()
+	snapshot, header, err := snapshotMetadataVersion(state, work, generation, nil, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := append([]byte(nil), header...)
+	err = visitSnapshotRecordsVersion(work, nil, version, func(kind snapshotRecordKind, payload []byte) error {
+		frame, frameErr := encodeSnapshotFrame(kind, payload)
+		image = append(image, frame...)
+		return frameErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(image)
+	image = append(image, digest[:]...)
+	return image, snapshot, digest
 }
 
 func recoverSnapshotImageForTest(t *testing.T, state RecoveredState, work RecoveredWork) error {
