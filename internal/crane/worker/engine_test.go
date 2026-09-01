@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -135,6 +136,98 @@ func TestEngineRecoveredPendingEventRetainsTransactionIdentity(t *testing.T) {
 	<-done
 }
 
+func TestEngineReconcileAssignmentObservesPostReadyDurableInstall(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	repository.work.Assignments = nil
+	repository.work.Sources = nil
+	repository.assignments = make(map[model.JobID]store.InstalledAssignment)
+	sender := &fakeSender{}
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, sender))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	runtimeYield()
+	if sender.count() != 0 {
+		t.Fatal("source emitted before durable post-Ready install")
+	}
+	repository.mu.Lock()
+	repository.assignments[fixture.assignment.Assignment.JobID] = fixture.assignment
+	repository.mu.Unlock()
+	if err = engine.ReconcileAssignment(ctx, fixture.assignment.Assignment.JobID); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 1_000_000 && sender.count() == 0; index++ {
+		runtime.Gosched()
+	}
+	if sender.count() == 0 {
+		repository.mu.Lock()
+		log, sources, outboxes := append([]string(nil), repository.log...), append([]store.SourceCursor(nil), repository.work.Sources...), len(repository.outboxes)
+		repository.mu.Unlock()
+		t.Fatalf("post-Ready source was not sent: log=%v sources=%+v outboxes=%d jobs=%d", log, sources, outboxes, len(engine.jobs))
+	}
+	cancel()
+	<-done
+}
+
+func TestEngineReconcileAssignmentRejectsClosedOrStalePostReadyInstall(t *testing.T) {
+	fixture := workerFixture(t)
+	for _, test := range []struct {
+		name      string
+		installed store.InstalledAssignment
+		fence     model.CoordinatorEpoch
+	}{
+		{name: "closed", installed: func() store.InstalledAssignment {
+			value := fixture.assignment
+			value.SchedulingState = model.Closed
+			return value
+		}(), fence: fixture.epoch},
+		{name: "stale", installed: fixture.assignment, fence: func() model.CoordinatorEpoch {
+			value := fixture.epoch
+			value.Term++
+			value.BeginIndex++
+			value.Nonce[0]++
+			return value
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := newFakeRepository(fixture)
+			repository.work.Assignments = nil
+			repository.work.Sources = nil
+			repository.work.Fence = test.fence
+			repository.assignments = map[model.JobID]store.InstalledAssignment{fixture.assignment.Assignment.JobID: test.installed}
+			sender := &fakeSender{}
+			gate := admission.NewGate()
+			if err := gate.Open(test.fence); err != nil {
+				t.Fatal(err)
+			}
+			engine, err := NewEngine(testEngineOptions(repository, gate, sender))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := runEngine(t, ctx, engine)
+			<-engine.Ready()
+			if err = engine.ReconcileAssignment(ctx, fixture.assignment.Assignment.JobID); err != nil {
+				t.Fatal(err)
+			}
+			runtimeYield()
+			if sender.count() != 0 {
+				t.Fatal("closed/stale install emitted source")
+			}
+			cancel()
+			<-done
+		})
+	}
+}
+
 func TestEngineCancellationJoinsBoundedExecutors(t *testing.T) {
 	fixture := workerFixture(t)
 	repository := newFakeRepository(fixture)
@@ -231,6 +324,117 @@ func TestEngineCloseAndWaitDrainsExecutionThroughDurableProcessed(t *testing.T) 
 	}
 	cancel()
 	<-done
+}
+
+func TestEngineFatalExitReleasesQueuedRunningAndBufferedExecutionPermits(t *testing.T) {
+	fixture := workerFixture(t)
+	for _, test := range []struct {
+		name      string
+		configure func(*testing.T, *fakeRepository, *EngineOptions, **Engine)
+	}{
+		{name: "queued and running", configure: func(t *testing.T, repository *fakeRepository, options *EngineOptions, _ **Engine) {
+			started := make(chan struct{})
+			options.MaxExecutors = 1
+			options.Execute = func(ctx context.Context, _ model.OperatorSpec, _ model.Tuple) ([]model.Tuple, error) {
+				select {
+				case <-started:
+				default:
+					close(started)
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			repository.advanceSourceBefore = func() { <-started }
+			repository.advanceSourceErr = errors.New("injected fatal source persistence")
+		}},
+		{name: "buffered results", configure: func(t *testing.T, repository *fakeRepository, options *EngineOptions, engine **Engine) {
+			var executed atomic.Int32
+			bothExecuting := make(chan struct{})
+			options.MaxExecutors = 2
+			options.Execute = func(ctx context.Context, operator model.OperatorSpec, tuple model.Tuple) ([]model.Tuple, error) {
+				if executed.Add(1) == 2 {
+					close(bothExecuting)
+				}
+				select {
+				case <-bothExecuting:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				return model.ExecuteOperator(operator, tuple)
+			}
+			repository.advanceSourceBefore = func() {
+				for index := 0; index < 1_000_000; index++ {
+					if *engine != nil && len((*engine).executorResults) >= 2 {
+						return
+					}
+					runtime.Gosched()
+				}
+				jobs, results := -1, -1
+				if *engine != nil {
+					jobs, results = len((*engine).executorJobs), len((*engine).executorResults)
+				}
+				t.Errorf("executor results did not buffer before injected fatal exit: executed=%d jobs=%d results=%d", executed.Load(), jobs, results)
+			}
+			repository.advanceSourceErr = errors.New("injected fatal with buffered results")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := newFakeRepository(fixture)
+			repository.work.Sources = nil
+			for sequence := uint64(10); sequence < 13; sequence++ {
+				record := fixture.delivery(t, sequence)
+				repository.work.Deliveries = append(repository.work.Deliveries, record)
+				repository.deliveries[record.ID] = record
+			}
+			gate := admission.NewGate()
+			if err := gate.Open(fixture.epoch); err != nil {
+				t.Fatal(err)
+			}
+			options := testEngineOptions(repository, gate, &fakeSender{})
+			var engine *Engine
+			test.configure(t, repository, &options, &engine)
+			var err error
+			engine, err = NewEngine(options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := runEngine(t, context.Background(), engine)
+			if err = <-done; err == nil {
+				t.Fatal("injected fatal owner error was lost")
+			}
+			assertGateClosesWithoutTimers(t, gate)
+			select {
+			case _, ok := <-engine.Events():
+				if ok {
+					t.Fatal("Events published after terminal pre-Ready exit")
+				}
+			default:
+				t.Fatal("Events remained open after terminal pre-Ready exit")
+			}
+		})
+	}
+}
+
+func assertGateClosesWithoutTimers(t *testing.T, gate *admission.Gate) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	closed := make(chan error, 1)
+	go func() { closed <- gate.CloseAndWait(ctx) }()
+	for index := 0; index < 1_000_000; index++ {
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel()
+			return
+		default:
+			runtime.Gosched()
+		}
+	}
+	cancel()
+	<-closed
+	t.Fatal("CloseAndWait did not finish after engine terminal cleanup")
 }
 
 func testEngineOptions(repository Repository, gate *admission.Gate, sender Sender) EngineOptions {
@@ -344,21 +548,30 @@ func (fixture workerTestFixture) failureEvent(transaction uint64) model.WorkerEv
 }
 
 type fakeRepository struct {
-	mu                sync.Mutex
-	work              store.RecoveredWork
-	assignments       map[model.JobID]store.InstalledAssignment
-	deliveries        map[model.DeliveryID]store.DeliveryRecord
-	outboxes          map[model.DeliveryID]store.OutboxRecord
-	log               []string
-	recoverCalls      int
-	recoverStarted    chan struct{}
-	recoverRelease    chan struct{}
-	processedStarted  chan struct{}
-	processedRelease  chan struct{}
-	receiveCalls      int
-	persistEventCalls int
-	localNode         uint16
-	localEpoch        model.WorkerEpoch
+	mu                    sync.Mutex
+	work                  store.RecoveredWork
+	assignments           map[model.JobID]store.InstalledAssignment
+	deliveries            map[model.DeliveryID]store.DeliveryRecord
+	outboxes              map[model.DeliveryID]store.OutboxRecord
+	log                   []string
+	recoverCalls          int
+	recoverStarted        chan struct{}
+	recoverRelease        chan struct{}
+	processedStarted      chan struct{}
+	processedRelease      chan struct{}
+	receiveCalls          int
+	probeCalls            int
+	persistEventCalls     int
+	localNode             uint16
+	localEpoch            model.WorkerEpoch
+	receiveStarted        chan struct{}
+	receiveRelease        chan struct{}
+	receiveErr            error
+	processedErr          error
+	advanceSourceErr      error
+	advanceSourceBefore   func()
+	outboxCompleteStarted chan struct{}
+	outboxCompleteRelease chan struct{}
 }
 
 func newFakeRepository(fixture workerTestFixture) *fakeRepository {
@@ -401,16 +614,42 @@ func (repository *fakeRepository) InstalledAssignment(job model.JobID) (store.In
 	return value, ok
 }
 func (repository *fakeRepository) Receive(record store.DeliveryRecord) (store.DeliveryState, error) {
+	if repository.receiveStarted != nil {
+		select {
+		case <-repository.receiveStarted:
+		default:
+			close(repository.receiveStarted)
+		}
+	}
+	if repository.receiveRelease != nil {
+		<-repository.receiveRelease
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	repository.receiveCalls++
 	repository.log = append(repository.log, "receive")
+	if repository.receiveErr != nil {
+		return 0, repository.receiveErr
+	}
 	if prior, ok := repository.deliveries[record.ID]; ok {
 		return prior.State, nil
 	}
 	record.State = store.Received
 	repository.deliveries[record.ID] = record
 	return store.Received, nil
+}
+func (repository *fakeRepository) ProbeDelivery(record store.DeliveryRecord) (store.DeliveryState, bool, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	repository.probeCalls++
+	prior, ok := repository.deliveries[record.ID]
+	if !ok {
+		return 0, false, nil
+	}
+	if !sameTestDeliveryDefinition(prior, record) {
+		return 0, true, model.ErrIdentityReuse
+	}
+	return prior.State, true, nil
 }
 func (repository *fakeRepository) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, outboxes []store.OutboxRecord) error {
 	if repository.processedStarted != nil {
@@ -425,6 +664,9 @@ func (repository *fakeRepository) MarkProcessed(id model.DeliveryID, outputs []m
 	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	if repository.processedErr != nil {
+		return repository.processedErr
+	}
 	repository.log = append(repository.log, "processed")
 	record := repository.deliveries[id]
 	record.State = store.Processed
@@ -447,8 +689,14 @@ func (repository *fakeRepository) MarkCompleted(id model.DeliveryID) error {
 	return nil
 }
 func (repository *fakeRepository) AdvanceSource(cursor store.SourceCursor, outboxes []store.OutboxRecord) error {
+	if repository.advanceSourceBefore != nil {
+		repository.advanceSourceBefore()
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	if repository.advanceSourceErr != nil {
+		return repository.advanceSourceErr
+	}
 	repository.log = append(repository.log, "source")
 	repository.work.Sources = upsertTestSource(repository.work.Sources, cursor)
 	for _, outbox := range outboxes {
@@ -456,7 +704,48 @@ func (repository *fakeRepository) AdvanceSource(cursor store.SourceCursor, outbo
 	}
 	return nil
 }
+func (repository *fakeRepository) MarkOutboxDispatched(id model.DeliveryID, deadlineUnixNano int64) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	record, ok := repository.outboxes[id]
+	if !ok {
+		return errors.New("unknown outbox")
+	}
+	record.RetryDeadlineUnixNano = deadlineUnixNano
+	repository.outboxes[id] = record
+	repository.log = append(repository.log, "outbox-dispatched")
+	return nil
+}
+func (repository *fakeRepository) MarkOutboxAccepted(id model.DeliveryID, deadlineUnixNano int64) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	record, ok := repository.outboxes[id]
+	if !ok {
+		return errors.New("unknown outbox")
+	}
+	if record.Accepted {
+		if record.RetryDeadlineUnixNano != deadlineUnixNano {
+			return model.ErrIdentityReuse
+		}
+		return nil
+	}
+	record.Accepted = true
+	record.RetryDeadlineUnixNano = deadlineUnixNano
+	repository.outboxes[id] = record
+	repository.log = append(repository.log, "outbox-accepted")
+	return nil
+}
 func (repository *fakeRepository) MarkOutboxCompleted(id model.DeliveryID) error {
+	if repository.outboxCompleteStarted != nil {
+		select {
+		case <-repository.outboxCompleteStarted:
+		default:
+			close(repository.outboxCompleteStarted)
+		}
+	}
+	if repository.outboxCompleteRelease != nil {
+		<-repository.outboxCompleteRelease
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	repository.log = append(repository.log, "outbox-completed")
@@ -482,6 +771,14 @@ func cloneTestTuples(input []model.Tuple) []model.Tuple {
 		result[i], _ = model.UnmarshalTuple(encoded)
 	}
 	return result
+}
+func sameTestDeliveryDefinition(left, right store.DeliveryRecord) bool {
+	if left.ID != right.ID || left.Producer != right.Producer || left.Destination != right.Destination || left.AssignmentRevision != right.AssignmentRevision || left.AssignmentDigest != right.AssignmentDigest || left.CoordinatorEpoch != right.CoordinatorEpoch || left.Reservation != right.Reservation {
+		return false
+	}
+	leftBytes, leftErr := model.MarshalTuple(left.Tuple)
+	rightBytes, rightErr := model.MarshalTuple(right.Tuple)
+	return leftErr == nil && rightErr == nil && string(leftBytes) == string(rightBytes)
 }
 func upsertTestSource(input []store.SourceCursor, cursor store.SourceCursor) []store.SourceCursor {
 	for i := range input {

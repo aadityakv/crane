@@ -3,6 +3,8 @@ package worker
 import (
 	"bytes"
 	"context"
+	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,7 +34,7 @@ func TestOutboxProcessingPersistsCanonicalChildrenBeforeSendAndCompletionOrder(t
 	waitFor(t, func() bool { return sender.count() == 1 })
 
 	repository.mu.Lock()
-	if len(repository.log) < 2 || repository.log[0] != "processed" || repository.log[1] != "send" {
+	if len(repository.log) < 3 || repository.log[0] != "processed" || repository.log[1] != "outbox-dispatched" || repository.log[2] != "send" {
 		t.Fatalf("durable/send order = %v", repository.log)
 	}
 	parent := repository.deliveries[record.ID]
@@ -133,13 +135,15 @@ func TestOutboxACKRejectsWrongEnvelopeBeforeDurableMutation(t *testing.T) {
 	repository.deliveries[record.ID] = record
 	gate := admission.NewGate()
 	_ = gate.Open(fixture.epoch)
-	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	sender := &fakeSender{}
+	engine, err := NewEngine(testEngineOptions(repository, gate, sender))
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runEngine(t, ctx, engine)
 	<-engine.Ready()
+	waitFor(t, func() bool { return sender.count() == 1 })
 	base := protocol.TupleACK{DeliveryID: outboxes[0].ID, Destination: outboxes[0].Destination, Assignment: protocol.AssignmentSetIdentity{JobID: fixture.assignment.Assignment.JobID, Revision: fixture.assignment.Assignment.Revision, Digest: fixture.assignment.Assignment.Digest}, Coordinator: fixture.epoch, Status: protocol.TupleCompleted}
 	for name, mutate := range map[string]func(*protocol.TupleACK){
 		"destination": func(ack *protocol.TupleACK) { ack.Destination.Attempt++ },
@@ -293,6 +297,224 @@ func TestOutboxAcceptedAndCompletedRetryIntervalsRemainDistinct(t *testing.T) {
 	<-done
 }
 
+func TestOutboxRecoveryRestoresDurableAcceptedDeadline(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	parent := fixture.delivery(t, 11)
+	outputs, err := model.ExecuteOperator(fixture.topology.Spec().Stages[1].Operator, parent.Tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxes, err := deriveOutboxes(fixture.assignment, parent, outputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manual := clock.NewManual(time.Unix(0, 0))
+	outboxes[0].Accepted = true
+	outboxes[0].RetryDeadlineUnixNano = int64(50 * time.Millisecond)
+	repository.work.Outboxes = outboxes
+	repository.outboxes[outboxes[0].ID] = outboxes[0]
+	sender := &fakeSender{}
+	gate := admission.NewGate()
+	if err = gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	options := testEngineOptions(repository, gate, sender)
+	options.Clock = manual
+	engine, err := NewEngine(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	runtimeYield()
+	if sender.count() != 0 {
+		t.Fatal("recovered Accepted outbox sent before durable deadline")
+	}
+	manual.Advance(49 * time.Millisecond)
+	runtimeYield()
+	if sender.count() != 0 {
+		t.Fatal("recovered Accepted outbox sent early")
+	}
+	manual.Advance(time.Millisecond)
+	waitFor(t, func() bool { return sender.count() == 1 })
+	cancel()
+	<-done
+}
+
+func TestOutboxRecoveryDispatchesAnExpiredDurableDeadline(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	parent := fixture.delivery(t, 12)
+	outputs, err := model.ExecuteOperator(fixture.topology.Spec().Stages[1].Operator, parent.Tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxes, err := deriveOutboxes(fixture.assignment, parent, outputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxes[0].Accepted = true
+	outboxes[0].RetryDeadlineUnixNano = int64(50 * time.Millisecond)
+	repository.work.Outboxes = outboxes
+	repository.outboxes[outboxes[0].ID] = outboxes[0]
+	manual := clock.NewManual(time.Unix(0, int64(100*time.Millisecond)))
+	sender := &fakeSender{}
+	gate := admission.NewGate()
+	if err = gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	options := testEngineOptions(repository, gate, sender)
+	options.Clock = manual
+	engine, err := NewEngine(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	waitFor(t, func() bool { return sender.count() == 1 })
+	cancel()
+	<-done
+}
+
+func TestRetryDeadlineRejectsUnrepresentableOrUnsetValues(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		start    time.Time
+		interval time.Duration
+		want     int64
+		wantErr  bool
+	}{
+		{name: "negative epoch supported", start: time.Unix(0, -20), interval: 10, want: -10},
+		{name: "zero is reserved for unset", start: time.Unix(0, -10), interval: 10, wantErr: true},
+		{name: "positive overflow", start: time.Unix(0, math.MaxInt64-5), interval: 10, wantErr: true},
+		{name: "nonpositive interval", start: time.Unix(0, 1), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := retryDeadline(test.start, test.interval)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("retryDeadline = %d,nil", got)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("retryDeadline = %d,%v, want %d,nil", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestOutboxRetryDeadlineStartsAtActualSerialSenderDispatch(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	repository.work.Sources = nil
+	first, err := deriveSourceOutboxes(fixture.assignment, fixture.source, 1, mustSourceTuple(t, fixture, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := deriveSourceOutboxes(fixture.assignment, fixture.source, 2, mustSourceTuple(t, fixture, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxes := append(first, second...)
+	if len(outboxes) != 2 {
+		t.Fatalf("fixture outboxes = %d", len(outboxes))
+	}
+	repository.work.Outboxes = outboxes
+	for _, outbox := range outboxes {
+		repository.outboxes[outbox.ID] = outbox
+	}
+	manual := clock.NewManual(time.Unix(0, 0))
+	sender := &serialBlockingSender{clock: manual, firstStarted: make(chan struct{}), firstRelease: make(chan struct{})}
+	gate := admission.NewGate()
+	if err = gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	options := testEngineOptions(repository, gate, sender)
+	options.Clock = manual
+	options.MaxPendingOutboxes = 2
+	engine, err := NewEngine(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	<-sender.firstStarted
+	manual.Advance(100 * time.Millisecond)
+	close(sender.firstRelease)
+	waitFor(t, func() bool { return sender.countFor(outboxes[1].ID) == 1 })
+	repository.mu.Lock()
+	secondDeadline := repository.outboxes[outboxes[1].ID].RetryDeadlineUnixNano
+	repository.mu.Unlock()
+	if want := manual.Now().Add(options.AcceptedRetryInterval).UnixNano(); secondDeadline != want {
+		t.Fatalf("second deadline = %d, want actual-dispatch deadline %d", secondDeadline, want)
+	}
+	runtimeYield()
+	if got := sender.countFor(outboxes[1].ID); got != 1 {
+		t.Fatalf("queue delay consumed retry interval: second sends=%d", got)
+	}
+	manual.Advance(options.AcceptedRetryInterval - time.Millisecond)
+	runtimeYield()
+	if got := sender.countFor(outboxes[1].ID); got != 1 {
+		t.Fatalf("second outbox retried early: %d", got)
+	}
+	manual.Advance(time.Millisecond)
+	waitFor(t, func() bool { return sender.countFor(outboxes[1].ID) == 2 })
+	cancel()
+	<-done
+}
+
+func mustSourceTuple(t *testing.T, fixture workerTestFixture, sequence uint64) model.Tuple {
+	t.Helper()
+	tuple, exists, err := model.SourceTuple(fixture.topology, fixture.source.Task, sequence)
+	if err != nil || !exists {
+		t.Fatalf("SourceTuple(%d) = %+v,%v,%v", sequence, tuple, exists, err)
+	}
+	return tuple
+}
+
+type serialBlockingSender struct {
+	mu           sync.Mutex
+	clock        clock.Clock
+	ids          []model.DeliveryID
+	times        []time.Time
+	firstStarted chan struct{}
+	firstRelease chan struct{}
+}
+
+func (sender *serialBlockingSender) Send(ctx context.Context, delivery protocol.TupleDelivery) error {
+	sender.mu.Lock()
+	sender.ids = append(sender.ids, delivery.DeliveryID)
+	sender.times = append(sender.times, sender.clock.Now())
+	first := len(sender.ids) == 1
+	sender.mu.Unlock()
+	if first {
+		close(sender.firstStarted)
+		select {
+		case <-sender.firstRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (sender *serialBlockingSender) countFor(id model.DeliveryID) int {
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	count := 0
+	for _, sent := range sender.ids {
+		if sent == id {
+			count++
+		}
+	}
+	return count
+}
+
 func advanceManualUntil(t *testing.T, manual *clock.Manual, condition func() bool) {
 	t.Helper()
 	for step := 0; step < 1_000; step++ {
@@ -323,7 +545,7 @@ func TestOutboxSourcePersistsCursorAndOutboxBeforeSendAndHonorsEOFAndFence(t *te
 	<-engine.Ready()
 	waitFor(t, func() bool { return sender.count() >= 1 })
 	repository.mu.Lock()
-	if len(repository.log) < 2 || repository.log[0] != "source" || repository.log[1] != "send" {
+	if len(repository.log) < 3 || repository.log[0] != "source" || repository.log[1] != "outbox-dispatched" || repository.log[2] != "send" {
 		t.Fatalf("source durability order = %v", repository.log)
 	}
 	if len(repository.work.Sources) != 1 || repository.work.Sources[0].NextSequence != 2 || repository.work.Sources[0].EOF != 15 {

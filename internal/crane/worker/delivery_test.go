@@ -106,6 +106,105 @@ func TestDeliveryReceiverStateTableAndVolatileExecutingDeduplication(t *testing.
 	<-done
 }
 
+func TestDeliveryDuplicateProbeDoesNotBypassReadyLifecycle(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	record := fixture.delivery(t, 7)
+	repository.deliveries[record.ID] = record
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = engine.HandleDelivery(context.Background(), deliveryMessage(record)); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("duplicate before Ready = %v", err)
+	}
+	if repository.probeCalls != 0 {
+		t.Fatal("duplicate probed durable state before recovery established local identity")
+	}
+}
+
+func TestDeliveryExactDurableDuplicateBypassesClosedAdvancedAdmission(t *testing.T) {
+	fixture := workerFixture(t)
+	for _, test := range []struct {
+		name  string
+		state store.DeliveryState
+		want  protocol.TupleACKStatus
+	}{
+		{name: "received", state: store.Received, want: protocol.TupleAccepted},
+		{name: "processed", state: store.Processed, want: protocol.TupleAccepted},
+		{name: "completed", state: store.Completed, want: protocol.TupleCompleted},
+		{name: "compacted", state: store.Compacted, want: protocol.TupleCompleted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := newFakeRepository(fixture)
+			record := fixture.delivery(t, 2)
+			record.State = test.state
+			if test.state == store.Processed {
+				outputs, err := model.ExecuteOperator(fixture.topology.Spec().Stages[1].Operator, record.Tuple)
+				if err != nil {
+					t.Fatal(err)
+				}
+				outboxes, err := deriveOutboxes(fixture.assignment, record, outputs)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, outbox := range outboxes {
+					record.OutboxIDs = append(record.OutboxIDs, outbox.ID)
+					repository.outboxes[outbox.ID] = outbox
+				}
+				record.Outputs = outputs
+				repository.work.Outboxes = outboxes
+			}
+			repository.deliveries[record.ID] = record
+			repository.work.Deliveries = []store.DeliveryRecord{record}
+			newer := fixture.epoch
+			newer.Term++
+			newer.BeginIndex++
+			newer.Nonce[0]++
+			repository.work.Fence = newer
+			gate := admission.NewGate()
+			engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := runEngine(t, ctx, engine)
+			<-engine.Ready()
+			ack, err := engine.HandleDelivery(ctx, deliveryMessage(record))
+			if err != nil || ack.Status != test.want {
+				t.Fatalf("exact durable duplicate = %+v,%v", ack, err)
+			}
+			changed := deliveryMessage(record)
+			encoded, marshalErr := protocol.MarshalTupleDelivery(changed)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			changed, marshalErr = protocol.UnmarshalTupleDelivery(encoded)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			changed.Tuple.Fields[0].Value.Int64++
+			if _, err = engine.HandleDelivery(ctx, changed); !errors.Is(err, model.ErrIdentityReuse) {
+				t.Fatalf("changed durable duplicate = %v", err)
+			}
+			unknown := deliveryMessage(record)
+			unknown.DeliveryID.Tuple.SourceSequence++
+			if _, err = engine.HandleDelivery(ctx, unknown); !errors.Is(err, admission.ErrClosed) {
+				t.Fatalf("unknown closed-gate delivery = %v", err)
+			}
+			if repository.receiveCalls != 0 {
+				t.Fatalf("duplicate path called Receive %d times", repository.receiveCalls)
+			}
+			cancel()
+			<-done
+		})
+	}
+}
+
 func TestDeliveryRejectsEveryAuthorityAndRouteMismatchBeforeReceive(t *testing.T) {
 	fixture := workerFixture(t)
 	base := fixture.message(t, 4)
@@ -255,6 +354,159 @@ func TestDeliveryOperatorFailurePersistsOneDurableDeduplicatedEvent(t *testing.T
 	}
 	repository.mu.Unlock()
 	cancel()
+	<-done
+}
+
+func TestDeliveryCanceledHandlerTransfersAdmissionUntilQueuedCommandFinishes(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	repository.receiveStarted = make(chan struct{})
+	repository.receiveRelease = make(chan struct{})
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engineCtx, cancelEngine := context.WithCancel(context.Background())
+	done := runEngine(t, engineCtx, engine)
+	<-engine.Ready()
+	first := make(chan error, 1)
+	go func() {
+		_, callErr := engine.HandleDelivery(context.Background(), fixture.message(t, 7))
+		first <- callErr
+	}()
+	<-repository.receiveStarted
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	second := make(chan error, 1)
+	go func() {
+		_, callErr := engine.HandleDelivery(requestCtx, fixture.message(t, 8))
+		second <- callErr
+	}()
+	waitFor(t, func() bool { return len(engine.commands) == 1 })
+	cancelRequest()
+	returned := false
+	for index := 0; index < 100_000; index++ {
+		select {
+		case err = <-second:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled delivery handler = %v", err)
+			}
+			returned = true
+		default:
+			runtime.Gosched()
+		}
+		if returned {
+			break
+		}
+	}
+	if !returned {
+		close(repository.receiveRelease)
+		<-second
+		cancelEngine()
+		<-done
+		t.Fatal("canceled delivery handler did not return promptly")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- gate.CloseAndWait(context.Background()) }()
+	for index := 0; index < 10_000; index++ {
+		select {
+		case err = <-closed:
+			t.Fatalf("CloseAndWait returned while admitted commands were unresolved: %v", err)
+		default:
+			runtime.Gosched()
+		}
+	}
+	close(repository.receiveRelease)
+	if err = <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err = <-closed; err != nil {
+		t.Fatal(err)
+	}
+	repository.mu.Lock()
+	callsAtClose := repository.receiveCalls
+	repository.mu.Unlock()
+	runtimeYield()
+	repository.mu.Lock()
+	callsAfterClose := repository.receiveCalls
+	repository.mu.Unlock()
+	if callsAtClose != 2 || callsAfterClose != callsAtClose {
+		t.Fatalf("Receive calls at/after close = %d/%d", callsAtClose, callsAfterClose)
+	}
+	cancelEngine()
+	<-done
+}
+
+func TestACKCanceledHandlerReturnsWhileDurableOwnerTransitionContinues(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	parent := fixture.delivery(t, 9)
+	outputs, err := model.ExecuteOperator(fixture.topology.Spec().Stages[1].Operator, parent.Tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxes, err := deriveOutboxes(fixture.assignment, parent, outputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent.State, parent.Outputs = store.Processed, outputs
+	for _, outbox := range outboxes {
+		parent.OutboxIDs = append(parent.OutboxIDs, outbox.ID)
+		repository.outboxes[outbox.ID] = outbox
+	}
+	repository.work.Deliveries = []store.DeliveryRecord{parent}
+	repository.work.Outboxes = outboxes
+	repository.deliveries[parent.ID] = parent
+	repository.outboxCompleteStarted = make(chan struct{})
+	repository.outboxCompleteRelease = make(chan struct{})
+	gate := admission.NewGate()
+	if err = gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engineCtx, cancelEngine := context.WithCancel(context.Background())
+	done := runEngine(t, engineCtx, engine)
+	<-engine.Ready()
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	ack := protocol.TupleACK{DeliveryID: outboxes[0].ID, Destination: outboxes[0].Destination, Assignment: protocol.AssignmentSetIdentity{JobID: fixture.assignment.Assignment.JobID, Revision: fixture.assignment.Assignment.Revision, Digest: fixture.assignment.Assignment.Digest}, Coordinator: fixture.epoch, Status: protocol.TupleCompleted}
+	go func() { result <- engine.HandleACK(requestCtx, ack) }()
+	<-repository.outboxCompleteStarted
+	cancelRequest()
+	returned := false
+	for index := 0; index < 100_000; index++ {
+		select {
+		case err = <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled ACK handler = %v", err)
+			}
+			returned = true
+		default:
+			runtime.Gosched()
+		}
+		if returned {
+			break
+		}
+	}
+	close(repository.outboxCompleteRelease)
+	if !returned {
+		<-result
+		cancelEngine()
+		<-done
+		t.Fatal("canceled ACK handler did not return promptly")
+	}
+	waitFor(t, func() bool {
+		repository.mu.Lock()
+		defer repository.mu.Unlock()
+		return repository.outboxes[outboxes[0].ID].Completed
+	})
+	cancelEngine()
 	<-done
 }
 

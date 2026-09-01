@@ -863,7 +863,7 @@ func TestSnapshotCapacityAccountsForSnapshotWALAndReservations(t *testing.T) {
 }
 
 func TestSnapshotRecoveryRejectsCommittedCorruptionForEveryDomainRecordKind(t *testing.T) {
-	for _, kind := range []RecordType{recordFence, recordAssignment, recordDelivery, recordDeliveryProcessed, recordDeliveryCompleted, recordCheckpoint, recordResult, recordEvent, recordEventAck, recordRepair, recordSource, recordOutboxAck} {
+	for _, kind := range []RecordType{recordFence, recordAssignment, recordDelivery, recordDeliveryProcessed, recordDeliveryCompleted, recordCheckpoint, recordResult, recordEvent, recordEventAck, recordRepair, recordSource, recordOutboxAck, recordOutboxRetry} {
 		t.Run(domainRecordName(kind), func(t *testing.T) {
 			path, identity, options, store, fixture := populatedSnapshotStore(t)
 			if _, err := store.Snapshot(); err != nil {
@@ -981,7 +981,7 @@ func domainRecordName(kind RecordType) string {
 		recordFence: "fence", recordAssignment: "assignment", recordDelivery: "delivery",
 		recordDeliveryProcessed: "processed", recordDeliveryCompleted: "completed", recordCheckpoint: "checkpoint",
 		recordResult: "result", recordEvent: "event", recordEventAck: "event-ack", recordRepair: "repair",
-		recordSource: "source", recordOutboxAck: "outbox-ack",
+		recordSource: "source", recordOutboxAck: "outbox-ack", recordOutboxRetry: "outbox-retry",
 	}
 	return names[kind]
 }
@@ -1038,6 +1038,8 @@ func corruptPostSnapshotRecord(t *testing.T, store *Store, fixture snapshotFixtu
 		return encode(encodeSource(cursor, nil))
 	case recordOutboxAck:
 		return encode(encodeDeliveryIDPayload(fixture.next.ID))
+	case recordOutboxRetry:
+		return encode(encodeOutboxRetry(outboxRetryUpdate{ID: fixture.next.ID, DeadlineUnixNano: 1}))
 	default:
 		t.Fatalf("unknown kind %d", kind)
 		return Record{}

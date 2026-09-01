@@ -80,6 +80,7 @@ type Engine struct {
 	executorResults chan executionResult
 	sendJobs        chan sendJob
 	sendResults     chan sendResult
+	dispatchStarts  chan dispatchStart
 	workers         sync.WaitGroup
 
 	deliveries        map[model.DeliveryID]store.DeliveryRecord
@@ -93,6 +94,11 @@ type Engine struct {
 	nextTransactionID uint64
 	localNode         uint16
 	localEpoch        model.WorkerEpoch
+}
+
+type assignmentCommand struct {
+	job      model.JobID
+	response chan error
 }
 
 // NewEngine validates and retains the caller's exact dependencies without
@@ -136,7 +142,8 @@ func NewEngine(options EngineOptions) (*Engine, error) {
 		commands:     make(chan any, options.MaxPendingWork),
 		executorJobs: make(chan executionJob, options.MaxPendingWork), executorResults: make(chan executionResult, options.MaxPendingWork),
 		sendJobs: make(chan sendJob, options.MaxPendingOutboxes), sendResults: make(chan sendResult, options.MaxPendingOutboxes),
-		deliveries: make(map[model.DeliveryID]store.DeliveryRecord), outboxes: make(map[model.DeliveryID]*ownedOutbox),
+		dispatchStarts: make(chan dispatchStart, options.MaxPendingOutboxes),
+		deliveries:     make(map[model.DeliveryID]store.DeliveryRecord), outboxes: make(map[model.DeliveryID]*ownedOutbox),
 		parents: make(map[model.DeliveryID]map[model.DeliveryID]struct{}), sources: make(map[model.TaskID]store.SourceCursor),
 		executing: make(map[model.DeliveryID]struct{}), failedTasks: make(map[model.TaskID]struct{}),
 		jobs: make(map[model.JobID]struct{}),
@@ -151,61 +158,99 @@ func (engine *Engine) Ready() <-chan struct{} { return engine.ready }
 // their globally ordered transaction identities.
 func (engine *Engine) Events() <-chan model.WorkerEvent { return engine.events }
 
+// ReconcileAssignment observes one already-durable post-recovery assignment
+// transition on the serialized owner. Task 17 calls it only after persistence.
+func (engine *Engine) ReconcileAssignment(ctx context.Context, job model.JobID) error {
+	if ctx == nil {
+		return errors.New("nil assignment reconciliation context")
+	}
+	if err := job.Validate(); err != nil {
+		return err
+	}
+	response := make(chan error, 1)
+	if err := engine.enqueue(assignmentCommand{job: job, response: response}, ctx); err != nil {
+		return err
+	}
+	select {
+	case err := <-response:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-engine.done:
+		return ErrNotReady
+	}
+}
+
 // Run performs one recovery and owns every subsequent state publication until
 // cancellation. It joins all bounded workers before returning.
-func (engine *Engine) Run(ctx context.Context) error {
+func (engine *Engine) Run(ctx context.Context) (runErr error) {
 	if ctx == nil {
 		return errors.New("nil engine context")
 	}
 	if !engine.started.CompareAndSwap(false, true) {
 		return errors.New("worker engine Run called more than once")
 	}
-	work, err := engine.repository.RecoverWork()
-	if err != nil {
-		close(engine.done)
-		return err
-	}
-	runContext, cancel := context.WithCancel(ctx)
-	engine.startWorkers(runContext)
-	if err = engine.consumeRecovery(work); err != nil {
-		cancel()
-		engine.stopWorkers()
-		close(engine.done)
-		return err
-	}
-	if err = engine.reconcile(runContext, engine.clock.Now()); err != nil {
-		cancel()
-		engine.stopWorkers()
-		close(engine.done)
-		return err
-	}
-	timer := engine.clock.NewTimer(engine.acceptedRetry)
-	timerActive := true
-	engine.readyState.Store(true)
-	close(engine.ready)
+	var cancel context.CancelFunc
+	var timer clock.Timer
+	workersStarted, timerActive := false, false
 	defer func() {
 		if timerActive {
 			timer.Stop()
 		}
 		engine.readyState.Store(false)
-		cancel()
-		engine.stopWorkers()
-		engine.failPendingCommands(ctx.Err())
+		if cancel != nil {
+			cancel()
+		}
+		if workersStarted {
+			engine.stopWorkers()
+			engine.drainExecutionResults()
+		}
+		engine.failPendingCommands(runErr)
 		close(engine.events)
 		close(engine.done)
 	}()
+	work, err := engine.repository.RecoverWork()
+	if err != nil {
+		return err
+	}
+	if err = engine.consumeRecovery(work); err != nil {
+		return err
+	}
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	engine.startWorkers(runContext)
+	workersStarted = true
+	if err = engine.reconcile(runContext, engine.clock.Now()); err != nil {
+		return err
+	}
+	timer = engine.clock.NewTimer(engine.nextWake(engine.clock.Now()))
+	timerActive = true
+	engine.readyState.Store(true)
+	close(engine.ready)
 
+	firstSelect := true
 	for {
-		now := engine.clock.Now()
-		if err := engine.reconcile(runContext, now); err != nil {
-			return err
+		if firstSelect {
+			firstSelect = false
+		} else {
+			now := engine.clock.Now()
+			if err := engine.reconcile(runContext, now); err != nil {
+				return err
+			}
+			if timerActive {
+				timer.Stop()
+			}
+			timer.Reset(engine.nextWake(engine.clock.Now()))
+			// A manual (or heavily delayed real) clock may cross an absolute
+			// durable deadline between computing a relative delay and Reset.
+			// Re-arm immediately when that happened so retries never slip by
+			// one full relative interval.
+			if engine.nextWake(engine.clock.Now()) == 0 {
+				timer.Stop()
+				timer.Reset(0)
+			}
+			timerActive = true
 		}
-		delay := engine.nextWake(now)
-		if timerActive {
-			timer.Stop()
-		}
-		timer.Reset(delay)
-		timerActive = true
 		var eventOutput chan model.WorkerEvent
 		var nextEvent model.WorkerEvent
 		if len(engine.eventQueue) > 0 {
@@ -222,6 +267,12 @@ func (engine *Engine) Run(ctx context.Context) error {
 			}
 		case result := <-engine.sendResults:
 			engine.handleSendResult(result)
+		case start := <-engine.dispatchStarts:
+			err := engine.handleDispatchStart(start)
+			start.response <- err
+			if err != nil {
+				return err
+			}
 		case eventOutput <- nextEvent:
 			engine.eventQueue = engine.eventQueue[1:]
 		case <-timer.C():
@@ -257,7 +308,7 @@ func (engine *Engine) consumeRecovery(work store.RecoveredWork) error {
 	}
 	for _, outbox := range work.Outboxes {
 		owned := outbox.Clone()
-		engine.outboxes[owned.ID] = &ownedOutbox{record: owned, nextAttempt: engine.clock.Now()}
+		engine.outboxes[owned.ID] = &ownedOutbox{record: owned}
 	}
 	engine.eventQueue = append(engine.eventQueue, work.PendingEvents...)
 	for _, event := range work.PendingEvents {
@@ -283,6 +334,17 @@ func (engine *Engine) stopWorkers() {
 	engine.workers.Wait()
 }
 
+func (engine *Engine) drainExecutionResults() {
+	for {
+		select {
+		case result := <-engine.executorResults:
+			result.job.release()
+		default:
+			return
+		}
+	}
+}
+
 func (engine *Engine) failPendingCommands(cause error) {
 	if cause == nil {
 		cause = ErrNotReady
@@ -292,8 +354,11 @@ func (engine *Engine) failPendingCommands(cause error) {
 		case command := <-engine.commands:
 			switch value := command.(type) {
 			case deliveryCommand:
+				value.release()
 				value.response <- deliveryResponse{err: cause}
 			case ackCommand:
+				value.response <- cause
+			case assignmentCommand:
 				value.response <- cause
 			}
 		default:
@@ -308,8 +373,12 @@ func (engine *Engine) nextWake(now time.Time) time.Duration {
 		if outbox.record.Completed || outbox.sending {
 			continue
 		}
-		if outbox.nextAttempt.Before(deadline) {
-			deadline = outbox.nextAttempt
+		if outbox.record.RetryDeadlineUnixNano == 0 {
+			return 0
+		}
+		candidate := time.Unix(0, outbox.record.RetryDeadlineUnixNano)
+		if candidate.Before(deadline) {
+			deadline = candidate
 		}
 	}
 	delay := deadline.Sub(now)
@@ -322,10 +391,19 @@ func (engine *Engine) nextWake(now time.Time) time.Duration {
 func (engine *Engine) handleCommand(ctx context.Context, command any) {
 	switch value := command.(type) {
 	case deliveryCommand:
+		defer value.release()
 		ack, err := engine.receiveDelivery(ctx, value.message)
 		value.response <- deliveryResponse{ack: ack, err: err}
 	case ackCommand:
 		value.response <- engine.receiveACK(value.ack)
+	case assignmentCommand:
+		assignment, ok := engine.currentRunning(value.job)
+		if ok && assignment.Assignment.JobID == value.job {
+			engine.jobs[value.job] = struct{}{}
+		} else {
+			delete(engine.jobs, value.job)
+		}
+		value.response <- nil
 	}
 }
 

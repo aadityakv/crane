@@ -14,10 +14,8 @@ import (
 )
 
 type ownedOutbox struct {
-	record      store.OutboxRecord
-	accepted    bool
-	sending     bool
-	nextAttempt time.Time
+	record  store.OutboxRecord
+	sending bool
 }
 
 type sendJob struct {
@@ -28,6 +26,12 @@ type sendResult struct {
 	id model.DeliveryID
 }
 
+type dispatchStart struct {
+	id       model.DeliveryID
+	started  time.Time
+	response chan error
+}
+
 func (engine *Engine) scheduleOutboxes(ctx context.Context, now time.Time) {
 	ids := make([]model.DeliveryID, 0, len(engine.outboxes))
 	for id := range engine.outboxes {
@@ -36,17 +40,12 @@ func (engine *Engine) scheduleOutboxes(ctx context.Context, now time.Time) {
 	sort.Slice(ids, func(i, j int) bool { return deliveryIDLess(ids[i], ids[j]) })
 	for _, id := range ids {
 		outbox := engine.outboxes[id]
-		if outbox.record.Completed || outbox.sending || outbox.nextAttempt.After(now) {
+		if outbox.record.Completed || outbox.sending || retryDeadlineAfter(outbox.record, now) {
 			continue
 		}
 		select {
 		case engine.sendJobs <- sendJob{record: outbox.record.Clone()}:
 			outbox.sending = true
-			interval := engine.acceptedRetry
-			if outbox.accepted {
-				interval = engine.completedRetry
-			}
-			outbox.nextAttempt = now.Add(interval)
 		default:
 			return
 		}
@@ -59,6 +58,21 @@ func (engine *Engine) senderWorker(ctx context.Context) {
 		if ctx.Err() != nil {
 			continue
 		}
+		response := make(chan error, 1)
+		start := dispatchStart{id: job.record.ID, started: engine.clock.Now(), response: response}
+		select {
+		case engine.dispatchStarts <- start:
+		case <-ctx.Done():
+			continue
+		}
+		select {
+		case err := <-response:
+			if err != nil {
+				continue
+			}
+		case <-ctx.Done():
+			continue
+		}
 		message := deliveryMessageForOutbox(job.record)
 		_ = engine.sender.Send(ctx, message)
 		select {
@@ -66,6 +80,26 @@ func (engine *Engine) senderWorker(ctx context.Context) {
 		case <-ctx.Done():
 		}
 	}
+}
+
+func (engine *Engine) handleDispatchStart(start dispatchStart) error {
+	outbox, ok := engine.outboxes[start.id]
+	if !ok || !outbox.sending || outbox.record.Completed {
+		return errors.New("sender dispatched unknown or inactive outbox")
+	}
+	interval := engine.acceptedRetry
+	if outbox.record.Accepted {
+		interval = engine.completedRetry
+	}
+	deadline, err := retryDeadline(start.started, interval)
+	if err != nil {
+		return err
+	}
+	if err = engine.repository.MarkOutboxDispatched(start.id, deadline); err != nil {
+		return engine.ownerError("persist outbox dispatch", err)
+	}
+	outbox.record.RetryDeadlineUnixNano = deadline
+	return nil
 }
 
 func (engine *Engine) handleSendResult(result sendResult) {
@@ -88,8 +122,18 @@ func (engine *Engine) receiveACK(ack protocol.TupleACK) error {
 		return nil
 	}
 	if ack.Status == protocol.TupleAccepted {
-		outbox.accepted = true
-		outbox.nextAttempt = engine.clock.Now().Add(engine.completedRetry)
+		if outbox.record.Accepted {
+			return nil
+		}
+		deadline, err := retryDeadline(engine.clock.Now(), engine.completedRetry)
+		if err != nil {
+			return err
+		}
+		if err = engine.repository.MarkOutboxAccepted(outbox.record.ID, deadline); err != nil {
+			return err
+		}
+		outbox.record.Accepted = true
+		outbox.record.RetryDeadlineUnixNano = deadline
 		return nil
 	}
 	if ack.Status != protocol.TupleCompleted {
@@ -278,7 +322,7 @@ func (engine *Engine) emitSources(ctx context.Context) error {
 				engine.sources[token.Task] = next
 				for _, record := range outboxes {
 					owned := record.Clone()
-					engine.outboxes[owned.ID] = &ownedOutbox{record: owned, nextAttempt: engine.clock.Now()}
+					engine.outboxes[owned.ID] = &ownedOutbox{record: owned}
 				}
 				release()
 				emitted = true
@@ -295,6 +339,26 @@ func (engine *Engine) emitSources(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func retryDeadlineAfter(record store.OutboxRecord, now time.Time) bool {
+	return record.RetryDeadlineUnixNano != 0 && time.Unix(0, record.RetryDeadlineUnixNano).After(now)
+}
+
+func retryDeadline(start time.Time, interval time.Duration) (int64, error) {
+	wall := start.Round(0)
+	nano := wall.UnixNano()
+	if !time.Unix(0, nano).Equal(wall) {
+		return 0, errors.New("dispatch clock is outside UnixNano range")
+	}
+	if interval <= 0 || nano > math.MaxInt64-int64(interval) {
+		return 0, errors.New("dispatch retry deadline overflows")
+	}
+	deadline := nano + int64(interval)
+	if deadline == 0 {
+		return 0, errors.New("dispatch retry deadline collides with unset value")
+	}
+	return deadline, nil
 }
 
 func deriveSourceOutboxes(assignment store.InstalledAssignment, source model.AssignmentToken, sequence uint64, tuple model.Tuple) ([]store.OutboxRecord, error) {

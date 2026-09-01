@@ -15,6 +15,7 @@ import (
 type deliveryCommand struct {
 	message  protocol.TupleDelivery
 	response chan deliveryResponse
+	release  func()
 }
 
 type deliveryResponse struct {
@@ -53,18 +54,26 @@ func (engine *Engine) HandleDelivery(ctx context.Context, message protocol.Tuple
 	if err != nil {
 		return protocol.TupleACK{}, err
 	}
+	if !engine.readyState.Load() {
+		return protocol.TupleACK{}, ErrNotReady
+	}
+	if ack, found, probeErr := engine.probeDelivery(owned); probeErr != nil || found {
+		return ack, probeErr
+	}
 	release, err := engine.gate.Enter()
 	if err != nil {
 		return protocol.TupleACK{}, err
 	}
-	defer release()
 	response := make(chan deliveryResponse, 1)
-	if err = engine.enqueue(deliveryCommand{message: owned, response: response}, ctx); err != nil {
+	if err = engine.enqueue(deliveryCommand{message: owned, response: response, release: release}, ctx); err != nil {
+		release()
 		return protocol.TupleACK{}, err
 	}
 	select {
 	case result := <-response:
 		return result.ack, result.err
+	case <-ctx.Done():
+		return protocol.TupleACK{}, ctx.Err()
 	case <-engine.done:
 		return protocol.TupleACK{}, ErrNotReady
 	}
@@ -92,9 +101,37 @@ func (engine *Engine) HandleACK(ctx context.Context, ack protocol.TupleACK) erro
 	select {
 	case err = <-response:
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-engine.done:
 		return ErrNotReady
 	}
+}
+
+func (engine *Engine) probeDelivery(message protocol.TupleDelivery) (protocol.TupleACK, bool, error) {
+	if message.Destination.WorkerID != engine.localNode || message.Destination.WorkerEpoch != engine.localEpoch {
+		return protocol.TupleACK{}, true, errors.New("delivery destination is not the durable local worker")
+	}
+	assignment, ok := engine.repository.InstalledAssignment(message.DeliveryID.Tuple.JobID)
+	if !ok {
+		return protocol.TupleACK{}, false, nil
+	}
+	reservation, err := assignment.Topology.WorstCaseCustodyBytes(message.Destination.Task)
+	if err != nil {
+		return protocol.TupleACK{}, true, err
+	}
+	record := store.DeliveryRecord{ID: message.DeliveryID, Tuple: message.Tuple, Producer: message.Producer, Destination: message.Destination, AssignmentRevision: message.Assignment.Revision, AssignmentDigest: message.Assignment.Digest, CoordinatorEpoch: message.Coordinator, State: store.Received, Reservation: reservation}
+	state, found, err := engine.repository.ProbeDelivery(record)
+	if err != nil || !found {
+		return protocol.TupleACK{}, found, err
+	}
+	status := protocol.TupleAccepted
+	if state == store.Completed || state == store.Compacted {
+		status = protocol.TupleCompleted
+	} else if state != store.Received && state != store.Processed {
+		return protocol.TupleACK{}, true, errors.New("repository returned unknown probed delivery state")
+	}
+	return protocol.TupleACK{DeliveryID: record.ID, Destination: record.Destination, Assignment: message.Assignment, Coordinator: record.CoordinatorEpoch, Status: status}, true, nil
 }
 
 func (engine *Engine) receiveDelivery(ctx context.Context, message protocol.TupleDelivery) (protocol.TupleACK, error) {
@@ -288,7 +325,7 @@ func (engine *Engine) handleExecutionResult(result executionResult) error {
 	for _, outbox := range outboxes {
 		record.OutboxIDs = append(record.OutboxIDs, outbox.ID)
 		owned := outbox.Clone()
-		engine.outboxes[owned.ID] = &ownedOutbox{record: owned, nextAttempt: engine.clock.Now()}
+		engine.outboxes[owned.ID] = &ownedOutbox{record: owned}
 		if engine.parents[owned.ID] == nil {
 			engine.parents[owned.ID] = make(map[model.DeliveryID]struct{})
 		}

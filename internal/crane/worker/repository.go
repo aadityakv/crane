@@ -15,11 +15,14 @@ type Repository interface {
 	LocalIdentity() (uint16, model.WorkerEpoch)
 	CurrentFence() model.CoordinatorEpoch
 	InstalledAssignment(model.JobID) (store.InstalledAssignment, bool)
+	ProbeDelivery(store.DeliveryRecord) (store.DeliveryState, bool, error)
 	Receive(store.DeliveryRecord) (store.DeliveryState, error)
 	MarkProcessed(model.DeliveryID, []model.Tuple, []store.OutboxRecord) error
 	MarkCompleted(model.DeliveryID) error
 	AdvanceSource(store.SourceCursor, []store.OutboxRecord) error
 	MarkOutboxCompleted(model.DeliveryID) error
+	MarkOutboxDispatched(model.DeliveryID, int64) error
+	MarkOutboxAccepted(model.DeliveryID, int64) error
 	PersistEvent(model.WorkerEvent) error
 }
 

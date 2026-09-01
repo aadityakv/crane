@@ -13,7 +13,10 @@ import (
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 )
 
-const domainRecordSchema uint16 = 1
+const (
+	domainRecordSchema uint16 = 1
+	outboxRecordSchema uint16 = 2
+)
 
 const (
 	recordFence RecordType = iota + 1
@@ -28,6 +31,7 @@ const (
 	recordRepair
 	recordSource
 	recordOutboxAck
+	recordOutboxRetry
 )
 
 // DeliveryState is the durable receiver state returned for duplicate custody.
@@ -97,6 +101,12 @@ type OutboxRecord struct {
 	CoordinatorEpoch model.CoordinatorEpoch
 	// Completed records a durable downstream completion acknowledgment.
 	Completed bool
+	// Accepted records durable downstream custody and selects the longer
+	// completion-wait retry phase.
+	Accepted bool
+	// RetryDeadlineUnixNano is the injected-clock absolute retry deadline. Zero
+	// means the outbox has never been dispatched.
+	RetryDeadlineUnixNano int64
 }
 
 // Clone returns an independently owned outbox.
@@ -291,7 +301,7 @@ func (work RecoveredWork) Clone() RecoveredWork {
 type workReducer struct {
 	current, transaction RecoveredWork
 	inTransaction        bool
-	prepared             [recordOutboxAck + 1]bool
+	prepared             [recordOutboxRetry + 1]bool
 }
 
 func newRecoveredWork() RecoveredWork {
@@ -306,7 +316,7 @@ func (r *workReducer) BeginTransaction(uint32) error {
 		return errors.New("nested transaction")
 	}
 	r.transaction = r.current
-	r.prepared = [recordOutboxAck + 1]bool{}
+	r.prepared = [recordOutboxRetry + 1]bool{}
 	r.inTransaction = true
 	return nil
 }
@@ -377,7 +387,7 @@ func (r *workReducer) prepare(recordType RecordType) {
 		if clone(recordOutboxAck) {
 			r.transaction.Outboxes = append([]OutboxRecord(nil), r.transaction.Outboxes...)
 		}
-	case recordOutboxAck:
+	case recordOutboxAck, recordOutboxRetry:
 		if clone(recordOutboxAck) {
 			r.transaction.Outboxes = append([]OutboxRecord(nil), r.transaction.Outboxes...)
 		}
@@ -462,6 +472,12 @@ func applyDomainRecord(work *RecoveredWork, record Record) error {
 			return err
 		}
 		return applyOutboxAck(work, id)
+	case recordOutboxRetry:
+		update, err := decodeOutboxRetry(record.Payload)
+		if err != nil {
+			return err
+		}
+		return applyOutboxRetry(work, update)
 	default:
 		return fmt.Errorf("unknown domain record type %d", record.Type)
 	}
@@ -612,8 +628,8 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 			return errors.New("duplicate outbox")
 		}
 		seen[outbox.ID] = struct{}{}
-		if outbox.Completed {
-			return errors.New("new processed outbox is already completed")
+		if outbox.Completed || outbox.Accepted || outbox.RetryDeadlineUnixNano != 0 {
+			return errors.New("new processed outbox has retry or completion state")
 		}
 		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
 			return err
@@ -984,7 +1000,7 @@ func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxReco
 		}
 		seen[outbox.ID] = struct{}{}
 		want, exists := expected[outbox.ID]
-		if !exists || outbox.Completed || !equalOutboxDefinition(want, outbox) {
+		if !exists || outbox.Completed || outbox.Accepted || outbox.RetryDeadlineUnixNano != 0 || !equalOutboxDefinition(want, outbox) {
 			if exactRetry {
 				return model.ErrIdentityReuse
 			}
@@ -1035,6 +1051,49 @@ func applyOutboxAck(work *RecoveredWork, id model.DeliveryID) error {
 	return nil
 }
 
+type outboxRetryUpdate struct {
+	ID               model.DeliveryID
+	Accepted         bool
+	AcceptTransition bool
+	DeadlineUnixNano int64
+}
+
+func applyOutboxRetry(work *RecoveredWork, update outboxRetryUpdate) error {
+	index := outboxIndex(work.Outboxes, update.ID)
+	if index < 0 {
+		return errors.New("retry references unknown outbox")
+	}
+	if update.DeadlineUnixNano == 0 {
+		return errors.New("retry deadline is unset")
+	}
+	record := &work.Outboxes[index]
+	if record.Completed {
+		return errors.New("retry references completed outbox")
+	}
+	if update.AcceptTransition {
+		if !update.Accepted {
+			return errors.New("accepted transition regresses retry phase")
+		}
+		if record.Accepted {
+			if record.RetryDeadlineUnixNano != update.DeadlineUnixNano {
+				return model.ErrIdentityReuse
+			}
+			return nil
+		}
+		record.Accepted = true
+		record.RetryDeadlineUnixNano = update.DeadlineUnixNano
+		return nil
+	}
+	if update.Accepted != record.Accepted {
+		return errors.New("dispatch retry phase mismatch")
+	}
+	if record.RetryDeadlineUnixNano == update.DeadlineUnixNano {
+		return nil
+	}
+	record.RetryDeadlineUnixNano = update.DeadlineUnixNano
+	return nil
+}
+
 func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch) error {
 	if record.State < Received || record.State > Compacted || record.AssignmentRevision == 0 || record.AssignmentDigest == ([32]byte{}) {
 		return errors.New("invalid delivery metadata")
@@ -1076,6 +1135,9 @@ func validateOutbox(record OutboxRecord, assignment InstalledAssignment, fence m
 	delivery := DeliveryRecord{ID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, AssignmentRevision: record.AssignmentRevision, AssignmentDigest: record.AssignmentDigest, CoordinatorEpoch: record.CoordinatorEpoch, State: Received}
 	if record.CoordinatorEpoch != fence {
 		return errors.New("outbox fence mismatch")
+	}
+	if record.Accepted && record.RetryDeadlineUnixNano == 0 {
+		return errors.New("accepted outbox has no retry deadline")
 	}
 	message := protocol.TupleDelivery{DeliveryID: delivery.ID, Tuple: delivery.Tuple, Producer: delivery.Producer, Destination: delivery.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: delivery.ID.Tuple.JobID, Revision: delivery.AssignmentRevision, Digest: delivery.AssignmentDigest}, Coordinator: delivery.CoordinatorEpoch}
 	if _, err := protocol.MarshalTupleDelivery(message); err != nil {
@@ -1384,39 +1446,8 @@ func (store *Store) Receive(record DeliveryRecord) (DeliveryState, error) {
 	if record.Destination.WorkerID != store.state.Identity.NodeID || record.Destination.WorkerEpoch != store.state.WorkerEpoch {
 		return 0, errors.New("delivery destination is not this worker incarnation")
 	}
-	if index := deliveryIndex(store.work.Deliveries, record.ID); index >= 0 {
-		prior := store.work.Deliveries[index]
-		if prior.State == Compacted {
-			digest, err := deliveryDefinitionDigest(record)
-			if err != nil {
-				return 0, err
-			}
-			if digest != prior.definitionDigest {
-				return 0, model.ErrIdentityReuse
-			}
-			return Compacted, nil
-		}
-		if !equalDeliveryDefinition(prior, record) {
-			return 0, model.ErrIdentityReuse
-		}
-		return prior.State, nil
-	}
-	if cursor := sourceIndex(store.work.Sources, record.ID.Tuple.SourceTask); cursor >= 0 {
-		checkpoint := store.work.Sources[cursor]
-		if record.ID.Tuple.SourceSequence <= checkpoint.Watermark {
-			assignment, ok := findAssignment(&store.work, record.ID.Tuple.JobID)
-			if !ok {
-				return 0, model.ErrIdentityReuse
-			}
-			expected, ok, err := deriveDeliveryDefinition(assignment, store.work.Fence, record.ID)
-			if err != nil {
-				return 0, err
-			}
-			if !ok || !equalDeliveryDefinition(expected, record) {
-				return 0, model.ErrIdentityReuse
-			}
-			return Compacted, nil
-		}
+	if state, found, err := probeDelivery(&store.work, record); found || err != nil {
+		return state, err
 	}
 	payload, err := encodeDeliveryRecord(record, nil)
 	if err != nil {
@@ -1431,6 +1462,63 @@ func (store *Store) Receive(record DeliveryRecord) (DeliveryState, error) {
 		return 0, err
 	}
 	return Received, nil
+}
+
+// ProbeDelivery non-mutatingly returns exact prior custody even when current
+// admission authority has advanced. Unknown identities remain distinguishable
+// from changed bytes under a known durable identity.
+func (store *Store) ProbeDelivery(record DeliveryRecord) (DeliveryState, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return 0, false, ErrClosed
+	}
+	if store.failed {
+		return 0, false, ErrUnavailable
+	}
+	if record.Destination.WorkerID != store.state.Identity.NodeID || record.Destination.WorkerEpoch != store.state.WorkerEpoch {
+		return 0, false, errors.New("delivery destination is not this worker incarnation")
+	}
+	return probeDelivery(&store.work, record)
+}
+
+func probeDelivery(work *RecoveredWork, record DeliveryRecord) (DeliveryState, bool, error) {
+	if index := deliveryIndex(work.Deliveries, record.ID); index >= 0 {
+		prior := work.Deliveries[index]
+		if prior.State == Compacted {
+			digest, err := deliveryDefinitionDigest(record)
+			if err != nil {
+				return 0, true, err
+			}
+			if digest != prior.definitionDigest {
+				return 0, true, model.ErrIdentityReuse
+			}
+			return Compacted, true, nil
+		}
+		if !equalDeliveryDefinition(prior, record) {
+			return 0, true, model.ErrIdentityReuse
+		}
+		return prior.State, true, nil
+	}
+	cursor := sourceIndex(work.Sources, record.ID.Tuple.SourceTask)
+	if cursor < 0 || record.ID.Tuple.SourceSequence > work.Sources[cursor].Watermark {
+		return 0, false, nil
+	}
+	assignment, ok := findAssignment(work, record.ID.Tuple.JobID)
+	if !ok {
+		return 0, true, model.ErrIdentityReuse
+	}
+	expected, exists, err := deriveDeliveryDefinition(assignment, assignment.CoordinatorEpoch, record.ID)
+	if err != nil {
+		return 0, true, err
+	}
+	if !exists {
+		return 0, false, nil
+	}
+	if !equalDeliveryDefinition(expected, record) {
+		return 0, true, model.ErrIdentityReuse
+	}
+	return Compacted, true, nil
 }
 
 // MarkProcessed atomically persists deterministic outputs and every downstream outbox.
@@ -1649,6 +1737,44 @@ func (store *Store) MarkOutboxCompleted(id model.DeliveryID) error {
 	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordOutboxAck, Payload: payload}}}, 0)
 }
 
+// MarkOutboxDispatched durably records the retry deadline chosen from the
+// injected clock at actual sender dispatch start.
+func (store *Store) MarkOutboxDispatched(id model.DeliveryID, deadlineUnixNano int64) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	if store.failed {
+		return ErrUnavailable
+	}
+	index := outboxIndex(store.work.Outboxes, id)
+	if index < 0 {
+		return errors.New("unknown outbox")
+	}
+	update := outboxRetryUpdate{ID: id, Accepted: store.work.Outboxes[index].Accepted, DeadlineUnixNano: deadlineUnixNano}
+	payload, err := encodeOutboxRetry(update)
+	if err != nil {
+		return err
+	}
+	tx := Transaction{Records: []Record{{Type: recordOutboxRetry, Payload: payload}}}
+	prospective, err := store.reduceWorkLocked(tx)
+	if err != nil {
+		return err
+	}
+	return store.commitWorkLocked(tx, prospective)
+}
+
+// MarkOutboxAccepted durably enters the completion-wait retry phase.
+func (store *Store) MarkOutboxAccepted(id model.DeliveryID, deadlineUnixNano int64) error {
+	update := outboxRetryUpdate{ID: id, Accepted: true, AcceptTransition: true, DeadlineUnixNano: deadlineUnixNano}
+	payload, err := encodeOutboxRetry(update)
+	if err != nil {
+		return err
+	}
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordOutboxRetry, Payload: payload}}}, 0)
+}
+
 // RecoverWork returns a complete independently owned validated worker view.
 func (store *Store) RecoverWork() (RecoveredWork, error) {
 	store.mu.Lock()
@@ -1727,7 +1853,7 @@ func validateRegisteredTransaction(transaction Transaction) error {
 		return err
 	}
 	for index, record := range transaction.Records {
-		if record.Type < recordFence || record.Type > recordOutboxAck {
+		if record.Type < recordFence || record.Type > recordOutboxRetry {
 			return fmt.Errorf("%w: record %d has unregistered type %d", ErrInvalidTransaction, index, record.Type)
 		}
 	}
@@ -1763,7 +1889,7 @@ func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch m
 		if !ok || outbox.Producer.WorkerID != nodeID || outbox.Producer.WorkerEpoch != workerEpoch {
 			return errors.New("recovered outbox producer is not this worker incarnation")
 		}
-		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
+		if err := validateSnapshotOutbox(outbox, assignment, work.Fence); err != nil {
 			return fmt.Errorf("recovered outbox cross-reference: %w", err)
 		}
 	}
@@ -1977,19 +2103,38 @@ func encodeOutbox(record OutboxRecord) ([]byte, error) {
 		return nil, err
 	}
 	w := newRecordWriter()
-	w.u16(domainRecordSchema)
+	w.u16(outboxRecordSchema)
 	w.u8(boolByte(record.Completed))
+	w.u8(boolByte(record.Accepted))
+	w.u64(uint64(record.RetryDeadlineUnixNano))
 	w.blob(encoded)
 	return w.bytes(), nil
 }
 func decodeOutbox(payload []byte) (OutboxRecord, error) {
 	r := newRecordReader(payload)
-	if err := r.schema(); err != nil {
-		return OutboxRecord{}, err
+	schema, err := r.u16()
+	if err != nil || schema != domainRecordSchema && schema != outboxRecordSchema {
+		return OutboxRecord{}, errors.New("unsupported outbox schema")
 	}
 	complete, err := r.u8()
 	if err != nil || complete > 1 {
 		return OutboxRecord{}, errors.New("invalid outbox status")
+	}
+	var accepted uint8
+	var deadline int64
+	if schema == outboxRecordSchema {
+		accepted, err = r.u8()
+		if err != nil || accepted > 1 {
+			return OutboxRecord{}, errors.New("invalid outbox retry phase")
+		}
+		raw, deadlineErr := r.u64()
+		if deadlineErr != nil {
+			return OutboxRecord{}, deadlineErr
+		}
+		deadline = int64(raw)
+		if accepted == 1 && deadline == 0 {
+			return OutboxRecord{}, errors.New("accepted outbox has unset retry deadline")
+		}
 	}
 	encoded, err := r.blob(MaxRecordPayloadBytes)
 	if err != nil || !r.done() {
@@ -1999,7 +2144,51 @@ func decodeOutbox(payload []byte) (OutboxRecord, error) {
 	if err != nil {
 		return OutboxRecord{}, err
 	}
-	return OutboxRecord{ID: message.DeliveryID, Tuple: message.Tuple, Producer: message.Producer, Destination: message.Destination, AssignmentRevision: message.Assignment.Revision, AssignmentDigest: message.Assignment.Digest, CoordinatorEpoch: message.Coordinator, Completed: complete == 1}, nil
+	return OutboxRecord{ID: message.DeliveryID, Tuple: message.Tuple, Producer: message.Producer, Destination: message.Destination, AssignmentRevision: message.Assignment.Revision, AssignmentDigest: message.Assignment.Digest, CoordinatorEpoch: message.Coordinator, Completed: complete == 1, Accepted: accepted == 1, RetryDeadlineUnixNano: deadline}, nil
+}
+
+func encodeOutboxRetry(update outboxRetryUpdate) ([]byte, error) {
+	if err := update.ID.Validate(); err != nil {
+		return nil, err
+	}
+	if update.DeadlineUnixNano == 0 || update.AcceptTransition && !update.Accepted {
+		return nil, errors.New("invalid outbox retry update")
+	}
+	w := newRecordWriter()
+	w.u16(domainRecordSchema)
+	w.u8(boolByte(update.Accepted))
+	w.u8(boolByte(update.AcceptTransition))
+	w.u64(uint64(update.DeadlineUnixNano))
+	w.deliveryID(update.ID)
+	return w.bytes(), nil
+}
+
+func decodeOutboxRetry(payload []byte) (outboxRetryUpdate, error) {
+	r := newRecordReader(payload)
+	if err := r.schema(); err != nil {
+		return outboxRetryUpdate{}, err
+	}
+	accepted, err := r.u8()
+	if err != nil || accepted > 1 {
+		return outboxRetryUpdate{}, errors.New("invalid outbox retry phase")
+	}
+	transition, err := r.u8()
+	if err != nil || transition > 1 {
+		return outboxRetryUpdate{}, errors.New("invalid outbox retry transition")
+	}
+	deadline, err := r.u64()
+	if err != nil {
+		return outboxRetryUpdate{}, err
+	}
+	id, err := r.deliveryID()
+	if err != nil || !r.done() {
+		return outboxRetryUpdate{}, errors.New("invalid outbox retry record")
+	}
+	update := outboxRetryUpdate{ID: id, Accepted: accepted == 1, AcceptTransition: transition == 1, DeadlineUnixNano: int64(deadline)}
+	if update.DeadlineUnixNano == 0 || update.AcceptTransition && !update.Accepted {
+		return outboxRetryUpdate{}, errors.New("invalid outbox retry update")
+	}
+	return update, nil
 }
 
 func encodeDeliveryIDPayload(id model.DeliveryID) ([]byte, error) {

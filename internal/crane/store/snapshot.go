@@ -1278,7 +1278,7 @@ func validateSnapshotDelivery(record DeliveryRecord, assignment InstalledAssignm
 }
 
 func validateSnapshotOutbox(record OutboxRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch) error {
-	if record.AssignmentRevision == 0 || record.AssignmentRevision > assignment.Assignment.Revision || record.AssignmentDigest == ([32]byte{}) || !snapshotEpochAtOrBefore(record.CoordinatorEpoch, fence) {
+	if record.AssignmentRevision == 0 || record.AssignmentRevision > assignment.Assignment.Revision || record.AssignmentDigest == ([32]byte{}) || !snapshotEpochAtOrBefore(record.CoordinatorEpoch, fence) || record.Accepted && record.RetryDeadlineUnixNano == 0 {
 		return errors.New("invalid snapshot outbox authority")
 	}
 	if record.AssignmentRevision == assignment.Assignment.Revision {
