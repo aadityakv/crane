@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/config"
+	craneworker "github.com/aaditya/cs425mp3/internal/crane/worker"
 	internalnode "github.com/aaditya/cs425mp3/internal/node"
 	"github.com/aaditya/cs425mp3/internal/raft"
 )
@@ -148,8 +149,24 @@ func TestNewLocalRuntimeComposesOnlyConfiguredVotersWithoutSideEffects(t *testin
 		wantNames []string
 		wantRaft  bool
 	}{
-		{name: "voter", nodeID: 1, wantNames: []string{"swim", "raft"}, wantRaft: true},
-		{name: "nonvoter", nodeID: 4, wantNames: []string{"swim"}, wantRaft: false},
+		{
+			name:   "voter",
+			nodeID: 1,
+			wantNames: []string{
+				"swim", "crane-membership-authorizer", "raft",
+				"crane-worker", "crane-coordinator", "crane-control",
+			},
+			wantRaft: true,
+		},
+		{
+			name:   "nonvoter",
+			nodeID: 4,
+			wantNames: []string{
+				"swim", "crane-membership-authorizer",
+				"crane-worker", "crane-control",
+			},
+			wantRaft: false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -161,6 +178,7 @@ func TestNewLocalRuntimeComposesOnlyConfiguredVotersWithoutSideEffects(t *testin
 				t.Fatalf("Validate: %v", err)
 			}
 			raftDirectory := filepath.Join(configuration.StorageDir, raft.RaftStorageDirectoryName)
+			workerDirectory := filepath.Join(configuration.StorageDir, craneworker.WorkerStoreDirectory)
 			if _, err := os.Stat(raftDirectory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("Raft directory exists before construction: %v", err)
 			}
@@ -169,11 +187,13 @@ func TestNewLocalRuntimeComposesOnlyConfiguredVotersWithoutSideEffects(t *testin
 			if err != nil {
 				t.Fatalf("newLocalRuntime: %v", err)
 			}
-			if runtime == nil || runtime.swim == nil || (runtime.raft != nil) != test.wantRaft {
+			if runtime == nil || runtime.SWIM == nil || runtime.Machine == nil || runtime.Gate == nil ||
+				runtime.Worker == nil || runtime.Control == nil ||
+				(runtime.Raft != nil) != test.wantRaft || (runtime.Coordinator != nil) != test.wantRaft {
 				t.Fatalf("runtime composition = %#v, wantRaft=%t", runtime, test.wantRaft)
 			}
-			gotNames := make([]string, len(runtime.services))
-			for index, service := range runtime.services {
+			gotNames := make([]string, len(runtime.Services))
+			for index, service := range runtime.Services {
 				gotNames[index] = service.Name()
 			}
 			if !reflect.DeepEqual(gotNames, test.wantNames) {
@@ -181,6 +201,9 @@ func TestNewLocalRuntimeComposesOnlyConfiguredVotersWithoutSideEffects(t *testin
 			}
 			if _, err := os.Stat(raftDirectory); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("construction created Raft durable state: %v", err)
+			}
+			if _, err := os.Stat(workerDirectory); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("construction created Crane worker durable state: %v", err)
 			}
 		})
 	}
@@ -226,42 +249,40 @@ func reserveConfiguredRaftEndpoint(t *testing.T, configuration *config.NodeConfi
 	return nil
 }
 
-func TestBootstrapStateMachineAcceptsOnlyVersionedEmptyState(t *testing.T) {
-	machine := &bootstrapStateMachine{}
-	if err := machine.Restore(0, nil); err != nil {
-		t.Fatalf("Restore(initial empty): %v", err)
-	}
-	capture, err := machine.Capture(7, 3)
+func TestNodeRuntimeMachinePreservesBootstrapMigration(t *testing.T) {
+	configuration := writeNodeTestConfig(t)
+	reservedRaftListener := reserveConfiguredRaftEndpoint(t, &configuration)
+	defer reservedRaftListener.Close()
+	runtime, err := newLocalRuntime(configuration)
 	if err != nil {
-		t.Fatalf("Capture: %v", err)
+		t.Fatalf("newLocalRuntime: %v", err)
 	}
-	if capture.SchemaVersion() != bootstrapSnapshotSchemaVersion {
-		t.Fatalf("snapshot schema = %d, want %d", capture.SchemaVersion(), bootstrapSnapshotSchemaVersion)
-	}
-	encoded, err := capture.MarshalBinary()
-	if err != nil || len(encoded) != 0 {
-		t.Fatalf("snapshot bytes = %x, err=%v; want deterministic empty snapshot", encoded, err)
-	}
-	if err := machine.Restore(capture.SchemaVersion(), encoded); err != nil {
-		t.Fatalf("Restore(own snapshot): %v", err)
+	machine := runtime.Machine
+	for _, schema := range []uint32{0, 1} {
+		if err := machine.Restore(schema, nil); err != nil {
+			t.Fatalf("Restore(empty schema %d): %v", schema, err)
+		}
 	}
 	for _, test := range []struct {
 		name    string
 		schema  uint32
 		payload []byte
 	}{
-		{name: "unknown schema", schema: bootstrapSnapshotSchemaVersion + 1},
-		{name: "nonempty initial", payload: []byte{1}},
-		{name: "nonempty versioned", schema: bootstrapSnapshotSchemaVersion, payload: []byte{1}},
+		{name: "unknown schema", schema: 7},
+		{name: "nonempty legacy", schema: 1, payload: []byte{1}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := machine.Restore(test.schema, test.payload); err == nil {
-				t.Fatal("Restore accepted unsupported snapshot")
+				t.Fatal("Restore accepted unsupported legacy snapshot")
 			}
 		})
 	}
-	if result, err := machine.Apply(1, 1, []byte("unexpected")); err == nil || result != nil || !strings.Contains(err.Error(), "bootstrap") {
-		t.Fatalf("Apply result=%x err=%v, want fail-closed bootstrap error", result, err)
+	capture, err := machine.Capture(1, 1)
+	if err != nil {
+		t.Fatalf("Capture after bootstrap restore: %v", err)
+	}
+	if capture.SchemaVersion() <= 1 {
+		t.Fatalf("post-bootstrap snapshot schema = %d, want the Crane schema", capture.SchemaVersion())
 	}
 }
 

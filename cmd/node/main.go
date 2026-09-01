@@ -15,17 +15,14 @@ import (
 
 	"github.com/aaditya/cs425mp3/internal/clock"
 	"github.com/aaditya/cs425mp3/internal/config"
-	"github.com/aaditya/cs425mp3/internal/crane/model"
+	craneruntime "github.com/aaditya/cs425mp3/internal/crane/runtime"
 	"github.com/aaditya/cs425mp3/internal/node"
-	"github.com/aaditya/cs425mp3/internal/raft"
 	internalrandom "github.com/aaditya/cs425mp3/internal/random"
 	"github.com/aaditya/cs425mp3/internal/swim"
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
 const incarnationStateFilename = swim.IncarnationStateFilename
-
-const bootstrapSnapshotSchemaVersion uint32 = 1
 
 type nodeFlags struct {
 	configPath    string
@@ -57,7 +54,7 @@ func executeNode(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return runSupervisedNode(ctx, configuration.NodeID, runtime.services, os.Stdout)
+	return runSupervisedNode(ctx, configuration.NodeID, []node.Service{runtime}, os.Stdout)
 }
 
 func runSupervisedNode(ctx context.Context, nodeID uint16, services []node.Service, readyWriter io.Writer) error {
@@ -106,13 +103,11 @@ func runSupervisedNode(ctx context.Context, nodeID uint16, services []node.Servi
 	}
 }
 
-type localRuntime struct {
-	swim     *swim.Service
-	raft     *raft.Service
-	services []node.Service
-}
-
-func newLocalRuntime(configuration config.NodeConfig) (*localRuntime, error) {
+// newLocalRuntime validates the strict configuration and composes the
+// complete Crane node runtime: SWIM, the membership authorizer, the shared
+// admission gate and state machine, the worker services, Raft plus the
+// coordinator on configured voters, and the +6 control service.
+func newLocalRuntime(configuration config.NodeConfig) (*craneruntime.Runtime, error) {
 	if err := configuration.Validate(); err != nil {
 		return nil, fmt.Errorf("validate node configuration: %w", err)
 	}
@@ -127,61 +122,12 @@ func newLocalRuntime(configuration config.NodeConfig) (*localRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	realClock := clock.NewReal()
-	sharedRandom := internalrandom.NewLockedSource(seed)
-
-	swimService, err := constructSWIMService(configuration, secret, realClock, sharedRandom)
-	if err != nil {
-		return nil, err
-	}
-	runtime := &localRuntime{
-		swim:     swimService,
-		services: []node.Service{swimService},
-	}
-	if _, voter := configuration.RaftVoterByID(configuration.NodeID); !voter {
-		return runtime, nil
-	}
-	raftService, err := raft.NewService(raft.ServiceOptions{
-		Config:                 ownedNodeConfig(configuration),
-		ApplicationFingerprint: model.ConsensusFingerprint(),
-		Secret:                 append([]byte(nil), secret...),
-		Clock:                  realClock,
-		Random:                 sharedRandom,
-		StateMachine:           &bootstrapStateMachine{},
+	return craneruntime.New(configuration, craneruntime.Dependencies{
+		Secret: secret,
+		Clock:  clock.NewReal(),
+		Random: internalrandom.NewLockedSource(seed),
 	})
-	if err != nil {
-		return nil, fmt.Errorf("construct Raft service: %w", err)
-	}
-	runtime.raft = raftService
-	runtime.services = append(runtime.services, raftService)
-	return runtime, nil
 }
-
-type bootstrapStateMachine struct{}
-
-func (*bootstrapStateMachine) Apply(index, term uint64, command []byte) ([]byte, error) {
-	return nil, fmt.Errorf("bootstrap Raft application rejects command at index %d term %d (%d bytes)", index, term, len(command))
-}
-
-func (*bootstrapStateMachine) Capture(uint64, uint64) (raft.SnapshotCapture, error) {
-	return bootstrapSnapshot{}, nil
-}
-
-func (*bootstrapStateMachine) Restore(schemaVersion uint32, snapshot []byte) error {
-	if len(snapshot) != 0 {
-		return fmt.Errorf("bootstrap Raft application rejects non-empty snapshot")
-	}
-	if schemaVersion != 0 && schemaVersion != bootstrapSnapshotSchemaVersion {
-		return fmt.Errorf("bootstrap Raft application rejects snapshot schema %d", schemaVersion)
-	}
-	return nil
-}
-
-type bootstrapSnapshot struct{}
-
-func (bootstrapSnapshot) SchemaVersion() uint32 { return bootstrapSnapshotSchemaVersion }
-
-func (bootstrapSnapshot) MarshalBinary() ([]byte, error) { return []byte{}, nil }
 
 func loadNodeConfiguration(args []string) (config.NodeConfig, error) {
 	options, err := parseNodeFlags(args)

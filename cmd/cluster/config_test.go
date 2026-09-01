@@ -10,8 +10,65 @@ import (
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/swim"
 )
+
+// TestGeneratedConfigsCarryCompiledCraneContract pins that every generated
+// node process receives the complete Crane operational fields and the exact
+// compiled consensus fingerprint required by the composed runtime.
+func TestGeneratedConfigsCarryCompiledCraneContract(t *testing.T) {
+	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
+	if err := os.WriteFile(secretFile, []byte("launcher-secret-that-must-not-enter-json-32"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configurations, err := GenerateConfigs(ClusterOptions{
+		Nodes: 4, Voters: 3, Host: "127.0.0.1", StartingBasePort: 9000,
+		DataRoot: t.TempDir(), SecretFile: secretFile,
+	})
+	if err != nil {
+		t.Fatalf("GenerateConfigs: %v", err)
+	}
+	want := config.DefaultCraneConfig()
+	for _, configuration := range configurations {
+		if configuration.Crane != want {
+			t.Fatalf("node %d Crane config = %#v, want %#v", configuration.NodeID, configuration.Crane, want)
+		}
+		if configuration.Crane.ConsensusFingerprint != model.ConsensusFingerprintHex() {
+			t.Fatalf("node %d fingerprint = %s, want compiled %s",
+				configuration.NodeID, configuration.Crane.ConsensusFingerprint, model.ConsensusFingerprintHex())
+		}
+	}
+}
+
+// TestExampleNodeConfigMatchesCompiledContract keeps the checked-in example
+// configuration loadable by this exact binary, including the compiled
+// consensus fingerprint the strict validation requires.
+func TestExampleNodeConfigMatchesCompiledContract(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "examples", "config", "node-1.json"))
+	if err != nil {
+		t.Fatalf("read example node config: %v", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	var configuration config.NodeConfig
+	if err := decoder.Decode(&configuration); err != nil {
+		t.Fatalf("decode example node config: %v", err)
+	}
+	// The example names a relative secret path a deployment provides; the
+	// strict validation needs one real owner-only secret file to inspect.
+	secretFile := filepath.Join(t.TempDir(), "cluster.secret")
+	if err := os.WriteFile(secretFile, []byte("example-config-secret-of-32-bytes!!!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration.ClusterSecretFile = secretFile
+	if err := configuration.Validate(); err != nil {
+		t.Fatalf("validate example node config: %v", err)
+	}
+	if got, want := configuration.Crane.ConsensusFingerprint, model.ConsensusFingerprintHex(); got != want {
+		t.Fatalf("example consensus fingerprint = %s, want compiled %s", got, want)
+	}
+}
 
 func TestGenerateConfigsBuildsStrictSharedLocalLayout(t *testing.T) {
 	secretContents := "launcher-secret-that-must-not-enter-json-32"
