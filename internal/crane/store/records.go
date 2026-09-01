@@ -587,16 +587,26 @@ func applyAssignment(work *RecoveredWork, installed InstalledAssignment) error {
 		if installed.Assignment.Revision < prior.Assignment.Revision {
 			return errors.New("stale assignment revision")
 		}
-		if installed.Assignment.Revision == prior.Assignment.Revision {
-			if equalInstalledAssignment(prior, installed) {
-				return nil
-			}
-			if equalInstalledAssignmentContent(prior, installed) && compareEpochOrder(installed.CoordinatorEpoch, prior.CoordinatorEpoch) > 0 {
-				// Leadership rebind: identical content under strictly newer
-				// committed authority durably rebinds the fence owner.
-				work.Assignments[index] = cloneInstalled(installed)
-				return nil
-			}
+	if installed.Assignment.Revision == prior.Assignment.Revision {
+		if equalInstalledAssignment(prior, installed) {
+			return nil
+		}
+		contentEqual := equalInstalledAssignmentContent(prior, installed)
+		if contentEqual && compareEpochOrder(installed.CoordinatorEpoch, prior.CoordinatorEpoch) > 0 {
+			// Leadership rebind: content identical under strictly newer
+			// committed authority durably rebinds the fence owner and
+			// records the incoming worker-local scheduling state.
+			work.Assignments[index] = cloneInstalled(installed)
+			return nil
+		}
+		if contentEqual && installed.CoordinatorEpoch == prior.CoordinatorEpoch && admissionSchedulingProgression(prior.SchedulingState, installed.SchedulingState) {
+			// Admission progressions at the equal current fence: verified
+			// activation (Closed→Running) and re-fence before
+			// re-verification (Running→Closed) change only worker-local
+			// admission state, never attempts or custody.
+			work.Assignments[index] = cloneInstalled(installed)
+			return nil
+		}
 			if installed.Assignment.Digest != prior.Assignment.Digest || !bytes.Equal(installed.SpecificationBytes, prior.SpecificationBytes) || !equalTokens(installed.Assignment.Tasks, prior.Assignment.Tasks) || !equalReplicas(installed.Assignment.ResultReplicas, prior.Assignment.ResultReplicas) || installed.JobControlRevision <= prior.JobControlRevision {
 				return model.ErrIdentityReuse
 			}
@@ -3867,10 +3877,16 @@ func findToken(set model.AssignmentSet, task model.TaskID) (model.AssignmentToke
 	return model.AssignmentToken{}, false
 }
 func equalInstalledAssignment(a, b InstalledAssignment) bool {
-	return equalInstalledAssignmentContent(a, b) && a.CoordinatorEpoch == b.CoordinatorEpoch
+	return equalInstalledAssignmentContent(a, b) && a.SchedulingState == b.SchedulingState && a.CoordinatorEpoch == b.CoordinatorEpoch
 }
 func equalInstalledAssignmentContent(a, b InstalledAssignment) bool {
-	return a.Assignment.JobID == b.Assignment.JobID && a.Assignment.Revision == b.Assignment.Revision && a.Assignment.Digest == b.Assignment.Digest && a.JobControlRevision == b.JobControlRevision && a.SchedulingState == b.SchedulingState && bytes.Equal(a.SpecificationBytes, b.SpecificationBytes) && equalTokens(a.Assignment.Tasks, b.Assignment.Tasks) && equalReplicas(a.Assignment.ResultReplicas, b.Assignment.ResultReplicas)
+	return a.Assignment.JobID == b.Assignment.JobID && a.Assignment.Revision == b.Assignment.Revision && a.Assignment.Digest == b.Assignment.Digest && a.JobControlRevision == b.JobControlRevision && bytes.Equal(a.SpecificationBytes, b.SpecificationBytes) && equalTokens(a.Assignment.Tasks, b.Assignment.Tasks) && equalReplicas(a.Assignment.ResultReplicas, b.Assignment.ResultReplicas)
+}
+// admissionSchedulingProgression reports whether one scheduling change at an
+// equal fence and revision is one of the two admitted worker-local admission
+// progressions of the current coordinator's install protocol.
+func admissionSchedulingProgression(prior, incoming model.SchedulingState) bool {
+	return prior == model.Running && incoming == model.Closed || prior == model.Closed && incoming == model.Running
 }
 func equalTokens(a, b []model.AssignmentToken) bool {
 	if len(a) != len(b) {
