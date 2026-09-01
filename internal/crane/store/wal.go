@@ -27,19 +27,19 @@ func recoverWAL(data []byte, expected Identity) (RecoveredState, int, error) {
 // second bounded streaming pass. The consumer therefore never observes a WAL
 // whose existing bytes were already known to be corrupt.
 func recoverWALReader(reader io.ReaderAt, size int64, expected Identity, consumer recoveryConsumer) (RecoveredState, int64, error) {
-	return recoverWALReaderWithAnchor(reader, size, expected, nil, 0, consumer)
+	return recoverWALReaderWithAnchor(reader, size, expected, nil, consumer)
 }
 
-func recoverSnapshotWALReader(reader io.ReaderAt, size int64, expected Identity, anchor walSnapshotAnchor, transactionCount uint64, consumer recoveryConsumer) (RecoveredState, int64, error) {
-	return recoverWALReaderWithAnchor(reader, size, expected, &anchor, transactionCount, consumer)
+func recoverSnapshotWALReader(reader io.ReaderAt, size int64, expected Identity, anchor walSnapshotAnchor, consumer recoveryConsumer) (RecoveredState, int64, error) {
+	return recoverWALReaderWithAnchor(reader, size, expected, &anchor, consumer)
 }
 
-func recoverWALReaderWithAnchor(reader io.ReaderAt, size int64, expected Identity, anchor *walSnapshotAnchor, transactionCount uint64, consumer recoveryConsumer) (RecoveredState, int64, error) {
-	state, truncateAt, err := scanWAL(reader, size, expected, nil, anchor, transactionCount)
+func recoverWALReaderWithAnchor(reader io.ReaderAt, size int64, expected Identity, anchor *walSnapshotAnchor, consumer recoveryConsumer) (RecoveredState, int64, error) {
+	state, truncateAt, err := scanWAL(reader, size, expected, nil, anchor)
 	if err != nil || consumer == nil {
 		return state, truncateAt, err
 	}
-	replayed, replayEnd, err := scanWAL(reader, truncateAt, expected, consumer, anchor, transactionCount)
+	replayed, replayEnd, err := scanWAL(reader, truncateAt, expected, consumer, anchor)
 	if err != nil {
 		return RecoveredState{}, 0, err
 	}
@@ -49,7 +49,7 @@ func recoverWALReaderWithAnchor(reader io.ReaderAt, size int64, expected Identit
 	return state, truncateAt, nil
 }
 
-func scanWAL(reader io.ReaderAt, size int64, expected Identity, consumer recoveryConsumer, expectedAnchor *walSnapshotAnchor, transactionCount uint64) (RecoveredState, int64, error) {
+func scanWAL(reader io.ReaderAt, size int64, expected Identity, consumer recoveryConsumer, expectedAnchor *walSnapshotAnchor) (RecoveredState, int64, error) {
 	state := RecoveredState{Identity: expected}
 	record, offset, incomplete, err := decodeRecordAt(reader, size, 0)
 	if err != nil || incomplete {
@@ -75,7 +75,7 @@ func scanWAL(reader io.ReaderAt, size int64, expected Identity, consumer recover
 		identity = anchor.Identity
 		state.WorkerEpoch = anchor.WorkerEpoch
 		state.LastSequence = anchor.BaseSequence
-		state.TransactionCount = transactionCount
+		state.TransactionCount = anchor.TransactionCount
 		state.SnapshotGeneration = anchor.Generation
 	}
 	if identity != expected {

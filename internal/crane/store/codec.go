@@ -19,7 +19,7 @@ const (
 	identityPayloadBytes              = 34
 	boundaryPayloadBytes              = 44
 	dataPrefixBytes                   = 6
-	snapshotAnchorPayloadBytes        = 84
+	snapshotAnchorPayloadBytes        = 92
 )
 
 var walMagic = [4]byte{'C', 'W', 'W', 'L'}
@@ -38,11 +38,12 @@ const (
 )
 
 type walSnapshotAnchor struct {
-	Identity       Identity
-	WorkerEpoch    model.WorkerEpoch
-	Generation     uint64
-	BaseSequence   uint64
-	SnapshotDigest [32]byte
+	Identity         Identity
+	WorkerEpoch      model.WorkerEpoch
+	Generation       uint64
+	BaseSequence     uint64
+	TransactionCount uint64
+	SnapshotDigest   [32]byte
 }
 
 type walRecord struct {
@@ -88,7 +89,7 @@ func encodeSnapshotAnchor(anchor walSnapshotAnchor) ([]byte, error) {
 	if err := validateEpoch(anchor.WorkerEpoch); err != nil {
 		return nil, err
 	}
-	if anchor.Generation == 0 || anchor.BaseSequence == 0 || anchor.SnapshotDigest == ([32]byte{}) {
+	if anchor.Generation == 0 || !validSnapshotTransactionMetadata(anchor.BaseSequence, anchor.TransactionCount) || anchor.SnapshotDigest == ([32]byte{}) {
 		return nil, fmt.Errorf("%w: invalid snapshot WAL anchor", ErrInvalidTransaction)
 	}
 	payload := make([]byte, snapshotAnchorPayloadBytes)
@@ -98,7 +99,8 @@ func encodeSnapshotAnchor(anchor walSnapshotAnchor) ([]byte, error) {
 	copy(payload[20:36], anchor.WorkerEpoch[:])
 	binary.BigEndian.PutUint64(payload[36:44], anchor.Generation)
 	binary.BigEndian.PutUint64(payload[44:52], anchor.BaseSequence)
-	copy(payload[52:84], anchor.SnapshotDigest[:])
+	binary.BigEndian.PutUint64(payload[52:60], anchor.TransactionCount)
+	copy(payload[60:92], anchor.SnapshotDigest[:])
 	return encodeRecord(recordSnapshotIdentity, anchor.BaseSequence, payload)
 }
 
@@ -112,8 +114,9 @@ func decodeSnapshotAnchor(payload []byte) (walSnapshotAnchor, error) {
 	copy(anchor.WorkerEpoch[:], payload[20:36])
 	anchor.Generation = binary.BigEndian.Uint64(payload[36:44])
 	anchor.BaseSequence = binary.BigEndian.Uint64(payload[44:52])
-	copy(anchor.SnapshotDigest[:], payload[52:84])
-	if anchor.Identity.Validate() != nil || validateEpoch(anchor.WorkerEpoch) != nil || anchor.Generation == 0 || anchor.BaseSequence == 0 || anchor.SnapshotDigest == ([32]byte{}) {
+	anchor.TransactionCount = binary.BigEndian.Uint64(payload[52:60])
+	copy(anchor.SnapshotDigest[:], payload[60:92])
+	if anchor.Identity.Validate() != nil || validateEpoch(anchor.WorkerEpoch) != nil || anchor.Generation == 0 || !validSnapshotTransactionMetadata(anchor.BaseSequence, anchor.TransactionCount) || anchor.SnapshotDigest == ([32]byte{}) {
 		return walSnapshotAnchor{}, fmt.Errorf("%w: invalid snapshot WAL anchor", ErrCorrupt)
 	}
 	return anchor, nil

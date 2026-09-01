@@ -850,6 +850,9 @@ func applyEvent(work *RecoveredWork, event model.WorkerEvent) error {
 	if event.TransactionID != work.NextTransactionID {
 		return errors.New("worker event transaction is not next")
 	}
+	if work.NextTransactionID == math.MaxUint64 {
+		return ErrCapacity
+	}
 	if len(work.PendingEvents) > 0 && event.TransactionID <= work.PendingEvents[len(work.PendingEvents)-1].TransactionID {
 		return errors.New("worker event order regression")
 	}
@@ -945,7 +948,7 @@ func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxReco
 	if err != nil || cursor.EOF != wantEOF {
 		return errors.New("source cursor EOF does not match installed topology")
 	}
-	if cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark > model.LimitsV1().MaxSourceSequences || cursor.EOF > model.LimitsV1().MaxSourceSequences || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark >= cursor.NextSequence {
+	if cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark > model.LimitsV1().MaxSourceSequences || cursor.EOF > model.LimitsV1().MaxSourceSequences || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark != 0 && cursor.RaftIndex == 0 {
 		return errors.New("source cursor outside bounds")
 	}
 	source, ok := findToken(assignment.Assignment, cursor.Source)
@@ -3221,6 +3224,14 @@ func deliveryIDLess(a, b model.DeliveryID) bool {
 func outboxesCanonical(outboxes []OutboxRecord) bool {
 	for index := 1; index < len(outboxes); index++ {
 		if !deliveryIDLess(outboxes[index-1].ID, outboxes[index].ID) {
+			return false
+		}
+	}
+	return true
+}
+func outboxIDsCanonical(ids []model.DeliveryID) bool {
+	for index := 1; index < len(ids); index++ {
+		if !deliveryIDLess(ids[index-1], ids[index]) {
 			return false
 		}
 	}

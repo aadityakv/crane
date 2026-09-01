@@ -155,7 +155,7 @@ func writeSnapshotChunk(file *os.File, data []byte, write func(*os.File, []byte)
 }
 
 func snapshotMetadata(state RecoveredState, work RecoveredWork, generation uint64) (Snapshot, []byte, error) {
-	if generation == 0 || !validSnapshotTransactionMetadata(state.LastSequence, state.TransactionCount) || state.WorkerEpoch.Validate() != nil || state.Identity.Validate() != nil || work.NextTransactionID == 0 {
+	if generation == 0 || !validSnapshotTransactionMetadata(state.LastSequence, state.TransactionCount) || !validSnapshotEventMetadata(work.NextTransactionID, state.TransactionCount) || state.WorkerEpoch.Validate() != nil || state.Identity.Validate() != nil {
 		return Snapshot{}, nil, fmt.Errorf("%w: invalid snapshot metadata", ErrInvalidTransaction)
 	}
 	var count, body uint64
@@ -367,9 +367,9 @@ func recoverSnapshotReader(reader io.ReaderAt, size int64, expected Identity, cu
 	if err := scanSnapshotFrames(reader, snapshotHeaderBytes, body, count, nil); err != nil {
 		return RecoveredWork{}, Snapshot{}, err
 	}
-	decoder := snapshotDecoder{work: newRecoveredWork()}
+	decoder := newSnapshotDecoder(newRecoveredWork(), body)
 	decoder.work.NextTransactionID = nextTransactionID
-	if err := scanSnapshotFrames(reader, snapshotHeaderBytes, body, count, decoder.consume); err != nil {
+	if err := scanSnapshotFrames(reader, snapshotHeaderBytes, body, count, decoder); err != nil {
 		return RecoveredWork{}, Snapshot{}, err
 	}
 	if err := validateSnapshotWork(decoder.work, expected.NodeID, current.WorkerEpoch); err != nil {
@@ -418,7 +418,7 @@ func decodeSnapshotHeader(header []byte, size int64, expected Identity, current 
 		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot header count", ErrCorrupt)
 	}
 	minimumBody := count * snapshotFrameOverhead
-	if body < minimumBody || body > uint64(size)-snapshotHeaderBytes-snapshotFooterBytes || total != uint64(size) || total != uint64(snapshotHeaderBytes+snapshotFooterBytes)+body || generation == 0 || baseSequence == 0 || nextTransactionID == 0 {
+	if body < minimumBody || body > uint64(size)-snapshotHeaderBytes-snapshotFooterBytes || total != uint64(size) || total != uint64(snapshotHeaderBytes+snapshotFooterBytes)+body || generation == 0 || !validSnapshotEventMetadata(nextTransactionID, transactions) {
 		return Snapshot{}, 0, 0, 0, fmt.Errorf("%w: snapshot header bounds", ErrCorrupt)
 	}
 	if current.Identity != identity || current.WorkerEpoch != epoch || current.Generation != generation || current.BaseSequence != baseSequence || current.TransactionCount != transactions || current.SnapshotBytes != total || !validSnapshotTransactionMetadata(baseSequence, transactions) {
@@ -427,34 +427,39 @@ func decodeSnapshotHeader(header []byte, size int64, expected Identity, current 
 	return Snapshot{Generation: generation, BaseSequence: baseSequence, TransactionCount: transactions, Bytes: total}, nextTransactionID, count, body, nil
 }
 
-func scanSnapshotFrames(reader io.ReaderAt, start int64, bodyBytes, count uint64, consume func(snapshotRecordKind, []byte) error) error {
+func scanSnapshotFrames(reader io.ReaderAt, start int64, bodyBytes, count uint64, decoder *snapshotDecoder) error {
 	offset, end := start, start+int64(bodyBytes)
 	for index := uint64(0); index < count; index++ {
 		if end-offset < snapshotFrameOverhead {
 			return fmt.Errorf("%w: truncated snapshot frame header", ErrCorrupt)
 		}
-		header := make([]byte, snapshotFrameHeaderBytes)
-		if err := readAtFull(reader, header, offset); err != nil {
+		var header [snapshotFrameHeaderBytes]byte
+		if err := readAtFull(reader, header[:], offset); err != nil {
 			return fmt.Errorf("%w: snapshot frame header", ErrCorrupt)
 		}
 		kind := snapshotRecordKind(binary.BigEndian.Uint16(header[:2]))
 		length := uint64(binary.BigEndian.Uint32(header[2:6]))
 		frameBytes := uint64(snapshotFrameOverhead) + length
-		if kind < snapshotFence || kind > snapshotEvent || length > MaxRecordPayloadBytes || frameBytes > uint64(end-offset) {
+		if kind < snapshotFence || kind > snapshotEvent || length < snapshotMinimumPayload(kind) || length > MaxRecordPayloadBytes || frameBytes > uint64(end-offset) {
 			return fmt.Errorf("%w: snapshot frame bounds", ErrCorrupt)
 		}
-		frame := make([]byte, int(frameBytes))
-		if err := readAtFull(reader, frame, offset); err != nil {
-			return fmt.Errorf("%w: snapshot frame", ErrCorrupt)
-		}
-		if crc32.Checksum(frame[:len(frame)-4], walCRC) != binary.BigEndian.Uint32(frame[len(frame)-4:]) {
-			return fmt.Errorf("%w: snapshot frame checksum", ErrCorrupt)
-		}
-		if consume != nil {
-			payload := frame[snapshotFrameHeaderBytes : len(frame)-snapshotFrameCRCBytes]
-			if err := consume(kind, payload); err != nil {
+		if decoder != nil {
+			if err := decoder.reserveFrame(kind, length); err != nil {
 				return fmt.Errorf("%w: snapshot frame %d: %v", ErrCorrupt, index, err)
 			}
+			payload := make([]byte, int(length))
+			if err := readAtFull(reader, payload, offset+snapshotFrameHeaderBytes); err != nil {
+				return fmt.Errorf("%w: snapshot frame", ErrCorrupt)
+			}
+			var checksum [snapshotFrameCRCBytes]byte
+			if err := readAtFull(reader, checksum[:], offset+snapshotFrameHeaderBytes+int64(length)); err != nil || snapshotFrameChecksum(header[:], payload) != binary.BigEndian.Uint32(checksum[:]) {
+				return fmt.Errorf("%w: snapshot frame checksum", ErrCorrupt)
+			}
+			if err := decoder.consumeReserved(kind, payload); err != nil {
+				return fmt.Errorf("%w: snapshot frame %d: %v", ErrCorrupt, index, err)
+			}
+		} else if err := verifySnapshotFrame(reader, offset, header[:], length); err != nil {
+			return err
 		}
 		offset += int64(frameBytes)
 	}
@@ -464,11 +469,179 @@ func scanSnapshotFrames(reader io.ReaderAt, start int64, bodyBytes, count uint64
 	return nil
 }
 
+func snapshotMinimumPayload(kind snapshotRecordKind) uint64 {
+	switch kind {
+	case snapshotFence:
+		return 36
+	case snapshotAssignment:
+		return 6 // schema plus a length-delimited canonical value
+	case snapshotResult:
+		return 303 // wrapper, minimum canonical result and fixed provenance
+	case snapshotSource:
+		return 56 // schema, task, four cursors, nested count
+	case snapshotDelivery:
+		return 19 // schema, state, reservation, delivery blob, two nested counts
+	case snapshotOutbox:
+		return 7 // schema, completion bit, delivery blob
+	case snapshotRepair:
+		return 410 // zero-checkpoint repair definition and fixed progress
+	case snapshotEvent:
+		return 223 // fixed event prefix plus the smaller failure body
+	default:
+		return math.MaxUint64
+	}
+}
+
+func snapshotFrameChecksum(header, payload []byte) uint32 {
+	digest := crc32.New(walCRC)
+	_, _ = digest.Write(header)
+	_, _ = digest.Write(payload)
+	return digest.Sum32()
+}
+
+func verifySnapshotFrame(reader io.ReaderAt, offset int64, header []byte, length uint64) error {
+	digest := crc32.New(walCRC)
+	_, _ = digest.Write(header)
+	var buffer [64 << 10]byte
+	payloadOffset := offset + snapshotFrameHeaderBytes
+	for remaining := length; remaining != 0; {
+		chunk := uint64(len(buffer))
+		if chunk > remaining {
+			chunk = remaining
+		}
+		if err := readAtFull(reader, buffer[:int(chunk)], payloadOffset); err != nil {
+			return fmt.Errorf("%w: snapshot frame", ErrCorrupt)
+		}
+		_, _ = digest.Write(buffer[:int(chunk)])
+		payloadOffset += int64(chunk)
+		remaining -= chunk
+	}
+	var checksum [snapshotFrameCRCBytes]byte
+	if err := readAtFull(reader, checksum[:], payloadOffset); err != nil || digest.Sum32() != binary.BigEndian.Uint32(checksum[:]) {
+		return fmt.Errorf("%w: snapshot frame checksum", ErrCorrupt)
+	}
+	return nil
+}
+
 type snapshotDecoder struct {
-	work RecoveredWork
+	work        RecoveredWork
+	initialized bool
+	fences      uint64
+	assignments uint64
+	sources     uint64
+	deliveries  uint64
+	outboxes    uint64
+	results     uint64
+	repairs     uint64
+	events      uint64
+	resultBytes map[model.JobID]uint64
+	maxOutboxes uint64
 }
 
 func (decoder *snapshotDecoder) consume(kind snapshotRecordKind, payload []byte) error {
+	if err := decoder.reserveFrame(kind, uint64(len(payload))); err != nil {
+		return err
+	}
+	return decoder.consumeReserved(kind, payload)
+}
+
+func newSnapshotDecoder(work RecoveredWork, bodyBytes uint64) *snapshotDecoder {
+	decoder := &snapshotDecoder{work: work}
+	if snapshotFrameOverhead != 0 {
+		decoder.maxOutboxes = bodyBytes / snapshotFrameOverhead
+	}
+	return decoder
+}
+
+func (decoder *snapshotDecoder) initializeCounts() error {
+	if decoder.initialized {
+		return nil
+	}
+	decoder.initialized = true
+	if decoder.work.Fence != (model.CoordinatorEpoch{}) {
+		decoder.fences = 1
+	}
+	decoder.assignments = uint64(len(decoder.work.Assignments))
+	decoder.sources = uint64(len(decoder.work.Sources))
+	decoder.deliveries = uint64(len(decoder.work.Deliveries))
+	decoder.outboxes = uint64(len(decoder.work.Outboxes))
+	decoder.repairs = uint64(len(decoder.work.Repairs))
+	decoder.events = uint64(len(decoder.work.PendingEvents))
+	decoder.resultBytes = make(map[model.JobID]uint64)
+	if decoder.work.indexes != nil {
+		decoder.results = decoder.work.indexes.resultCount
+		for job, total := range decoder.work.indexes.resultBytesByJob {
+			decoder.resultBytes[job] = total
+		}
+		return nil
+	}
+	decoder.results = uint64(len(decoder.work.Results))
+	for _, result := range decoder.work.Results {
+		if result.canonical == nil {
+			return errors.New("snapshot decoder seed has unindexed result")
+		}
+		prior := decoder.resultBytes[result.Record.TupleID.JobID]
+		if uint64(len(result.canonical)) > math.MaxUint64-prior {
+			return ErrCapacity
+		}
+		decoder.resultBytes[result.Record.TupleID.JobID] = prior + uint64(len(result.canonical))
+	}
+	return nil
+}
+
+func reserveSnapshotCount(count *uint64, maximum uint64) error {
+	if *count >= maximum {
+		return ErrCapacity
+	}
+	*count++
+	return nil
+}
+
+func (decoder *snapshotDecoder) reserveFrame(kind snapshotRecordKind, length uint64) error {
+	if length < snapshotMinimumPayload(kind) || length > MaxRecordPayloadBytes {
+		return ErrCapacity
+	}
+	if err := decoder.initializeCounts(); err != nil {
+		return err
+	}
+	limits := model.LimitsV1()
+	if limits.MaxRetainedJobs != 0 && limits.MaxTasksPerJob > math.MaxUint64/limits.MaxRetainedJobs {
+		return ErrCapacity
+	}
+	maxSources := limits.MaxRetainedJobs * limits.MaxTasksPerJob
+	switch kind {
+	case snapshotFence:
+		return reserveSnapshotCount(&decoder.fences, 1)
+	case snapshotAssignment:
+		return reserveSnapshotCount(&decoder.assignments, limits.MaxRetainedJobs)
+	case snapshotSource:
+		return reserveSnapshotCount(&decoder.sources, maxSources)
+	case snapshotDelivery:
+		return reserveSnapshotCount(&decoder.deliveries, MaxTransactionRecords)
+	case snapshotOutbox:
+		if decoder.maxOutboxes != 0 {
+			return reserveSnapshotCount(&decoder.outboxes, decoder.maxOutboxes)
+		}
+		if decoder.outboxes == math.MaxUint64 {
+			return ErrCapacity
+		}
+		decoder.outboxes++
+		return nil
+	case snapshotResult:
+		return reserveSnapshotCount(&decoder.results, maxStoredResultCount())
+	case snapshotRepair:
+		return reserveSnapshotCount(&decoder.repairs, 64)
+	case snapshotEvent:
+		return reserveSnapshotCount(&decoder.events, MaxTransactionRecords)
+	default:
+		return errors.New("unknown snapshot record kind")
+	}
+}
+
+func (decoder *snapshotDecoder) consumeReserved(kind snapshotRecordKind, payload []byte) error {
+	if err := decoder.preflightNested(kind, payload); err != nil {
+		return err
+	}
 	switch kind {
 	case snapshotFence:
 		epoch, err := decodeFence(payload)
@@ -491,7 +664,10 @@ func (decoder *snapshotDecoder) consume(kind snapshotRecordKind, payload []byte)
 		return nil
 	case snapshotDelivery:
 		delivery, outboxes, err := decodeDeliveryRecord(payload)
-		if err != nil {
+		if err != nil || !outboxesCanonical(outboxes) {
+			if err == nil {
+				err = errors.New("snapshot delivery outboxes are not canonical")
+			}
 			return err
 		}
 		delivery.definitionDigest, err = deliveryDefinitionDigest(delivery)
@@ -530,6 +706,151 @@ func (decoder *snapshotDecoder) consume(kind snapshotRecordKind, payload []byte)
 	default:
 		return errors.New("unknown snapshot record kind")
 	}
+}
+
+func (decoder *snapshotDecoder) reserveOutboxes(count uint64) error {
+	if count > math.MaxUint64-decoder.outboxes {
+		return ErrCapacity
+	}
+	next := decoder.outboxes + count
+	if decoder.maxOutboxes != 0 && next > decoder.maxOutboxes {
+		return ErrCapacity
+	}
+	decoder.outboxes = next
+	return nil
+}
+
+// preflightNested walks only fixed-width lengths and counters. It deliberately
+// does not decode or clone peer bytes; semantic decoding happens after every
+// collection and byte reservation is known to fit.
+func (decoder *snapshotDecoder) preflightNested(kind snapshotRecordKind, payload []byte) error {
+	switch kind {
+	case snapshotDelivery:
+		reader := snapshotPayloadReader{data: payload}
+		if err := reader.schema(); err != nil || reader.skip(1+8) != nil || reader.blob(MaxRecordPayloadBytes) != nil {
+			return errors.New("invalid snapshot delivery prefix")
+		}
+		outputs, err := reader.u16()
+		if err != nil || uint64(outputs) > model.LimitsV1().MaxOperatorOutputs || reader.remaining() < int(outputs)*4+2 {
+			return errors.New("snapshot delivery outputs exceed bounds")
+		}
+		for index := uint16(0); index < outputs; index++ {
+			if err := reader.blob(model.LimitsV1().MaxTuplePayloadBytes); err != nil {
+				return err
+			}
+		}
+		outboxes, err := reader.u16()
+		if err != nil || uint64(outboxes) > model.LimitsV1().MaxDerivedDeliveries || reader.remaining() < int(outboxes)*4 {
+			return errors.New("snapshot delivery outboxes exceed bounds")
+		}
+		if err := decoder.reserveOutboxes(uint64(outboxes)); err != nil {
+			return err
+		}
+		for index := uint16(0); index < outboxes; index++ {
+			if err := reader.blob(MaxRecordPayloadBytes); err != nil {
+				return err
+			}
+		}
+		if !reader.done() {
+			return errors.New("trailing snapshot delivery bytes")
+		}
+	case snapshotSource:
+		reader := snapshotPayloadReader{data: payload}
+		if err := reader.schema(); err != nil || reader.skip(20+4*8) != nil {
+			return errors.New("invalid snapshot source prefix")
+		}
+		outboxes, err := reader.u16()
+		if err != nil || uint64(outboxes) > model.LimitsV1().MaxDerivedDeliveries || reader.remaining() < int(outboxes)*4 {
+			return errors.New("snapshot source outboxes exceed bounds")
+		}
+		// Snapshot source cursors never embed outboxes: those are emitted as
+		// independently bounded canonical outbox frames.
+		if outboxes != 0 {
+			return errors.New("snapshot source embeds outboxes")
+		}
+		if !reader.done() {
+			return errors.New("trailing snapshot source bytes")
+		}
+	case snapshotResult:
+		reader := snapshotPayloadReader{data: payload}
+		if err := reader.schema(); err != nil {
+			return err
+		}
+		logical, err := reader.blobBytes(MaxRecordPayloadBytes)
+		if err != nil || uint64(len(logical)) < model.ResultArtifactMinRecordBytesV1 || uint64(len(logical)) > model.ResultArtifactMaxRecordBytesV1 {
+			return errors.New("snapshot result logical bytes exceed bounds")
+		}
+		var job model.JobID
+		copy(job[:], logical[2:18])
+		prior := decoder.resultBytes[job]
+		if prior > model.LimitsV1().MaxResultRecordsBytesPerJob || uint64(len(logical)) > model.LimitsV1().MaxResultRecordsBytesPerJob-prior {
+			return ErrCapacity
+		}
+		decoder.resultBytes[job] = prior + uint64(len(logical))
+	case snapshotRepair:
+		// Through SpecificationHash in RepairResultPartitionDefinition.
+		const checkpointCountOffset = 2 + 16 + 34 + 16 + 8 + 32 + 2 + 16 + 2 + 16 + 20 + 32
+		reader := snapshotPayloadReader{data: payload}
+		if err := reader.skip(checkpointCountOffset); err != nil {
+			return errors.New("truncated snapshot repair definition")
+		}
+		checkpoints, err := reader.u16()
+		if err != nil || checkpoints > model.WorkerControlMaxCheckpointsV1 || reader.remaining() < int(checkpoints)*28+212 {
+			return errors.New("snapshot repair checkpoints exceed bounds")
+		}
+	}
+	return nil
+}
+
+type snapshotPayloadReader struct {
+	data   []byte
+	offset int
+}
+
+func (reader *snapshotPayloadReader) remaining() int { return len(reader.data) - reader.offset }
+func (reader *snapshotPayloadReader) done() bool     { return reader.remaining() == 0 }
+func (reader *snapshotPayloadReader) skip(count int) error {
+	if count < 0 || reader.remaining() < count {
+		return errors.New("truncated snapshot payload")
+	}
+	reader.offset += count
+	return nil
+}
+func (reader *snapshotPayloadReader) u16() (uint16, error) {
+	if reader.remaining() < 2 {
+		return 0, errors.New("truncated snapshot uint16")
+	}
+	value := binary.BigEndian.Uint16(reader.data[reader.offset : reader.offset+2])
+	reader.offset += 2
+	return value, nil
+}
+func (reader *snapshotPayloadReader) u32() (uint32, error) {
+	if reader.remaining() < 4 {
+		return 0, errors.New("truncated snapshot uint32")
+	}
+	value := binary.BigEndian.Uint32(reader.data[reader.offset : reader.offset+4])
+	reader.offset += 4
+	return value, nil
+}
+func (reader *snapshotPayloadReader) schema() error {
+	value, err := reader.u16()
+	if err != nil || value != domainRecordSchema {
+		return errors.New("unsupported snapshot domain schema")
+	}
+	return nil
+}
+func (reader *snapshotPayloadReader) blob(maximum uint64) error {
+	_, err := reader.blobBytes(maximum)
+	return err
+}
+func (reader *snapshotPayloadReader) blobBytes(maximum uint64) ([]byte, error) {
+	count, err := reader.u32()
+	if err != nil || uint64(count) > maximum || reader.remaining() < int(count) {
+		return nil, errors.New("snapshot blob exceeds bounds or remaining bytes")
+	}
+	value := reader.data[reader.offset : reader.offset+int(count)]
+	reader.offset += int(count)
+	return value, nil
 }
 
 // Snapshot records are already-accepted durable facts. A later fence or
@@ -709,7 +1030,7 @@ func validateSnapshotWork(work RecoveredWork, nodeID uint16, workerEpoch model.W
 		assignment, ok := findAssignment(&work, cursor.Source.JobID)
 		token, tokenOK := findToken(assignment.Assignment, cursor.Source)
 		eof, eofErr := model.SourceEOF(assignment.Topology, cursor.Source)
-		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch || eofErr != nil || eof != cursor.EOF || cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark > cursor.EOF || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 {
+		if !ok || !tokenOK || token.WorkerID != nodeID || token.WorkerEpoch != workerEpoch || eofErr != nil || eof != cursor.EOF || cursor.NextSequence == 0 || cursor.NextSequence > model.LimitsV1().MaxSourceSequences+1 || cursor.Watermark >= cursor.NextSequence || cursor.Watermark > cursor.EOF || cursor.EOF != 0 && cursor.NextSequence > cursor.EOF+1 || cursor.Watermark != 0 && cursor.RaftIndex == 0 {
 			return errors.New("invalid snapshot source cursor")
 		}
 	}
@@ -733,6 +1054,9 @@ func validateSnapshotWork(work RecoveredWork, nodeID uint16, workerEpoch model.W
 				return errors.New("received snapshot delivery has processed content")
 			}
 			continue
+		}
+		if !outboxIDsCanonical(delivery.OutboxIDs) {
+			return errors.New("snapshot delivery outbox identities are not canonical")
 		}
 		if err := validateProcessedOutputs(delivery, delivery.Outputs, assignment); err != nil {
 			return err
@@ -1057,7 +1381,25 @@ func decodeCurrentGeneration(data []byte, expected Identity) (currentGeneration,
 }
 
 func validSnapshotTransactionMetadata(baseSequence, transactionCount uint64) bool {
-	return baseSequence != 0 && transactionCount <= (baseSequence-1)/3
+	if transactionCount == 0 {
+		return baseSequence == 1
+	}
+	if transactionCount > (math.MaxUint64-1)/3 {
+		return false
+	}
+	minimum := 1 + 3*transactionCount
+	if baseSequence < minimum {
+		return false
+	}
+	maximumRecords := uint64(MaxTransactionRecords + 2)
+	if transactionCount <= (math.MaxUint64-1)/maximumRecords && baseSequence > 1+maximumRecords*transactionCount {
+		return false
+	}
+	return true
+}
+
+func validSnapshotEventMetadata(nextTransactionID, transactionCount uint64) bool {
+	return nextTransactionID != 0 && nextTransactionID-1 <= transactionCount
 }
 
 func (store *Store) recoverExisting(identity Identity) error {
@@ -1113,9 +1455,9 @@ func (store *Store) recoverExisting(identity Identity) error {
 	if err != nil || walInfo.Size() <= 0 || uint64(walInfo.Size()) > store.options.MaxBytes || uint64(walInfo.Size()) > uint64(math.MaxInt) {
 		return fmt.Errorf("%w: active generation WAL size", ErrCorrupt)
 	}
-	anchor := walSnapshotAnchor{Identity: identity, WorkerEpoch: current.WorkerEpoch, Generation: current.Generation, BaseSequence: current.BaseSequence, SnapshotDigest: current.SnapshotDigest}
+	anchor := walSnapshotAnchor{Identity: identity, WorkerEpoch: current.WorkerEpoch, Generation: current.Generation, BaseSequence: current.BaseSequence, TransactionCount: current.TransactionCount, SnapshotDigest: current.SnapshotDigest}
 	reducer := &workReducer{current: work}
-	state, truncateAt, err := recoverSnapshotWALReader(wal, walInfo.Size(), identity, anchor, current.TransactionCount, reducer)
+	state, truncateAt, err := recoverSnapshotWALReader(wal, walInfo.Size(), identity, anchor, reducer)
 	if err != nil {
 		if errors.Is(err, ErrIdentityMismatch) {
 			return err
@@ -1228,7 +1570,7 @@ func (store *Store) Snapshot() (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	placeholder := walSnapshotAnchor{Identity: store.state.Identity, WorkerEpoch: store.state.WorkerEpoch, Generation: generation, BaseSequence: store.state.LastSequence, SnapshotDigest: [32]byte{1}}
+	placeholder := walSnapshotAnchor{Identity: store.state.Identity, WorkerEpoch: store.state.WorkerEpoch, Generation: generation, BaseSequence: store.state.LastSequence, TransactionCount: store.state.TransactionCount, SnapshotDigest: [32]byte{1}}
 	anchorBytes, err := encodeSnapshotAnchor(placeholder)
 	if err != nil {
 		return Snapshot{}, err
@@ -1284,7 +1626,7 @@ func (store *Store) replaceWithSnapshot(generation uint64) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 
-	anchor := walSnapshotAnchor{Identity: store.state.Identity, WorkerEpoch: store.state.WorkerEpoch, Generation: generation, BaseSequence: store.state.LastSequence, SnapshotDigest: digest}
+	anchor := walSnapshotAnchor{Identity: store.state.Identity, WorkerEpoch: store.state.WorkerEpoch, Generation: generation, BaseSequence: store.state.LastSequence, TransactionCount: store.state.TransactionCount, SnapshotDigest: digest}
 	anchorBytes, err := encodeSnapshotAnchor(anchor)
 	if err != nil {
 		return Snapshot{}, err

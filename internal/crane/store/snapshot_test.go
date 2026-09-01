@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"math"
 	"os"
 	"path/filepath"
@@ -147,7 +148,7 @@ func TestSnapshotProspectiveCapacityReclaimsAFullLegacyWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	anchor, err := encodeSnapshotAnchor(walSnapshotAnchor{Identity: store.state.Identity, WorkerEpoch: store.state.WorkerEpoch, Generation: 1, BaseSequence: store.state.LastSequence, SnapshotDigest: [32]byte{1}})
+	anchor, err := encodeSnapshotAnchor(walSnapshotAnchor{Identity: store.state.Identity, WorkerEpoch: store.state.WorkerEpoch, Generation: 1, BaseSequence: store.state.LastSequence, TransactionCount: store.state.TransactionCount, SnapshotDigest: [32]byte{1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,14 +168,314 @@ func TestSnapshotProspectiveCapacityReclaimsAFullLegacyWAL(t *testing.T) {
 func TestSnapshotRejectsImpossibleCheckedTransactionMetadata(t *testing.T) {
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
 	epoch := model.WorkerEpoch{7}
-	state := RecoveredState{Identity: identity, WorkerEpoch: epoch, LastSequence: 1, TransactionCount: 1}
-	if _, _, err := snapshotMetadata(state, newRecoveredWork(), 1); err == nil {
-		t.Fatal("snapshot accepted more transactions than its global sequence can contain")
+	for _, test := range []struct {
+		name               string
+		base, transactions uint64
+		valid              bool
+	}{
+		{name: "empty exact", base: 1, valid: true},
+		{name: "empty too large", base: 2},
+		{name: "one below minimum", base: 3, transactions: 1},
+		{name: "one minimum", base: 4, transactions: 1, valid: true},
+		{name: "one mixed", base: 17, transactions: 1, valid: true},
+		{name: "one maximum", base: MaxTransactionRecords + 3, transactions: 1, valid: true},
+		{name: "one above maximum", base: MaxTransactionRecords + 4, transactions: 1},
+		{name: "two minimum", base: 7, transactions: 2, valid: true},
+		{name: "two maximum", base: 1 + 2*(MaxTransactionRecords+2), transactions: 2, valid: true},
+		{name: "lower overflow", base: math.MaxUint64, transactions: math.MaxUint64/3 + 1},
+		{name: "upper overflow cannot excuse low base", base: 2, transactions: math.MaxUint64},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validSnapshotTransactionMetadata(test.base, test.transactions); got != test.valid {
+				t.Fatalf("validSnapshotTransactionMetadata(%d,%d)=%v want=%v", test.base, test.transactions, got, test.valid)
+			}
+			state := RecoveredState{Identity: identity, WorkerEpoch: epoch, LastSequence: test.base, TransactionCount: test.transactions}
+			_, _, snapshotErr := snapshotMetadata(state, newRecoveredWork(), 1)
+			current := currentGeneration{Identity: identity, WorkerEpoch: epoch, Generation: 1, BaseSequence: test.base, TransactionCount: test.transactions, SnapshotBytes: snapshotHeaderBytes + snapshotFooterBytes, SnapshotDigest: [32]byte{1}}
+			_, currentErr := encodeCurrentGeneration(current)
+			if (snapshotErr == nil) != test.valid || (currentErr == nil) != test.valid {
+				t.Fatalf("artifact validation snapshot=%v current=%v valid=%v", snapshotErr, currentErr, test.valid)
+			}
+		})
 	}
-	current := currentGeneration{Identity: identity, WorkerEpoch: epoch, Generation: 1, BaseSequence: 1, TransactionCount: math.MaxUint64, SnapshotBytes: snapshotHeaderBytes + snapshotFooterBytes, SnapshotDigest: [32]byte{1}}
-	if _, err := encodeCurrentGeneration(current); err == nil {
-		t.Fatal("current marker accepted overflowing/impossible transaction count")
+
+	for _, test := range []struct {
+		name               string
+		base, transactions uint64
+		valid              bool
+	}{
+		{name: "anchor minimum", base: 4, transactions: 1, valid: true},
+		{name: "anchor maximum", base: MaxTransactionRecords + 3, transactions: 1, valid: true},
+		{name: "anchor below", base: 3, transactions: 1},
+		{name: "anchor above", base: MaxTransactionRecords + 4, transactions: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := rawSnapshotAnchorPayloadForTest(identity, epoch, 1, test.base, test.transactions, [32]byte{1})
+			decoded, err := decodeSnapshotAnchor(payload)
+			if (err == nil) != test.valid {
+				t.Fatalf("decodeSnapshotAnchor=%v valid=%v", err, test.valid)
+			}
+			if test.valid {
+				field := reflect.ValueOf(decoded).FieldByName("TransactionCount")
+				if !field.IsValid() || field.Uint() != test.transactions {
+					t.Fatalf("anchor transaction count field=%v want=%d", field.IsValid(), test.transactions)
+				}
+			}
+		})
 	}
+}
+
+func TestSnapshotEventIdentityIsTransactionBoundedAndCannotWrap(t *testing.T) {
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+	epoch := model.WorkerEpoch{7}
+	for _, test := range []struct {
+		name, next   string
+		transactions uint64
+		valid        bool
+	}{
+		{name: "initial", next: "1", valid: true},
+		{name: "exact", next: "2", transactions: 1, valid: true},
+		{name: "ahead", next: "3", transactions: 1},
+		{name: "zero", next: "0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var next uint64
+			for _, digit := range []byte(test.next) {
+				next = next*10 + uint64(digit-'0')
+			}
+			work := newRecoveredWork()
+			work.NextTransactionID = next
+			state := RecoveredState{Identity: identity, WorkerEpoch: epoch, LastSequence: 1 + 3*test.transactions, TransactionCount: test.transactions}
+			_, _, err := snapshotMetadata(state, work, 1)
+			if (err == nil) != test.valid {
+				t.Fatalf("snapshotMetadata=%v valid=%v", err, test.valid)
+			}
+		})
+	}
+
+	for _, raw := range []bool{false, true} {
+		t.Run(map[bool]string{false: "public", true: "raw"}[raw], func(t *testing.T) {
+			_, _, _, store, fixture := populatedSnapshotStore(t)
+			store.work.NextTransactionID = math.MaxUint64
+			event := domainFailureEvent(store, fixture.assignment, fixture.epoch, math.MaxUint64)
+			beforeState, beforeWork := store.Recovered(), mustRecoverWork(t, store)
+			fault := &oneShotFault{point: FaultBeforeAppend, err: errors.New("must not reach WAL")}
+			store.options.Faults = fault
+			var err error
+			if raw {
+				payload, encodeErr := encodeEvent(event)
+				if encodeErr != nil {
+					t.Fatal(encodeErr)
+				}
+				err = store.Commit(Transaction{Records: []Record{{Type: recordEvent, Payload: payload}}})
+			} else {
+				err = store.PersistEvent(event)
+			}
+			if err == nil || fault.fired || store.Recovered() != beforeState || !reflect.DeepEqual(mustRecoverWork(t, store), beforeWork) {
+				t.Fatalf("wrap admission err=%v fault=%v metadata=%+v", err, fault.fired, store.Recovered())
+			}
+		})
+	}
+}
+
+func TestSnapshotRejectsAckedEmptyEventIdentityAheadOfTransactionCount(t *testing.T) {
+	_, _, _, store, _ := populatedSnapshotStore(t)
+	if err := store.AcknowledgeEvents(store.work.NextTransactionID - 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.work.PendingEvents) != 0 {
+		t.Fatal("event fixture was not fully acknowledged")
+	}
+	work := store.work
+	work.NextTransactionID = store.state.TransactionCount + 1
+	if err := recoverSnapshotImageWithNextForTest(t, store.state, work, store.state.TransactionCount+2); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("acked-empty oversized next transaction recovered: %v", err)
+	}
+	if err := recoverSnapshotImageForTest(t, store.state, work); err != nil {
+		t.Fatalf("exact acked-empty event boundary rejected: %v", err)
+	}
+}
+
+func TestSnapshotCheckpointEvidenceRequiresRaftIndexAndPinsZeroWatermark(t *testing.T) {
+	path, identity, options, store, fixture := populatedSnapshotStore(t)
+	work := store.work.Clone()
+	work.Sources[0].RaftIndex = 0
+	if err := recoverSnapshotImageForTest(t, store.state, work); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("watermark without committed Raft index recovered: %v", err)
+	}
+	work.Sources[0].Watermark = 0
+	work.Sources[0].RaftIndex = 0
+	if err := recoverSnapshotImageForTest(t, store.state, work); err != nil {
+		t.Fatalf("initial zero watermark/index rejected: %v", err)
+	}
+	work.Sources[0].RaftIndex = 12
+	if err := recoverSnapshotImageForTest(t, store.state, work); err != nil {
+		t.Fatalf("committed zero-watermark checkpoint rejected: %v", err)
+	}
+	if _, err := store.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, identity, Options{MaxBytes: options.MaxBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if state, err := reopened.Receive(fixture.compacted); err != nil || state != Compacted {
+		t.Fatalf("late retry after checkpoint snapshot=%v,%v", state, err)
+	}
+}
+
+func TestSnapshotRejectsNoncanonicalNestedOutboxOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+	store, err := Open(path, identity, Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	spec := domainTopologySpec(8)
+	spec.Stages[2] = model.StageSpec{StageID: 3, Name: "fanout", Role: model.StageTransform, Parallelism: 2, Operator: model.OperatorSpec{Name: "multiply", Version: 1, Settings: []model.Setting{{Key: "factor", Value: "1"}}}}
+	spec.Stages = append(spec.Stages, model.StageSpec{StageID: 4, Name: "sink", Role: model.StageSink, Parallelism: 2, Operator: model.OperatorSpec{Name: "collect", Version: 1}})
+	spec.Edges[1].Routing = model.RoutingBroadcast
+	spec.Edges[1].Field = ""
+	spec.Edges = append(spec.Edges, model.EdgeSpec{EdgeID: 3, SourceStageID: 3, DestinationStageID: 4, Routing: model.RoutingFieldHash, Field: "value"})
+	topology, assignment, epoch := domainAssignmentFromSpec(t, store.WorkerEpoch(), identity.NodeID, spec)
+	if err := store.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	delivery := domainDeliverySequence(t, topology, assignment, epoch, 1)
+	if _, err := store.Receive(delivery); err != nil {
+		t.Fatal(err)
+	}
+	outputs, outboxes := exactProcessedRecords(t, topology, assignment, delivery)
+	if len(outboxes) < 2 {
+		t.Fatalf("fixture needs at least two derived outboxes, got %d", len(outboxes))
+	}
+	if err := store.MarkProcessed(delivery.ID, outputs, outboxes); err != nil {
+		t.Fatal(err)
+	}
+	work := store.work.Clone()
+	index := deliveryIndex(work.Deliveries, delivery.ID)
+	work.Deliveries[index].OutboxIDs[0], work.Deliveries[index].OutboxIDs[1] = work.Deliveries[index].OutboxIDs[1], work.Deliveries[index].OutboxIDs[0]
+	if err := recoverSnapshotImageForTest(t, store.state, work); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("checksummed swapped nested outboxes recovered: %v", err)
+	}
+}
+
+func TestSnapshotDecoderRejectsEveryCollectionOverflowBeforeDecodeAllocation(t *testing.T) {
+	_, _, _, store, fixture := populatedSnapshotStore(t)
+	base := store.work.Clone()
+	assignmentPayload, err := encodeAssignment(base.Assignments[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePayload, err := encodeSource(base.Sources[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryPayload, err := encodeDeliveryRecord(fixture.next, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultPayload, err := encodeStoredResult(base.Results[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairPayload, err := encodeRepair(base.Repairs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventPayload, err := encodeEvent(base.PendingEvents[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	fencePayload, err := encodeFence(base.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxSources := model.LimitsV1().MaxRetainedJobs * model.LimitsV1().MaxTasksPerJob
+	if maxSources > uint64(math.MaxInt) {
+		t.Fatal("source cap exceeds test address space")
+	}
+
+	tests := []struct {
+		name    string
+		kind    snapshotRecordKind
+		payload []byte
+		seed    func() RecoveredWork
+		budget  uint64
+	}{
+		{name: "fence", kind: snapshotFence, payload: fencePayload, seed: func() RecoveredWork { return base.Clone() }, budget: 1024},
+		{name: "assignments", kind: snapshotAssignment, payload: assignmentPayload, seed: func() RecoveredWork {
+			work := newRecoveredWork()
+			work.Fence = base.Fence
+			work.Assignments = make([]InstalledAssignment, int(model.LimitsV1().MaxRetainedJobs))
+			return work
+		}, budget: 1024},
+		{name: "sources", kind: snapshotSource, payload: sourcePayload, seed: func() RecoveredWork {
+			work := newRecoveredWork()
+			work.Sources = make([]SourceCursor, int(maxSources))
+			return work
+		}, budget: 1024},
+		{name: "deliveries", kind: snapshotDelivery, payload: deliveryPayload, seed: func() RecoveredWork {
+			work := newRecoveredWork()
+			work.Deliveries = make([]DeliveryRecord, MaxTransactionRecords)
+			return work
+		}, budget: 1024},
+		{name: "results", kind: snapshotResult, payload: resultPayload, seed: func() RecoveredWork {
+			work := newRecoveredWork()
+			work.Fence = base.Fence
+			work.Assignments = append([]InstalledAssignment(nil), base.Assignments...)
+			work.indexes.resultCount = maxStoredResultCount()
+			work.indexes.resultBytesByJob[base.Results[0].Record.TupleID.JobID] = model.LimitsV1().MaxResultRecordsBytesPerJob
+			return work
+		}, budget: 1024},
+		{name: "repairs", kind: snapshotRepair, payload: repairPayload, seed: func() RecoveredWork {
+			work := newRecoveredWork()
+			work.Fence = base.Fence
+			work.Assignments = append([]InstalledAssignment(nil), base.Assignments...)
+			work.Repairs = make([]ResultRepairRecord, 64)
+			return work
+		}, budget: 1024},
+		{name: "events", kind: snapshotEvent, payload: eventPayload, seed: func() RecoveredWork {
+			work := newRecoveredWork()
+			work.PendingEvents = make([]model.WorkerEvent, MaxTransactionRecords)
+			return work
+		}, budget: 1024},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := snapshotDecoder{work: test.seed()}
+			var consumeErr error
+			allocated := allocatedBytesForTest(func() { consumeErr = decoder.consume(test.kind, test.payload) }, 1)
+			if consumeErr == nil {
+				t.Fatal("collection overflow was accepted")
+			}
+			if allocated > test.budget {
+				t.Fatalf("overflow allocated %d bytes before rejection; budget=%d", allocated, test.budget)
+			}
+		})
+	}
+
+	t.Run("nested delivery outboxes", func(t *testing.T) {
+		payload := append([]byte(nil), deliveryPayload...)
+		binary.BigEndian.PutUint16(payload[len(payload)-2:], uint16(model.LimitsV1().MaxDerivedDeliveries+1))
+		decoder := snapshotDecoder{work: newRecoveredWork()}
+		var consumeErr error
+		allocated := allocatedBytesForTest(func() { consumeErr = decoder.consume(snapshotDelivery, payload) }, 1)
+		if consumeErr == nil {
+			t.Fatal("nested outbox overflow was accepted")
+		}
+		if allocated > 1024 {
+			t.Fatalf("nested overflow allocated %d bytes before rejection", allocated)
+		}
+	})
 }
 
 func TestSnapshotConcurrentLifecycleIsSerializedAndReopenable(t *testing.T) {
@@ -436,6 +737,39 @@ func snapshotImageForTest(t *testing.T, state RecoveredState, work RecoveredWork
 		t.Fatal(err)
 	}
 	return data, snapshot, digest
+}
+
+func recoverSnapshotImageForTest(t *testing.T, state RecoveredState, work RecoveredWork) error {
+	t.Helper()
+	data, snapshot, digest := snapshotImageForTest(t, state, work, 1)
+	current := currentGeneration{Identity: state.Identity, WorkerEpoch: state.WorkerEpoch, Generation: 1, BaseSequence: state.LastSequence, TransactionCount: state.TransactionCount, SnapshotBytes: snapshot.Bytes, SnapshotDigest: digest}
+	_, _, err := recoverSnapshotReader(bytes.NewReader(data), int64(len(data)), state.Identity, current, uint64(len(data)))
+	return err
+}
+
+func recoverSnapshotImageWithNextForTest(t *testing.T, state RecoveredState, work RecoveredWork, next uint64) error {
+	t.Helper()
+	data, snapshot, _ := snapshotImageForTest(t, state, work, 1)
+	binary.BigEndian.PutUint64(data[74:82], next)
+	binary.BigEndian.PutUint32(data[100:104], crc32.Checksum(data[:100], walCRC))
+	digest := sha256.Sum256(data[:len(data)-snapshotFooterBytes])
+	copy(data[len(data)-snapshotFooterBytes:], digest[:])
+	current := currentGeneration{Identity: state.Identity, WorkerEpoch: state.WorkerEpoch, Generation: 1, BaseSequence: state.LastSequence, TransactionCount: state.TransactionCount, SnapshotBytes: snapshot.Bytes, SnapshotDigest: digest}
+	_, _, err := recoverSnapshotReader(bytes.NewReader(data), int64(len(data)), state.Identity, current, uint64(len(data)))
+	return err
+}
+
+func rawSnapshotAnchorPayloadForTest(identity Identity, epoch model.WorkerEpoch, generation, baseSequence, transactionCount uint64, digest [32]byte) []byte {
+	payload := make([]byte, 92)
+	binary.BigEndian.PutUint16(payload[:2], 1)
+	copy(payload[2:18], identity.ClusterID[:])
+	binary.BigEndian.PutUint16(payload[18:20], identity.NodeID)
+	copy(payload[20:36], epoch[:])
+	binary.BigEndian.PutUint64(payload[36:44], generation)
+	binary.BigEndian.PutUint64(payload[44:52], baseSequence)
+	binary.BigEndian.PutUint64(payload[52:60], transactionCount)
+	copy(payload[60:92], digest[:])
+	return payload
 }
 
 func domainRecordName(kind RecordType) string {
