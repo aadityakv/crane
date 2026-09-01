@@ -214,8 +214,12 @@ type WorkerStatus struct {
 	Events             []model.WorkerEvent
 	LastTransactionID  uint64
 	HasMore            bool
-	Inventory          *ResultInventorySummary
-	Repair             *ResultRepairStatus
+	// AdmissionEpoch is the coordinator epoch the worker's process admission
+	// gate is currently open under; the zero epoch reports a closed gate (a
+	// fresh or fenced process that has not yet received its Running install).
+	AdmissionEpoch model.CoordinatorEpoch
+	Inventory      *ResultInventorySummary
+	Repair         *ResultRepairStatus
 }
 
 func (WorkerStatus) MessageType() wire.MessageType { return wire.MessageCraneWorkerStatusReport }
@@ -657,6 +661,9 @@ func (m WorkerStatusRequest) validate() error {
 func (m WorkerStatus) validate() error {
 	if m.NodeID == 0 || m.WorkerEpoch.Validate() != nil || m.CoordinatorEpoch.Validate() != nil || m.StoreTransactionID == 0 || len(m.Assignments) > int(model.LimitsV1().MaxRetainedJobs) || len(m.Events) > MaxWorkerStatusEvents || m.Inventory != nil && m.Repair != nil {
 		return errors.New("invalid worker status bounds")
+	}
+	if m.AdmissionEpoch != (model.CoordinatorEpoch{}) && m.AdmissionEpoch.Validate() != nil {
+		return errors.New("invalid admission epoch")
 	}
 	for i, a := range m.Assignments {
 		if a.JobID.Validate() != nil || a.JobControlRevision == 0 || a.AssignmentRevision == 0 || a.AssignmentDigest == ([32]byte{}) || a.SpecificationDigest == ([32]byte{}) || validateScheduling(a.SchedulingState) != nil {

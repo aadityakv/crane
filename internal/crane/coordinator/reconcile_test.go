@@ -166,6 +166,64 @@ func TestReconcileStatusPagingDrainsAndAdvancesCursorAfterCommit(t *testing.T) {
 	h.waitFor(func() bool { return h.workers.lastAck(node) == 3 }, "cursor acknowledged")
 }
 
+func TestReconcileRedrivesRunningInstallAfterSameEpochWorkerRestart(t *testing.T) {
+	h, job, _, assignment := runningHarness(t)
+	token := sourceToken(t, assignment)
+	node := token.WorkerID
+	other := uint16(2)
+	if node == 2 {
+		other = 3
+	}
+	statusEntry := "status:" + fmt.Sprint(node)
+	h.start()
+	h.markReady()
+	h.lead(2)
+	h.waitGateOpen()
+	h.waitFor(func() bool { return len(h.workers.installsFor(node, model.Running)) >= 1 }, "initial running install")
+	if epoch := h.workers.admissionEpoch(node); epoch != h.view().CoordinatorEpoch {
+		t.Fatalf("modeled gate = %#v want %#v", epoch, h.view().CoordinatorEpoch)
+	}
+	passes := h.log.count(statusEntry)
+
+	// Steady state: with the gate observed open under the current epoch, the
+	// reconciled job stays inert across passes — no install churn.
+	h.rescan()
+	h.rescan()
+	h.waitFor(func() bool { return h.log.count(statusEntry) >= passes+2 }, "two inert passes")
+	if got := len(h.workers.installsFor(node, model.Running)); got != 1 {
+		t.Fatalf("install churn on an open gate: %d", got)
+	}
+	if got := len(h.workers.installsFor(other, model.Running)); got != 1 {
+		t.Fatalf("install churn on the healthy worker: %d", got)
+	}
+
+	// Same-epoch worker restart: the durable store (identity, events,
+	// installed Running assignment) survives, but the process admission gate
+	// starts closed. The next pass must observe the closed gate under the
+	// per-fence reconciled cache and re-drive the idempotent Running install.
+	h.workers.restartGate(node)
+	h.rescan()
+	h.waitFor(func() bool {
+		return len(h.workers.installsFor(node, model.Running)) >= 2 && h.workers.admissionEpoch(node) == h.view().CoordinatorEpoch
+	}, "running install re-driven after restart")
+
+	// The re-drive is one idempotent whole-set install: both workers gain at
+	// most one duplicate Running install and the job returns to inert — no
+	// further churn on later passes.
+	h.rescan()
+	h.waitFor(func() bool { return h.log.count(statusEntry) >= 5 }, "post-restart inert pass")
+	if got := len(h.workers.installsFor(node, model.Running)); got != 2 {
+		t.Fatalf("running installs after restart = %d", got)
+	}
+	if got := len(h.workers.installsFor(other, model.Running)); got != 2 {
+		t.Fatalf("healthy worker installs after restart = %d", got)
+	}
+	record, ok := h.job(job)
+	if !ok || record.Lifecycle != state.JobRunning || record.JobControlRevision != 3 {
+		t.Fatalf("re-drive mutated the job: %#v", record)
+	}
+}
+
 func TestReconcileRejectsUnorderedStatusPage(t *testing.T) {
 	h, job, _, assignment := runningHarness(t)
 	h.start()

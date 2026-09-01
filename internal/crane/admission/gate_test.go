@@ -118,6 +118,26 @@ func TestGateCanceledCloseWaiterDoesNotLeakOrReopen(t *testing.T) {
 	}
 }
 
+func TestGateReportsAdmissionEpoch(t *testing.T) {
+	gate := NewGate()
+	if epoch, open := gate.AdmissionEpoch(); open || epoch != (model.CoordinatorEpoch{}) {
+		t.Fatalf("closed gate reported admission epoch %#v open=%t", epoch, open)
+	}
+	epoch := gateEpoch(2)
+	if err := gate.Open(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if got, open := gate.AdmissionEpoch(); !open || got != epoch {
+		t.Fatalf("open gate reported admission epoch %#v open=%t", got, open)
+	}
+	if err := gate.CloseAndWait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, open := gate.AdmissionEpoch(); open {
+		t.Fatal("closed-through gate reported open")
+	}
+}
+
 func gateEpoch(term uint64) model.CoordinatorEpoch {
 	return model.CoordinatorEpoch{Term: term, BeginIndex: term, Coordinator: 1, Nonce: [16]byte{byte(term)}}
 }

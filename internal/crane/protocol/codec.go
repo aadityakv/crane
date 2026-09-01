@@ -537,6 +537,7 @@ func (e *workerEncoder) message(message WorkerMessage) error {
 		}
 		e.u64(m.LastTransactionID)
 		e.bool(m.HasMore)
+		e.epoch(m.AdmissionEpoch)
 		if m.Inventory != nil {
 			e.u8(1)
 			e.add(m.Inventory.QueryDigest[:])
@@ -1649,11 +1650,15 @@ func (d *workerDecoder) status() (WorkerMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+	admission, err := d.epoch()
+	if err != nil {
+		return nil, err
+	}
 	tag, err := d.u8()
 	if err != nil {
 		return nil, err
 	}
-	v := WorkerStatus{NodeID: n, WorkerEpoch: we, CoordinatorEpoch: ep, StoreTransactionID: store, AfterTransactionID: after, Assignments: assignments, Events: events, LastTransactionID: last, HasMore: more}
+	v := WorkerStatus{NodeID: n, WorkerEpoch: we, CoordinatorEpoch: ep, StoreTransactionID: store, AfterTransactionID: after, Assignments: assignments, Events: events, LastTransactionID: last, HasMore: more, AdmissionEpoch: admission}
 	switch tag {
 	case 0:
 	case 1:

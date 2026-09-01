@@ -189,9 +189,10 @@ func (actor *Actor) drainWorkerEvents(ctx context.Context, reachable map[uint16]
 
 // drainWorker fully handles one worker's durable events. A transport failure
 // feeds the failure tracker; a validation or handling failure only leaves the
-// pass unconverged so the periodic rescan retries it.
+// pass unconverged so the periodic rescan retries it. Each drained page also
+// refreshes the session's observation of the worker's process admission gate.
 func (actor *Actor) drainWorker(ctx context.Context, node uint16, session *sessionState, converged *bool) {
-	if err := actor.PollWorkerEvents(ctx, node); err != nil {
+	if err := actor.pollWorkerEvents(ctx, node, session); err != nil {
 		if errors.Is(err, ErrWorkerUnavailable) {
 			session.controlFailed[node] = true
 			return
@@ -246,6 +247,17 @@ func (actor *Actor) reconcileJob(ctx context.Context, epoch model.CoordinatorEpo
 	}
 	fence := jobFence{jobControlRevision: job.JobControlRevision, assignmentRevision: job.Assignment.Revision}
 	if session.reconciled[jobID] == fence {
+		// Convergence derives from worker-observed state, not committed
+		// revisions alone: a same-epoch worker restart retains the durable
+		// Running assignment but starts with the process admission gate
+		// closed, so the cached fence alone proves nothing about execution.
+		// Re-drive the idempotent Running install until every assigned worker
+		// is observed admitted under this leadership epoch.
+		if job.Lifecycle == state.JobRunning && !actor.assignmentAdmissionCurrent(epoch, job, session) {
+			if !actor.activateJob(ctx, epoch, job) {
+				*converged = false
+			}
+		}
 		return
 	}
 	if job.Lifecycle == state.JobDeploying {
@@ -274,6 +286,24 @@ func (actor *Actor) reconcileJob(ctx context.Context, epoch model.CoordinatorEpo
 		return
 	}
 	session.reconciled[jobID] = fence
+}
+
+// assignmentAdmissionCurrent reports whether every current worker of one
+// Running job's assignment was observed this leadership session with its
+// process admission gate open under exactly the session's coordinator epoch.
+// A missing observation (an unreachable or never-polled worker) or a closed
+// gate (a same-epoch restart) leaves the job unconverged so the idempotent
+// Running install is re-driven.
+func (actor *Actor) assignmentAdmissionCurrent(epoch model.CoordinatorEpoch, job state.JobRecord, session *sessionState) bool {
+	if job.Assignment == nil {
+		return false
+	}
+	for _, node := range assignmentNodes(*job.Assignment) {
+		if session.admission[node] != epoch {
+			return false
+		}
+	}
+	return true
 }
 
 // propagateTerminal durably installs the exact committed Closed/terminal job

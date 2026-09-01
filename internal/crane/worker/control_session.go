@@ -795,6 +795,12 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSes
 		return nil, ErrControlStaleAssignment
 	}
 	status := protocol.WorkerStatus{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, CoordinatorEpoch: work.Fence, StoreTransactionID: transaction, AfterTransactionID: request.AfterTransactionID, Events: cloneControlEvents(events), LastTransactionID: last, HasMore: more, Repair: repair}
+	if admission, open := owner.gate.AdmissionEpoch(); open {
+		// The process admission gate opens only on a Running install, so the
+		// reported epoch distinguishes a restarted (closed-gate) process from
+		// an admitted one for the leader's convergence decisions.
+		status.AdmissionEpoch = admission
+	}
 	status.Assignments = make([]protocol.InstalledAssignmentStatus, len(work.Assignments))
 	for index, assignment := range work.Assignments {
 		status.Assignments[index] = protocol.InstalledAssignmentStatus{JobID: assignment.Assignment.JobID, JobControlRevision: assignment.JobControlRevision, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, SpecificationDigest: assignment.Topology.Digest(), SchedulingState: assignment.SchedulingState}

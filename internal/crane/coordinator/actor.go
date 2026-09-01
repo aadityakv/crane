@@ -278,13 +278,19 @@ type sessionState struct {
 	observations  map[uint16]time.Time
 	controlFailed map[uint16]bool
 	reconciled    map[model.JobID]jobFence
-	members       MembershipSubscription
+	// admission retains each worker's last observed process admission epoch
+	// from the durable status exchange. A missing or non-current entry means
+	// the worker's gate was not observed open under this leadership epoch —
+	// for example after a same-epoch process restart.
+	admission map[uint16]model.CoordinatorEpoch
+	members   MembershipSubscription
 }
 
 func newSessionState() *sessionState {
 	return &sessionState{
 		observations: make(map[uint16]time.Time),
 		reconciled:   make(map[model.JobID]jobFence),
+		admission:    make(map[uint16]model.CoordinatorEpoch),
 	}
 }
 

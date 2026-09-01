@@ -385,7 +385,10 @@ type recordedInstall struct {
 	install protocol.AssignmentSetInstall
 }
 
-// fakeWorkers implements WorkerClient against scripted per-node behavior.
+// fakeWorkers implements WorkerClient against scripted per-node behavior. It
+// also models each node's process admission gate: a fresh leadership fence
+// closes it, a Running install opens it under the install's coordinator
+// epoch, and a same-epoch restart reopens nothing until the next install.
 type fakeWorkers struct {
 	mu          sync.Mutex
 	log         *opLog
@@ -395,6 +398,7 @@ type fakeWorkers struct {
 	// checkpointNodes records the destination node of each recorded notice.
 	checkpointNodes []uint16
 	fences          map[uint16]model.CoordinatorEpoch
+	gates           map[uint16]model.CoordinatorEpoch
 	acks            map[uint16]uint64
 	grants          []protocol.RepairGrant
 }
@@ -402,8 +406,25 @@ type fakeWorkers struct {
 func newFakeWorkers(log *opLog) *fakeWorkers {
 	return &fakeWorkers{
 		log: log, scripts: make(map[uint16]*workerScript),
-		fences: make(map[uint16]model.CoordinatorEpoch), acks: make(map[uint16]uint64),
+		fences: make(map[uint16]model.CoordinatorEpoch), gates: make(map[uint16]model.CoordinatorEpoch),
+		acks: make(map[uint16]uint64),
 	}
+}
+
+// restartGate models one same-epoch worker process restart: the durable store
+// (identity, events, installed assignments) survives while the process
+// admission gate starts closed.
+func (w *fakeWorkers) restartGate(node uint16) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.gates, node)
+}
+
+// admissionEpoch reports one node's modeled process admission epoch.
+func (w *fakeWorkers) admissionEpoch(node uint16) model.CoordinatorEpoch {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.gates[node]
 }
 
 func (w *fakeWorkers) script(node uint16) *workerScript {
@@ -442,6 +463,7 @@ func (w *fakeWorkers) Fence(ctx context.Context, node uint16, epoch model.Coordi
 	blocked := script.blockFence
 	script.blockFence = nil
 	fenceErr := script.fenceErr
+	priorFence, fencedBefore := w.fences[node]
 	w.mu.Unlock()
 	if blocked != nil {
 		close(blocked)
@@ -452,6 +474,10 @@ func (w *fakeWorkers) Fence(ctx context.Context, node uint16, epoch model.Coordi
 		return fenceErr
 	}
 	w.mu.Lock()
+	if !fencedBefore || priorFence != epoch {
+		// A fresh leadership fence drains the process admission gate.
+		delete(w.gates, node)
+	}
 	w.fences[node] = epoch
 	w.mu.Unlock()
 	return nil
@@ -469,6 +495,7 @@ func (w *fakeWorkers) Status(_ context.Context, node uint16, request protocol.Wo
 	epoch := script.identity.WorkerEpoch
 	events := append([]model.WorkerEvent(nil), script.events...)
 	pageSize := script.pageSize
+	admission := w.gates[node]
 	w.mu.Unlock()
 	switch {
 	case request.Inventory != nil:
@@ -492,7 +519,7 @@ func (w *fakeWorkers) Status(_ context.Context, node uint16, request protocol.Wo
 	status := protocol.WorkerStatus{
 		NodeID: node, WorkerEpoch: epoch, CoordinatorEpoch: request.CoordinatorEpoch,
 		AfterTransactionID: request.AfterTransactionID, LastTransactionID: request.AfterTransactionID,
-		StoreTransactionID: 1,
+		StoreTransactionID: 1, AdmissionEpoch: admission,
 	}
 	remaining := make([]model.WorkerEvent, 0, len(events))
 	for _, event := range events {
@@ -574,6 +601,10 @@ func (w *fakeWorkers) Install(_ context.Context, node uint16, install protocol.A
 	if script.installErrs > 0 {
 		script.installErrs--
 		return errors.New("injected install failure")
+	}
+	if install.SchedulingState == model.Running {
+		// Only a Running install opens the process admission gate.
+		w.gates[node] = install.CoordinatorEpoch
 	}
 	w.installs = append(w.installs, recordedInstall{node: node, install: install})
 	return nil

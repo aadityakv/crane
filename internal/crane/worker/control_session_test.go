@@ -200,6 +200,41 @@ func TestControlFenceRetryDoesNotRecloseCurrentRunningGateAndRejectsCollisions(t
 	}
 }
 
+func TestControlStatusReportsProcessAdmissionEpoch(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	request := protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 1}
+
+	// The process gate starts closed (a fresh worker process): the durable
+	// status reports no admission epoch even though the Running assignment is
+	// durably installed.
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := response.(protocol.WorkerStatus); status.AdmissionEpoch != (model.CoordinatorEpoch{}) {
+		t.Fatalf("closed process gate reported admission epoch %#v", status.AdmissionEpoch)
+	}
+
+	install := protocol.AssignmentSetInstall{
+		Assignment: fixture.assignment.Assignment, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(),
+		JobControlRevision: fixture.assignment.JobControlRevision, SchedulingState: model.Running, CoordinatorEpoch: fixture.epoch,
+	}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, install)); err != nil {
+		t.Fatal(err)
+	}
+	response, err = session.Handle(context.Background(), fixture.frame(t, 2, 4, request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := response.(protocol.WorkerStatus); status.AdmissionEpoch != fixture.epoch {
+		t.Fatalf("Running install admission epoch = %#v want %#v", status.AdmissionEpoch, fixture.epoch)
+	}
+}
+
 func TestControlAssignmentIsDurableBeforeReconcileAndOpensExactCurrentRunningGate(t *testing.T) {
 	fixture := newControlFixture(t)
 	fixture.repository.work.Fence = fixture.epoch
