@@ -325,6 +325,13 @@ func TestSnapshotCaptureRejectsIncrementalEstimatorDriftBeforeAndAfterCursorDele
 }
 
 func TestReachableStateCapacityRejectsNextCanonicalMutationWithoutStateChange(t *testing.T) {
+	if testing.Short() {
+		// This proof drives a real Machine to the snapshot-capacity fence
+		// through maximal canonical commands and dominates the package's
+		// runtime; it stays authoritative in full mode (block-boundary and
+		// final verification gates run without -short).
+		t.Skip("skipping whole-machine capacity proof in -short mode")
+	}
 	machine := NewMachine()
 	nextIndex := uint64(1)
 	begin, _ := NewBeginCoordinatorEpoch(capacityCommandID(0, 0, 0), 0, 1, [16]byte{1})

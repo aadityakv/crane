@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -656,12 +657,20 @@ func decodeACKError(input []byte) error      { _, err := UnmarshalTupleACK(input
 func decodeNACKError(input []byte) error     { _, err := UnmarshalTupleNACK(input); return err }
 
 func benchmarkTupleDecodeBytes(input []byte) int64 {
-	result := testing.Benchmark(func(benchmark *testing.B) {
-		for index := 0; index < benchmark.N; index++ {
-			_, _ = UnmarshalTupleDelivery(input)
-		}
-	})
-	return result.AllocedBytesPerOp()
+	// Amortized bytes/op over a fixed iteration count via the monotonic
+	// process TotalAlloc counter; no protocol test runs in parallel, so the
+	// counter is not polluted by concurrent allocations. This measures the
+	// same per-input allocation bound as testing.Benchmark did without
+	// spending a full benchtime second per malformed input.
+	const iterations = 4096
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for index := 0; index < iterations; index++ {
+		_, _ = UnmarshalTupleDelivery(input)
+	}
+	runtime.ReadMemStats(&after)
+	return int64(after.TotalAlloc-before.TotalAlloc) / iterations
 }
 
 func assertNoTupleCodecPanic(t *testing.T, input []byte) {
