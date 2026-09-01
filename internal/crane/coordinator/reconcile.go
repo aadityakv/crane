@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"sort"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -21,7 +22,7 @@ func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch,
 	actor.registerWorkers(ctx, epoch, &converged)
 	view := actor.options.Machine.View()
 	reachable := actor.fenceWorkers(ctx, epoch, view, session, &converged)
-	actor.drainWorkerEvents(ctx, epoch, reachable, session, &converged)
+	actor.drainWorkerEvents(ctx, reachable, session, &converged)
 	actor.resolveWorkerFailures(ctx, epoch, session, &converged)
 
 	view = actor.options.Machine.View()
@@ -172,7 +173,7 @@ func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpo
 // drainWorkerEvents drains every fenced worker's bounded event pages with
 // explicit cursors, resolving each event's replicated effect before advancing
 // the leader-local cursor.
-func (actor *Actor) drainWorkerEvents(ctx context.Context, epoch model.CoordinatorEpoch, reachable map[uint16]bool, session *sessionState, converged *bool) {
+func (actor *Actor) drainWorkerEvents(ctx context.Context, reachable map[uint16]bool, session *sessionState, converged *bool) {
 	nodes := make([]uint16, 0, len(reachable))
 	for node := range reachable {
 		nodes = append(nodes, node)
@@ -182,90 +183,20 @@ func (actor *Actor) drainWorkerEvents(ctx context.Context, epoch model.Coordinat
 		if ctx.Err() != nil {
 			return
 		}
-		actor.drainWorker(ctx, epoch, node, session, converged)
+		actor.drainWorker(ctx, node, session, converged)
 	}
 }
 
-func (actor *Actor) drainWorker(ctx context.Context, epoch model.CoordinatorEpoch, node uint16, session *sessionState, converged *bool) {
-	cursor := session.cursors[node]
-	for {
-		request := protocol.WorkerStatusRequest{CoordinatorEpoch: epoch, AfterTransactionID: cursor, MaxEvents: statusPageEvents}
-		status, err := actor.options.Workers.Status(ctx, node, request)
-		if err != nil {
+// drainWorker fully handles one worker's durable events. A transport failure
+// feeds the failure tracker; a validation or handling failure only leaves the
+// pass unconverged so the periodic rescan retries it.
+func (actor *Actor) drainWorker(ctx context.Context, node uint16, session *sessionState, converged *bool) {
+	if err := actor.PollWorkerEvents(ctx, node); err != nil {
+		if errors.Is(err, ErrWorkerUnavailable) {
 			session.controlFailed[node] = true
 			return
 		}
-		if !validStatusPage(node, cursor, status) {
-			*converged = false
-			return
-		}
-		for _, event := range status.Events {
-			if !actor.resolveWorkerEvent(ctx, epoch, event) {
-				*converged = false
-				return
-			}
-			cursor = event.TransactionID
-			session.cursors[node] = cursor
-		}
-		if !status.HasMore {
-			return
-		}
-	}
-}
-
-// validStatusPage enforces strictly ordered events and a nondecreasing cursor.
-func validStatusPage(node uint16, cursor uint64, status protocol.WorkerStatus) bool {
-	if status.NodeID != node || status.LastTransactionID < cursor {
-		return false
-	}
-	prior := cursor
-	for _, event := range status.Events {
-		if event.WorkerID != node || event.TransactionID <= prior {
-			return false
-		}
-		prior = event.TransactionID
-	}
-	if len(status.Events) > 0 && status.LastTransactionID != prior {
-		return false
-	}
-	return true
-}
-
-// resolveWorkerEvent commits one worker event's replicated effect. Both
-// success and deterministic rejection resolve the event; only transport
-// ambiguity that stays unresolved keeps the cursor pinned.
-func (actor *Actor) resolveWorkerEvent(ctx context.Context, epoch model.CoordinatorEpoch, event model.WorkerEvent) bool {
-	switch event.Kind {
-	case model.WorkerEventCompletion:
-		if event.Completion == nil {
-			return true
-		}
-		report := *event.Completion
-		subject := state.SubjectKey{Kind: state.SubjectSourceCheckpoint, JobID: report.JobID, TaskID: report.Source}
-		id := internalCommandID(state.CommandAdvanceCheckpoint, epoch, subject, report.ExpectedCheckpointRevision, report.Digest[:], uint64Bytes(report.WorkerTransactionID))
-		command, err := state.NewAdvanceCheckpoint(id, report.ExpectedCheckpointRevision, report, epoch)
-		if err != nil {
-			// A locally invalid event has no committable effect; it resolves
-			// as rejected and the durable worker record retains it.
-			return true
-		}
-		_, err = actor.proposeResolved(ctx, id, subject, command)
-		return err == nil
-	case model.WorkerEventFailure:
-		if event.Failure == nil {
-			return true
-		}
-		report := *event.Failure
-		subject := state.SubjectKey{Kind: state.SubjectJobControl, JobID: report.JobID}
-		id := internalCommandID(state.CommandFailJob, epoch, subject, report.JobControlRevision, report.DetailDigest[:], uint64Bytes(report.TransactionID))
-		command, err := state.NewFailJob(id, report.JobControlRevision, report, epoch)
-		if err != nil {
-			return true
-		}
-		_, err = actor.proposeResolved(ctx, id, subject, command)
-		return err == nil
-	default:
-		return true
+		*converged = false
 	}
 }
 
@@ -370,7 +301,7 @@ func (actor *Actor) activateJob(ctx context.Context, epoch model.CoordinatorEpoc
 	if !actor.installAssignment(ctx, epoch, job, model.Closed, true, 0) {
 		return false
 	}
-	if !actor.resendCheckpointNotices(ctx, epoch, job) {
+	if !actor.resendCheckpointNotices(ctx, job) {
 		return false
 	}
 	if !actor.repairResults(ctx, epoch, job) {
@@ -487,36 +418,21 @@ func (actor *Actor) buildInstall(job state.JobRecord, scheduling model.Schedulin
 	}, true
 }
 
-// resendCheckpointNotices resends the committed checkpoint watermarks for
-// every source to every current worker of the job.
-func (actor *Actor) resendCheckpointNotices(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord) bool {
+// resendCheckpointNotices redelivers the committed checkpoint watermark of
+// every source to every current worker of the job through the validated
+// committed-notice path.
+func (actor *Actor) resendCheckpointNotices(ctx context.Context, job state.JobRecord) bool {
 	topology, err := model.DecodeTopology(job.TopologyBytes)
 	if err != nil {
 		return false
 	}
-	vector := checkpointVector(topology, job)
 	appliedIndex := actor.options.Machine.View().AppliedIndex
 	if appliedIndex == 0 {
 		return false
 	}
-	members := actor.options.Membership.View()
-	set := *job.Assignment
-	for _, node := range assignmentNodes(set) {
-		if !memberActive(members, node) {
+	for _, entry := range checkpointVector(topology, job) {
+		if err := actor.ApplyCommittedCheckpoint(ctx, job.JobID, entry.Source, entry.Watermark, appliedIndex); err != nil {
 			return false
-		}
-		for _, entry := range vector {
-			notice := protocol.CheckpointNotice{
-				Notice: model.CheckpointNotice{
-					JobID: job.JobID, Source: entry.Source, Watermark: entry.Watermark,
-					RaftIndex: appliedIndex, Epoch: epoch,
-				},
-				JobControlRevision: job.JobControlRevision,
-				AssignmentRevision: set.Revision, AssignmentDigest: set.Digest,
-			}
-			if err := actor.options.Workers.Checkpoint(ctx, node, notice); err != nil {
-				return false
-			}
 		}
 	}
 	return true

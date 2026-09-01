@@ -6,6 +6,7 @@ import (
 	"net"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1390,4 +1391,157 @@ func (members *controlTestMembership) incrementIncarnation(index int) {
 }
 func (members *controlTestMembership) AuthorizeTCP(uint16, net.Addr) error {
 	return members.authorizeErr
+}
+
+func TestControlCheckpointZeroWatermarkConfirmsWithoutEngineMutation(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	var source model.TaskID
+	for _, token := range fixture.assignment.Assignment.Tasks {
+		stage, ok := controlStage(fixture.assignment.Topology.Spec(), token.Task.StageID)
+		if ok && stage.Role == model.StageSource && token.WorkerID == fixture.repository.localNode {
+			source = token.Task
+			break
+		}
+	}
+	if source == (model.TaskID{}) {
+		t.Fatal("fixture requires a local source token")
+	}
+	// The zero watermark is trivially committed: an untouched source has no
+	// durable checkpoint to correlate, so the confirmation must acknowledge
+	// without any engine or store mutation.
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: fixture.assignment.Assignment.JobID, Source: source, Watermark: 0, RaftIndex: 7, Epoch: fixture.epoch}, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, notice))
+	if err != nil {
+		t.Fatalf("zero-watermark notice: %v", err)
+	}
+	ack, ok := response.(protocol.CheckpointAck)
+	if !ok || ack.Watermark != 0 || ack.Source != source {
+		t.Fatalf("zero-watermark response = %#v", response)
+	}
+	if len(fixture.repository.log) != 0 || fixture.repository.observeCalls != 0 {
+		t.Fatalf("zero-watermark confirmation mutated durable state: %v", fixture.repository.log)
+	}
+}
+
+func TestControlCheckpointHigherIndexDuplicateConfirmsWithoutRemutation(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+	var sourceToken model.AssignmentToken
+	for _, token := range fixture.assignment.Assignment.Tasks {
+		stage, ok := controlStage(fixture.assignment.Topology.Spec(), token.Task.StageID)
+		if ok && stage.Role == model.StageSource && token.WorkerID == fixture.repository.localNode {
+			sourceToken = token
+			break
+		}
+	}
+	if sourceToken == (model.AssignmentToken{}) {
+		t.Fatal("fixture requires a local source token")
+	}
+	cursor := fixture.sourceCursor(t, protocol.SourceCheckpoint{Source: sourceToken.Task, Watermark: 1}, 9)
+	cursor.CheckpointRevision = 1
+	fixture.repository.work.Sources = []store.SourceCursor{cursor}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: fixture.assignment.Assignment.JobID, Source: sourceToken.Task, Watermark: 1, RaftIndex: 12, Epoch: fixture.epoch}, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	// A committed notice redelivered by a later leadership pass carries a
+	// higher Raft index: the worker confirms the already-durable checkpoint
+	// without re-mutating engine or store state.
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, notice))
+	if err != nil {
+		t.Fatalf("higher-index duplicate: %v", err)
+	}
+	if _, ok := response.(protocol.CheckpointAck); !ok || len(fixture.repository.log) != 0 {
+		t.Fatalf("higher-index confirmation response/log = %#v/%v", response, fixture.repository.log)
+	}
+	// The byte-exact duplicate still flows through the serialized engine so
+	// the durable store answers it.
+	exact := notice
+	exact.Notice.RaftIndex = 9
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, exact)); err != nil {
+		t.Fatalf("byte-exact duplicate: %v", err)
+	}
+	if !reflect.DeepEqual(fixture.repository.log, []string{"checkpoint"}) {
+		t.Fatalf("byte-exact duplicate bypassed the engine: %v", fixture.repository.log)
+	}
+}
+
+func TestControlInventoryTreatsZeroCheckpointVectorAsTriviallyCommitted(t *testing.T) {
+	t.Run("local source without cursor", func(t *testing.T) {
+		fixture := newControlFixture(t)
+		fixture.repository.work.Fence = fixture.epoch
+		fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+		session := fixture.session(t, 2)
+		fixture.authenticate(t, session, 2, 1)
+		query := fixture.inventoryQuery(t)
+		query.Checkpoints = zeroSourceVector(fixture.assignment)
+		query.CheckpointDigest = protocol.CheckpointVectorDigest(query.Checkpoints)
+		query.QueryDigest = protocol.InventoryQueryDigest(query)
+		response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 1, Inventory: &query}))
+		if err != nil {
+			t.Fatalf("zero-vector inventory: %v", err)
+		}
+		status := response.(protocol.WorkerStatus)
+		if status.Inventory == nil || status.Inventory.RecordCount != 0 || status.Inventory.QueryDigest != query.QueryDigest {
+			t.Fatalf("zero-vector summary = %#v", status.Inventory)
+		}
+	})
+	t.Run("replica-only source without observation", func(t *testing.T) {
+		fixture := newControlFixture(t)
+		tasks := append([]model.AssignmentToken(nil), fixture.assignment.Assignment.Tasks...)
+		var source model.TaskID
+		for index := range tasks {
+			stage, _ := controlStage(fixture.assignment.Topology.Spec(), tasks[index].Task.StageID)
+			if stage.Role == model.StageSource {
+				source = tasks[index].Task
+				tasks[index].WorkerID = 4
+				tasks[index].WorkerEpoch = model.WorkerEpoch{4}
+				break
+			}
+		}
+		set, err := model.NewAssignmentSet(fixture.assignment.Assignment.JobID, fixture.assignment.Assignment.Revision, tasks, fixture.assignment.Assignment.ResultReplicas, fixture.assignment.Topology)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.assignment.Assignment = set
+		fixture.repository.work.Fence = fixture.epoch
+		fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+		session := fixture.session(t, 2)
+		fixture.authenticate(t, session, 2, 1)
+		if source == (model.TaskID{}) {
+			t.Fatal("fixture requires a source token")
+		}
+		query := fixture.inventoryQuery(t)
+		query.AssignmentDigest = set.Digest
+		query.Checkpoints = zeroSourceVector(fixture.assignment)
+		query.CheckpointDigest = protocol.CheckpointVectorDigest(query.Checkpoints)
+		query.QueryDigest = protocol.InventoryQueryDigest(query)
+		response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 1, Inventory: &query}))
+		if err != nil {
+			t.Fatalf("replica zero-vector inventory: %v", err)
+		}
+		status := response.(protocol.WorkerStatus)
+		if status.Inventory == nil || status.Inventory.RecordCount != 0 {
+			t.Fatalf("replica zero-vector summary = %#v", status.Inventory)
+		}
+	})
+}
+
+// zeroSourceVector lists every source task of one installed assignment at the
+// trivially committed zero watermark in canonical order.
+func zeroSourceVector(assignment store.InstalledAssignment) []protocol.SourceCheckpoint {
+	vector := make([]protocol.SourceCheckpoint, 0)
+	for _, token := range assignment.Assignment.Tasks {
+		stage, ok := controlStage(assignment.Topology.Spec(), token.Task.StageID)
+		if ok && stage.Role == model.StageSource {
+			vector = append(vector, protocol.SourceCheckpoint{Source: token.Task})
+		}
+	}
+	sort.Slice(vector, func(i, j int) bool { return controlTaskLess(vector[i].Source, vector[j].Source) })
+	return vector
 }

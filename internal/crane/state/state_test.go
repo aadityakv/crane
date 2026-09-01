@@ -356,3 +356,243 @@ func mustResult(t *testing.T, encoded []byte) CommandResult {
 	}
 	return result
 }
+
+// TestEOFOrderingGuardsAssignmentInstallAndRunningTransition pins the Task 19
+// EOF ordering contract: every partition's topology-recomputed EOF must commit
+// exactly once before the initial complete assignment set, wrong values are
+// rejected without mutation, and Running is unreachable with missing EOFs.
+func TestEOFOrderingGuardsAssignmentInstallAndRunningTransition(t *testing.T) {
+	machine := NewMachine()
+	begin, _ := NewBeginCoordinatorEpoch(InternalCommandID{0xA0}, 0, 1, [16]byte{0xA0})
+	applyTask10(t, machine, 1, begin)
+	for index := 1; index <= 2; index++ {
+		record := WorkerRecord{NodeID: uint16(index), Epoch: model.WorkerEpoch{byte(index), 0x55}, State: WorkerEligible, Revision: 1, Slots: 16, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
+		register, _ := NewRegisterWorker(InternalCommandID{byte(index), 0x55}, 0, record, machine.coordinatorEpoch)
+		applyTask10(t, machine, uint64(1+index), register)
+	}
+	topology, err := model.ValidateTopology(task10ProgressTopology())
+	if err != nil {
+		t.Fatal(err)
+	}
+	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xA1}, Sequence: 1}, topology.Spec(), machine.coordinatorEpoch)
+	applyTask10(t, machine, 4, submit)
+	job := submit.JobID()
+	assignment, err := model.BuildAssignmentSet(job, topology.Digest(), 1, topology, task10EligiblePlacements(machine))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	install, _ := NewInstallAssignments(InternalCommandID{0xA2}, 1, assignment, machine.coordinatorEpoch)
+	if got := applyTask10(t, machine, 5, install); got.Code != ResultInvalidTransition {
+		t.Fatalf("install without any committed EOF = %#v", got)
+	}
+	if machine.jobs[job].Assignment != nil {
+		t.Fatal("rejected install mutated the assignment")
+	}
+
+	sources := make([]model.TaskID, 3)
+	for partition := uint16(0); partition < 3; partition++ {
+		sources[partition] = model.TaskID{JobID: job, StageID: 1, Partition: partition}
+	}
+	// A wrong empty claim for a nonempty partition never commits.
+	wrongEmpty, _ := NewRecordSourceEOF(InternalCommandID{0xA3, 0xFF}, 0, sources[0], 0, machine.coordinatorEpoch)
+	if got := applyTask10(t, machine, 6, wrongEmpty); got.Code != ResultInvalidTarget {
+		t.Fatalf("wrong empty EOF = %#v", got)
+	}
+	if _, exists := machine.jobs[job].SourceEOFs[sources[0]]; exists {
+		t.Fatal("wrong empty EOF mutated state")
+	}
+	for partition := uint16(0); partition < 2; partition++ {
+		eof, eofErr := model.SourceEOF(topology, sources[partition])
+		if eofErr != nil {
+			t.Fatal(eofErr)
+		}
+		record, _ := NewRecordSourceEOF(InternalCommandID{0xA4, byte(partition)}, 0, sources[partition], eof, machine.coordinatorEpoch)
+		if got := applyTask10(t, machine, uint64(7+partition), record); got.Code != ResultSuccess {
+			t.Fatalf("partition %d EOF = %#v", partition, got)
+		}
+	}
+	partialInstall, _ := NewInstallAssignments(InternalCommandID{0xA5}, 1, assignment, machine.coordinatorEpoch)
+	if got := applyTask10(t, machine, 9, partialInstall); got.Code != ResultInvalidTransition {
+		t.Fatalf("install with one missing EOF = %#v", got)
+	}
+	lastEOF, err := model.SourceEOF(topology, sources[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongValue, _ := NewRecordSourceEOF(InternalCommandID{0xA6}, 0, sources[2], lastEOF+1, machine.coordinatorEpoch)
+	if got := applyTask10(t, machine, 10, wrongValue); got.Code != ResultInvalidTarget {
+		t.Fatalf("wrong recomputed EOF = %#v", got)
+	}
+	exact, _ := NewRecordSourceEOF(InternalCommandID{0xA7}, 0, sources[2], lastEOF, machine.coordinatorEpoch)
+	if got := applyTask10(t, machine, 11, exact); got.Code != ResultSuccess {
+		t.Fatalf("exact EOF = %#v", got)
+	}
+	completeInstall, _ := NewInstallAssignments(InternalCommandID{0xA8}, 1, assignment, machine.coordinatorEpoch)
+	if got := applyTask10(t, machine, 12, completeInstall); got.Code != ResultSuccess {
+		t.Fatalf("install after complete EOFs = %#v", got)
+	}
+	running, _ := NewTransitionJob(InternalCommandID{0xA9}, 2, job, JobDeploying, JobRunning, machine.coordinatorEpoch)
+	if got := applyTask10(t, machine, 13, running); got.Code != ResultSuccess {
+		t.Fatalf("running transition = %#v", got)
+	}
+	if machine.jobs[job].Lifecycle != JobRunning {
+		t.Fatalf("lifecycle = %d", machine.jobs[job].Lifecycle)
+	}
+}
+
+// TestCompletionProposalRejectionMatrix pins the exact fail-closed completion
+// validation: token, epoch, revisions, contiguity, EOF equality, durable
+// increasing worker transactions, and byte-bound digests all reject without
+// any mutation.
+func TestCompletionProposalRejectionMatrix(t *testing.T) {
+	baseReport := func(machine *Machine, job model.JobID, assignment model.AssignmentSet) (model.CompletionReport, model.AssignmentToken) {
+		var token model.AssignmentToken
+		for _, candidate := range assignment.Tasks {
+			if candidate.Task.StageID == 1 && machine.jobs[job].SourceEOFs[candidate.Task].EOF >= 2 {
+				token = candidate
+				break
+			}
+		}
+		eof := machine.jobs[job].SourceEOFs[token.Task].EOF
+		report := model.CompletionReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Source: token.Task, Token: token, Epoch: machine.coordinatorEpoch, ExpectedCheckpointRevision: 0, Prior: 0, New: 1, EOF: eof, WorkerTransactionID: 11}
+		return report, token
+	}
+	tests := []struct {
+		name   string
+		mutate func(machine *Machine, report *model.CompletionReport)
+	}{
+		{name: "gap before committed watermark", mutate: func(_ *Machine, report *model.CompletionReport) {
+			report.Prior, report.New = 1, 2
+		}},
+		{name: "job control revision mismatch", mutate: func(_ *Machine, report *model.CompletionReport) {
+			report.JobControlRevision++
+		}},
+		{name: "stale attempt token", mutate: func(_ *Machine, report *model.CompletionReport) {
+			report.Token.Attempt++
+		}},
+		{name: "foreign worker epoch token", mutate: func(_ *Machine, report *model.CompletionReport) {
+			report.Token.WorkerEpoch = model.WorkerEpoch{0xEE}
+		}},
+		{name: "coordinator epoch mismatch", mutate: func(_ *Machine, report *model.CompletionReport) {
+			report.Epoch.Nonce[0] ^= 0xFF
+		}},
+		{name: "committed EOF mismatch", mutate: func(_ *Machine, report *model.CompletionReport) {
+			report.EOF--
+		}},
+		{name: "uncommitted offline worker", mutate: func(machine *Machine, report *model.CompletionReport) {
+			worker := machine.workers[report.Token.WorkerID]
+			worker.State = WorkerOffline
+			machine.workers[worker.NodeID] = worker
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			machine, job, _, assignment := task10RunningJob(t)
+			report, token := baseReport(machine, job, assignment)
+			test.mutate(machine, &report)
+			report.Digest = model.CompletionReportDigest(report)
+			command, err := NewAdvanceCheckpoint(InternalCommandID{0xB0, byte(len(test.name))}, report.ExpectedCheckpointRevision, report, machine.coordinatorEpoch)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if got := applyTask10(t, machine, 70, command); got.Code != ResultInvalidTarget {
+				t.Fatalf("code = %#v", got)
+			}
+			if _, exists := machine.jobs[job].Checkpoints[token.Task]; exists {
+				t.Fatal("rejected completion mutated checkpoint state")
+			}
+			if len(machine.workerEvents) != 0 {
+				t.Fatal("rejected completion advanced the worker event cursor")
+			}
+		})
+	}
+
+	t.Run("replay under different bytes rejects stale worker transaction", func(t *testing.T) {
+		machine, job, _, assignment := task10RunningJob(t)
+		report, token := baseReport(machine, job, assignment)
+		report.Digest = model.CompletionReportDigest(report)
+		first, err := NewAdvanceCheckpoint(InternalCommandID{0xB1}, 0, report, machine.coordinatorEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := applyTask10(t, machine, 71, first); got.Code != ResultSuccess {
+			t.Fatalf("first advance = %#v", got)
+		}
+		replay := report
+		replay.ExpectedCheckpointRevision, replay.Prior, replay.New = 1, 1, 2
+		replay.Digest = model.CompletionReportDigest(replay)
+		second, err := NewAdvanceCheckpoint(InternalCommandID{0xB2}, 1, replay, machine.coordinatorEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := applyTask10(t, machine, 72, second); got.Code != ResultStaleWorkerEvent {
+			t.Fatalf("different-bytes replay = %#v", got)
+		}
+		checkpoint := machine.jobs[job].Checkpoints[token.Task]
+		if checkpoint.Watermark != 1 || checkpoint.Revision != 1 {
+			t.Fatalf("replay mutated committed checkpoint: %#v", checkpoint)
+		}
+	})
+}
+
+// TestFailJobReplayCreatesNoSecondTransition pins deterministic failure
+// deduplication: one committed FailJob transition, and every late duplicate is
+// answered from retained state without another transition.
+func TestFailJobReplayCreatesNoSecondTransition(t *testing.T) {
+	machine, job, _, assignment := task10RunningJob(t)
+	var token model.AssignmentToken
+	for _, candidate := range assignment.Tasks {
+		if candidate.Task.StageID == 1 {
+			token = candidate
+			break
+		}
+	}
+	report := model.JobFailureReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Task: token, Epoch: machine.coordinatorEpoch, TransactionID: 21, Code: model.FailureOperator, DetailDigest: [32]byte{0xC1}}
+	if failureEventDigest(report) != failureEventDigest(report) {
+		t.Fatal("failure digest is not deterministic")
+	}
+	fail, err := NewFailJob(InternalCommandID{0xC2}, report.JobControlRevision, report, machine.coordinatorEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := applyTask10(t, machine, 80, fail); got.Code != ResultSuccess {
+		t.Fatalf("failure = %#v", got)
+	}
+	failed := machine.jobs[job]
+	if failed.Lifecycle != JobFailed || failed.Failure == nil {
+		t.Fatalf("job = %#v", failed)
+	}
+	terminalRevision := failed.JobControlRevision
+
+	// A new leader replays the same durable event bytes under a fresh command
+	// identity: the retained applied target answers it Completed from cache
+	// without any second transition.
+	duplicate, err := NewFailJob(InternalCommandID{0xC3}, report.JobControlRevision, report, machine.coordinatorEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := applyTask10(t, machine, 81, duplicate); got.Code != ResultSuccess || got.Revision != terminalRevision {
+		t.Fatalf("duplicate replay = %#v", got)
+	}
+	after := machine.jobs[job]
+	if after.JobControlRevision != terminalRevision || after.Lifecycle != JobFailed {
+		t.Fatalf("duplicate replay transitioned again: %#v", after)
+	}
+
+	// A later distinct failure event for the terminal job is also rejected.
+	late := report
+	late.TransactionID = 22
+	late.DetailDigest[1] = 0xC4
+	late.JobControlRevision = terminalRevision
+	lateCommand, err := NewFailJob(InternalCommandID{0xC5}, terminalRevision, late, machine.coordinatorEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := applyTask10(t, machine, 82, lateCommand); got.Code != ResultInvalidTarget {
+		t.Fatalf("terminal-job failure = %#v", got)
+	}
+	if machine.jobs[job].JobControlRevision != terminalRevision {
+		t.Fatal("late failure transitioned a terminal job")
+	}
+}

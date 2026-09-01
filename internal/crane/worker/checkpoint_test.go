@@ -479,3 +479,98 @@ func TestCheckpointSupersededUnappliedReportCanBeAcknowledgedAndRepublished(t *t
 	cancel()
 	<-done
 }
+
+func TestCheckpointCompactionNeverCollectsAboveWatermarkOrResults(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "3")
+	repository := newFakeRepository(fixture)
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	source := fixture.source.Task
+	cursor := store.SourceCursor{Source: source, NextSequence: 3, EOF: 2}
+	engine.sources[source] = cursor
+	repository.mu.Lock()
+	repository.sources[source] = cursor
+	repository.mu.Unlock()
+
+	report := model.CompletionReport{JobID: fixture.assignment.Assignment.JobID, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, Source: source, Token: fixture.source, Epoch: fixture.epoch, Prior: 0, New: 1, EOF: 2, WorkerTransactionID: 1}
+	report.Digest = model.CompletionReportDigest(report)
+	event := model.WorkerEvent{WorkerID: fixture.localNode, WorkerEpoch: fixture.localEpoch, TransactionID: 1, Kind: model.WorkerEventCompletion, Completion: &report}
+	engine.completionReports[source] = event
+	repository.mu.Lock()
+	repository.work.PendingEvents = []model.WorkerEvent{event}
+	repository.work.NextTransactionID = 2
+	repository.mu.Unlock()
+
+	makeID := func(sequence uint64) model.DeliveryID {
+		return model.DeliveryID{Tuple: model.TupleID{JobID: source.JobID, SourceTask: source, SourceSequence: sequence}, EdgeID: 1, DestinationTask: fixture.transform.Task}
+	}
+	engine.deliveries[makeID(1)] = store.DeliveryRecord{ID: makeID(1)}
+	engine.deliveries[makeID(2)] = store.DeliveryRecord{ID: makeID(2)}
+	engine.outboxes[makeID(1)] = &ownedOutbox{record: store.OutboxRecord{ID: makeID(1), Completed: true}}
+	engine.outboxes[makeID(2)] = &ownedOutbox{record: store.OutboxRecord{ID: makeID(2)}}
+	result := model.ResultRecord{TupleID: makeID(1).Tuple, SinkTask: fixture.transform.Task, SpecificationHash: fixture.assignment.Topology.Digest()}
+	engine.results[resultID(result)] = &ownedResult{record: result}
+
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: report.JobID, Source: source, Watermark: 1, RaftIndex: 9, Epoch: fixture.epoch}, JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	if err := engine.applyCheckpoint(notice); err != nil {
+		t.Fatalf("apply checkpoint: %v", err)
+	}
+	if _, retained := engine.deliveries[makeID(1)]; retained {
+		t.Fatal("covered delivery survived compaction")
+	}
+	if _, retained := engine.outboxes[makeID(1)]; retained {
+		t.Fatal("covered outbox survived compaction")
+	}
+	if _, retained := engine.deliveries[makeID(2)]; !retained {
+		t.Fatal("compaction collected delivery state above the watermark")
+	}
+	if _, retained := engine.outboxes[makeID(2)]; !retained {
+		t.Fatal("compaction collected outbox state above the watermark")
+	}
+	if _, retained := engine.results[resultID(result)]; !retained {
+		t.Fatal("compaction collected a result record")
+	}
+}
+
+func TestCheckpointFailureEventAcknowledgmentRequiresDurableClosedInstallation(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	event := fixture.failureEvent(1)
+	repository.work.PendingEvents = []model.WorkerEvent{event}
+	repository.work.NextTransactionID = 2
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	// The job is durably Running: the originating failure event must stay
+	// durable until the terminal Closed installation exists.
+	if err := engine.AcknowledgeEvents(ctx, 1); err == nil {
+		t.Fatal("failure event acknowledged before durable closure")
+	}
+	closed := fixture.assignment
+	closed.SchedulingState = model.Closed
+	repository.mu.Lock()
+	repository.assignments[closed.Assignment.JobID] = closed
+	repository.mu.Unlock()
+	if err := engine.AcknowledgeEvents(ctx, 1); err != nil {
+		t.Fatalf("acknowledgment after durable closure: %v", err)
+	}
+	repository.mu.Lock()
+	remaining := len(repository.work.PendingEvents)
+	repository.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("acknowledged failure event retained: %d", remaining)
+	}
+	cancel()
+	<-done
+}

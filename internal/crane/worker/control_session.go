@@ -884,15 +884,24 @@ func (owner *ControlOwner) controlInventory(work store.RecoveredWork, query prot
 func (owner *ControlOwner) controlCheckpointProof(work store.RecoveredWork, assignment store.InstalledAssignment, token model.AssignmentToken) (uint64, bool) {
 	if token.WorkerID == owner.localNode && token.WorkerEpoch == owner.localEpoch {
 		cursor, ok := controlSource(work, token.Task)
+		if !ok || cursor.Watermark == 0 && cursor.CheckpointRevision == 0 {
+			// The zero watermark is trivially committed: an untouched source
+			// covers no records, and the query's bound vector still rejects
+			// any nonzero claim for it.
+			return 0, true
+		}
 		authority := cursor.CheckpointAuthority
-		return cursor.Watermark, ok && cursor.RaftIndex != 0 && authority.JobControlRevision == assignment.JobControlRevision && authority.AssignmentRevision == assignment.Assignment.Revision && authority.AssignmentDigest == assignment.Assignment.Digest && authority.SourceToken == token && authority.CoordinatorEpoch == work.Fence
+		return cursor.Watermark, cursor.RaftIndex != 0 && authority.JobControlRevision == assignment.JobControlRevision && authority.AssignmentRevision == assignment.Assignment.Revision && authority.AssignmentDigest == assignment.Assignment.Digest && authority.SourceToken == token && authority.CoordinatorEpoch == work.Fence
 	}
 	for _, observation := range work.Checkpoints {
 		if observation.Notice.Source == token.Task && observation.Notice.JobID == assignment.Assignment.JobID && observation.Notice.Epoch == work.Fence && observation.JobControlRevision == assignment.JobControlRevision && observation.AssignmentRevision == assignment.Assignment.Revision && observation.AssignmentDigest == assignment.Assignment.Digest && observation.Notice.RaftIndex != 0 {
 			return observation.Notice.Watermark, true
 		}
 	}
-	return 0, false
+	// Without any durable observation only the trivially committed zero
+	// watermark can be proven; a nonzero committed source fails the vector
+	// equality and the query stays refused.
+	return 0, true
 }
 
 func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSession, peer controlPeer, work store.RecoveredWork, grant protocol.RepairGrant) (*protocol.ResultRepairStatus, error) {
@@ -1038,6 +1047,20 @@ func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *Contro
 	if source == (model.AssignmentToken{}) || !stageOK || stage.Role != model.StageSource {
 		return nil, ErrControlStaleAssignment
 	}
+	if source.WorkerID == owner.localNode && source.WorkerEpoch == owner.localEpoch {
+		if confirmed := owner.checkpointAlreadyDurable(work, request); confirmed {
+			// The committed checkpoint is already durable here; a redelivered
+			// notice (a later leadership pass carries a higher Raft index, and
+			// the trivially committed zero watermark carries nothing) is
+			// confirmed without any engine or store mutation. Byte-exact
+			// duplicates still flow through the serialized engine so the
+			// durable store answers them.
+			if err := owner.finalCurrentSession(ctx, session, peer, "checkpoint", request.Notice.Epoch); err != nil {
+				return nil, err
+			}
+			return owner.checkpointAck(request), nil
+		}
+	}
 	if err := owner.finalMutation(ctx, session, peer, "checkpoint", request.Notice.Epoch, true); err != nil {
 		return nil, err
 	}
@@ -1049,7 +1072,34 @@ func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *Contro
 	if err != nil {
 		return nil, err
 	}
-	return protocol.CheckpointAck{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, JobID: request.Notice.JobID, Source: request.Notice.Source, Watermark: request.Notice.Watermark, RaftIndex: request.Notice.RaftIndex, JobControlRevision: request.JobControlRevision, AssignmentRevision: request.AssignmentRevision, AssignmentDigest: request.AssignmentDigest, CoordinatorEpoch: request.Notice.Epoch}, nil
+	return owner.checkpointAck(request), nil
+}
+
+// checkpointAck builds the exact acknowledgment for one accepted or confirmed
+// checkpoint notice.
+func (owner *ControlOwner) checkpointAck(request protocol.CheckpointNotice) protocol.CheckpointAck {
+	return protocol.CheckpointAck{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, JobID: request.Notice.JobID, Source: request.Notice.Source, Watermark: request.Notice.Watermark, RaftIndex: request.Notice.RaftIndex, JobControlRevision: request.JobControlRevision, AssignmentRevision: request.AssignmentRevision, AssignmentDigest: request.AssignmentDigest, CoordinatorEpoch: request.Notice.Epoch}
+}
+
+// checkpointAlreadyDurable reports whether a locally owned source already
+// durably covers the exact committed notice so that a redelivery may be
+// confirmed without mutation: either the trivially committed zero watermark on
+// an untouched source, or a matching-authority duplicate whose only change is
+// a strictly higher Raft index from a later leadership pass. A byte-exact
+// duplicate (equal index) is never confirmed here so the durable store keeps
+// answering it.
+func (owner *ControlOwner) checkpointAlreadyDurable(work store.RecoveredWork, request protocol.CheckpointNotice) bool {
+	cursor, ok := controlSource(work, request.Notice.Source)
+	if !ok || cursor.Watermark == 0 && cursor.CheckpointRevision == 0 {
+		return request.Notice.Watermark == 0
+	}
+	if request.Notice.Watermark != cursor.Watermark || cursor.CheckpointRevision == 0 || request.Notice.RaftIndex <= cursor.RaftIndex {
+		return false
+	}
+	proof := cursor.CheckpointAuthority
+	return proof.CoordinatorEpoch == request.Notice.Epoch && proof.JobControlRevision == request.JobControlRevision &&
+		proof.AssignmentRevision == request.AssignmentRevision && proof.AssignmentDigest == request.AssignmentDigest &&
+		proof.SourceToken.Task == request.Notice.Source
 }
 
 type controlReplay struct {

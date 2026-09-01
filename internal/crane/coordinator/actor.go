@@ -118,6 +118,9 @@ type Actor struct {
 	ready   chan struct{}
 	wake    chan struct{}
 	started atomic.Bool
+	// events holds the leader-local per-worker durable event cursors shared
+	// by the reconciliation loop and the exported polling entry points.
+	events eventCursors
 }
 
 // NewActor validates the complete dependency set without side effects.
@@ -135,7 +138,9 @@ func NewActor(options ActorOptions) (*Actor, error) {
 	if options.RescanInterval <= 0 {
 		options.RescanInterval = DefaultRescanInterval
 	}
-	return &Actor{options: options, ready: make(chan struct{}), wake: make(chan struct{}, 1)}, nil
+	actor := &Actor{options: options, ready: make(chan struct{}), wake: make(chan struct{}, 1)}
+	actor.events.reset()
+	return actor, nil
 }
 
 // Name returns the stable supervisor registration name.
@@ -266,7 +271,6 @@ type jobFence struct {
 // one leadership session and nothing in it is authoritative: every decision is
 // re-derived from the replicated Machine view and the membership view.
 type sessionState struct {
-	cursors       map[uint16]uint64
 	observations  map[uint16]time.Time
 	controlFailed map[uint16]bool
 	reconciled    map[model.JobID]jobFence
@@ -275,7 +279,6 @@ type sessionState struct {
 
 func newSessionState() *sessionState {
 	return &sessionState{
-		cursors:      make(map[uint16]uint64),
 		observations: make(map[uint16]time.Time),
 		reconciled:   make(map[model.JobID]jobFence),
 	}
@@ -289,6 +292,9 @@ func (actor *Actor) runLeader(ctx context.Context) {
 		return
 	}
 	session := newSessionState()
+	// A new leadership session performs a complete repoll of every worker's
+	// durable events; the replicated tombstones answer the late duplicates.
+	actor.events.reset()
 	if subscription, subscribeErr := actor.options.Membership.Subscribe(ctx, membershipSubscriptionCapacity); subscribeErr == nil {
 		session.members = subscription
 	}

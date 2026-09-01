@@ -337,11 +337,13 @@ type workerScript struct {
 	fenceErr     error
 	statusErr    error
 	installErrs  int
-	blockFence   chan struct{}
-	events       []model.WorkerEvent
-	pageSize     int
-	inventory    func(query protocol.ResultInventoryQuery) (protocol.ResultInventorySummary, error)
-	repair       func(grant protocol.RepairGrant) (protocol.ResultRepairStatus, error)
+	// checkpointErrs injects that many failing Checkpoint deliveries.
+	checkpointErrs int
+	blockFence     chan struct{}
+	events         []model.WorkerEvent
+	pageSize       int
+	inventory      func(query protocol.ResultInventoryQuery) (protocol.ResultInventorySummary, error)
+	repair         func(grant protocol.RepairGrant) (protocol.ResultRepairStatus, error)
 }
 
 type recordedInstall struct {
@@ -356,9 +358,11 @@ type fakeWorkers struct {
 	scripts     map[uint16]*workerScript
 	installs    []recordedInstall
 	checkpoints []protocol.CheckpointNotice
-	fences      map[uint16]model.CoordinatorEpoch
-	acks        map[uint16]uint64
-	grants      []protocol.RepairGrant
+	// checkpointNodes records the destination node of each recorded notice.
+	checkpointNodes []uint16
+	fences          map[uint16]model.CoordinatorEpoch
+	acks            map[uint16]uint64
+	grants          []protocol.RepairGrant
 }
 
 func newFakeWorkers(log *opLog) *fakeWorkers {
@@ -545,10 +549,16 @@ func (w *fakeWorkers) Checkpoint(_ context.Context, node uint16, notice protocol
 	w.log.add(fmt.Sprintf("checkpoint:%d", node))
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, ok := w.scripts[node]; !ok {
+	script, ok := w.scripts[node]
+	if !ok {
 		return errors.New("no scripted worker")
 	}
+	if script.checkpointErrs > 0 {
+		script.checkpointErrs--
+		return errors.New("injected checkpoint delivery failure")
+	}
 	w.checkpoints = append(w.checkpoints, notice)
+	w.checkpointNodes = append(w.checkpointNodes, node)
 	return nil
 }
 
