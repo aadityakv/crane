@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -273,6 +274,142 @@ func TestTask15RecoveryAcceptsLegacyEventAckBeforeCheckpointProof(t *testing.T) 
 	if pending := mustRecoverWork(t, reopened).PendingEvents; len(pending) != 0 {
 		t.Fatalf("legacy acknowledged events=%+v", pending)
 	}
+}
+
+func TestTask15LiveCommitCannotInvokeLegacyCheckpointOrEventAckSemantics(t *testing.T) {
+	t.Run("checkpoint", func(t *testing.T) {
+		workerStore, identity, _ := openDomainStore(t, 16<<20)
+		topology, assignment, epoch := domainAssignmentWithRange(t, workerStore.WorkerEpoch(), identity.NodeID, 3)
+		if err := workerStore.Fence(epoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := workerStore.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+			t.Fatal(err)
+		}
+		source := sourceTaskForTest(t, assignment)
+		notice := model.CheckpointNotice{JobID: assignment.JobID, Source: source, Watermark: 1, RaftIndex: 9, Epoch: epoch}
+		payload, err := encodeCheckpoint(notice)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binary.BigEndian.PutUint16(payload[:2], domainRecordSchema)
+		before := mustRecoverWork(t, workerStore)
+		if err := workerStore.Commit(Transaction{Records: []Record{{Type: recordCheckpoint, Payload: payload}}}); err == nil {
+			t.Fatal("live Commit invoked legacy checkpoint semantics")
+		}
+		if after := mustRecoverWork(t, workerStore); !reflect.DeepEqual(after, before) {
+			t.Fatal("rejected legacy checkpoint mutated live store")
+		}
+	})
+
+	t.Run("event ack", func(t *testing.T) {
+		workerStore, identity, _ := openDomainStore(t, 16<<20)
+		topology, assignment, epoch := domainAssignmentWithRange(t, workerStore.WorkerEpoch(), identity.NodeID, 3)
+		if err := workerStore.Fence(epoch); err != nil {
+			t.Fatal(err)
+		}
+		if err := workerStore.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+			t.Fatal(err)
+		}
+		notice := model.CheckpointNotice{JobID: assignment.JobID, Source: sourceTaskForTest(t, assignment), Watermark: 1, RaftIndex: 9, Epoch: epoch}
+		event := completionEventForCheckpoint(t, mustRecoverWork(t, workerStore), notice)
+		if err := workerStore.PersistEvent(event); err != nil {
+			t.Fatal(err)
+		}
+		payload := encodeUint64Payload(event.TransactionID)
+		binary.BigEndian.PutUint16(payload[:2], domainRecordSchema)
+		before := mustRecoverWork(t, workerStore)
+		if err := workerStore.Commit(Transaction{Records: []Record{{Type: recordEventAck, Payload: payload}}}); err == nil {
+			t.Fatal("live Commit invoked legacy event-ack semantics")
+		}
+		if after := mustRecoverWork(t, workerStore); !reflect.DeepEqual(after, before) {
+			t.Fatal("rejected legacy event ack mutated live store")
+		}
+	})
+}
+
+func TestTask15LegacyCheckpointRecoveryDistinguishesHistoricalAndExactProof(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		replace   bool
+		wantProof bool
+	}{
+		{name: "historical mismatched pending completion", replace: true},
+		{name: "exact 6d proof", wantProof: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "worker")
+			identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+			options := Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }}
+			workerStore, err := Open(path, identity, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			topology, assignment, epoch := domainAssignmentWithRange(t, workerStore.WorkerEpoch(), identity.NodeID, 3)
+			if err := workerStore.Fence(epoch); err != nil {
+				t.Fatal(err)
+			}
+			if err := workerStore.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+				t.Fatal(err)
+			}
+			notice := model.CheckpointNotice{JobID: assignment.JobID, Source: sourceTaskForTest(t, assignment), Watermark: 1, RaftIndex: 9, Epoch: epoch}
+			event := completionEventForCheckpoint(t, mustRecoverWork(t, workerStore), notice)
+			if err := workerStore.PersistEvent(event); err != nil {
+				t.Fatal(err)
+			}
+			if test.replace {
+				tokens := append([]model.AssignmentToken(nil), assignment.Tasks...)
+				for index := range tokens {
+					tokens[index].AssignmentRevision++
+				}
+				replacement, replaceErr := model.NewAssignmentSet(assignment.JobID, assignment.Revision+1, tokens, assignment.ResultReplicas, topology)
+				if replaceErr != nil {
+					t.Fatal(replaceErr)
+				}
+				if err := workerStore.InstallAssignment(replacement, topology.Spec(), 2, model.Running, epoch); err != nil {
+					t.Fatal(err)
+				}
+			}
+			firstSequence := workerStore.Recovered().LastSequence + 1
+			if err := workerStore.Close(); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := encodeCheckpoint(notice)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binary.BigEndian.PutUint16(payload[:2], domainRecordSchema)
+			appendLegacyTransactionForTest(t, path, firstSequence, Transaction{Records: []Record{{Type: recordCheckpoint, Payload: payload}}})
+			reopened, err := Open(path, identity, Options{MaxBytes: options.MaxBytes})
+			if err != nil {
+				t.Fatalf("legacy checkpoint recovery: %v", err)
+			}
+			defer reopened.Close()
+			work := mustRecoverWork(t, reopened)
+			if len(work.Sources) != 1 || work.Sources[0].Watermark != 1 {
+				t.Fatalf("recovered cursor=%+v", work.Sources)
+			}
+			proof := work.Sources[0].CheckpointAuthority
+			if test.wantProof {
+				if work.Sources[0].CheckpointRevision != 1 || proof.AssignmentRevision != assignment.Revision || proof.AssignmentDigest != assignment.Digest || proof.SourceToken != event.Completion.Token {
+					t.Fatalf("exact 6d proof not reconstructed: cursor=%+v", work.Sources[0])
+				}
+			} else if work.Sources[0].CheckpointRevision != 0 || proof != (CheckpointAuthority{}) {
+				t.Fatalf("historical Task14 checkpoint invented proof: cursor=%+v", work.Sources[0])
+			}
+		})
+	}
+}
+
+func sourceTaskForTest(t *testing.T, assignment model.AssignmentSet) model.TaskID {
+	t.Helper()
+	for _, token := range assignment.Tasks {
+		if token.Task.StageID == 1 {
+			return token.Task
+		}
+	}
+	t.Fatal("assignment has no source task")
+	return model.TaskID{}
 }
 
 func appendLegacyTransactionForTest(t *testing.T, path string, firstSequence uint64, transaction Transaction) {

@@ -1496,7 +1496,7 @@ func (store *Store) recoverExisting(identity Identity) error {
 		return fmt.Errorf("%w: active generation WAL size", ErrCorrupt)
 	}
 	anchor := walSnapshotAnchor{Identity: identity, WorkerEpoch: current.WorkerEpoch, Generation: current.Generation, BaseSequence: current.BaseSequence, TransactionCount: current.TransactionCount, SnapshotDigest: current.SnapshotDigest}
-	reducer := &workReducer{current: work}
+	reducer := &workReducer{current: work, allowLegacy: true}
 	state, truncateAt, err := recoverSnapshotWALReader(wal, walInfo.Size(), identity, anchor, reducer)
 	if err != nil {
 		if errors.Is(err, ErrIdentityMismatch) {
@@ -1544,7 +1544,7 @@ func (store *Store) recoverLegacy(identity Identity) error {
 	if info.Size() <= 0 || uint64(info.Size()) > store.options.MaxBytes || uint64(info.Size()) > uint64(math.MaxInt) {
 		return fmt.Errorf("%w: WAL size %d", ErrCorrupt, info.Size())
 	}
-	reducer := newWorkReducer()
+	reducer := newRecoveryWorkReducer()
 	state, truncateAt, err := recoverWALReader(wal, info.Size(), identity, reducer)
 	if err != nil {
 		if !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrIdentityMismatch) {

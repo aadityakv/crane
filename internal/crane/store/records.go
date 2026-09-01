@@ -322,6 +322,7 @@ func (work RecoveredWork) Clone() RecoveredWork {
 type workReducer struct {
 	current, transaction RecoveredWork
 	inTransaction        bool
+	allowLegacy          bool
 	prepared             [recordOutboxRetry + 1]bool
 }
 
@@ -329,7 +330,9 @@ func newRecoveredWork() RecoveredWork {
 	return RecoveredWork{NextTransactionID: 1, indexes: &workIndexes{resultBytesByJob: make(map[model.JobID]uint64)}}
 }
 
-func newWorkReducer() *workReducer { return &workReducer{current: newRecoveredWork()} }
+func newRecoveryWorkReducer() *workReducer {
+	return &workReducer{current: newRecoveredWork(), allowLegacy: true}
+}
 
 // BeginTransaction starts one prospective atomic high-level reduction.
 func (r *workReducer) BeginTransaction(uint32) error {
@@ -348,7 +351,7 @@ func (r *workReducer) ConsumeRecord(record Record) error {
 		return errors.New("record outside transaction")
 	}
 	r.prepare(record.Type)
-	return applyDomainRecord(&r.transaction, record)
+	return applyDomainRecord(&r.transaction, record, r.allowLegacy)
 }
 
 func (r *workReducer) prepare(recordType RecordType) {
@@ -425,7 +428,7 @@ func (r *workReducer) CommitTransaction() error {
 	return nil
 }
 
-func applyDomainRecord(work *RecoveredWork, record Record) error {
+func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) error {
 	switch record.Type {
 	case recordFence:
 		epoch, err := decodeFence(record.Payload)
@@ -458,7 +461,10 @@ func applyDomainRecord(work *RecoveredWork, record Record) error {
 			return err
 		}
 		if schema == domainRecordSchema {
-			if hasCheckpointCompletionIdentity(work, notice) {
+			if !allowLegacy {
+				return errors.New("legacy checkpoint schema is recovery-only")
+			}
+			if exactLegacyCheckpointProofAvailable(work, notice) {
 				return applyCheckpoint(work, notice)
 			}
 			return applyLegacyCheckpoint(work, notice)
@@ -483,6 +489,9 @@ func applyDomainRecord(work *RecoveredWork, record Record) error {
 			return err
 		}
 		if schema == domainRecordSchema {
+			if !allowLegacy {
+				return errors.New("legacy event acknowledgement schema is recovery-only")
+			}
 			return applyLegacyEventAck(work, through)
 		}
 		return applyEventAck(work, through)
@@ -917,13 +926,40 @@ func applyLegacyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) e
 	return nil
 }
 
-func hasCheckpointCompletionIdentity(work *RecoveredWork, notice model.CheckpointNotice) bool {
-	for _, event := range work.PendingEvents {
-		if event.Completion != nil && event.Completion.JobID == notice.JobID && event.Completion.Source == notice.Source && event.Completion.New == notice.Watermark {
-			return true
-		}
+func exactLegacyCheckpointProofAvailable(work *RecoveredWork, notice model.CheckpointNotice) bool {
+	if notice.Validate() != nil {
+		return false
 	}
-	return false
+	index := sourceIndex(work.Sources, notice.Source)
+	if index >= 0 && notice.Watermark == work.Sources[index].Watermark {
+		prior := work.Sources[index]
+		if prior.CheckpointRevision != 0 {
+			return notice.RaftIndex == prior.RaftIndex && notice.Epoch == prior.CheckpointAuthority.CoordinatorEpoch
+		}
+		assignment, ok := findAssignment(work, notice.JobID)
+		if !ok || assignment.CoordinatorEpoch != notice.Epoch {
+			return false
+		}
+		_, err := matchingLegacyCompletionReport(work, assignment, notice, prior)
+		return err == nil
+	}
+	if notice.Epoch != work.Fence {
+		return false
+	}
+	assignment, ok := findAssignment(work, notice.JobID)
+	if !ok || assignment.CoordinatorEpoch != notice.Epoch {
+		return false
+	}
+	eof, err := model.SourceEOF(assignment.Topology, notice.Source)
+	if err != nil || notice.Watermark > eof {
+		return false
+	}
+	prior := SourceCursor{Source: notice.Source, NextSequence: 1, EOF: eof}
+	if index >= 0 {
+		prior = work.Sources[index]
+	}
+	_, err = matchingCompletionReport(work, assignment, notice, prior, eof)
+	return err == nil
 }
 
 func matchingCompletionReport(work *RecoveredWork, assignment InstalledAssignment, notice model.CheckpointNotice, prior SourceCursor, eof uint64) (*model.CompletionReport, error) {
