@@ -186,7 +186,7 @@ func TestStoreRuntimeWritesStayOnAnchoredDirectoryAfterPathReplacement(t *testin
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("anchored")}}}); err != nil {
+	if err := commitRawForTest(store, Transaction{Records: []Record{{Type: 100, Payload: []byte("anchored")}}}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.Stat(filepath.Join(moved, WorkerWALFilename))
@@ -239,7 +239,7 @@ func TestLiveLockReplacementCannotCreateSecondStoreOwner(t *testing.T) {
 	if string(after) != string(replacement) {
 		t.Fatalf("replacement lock mutated: %q", after)
 	}
-	if err := first.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("first-owner")}}}); err != nil {
+	if err := commitRawForTest(first, Transaction{Records: []Record{{Type: 100, Payload: []byte("first-owner")}}}); err != nil {
 		t.Fatalf("first owner became unsafe: %v", err)
 	}
 }
@@ -264,7 +264,7 @@ func TestLiveWALReplacementCannotBeOpenedOrMutatedBySecondOwner(t *testing.T) {
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("second Open error=%v, want ErrLocked", err)
 	}
-	if err := first.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("anchored-wal")}}}); err != nil {
+	if err := commitRawForTest(first, Transaction{Records: []Record{{Type: 100, Payload: []byte("anchored-wal")}}}); err != nil {
 		t.Fatalf("first owner became unsafe: %v", err)
 	}
 	after, readErr := os.ReadFile(walPath)

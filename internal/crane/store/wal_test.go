@@ -92,7 +92,7 @@ func TestWALCommitChecksMaxBytesBeforeWriteAndSyncsBeforeSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := store.Recovered()
-	if err := store.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte{1}}}}); !errors.Is(err, ErrCapacity) {
+	if err := commitRawForTest(store, Transaction{Records: []Record{{Type: 100, Payload: []byte{1}}}}); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("capacity err=%v", err)
 	}
 	if store.Recovered().LastSequence != before.LastSequence {
@@ -104,7 +104,7 @@ func TestWALCommitChecksMaxBytesBeforeWriteAndSyncsBeforeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte{1}}}}); !errors.Is(err, fault.err) {
+	if err := commitRawForTest(store, Transaction{Records: []Record{{Type: 100, Payload: []byte{1}}}}); !errors.Is(err, fault.err) {
 		t.Fatalf("fault err=%v", err)
 	}
 	if store.Recovered().LastSequence != before.LastSequence {
@@ -131,7 +131,7 @@ func TestCommitPreflightsExactBytesBeforeTransactionSizedAllocation(t *testing.T
 	}
 	transaction := Transaction{Records: records}
 	allocations := testing.AllocsPerRun(5, func() {
-		if err := store.Commit(transaction); !errors.Is(err, ErrCapacity) {
+		if err := commitRawForTest(store, transaction); !errors.Is(err, ErrCapacity) {
 			t.Fatalf("capacity error=%v", err)
 		}
 	})
@@ -166,7 +166,7 @@ func TestTransactionAccountingExactCapacityAndSequenceBoundaries(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store := mustOpen(t, filepath.Join(t.TempDir(), "worker"), identity, test.limit, model.WorkerEpoch{3})
 			defer store.Close()
-			if err := store.Commit(transaction); !errors.Is(err, test.wantErr) {
+			if err := commitRawForTest(store, transaction); !errors.Is(err, test.wantErr) {
 				t.Fatalf("Commit error=%v want=%v", err, test.wantErr)
 			}
 		})
@@ -193,7 +193,7 @@ func TestStoreCommitValidatesBeforeAppendAndIsConcurrencyBounded(t *testing.T) {
 		wait.Add(1)
 		go func(i int) {
 			defer wait.Done()
-			if err := store.Commit(Transaction{Records: []Record{{Type: RecordType(100 + i), Payload: []byte{byte(i)}}}}); err != nil {
+			if err := commitRawForTest(store, Transaction{Records: []Record{{Type: RecordType(100 + i), Payload: []byte{byte(i)}}}}); err != nil {
 				t.Errorf("commit %d: %v", i, err)
 			}
 		}(i)
@@ -217,7 +217,7 @@ func TestStoreConcurrentAccessAndCloseAreRaceSafeAndBounded(t *testing.T) {
 			<-start
 			_ = store.WorkerEpoch()
 			_ = store.Recovered()
-			err := store.Commit(Transaction{Records: []Record{{Type: RecordType(100 + i), Payload: []byte{byte(i)}}}})
+			err := commitRawForTest(store, Transaction{Records: []Record{{Type: RecordType(100 + i), Payload: []byte{byte(i)}}}})
 			if err != nil && !errors.Is(err, ErrClosed) {
 				t.Errorf("concurrent Commit error=%v", err)
 			}
@@ -242,7 +242,7 @@ func TestStoreConcurrentAccessAndCloseAreRaceSafeAndBounded(t *testing.T) {
 }
 
 func TestStoreExportedAPIsHaveUtilityDocumentation(t *testing.T) {
-	files := []string{"errors.go", "types.go", "store.go", "store_lock_unix.go"}
+	files := []string{"errors.go", "records.go", "types.go", "store.go", "store_lock_unix.go"}
 	for _, filename := range files {
 		parsed, err := parser.ParseFile(token.NewFileSet(), filename, nil, parser.ParseComments)
 		if err != nil {

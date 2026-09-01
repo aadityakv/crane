@@ -24,6 +24,7 @@ type Store struct {
 	directoryLocked bool
 	root            *os.Root
 	state           RecoveredState
+	work            RecoveredWork
 	closed          bool
 	failed          bool
 }
@@ -122,6 +123,7 @@ func openWithOperations(path string, identity Identity, options Options, operati
 			return nil, err
 		}
 		store.state = RecoveredState{Identity: identity, WorkerEpoch: epoch, LastSequence: 1, WALBytes: uint64(len(encoded))}
+		store.work = RecoveredWork{NextTransactionID: 1}
 		return store, nil
 	}
 	wal, err := openWAL(root, WorkerWALFilename, false)
@@ -136,8 +138,12 @@ func openWithOperations(path string, identity Identity, options Options, operati
 	if info.Size() <= 0 || uint64(info.Size()) > options.MaxBytes || uint64(info.Size()) > uint64(math.MaxInt) {
 		return nil, fmt.Errorf("%w: WAL size %d", ErrCorrupt, info.Size())
 	}
-	state, truncateAt, err := recoverWALReader(wal, info.Size(), identity, nil)
+	reducer := newWorkReducer()
+	state, truncateAt, err := recoverWALReader(wal, info.Size(), identity, reducer)
 	if err != nil {
+		if !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrIdentityMismatch) {
+			return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+		}
 		return nil, err
 	}
 	if truncateAt != info.Size() {
@@ -151,7 +157,11 @@ func openWithOperations(path string, identity Identity, options Options, operati
 	if _, err := wal.Seek(0, io.SeekEnd); err != nil {
 		return nil, err
 	}
+	if err := validateRecoveredWorkLocal(reducer.current, state.Identity.NodeID, state.WorkerEpoch); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
 	store.state = state
+	store.work = reducer.current
 	return store, nil
 }
 
@@ -195,6 +205,38 @@ func (store *Store) Recovered() RecoveredState {
 func (store *Store) Commit(transaction Transaction) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	if store.failed {
+		return ErrUnavailable
+	}
+	if err := validateRegisteredTransaction(transaction); err != nil {
+		return err
+	}
+	prospective, err := store.reduceWorkLocked(transaction)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTransaction, err)
+	}
+	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTransaction, err)
+	}
+	before, err := reservedBytes(store.work)
+	if err != nil {
+		return err
+	}
+	after, err := reservedBytes(prospective)
+	if err != nil {
+		return err
+	}
+	additional := uint64(0)
+	if after > before {
+		additional = after - before
+	}
+	return store.commitWorkLocked(transaction, prospective, additional)
+}
+
+func (store *Store) commitLocked(transaction Transaction) error {
 	if store.closed {
 		return ErrClosed
 	}

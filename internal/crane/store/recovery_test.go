@@ -111,7 +111,7 @@ func TestRecoveryTruncatesEveryIncompleteFinalTransactionButRejectsCommittedCorr
 		t.Run(fmt.Sprintf("cut-%d", cut), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "worker")
 			store := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
-			if err := store.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("one")}}}); err != nil {
+			if err := store.Fence(model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}}); err != nil {
 				t.Fatal(err)
 			}
 			store.Close()
@@ -136,7 +136,7 @@ func TestRecoveryTruncatesEveryIncompleteFinalTransactionButRejectsCommittedCorr
 	}
 	path := filepath.Join(t.TempDir(), "worker")
 	store := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
-	_ = store.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("one")}}})
+	_ = store.Fence(model.CoordinatorEpoch{Term: 1, BeginIndex: 1, Coordinator: 1, Nonce: [16]byte{1}})
 	store.Close()
 	walPath := filepath.Join(path, WorkerWALFilename)
 	data, _ := os.ReadFile(walPath)
@@ -152,7 +152,7 @@ func TestCommitAndRecoveryConsumerOwnTransactionPayloads(t *testing.T) {
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
 	store := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
 	payload := []byte("owned")
-	if err := store.Commit(Transaction{Records: []Record{{Type: 100, Payload: payload}}}); err != nil {
+	if err := commitRawForTest(store, Transaction{Records: []Record{{Type: 100, Payload: payload}}}); err != nil {
 		t.Fatal(err)
 	}
 	payload[0] = 'X'
@@ -181,7 +181,7 @@ func TestRecoveryRejectsCommittedInnerLengthInflatedPastEOF(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "worker")
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
 	store := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
-	if err := store.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("abc")}}}); err != nil {
+	if err := commitRawForTest(store, Transaction{Records: []Record{{Type: 100, Payload: []byte("abc")}}}); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
