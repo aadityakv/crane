@@ -74,19 +74,20 @@ func NewService(options ServiceOptions) (*Service, error) {
 	if options.Authenticator == nil || options.Clock == nil || options.Membership == nil || options.Gate == nil || options.OpenStore == nil || options.Datagram == nil {
 		return nil, errors.New("Crane worker service requires authenticator, clock, membership, gate, store opener, and datagram")
 	}
-	if err := options.Config.Validate(); err != nil {
+	configuration := cloneWorkerNodeConfig(options.Config)
+	if err := configuration.Validate(); err != nil {
 		return nil, fmt.Errorf("validate Crane worker configuration: %w", err)
 	}
-	clusterID, err := decodeTupleClusterID(options.Config.ClusterID)
+	clusterID, err := decodeTupleClusterID(configuration.ClusterID)
 	if err != nil {
 		return nil, fmt.Errorf("decode Crane cluster ID: %w", err)
 	}
-	controlBind, err := options.Config.BindEndpoint(config.ServiceCraneWorker)
+	controlBind, err := configuration.BindEndpoint(config.ServiceCraneWorker)
 	if err != nil {
 		return nil, fmt.Errorf("derive Crane worker control endpoint: %w", err)
 	}
 	return &Service{
-		configuration: options.Config, authenticator: options.Authenticator, clock: options.Clock,
+		configuration: configuration, authenticator: options.Authenticator, clock: options.Clock,
 		membership: options.Membership, gate: options.Gate, openStore: options.OpenStore,
 		datagram: options.Datagram, clusterID: clusterID, controlBind: controlBind,
 		listen: net.Listen, ready: make(chan struct{}),
@@ -130,7 +131,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		runErr = errors.Join(runErr, workerStore.Close())
 	}()
 
-	repository := &serviceRepository{Store: workerStore, node: service.configuration.NodeID}
+	repository := &serviceRepository{Store: workerStore, node: service.configuration.NodeID, fatal: make(chan error, 1)}
 	service.repository = repository
 	endpoint, err := NewTupleEndpoint(TupleEndpointOptions{Config: service.configuration, Authenticator: service.authenticator, Clock: service.clock, Membership: service.membership, Datagram: service.datagram})
 	if err != nil {
@@ -170,21 +171,25 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	runContext, cancel := context.WithCancel(ctx)
 	results := make(chan serviceRunResult, 3)
 	controlReady := make(chan struct{})
+	controlDispatch := make(chan struct{})
 	go func() { results <- serviceRunResult{name: "engine", err: engine.Run(runContext)} }()
 	go func() { results <- serviceRunResult{name: "tuple", err: tuple.Run(runContext)} }()
 	go func() {
-		results <- serviceRunResult{name: "control", err: service.runControl(runContext, listener, control, controlReady)}
+		results <- serviceRunResult{name: "control", err: service.runControl(runContext, listener, control, controlReady, controlDispatch)}
 	}()
 
 	engineReady, tupleReady := engine.Ready(), tuple.Ready()
 	readyOwners, completedOwners := 0, 0
+	engineIsReady, tupleIsReady, dispatchEnabled := false, false, false
 	for readyOwners < 3 && runErr == nil {
 		select {
 		case <-engineReady:
 			engineReady = nil
+			engineIsReady = true
 			readyOwners++
 		case <-tupleReady:
 			tupleReady = nil
+			tupleIsReady = true
 			readyOwners++
 		case <-controlReady:
 			controlReady = nil
@@ -194,6 +199,12 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 			runErr = fmt.Errorf("run Crane worker %s: %w", result.name, result.err)
 		case <-ctx.Done():
 			runErr = ctx.Err()
+		case fatalErr := <-repository.fatal:
+			runErr = fmt.Errorf("Crane worker durable authority: %w", fatalErr)
+		}
+		if engineIsReady && tupleIsReady && !dispatchEnabled {
+			close(controlDispatch)
+			dispatchEnabled = true
 		}
 	}
 	if runErr == nil {
@@ -205,6 +216,8 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 			runErr = fmt.Errorf("run Crane worker %s: %w", result.name, result.err)
 		case <-ctx.Done():
 			runErr = ctx.Err()
+		case fatalErr := <-repository.fatal:
+			runErr = fmt.Errorf("Crane worker durable authority: %w", fatalErr)
 		}
 	}
 
@@ -221,10 +234,14 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 			runErr = fmt.Errorf("run Crane worker %s: %w", result.name, result.err)
 		}
 	}
+	finalGateErr := service.gate.CloseAndWait(context.Background())
+	if finalGateErr == nil && (errors.Is(gateErr, context.DeadlineExceeded) || errors.Is(gateErr, context.Canceled)) {
+		gateErr = nil
+	}
 	if ctx.Err() != nil {
 		runErr = ctx.Err()
 	}
-	return errors.Join(runErr, gateErr, ignoreClosedNetworkError(listenerErr), ignoreClosedNetworkError(controlErr))
+	return errors.Join(runErr, gateErr, finalGateErr, ignoreClosedNetworkError(listenerErr), ignoreClosedNetworkError(controlErr))
 }
 
 type serviceRunResult struct {
@@ -244,8 +261,10 @@ func (service *Service) LocalStatus(ctx context.Context) (protocol.WorkerStatus,
 	return service.control.localStatus(ctx)
 }
 
-func (service *Service) runControl(ctx context.Context, listener net.Listener, owner *ControlOwner, ready chan<- struct{}) error {
+func (service *Service) runControl(ctx context.Context, listener net.Listener, owner *ControlOwner, ready chan<- struct{}, dispatch <-chan struct{}) error {
 	close(ready)
+	stopAccept := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	defer stopAccept()
 	handlerErrors := make(chan error, DefaultMaxControlSessions)
 	var handlers sync.WaitGroup
 	defer func() {
@@ -253,6 +272,11 @@ func (service *Service) runControl(ctx context.Context, listener net.Listener, o
 		_ = owner.Close()
 		handlers.Wait()
 	}()
+	select {
+	case <-dispatch:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -338,6 +362,8 @@ func (service *Service) controlError(message wire.MessageType, err error) protoc
 		code, retryable, detail = protocol.WorkerErrorCapacity, true, "worker capacity exhausted"
 	case errors.Is(err, store.ErrUnavailable), errors.Is(err, store.ErrClosed):
 		code, retryable, detail = protocol.WorkerErrorUnavailable, true, "worker store unavailable"
+	case errors.Is(err, ErrResultArtifactUnavailable), errors.Is(err, ErrResultFetchUnavailable):
+		code, retryable, detail = protocol.WorkerErrorUnavailable, true, "result storage unavailable"
 	case errors.Is(err, store.ErrCorrupt):
 		code, detail = protocol.WorkerErrorCorrupt, "worker store corrupt"
 	}
@@ -360,7 +386,24 @@ func ignoreClosedNetworkError(err error) error {
 
 type serviceRepository struct {
 	*store.Store
-	node uint16
+	node      uint16
+	fatal     chan error
+	fatalOnce sync.Once
+}
+
+func (repository *serviceRepository) RecoverWork() (store.RecoveredWork, error) {
+	work, err := repository.Store.RecoverWork()
+	if err != nil {
+		repository.signalFatal(err)
+	}
+	return work, err
+}
+
+func (repository *serviceRepository) signalFatal(err error) {
+	if err == nil {
+		return
+	}
+	repository.fatalOnce.Do(func() { repository.fatal <- err })
 }
 
 func (repository *serviceRepository) LocalIdentity() (uint16, model.WorkerEpoch) {
@@ -597,10 +640,6 @@ func (owner *ControlOwner) localStatus(ctx context.Context) (protocol.WorkerStat
 	sort.Slice(status.Assignments, func(i, j int) bool {
 		return string(status.Assignments[i].JobID[:]) < string(status.Assignments[j].JobID[:])
 	})
-	if len(work.Repairs) != 0 {
-		repair := repairStatus(work.Repairs[0])
-		status.Repair = &repair
-	}
 	return status, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -216,7 +217,7 @@ func TestControlRepairPersistsBeforeStatusAndResultChunkBindsExactSessionPeer(t 
 	fixture.repository.work.Fence = fixture.epoch
 	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
 	query := fixture.inventoryQuery(t)
-	fixture.repository.work.Sources = []store.SourceCursor{{Source: query.Checkpoints[0].Source, Watermark: query.Checkpoints[0].Watermark, RaftIndex: 11}}
+	fixture.repository.work.Sources = []store.SourceCursor{fixture.sourceCursor(t, query.Checkpoints[0], 11)}
 	grant := fixture.repairGrant(t, query)
 	session := fixture.session(t, 2)
 	fixture.authenticate(t, session, 2, 1)
@@ -242,6 +243,7 @@ func TestControlRepairPersistsBeforeStatusAndResultChunkBindsExactSessionPeer(t 
 func TestControlCheckpointUsesSerializedEngineBeforeAck(t *testing.T) {
 	fixture := newControlFixture(t)
 	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
 	session := fixture.session(t, 2)
 	fixture.authenticate(t, session, 2, 1)
 	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: fixture.assignment.Assignment.JobID, Source: fixture.assignment.Assignment.Tasks[0].Task, Watermark: 1, RaftIndex: 7, Epoch: fixture.epoch}, JobControlRevision: 1, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest}
@@ -251,6 +253,45 @@ func TestControlCheckpointUsesSerializedEngineBeforeAck(t *testing.T) {
 	}
 	if _, ok := response.(protocol.CheckpointAck); !ok || !reflect.DeepEqual(fixture.repository.log, []string{"checkpoint"}) {
 		t.Fatalf("checkpoint response/log = %#v/%v", response, fixture.repository.log)
+	}
+}
+
+func TestControlReplicaCheckpointPersistsObservationBeforeAckAndInventoryUsesIt(t *testing.T) {
+	fixture := newControlFixture(t)
+	tasks := append([]model.AssignmentToken(nil), fixture.assignment.Assignment.Tasks...)
+	var source model.TaskID
+	for index := range tasks {
+		stage, _ := controlStage(fixture.assignment.Topology.Spec(), tasks[index].Task.StageID)
+		if stage.Role == model.StageSource {
+			source = tasks[index].Task
+			tasks[index].WorkerID = 4
+			tasks[index].WorkerEpoch = model.WorkerEpoch{4}
+			break
+		}
+	}
+	set, err := model.NewAssignmentSet(fixture.assignment.Assignment.JobID, fixture.assignment.Assignment.Revision, tasks, fixture.assignment.Assignment.ResultReplicas, fixture.assignment.Topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.assignment.Assignment = set
+	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: set.JobID, Source: source, Watermark: 1, RaftIndex: 7, Epoch: fixture.epoch}, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: set.Revision, AssignmentDigest: set.Digest}
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, notice))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := response.(protocol.CheckpointAck); !ok || !reflect.DeepEqual(fixture.repository.log, []string{"observation"}) {
+		t.Fatalf("checkpoint response/log = %#v/%v", response, fixture.repository.log)
+	}
+	query := fixture.inventoryQuery(t)
+	query.Checkpoints = []protocol.SourceCheckpoint{{Source: source, Watermark: notice.Notice.Watermark}}
+	query.CheckpointDigest = protocol.CheckpointVectorDigest(query.Checkpoints)
+	query.QueryDigest = protocol.InventoryQueryDigest(query)
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 1, Inventory: &query})); err != nil {
+		t.Fatalf("inventory from observation: %v", err)
 	}
 }
 
@@ -282,6 +323,199 @@ func TestControlBoundsInvalidReplaySendersAndCanceledWorkNeverMutates(t *testing
 	if fixture.repository.fenceCalls != 0 {
 		t.Fatalf("canceled work persisted %d fences", fixture.repository.fenceCalls)
 	}
+}
+
+func TestControlQueuedCommandRevalidatesClosedSessionAndMembershipUnderMutationLock(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*controlFixture, *ControlSession)
+	}{
+		{name: "session closed", change: func(_ *controlFixture, session *ControlSession) { _ = session.Close() }},
+		{name: "membership incarnation changed", change: func(fixture *controlFixture, _ *ControlSession) { fixture.members.view.Members[1].Incarnation++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newControlFixture(t)
+			fixture.repository.work.Fence = fixture.epoch
+			session := fixture.session(t, 2)
+			fixture.authenticate(t, session, 2, 1)
+			newer := fixture.epoch
+			newer.Term++
+			newer.BeginIndex++
+			newer.Nonce[0]++
+			fixture.owner.mutations.Lock()
+			done := make(chan error, 1)
+			go func() {
+				_, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.FenceRequest{CoordinatorEpoch: newer}))
+				done <- err
+			}()
+			time.Sleep(10 * time.Millisecond)
+			test.change(fixture, session)
+			fixture.owner.mutations.Unlock()
+			if err := <-done; !errors.Is(err, ErrControlClosed) && !errors.Is(err, ErrControlUnauthorized) {
+				t.Fatalf("blocked command error = %v", err)
+			}
+			if fixture.repository.fenceCalls != 0 || fixture.repository.work.Fence != fixture.epoch {
+				t.Fatalf("closed/stale session persisted fence: calls=%d fence=%#v", fixture.repository.fenceCalls, fixture.repository.work.Fence)
+			}
+		})
+	}
+}
+
+func TestControlAssignmentRejectsAggregateLocalTaskSlotsBeforeMutation(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.configuration.Crane.WorkerSlots = 1
+	owner, err := NewControlOwner(ControlOptions{Config: fixture.configuration, ClusterID: fixture.cluster, Repository: fixture.repository, Engine: fixture.engine, Transfer: fixture.transfer, Gate: fixture.gate, Membership: fixture.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner = owner
+	fixture.repository.work.Fence = fixture.epoch
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	install := protocol.AssignmentSetInstall{Assignment: fixture.assignment.Assignment, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: fixture.assignment.JobControlRevision, SchedulingState: model.Running, CoordinatorEpoch: fixture.epoch}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, install)); !errors.Is(err, ErrControlCapacity) {
+		t.Fatalf("over-slot assignment error = %v", err)
+	}
+	if fixture.repository.installCalls != 0 || len(fixture.repository.work.Assignments) != 0 {
+		t.Fatalf("over-slot assignment mutated repository: calls=%d assignments=%d", fixture.repository.installCalls, len(fixture.repository.work.Assignments))
+	}
+}
+
+func TestControlAssignmentCapacityIsAtomicAndExactReplacementRetriesWithRealStore(t *testing.T) {
+	fixture := newControlFixture(t)
+	path := filepath.Join(t.TempDir(), "worker")
+	durable, err := store.Open(path, store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	if err := durable.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.InstallAssignment(fixture.assignment.Assignment, fixture.assignment.Topology.Spec(), fixture.assignment.JobControlRevision, model.Running, fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	localSlots := localTaskCount(fixture.assignment.Assignment, fixture.repository.localNode, fixture.repository.localEpoch)
+	if localSlots == 0 {
+		t.Fatal("fixture has no local task slots")
+	}
+	fixture.configuration.Crane.WorkerSlots = uint16(localSlots)
+	repository := &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}
+	engine := &controlNoopEngine{}
+	owner, err := NewControlOwner(ControlOptions{Config: fixture.configuration, ClusterID: fixture.cluster, Repository: repository, Engine: engine, Transfer: fixture.transfer, Gate: fixture.gate, Membership: fixture.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner = owner
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	replacement := protocol.AssignmentSetInstall{Assignment: fixture.assignment.Assignment, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: fixture.assignment.JobControlRevision, SchedulingState: model.Running, CoordinatorEpoch: fixture.epoch}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, replacement)); err != nil {
+		t.Fatalf("exact replacement retry: %v", err)
+	}
+	workers := []model.WorkerPlacement{{NodeID: 1, WorkerEpoch: fixture.repository.localEpoch, SlotCapacity: 8}, {NodeID: 2, WorkerEpoch: model.WorkerEpoch{2}, SlotCapacity: 8}, {NodeID: 3, WorkerEpoch: model.WorkerEpoch{3}, SlotCapacity: 8}}
+	var candidate model.AssignmentSet
+	for value := uint16(2); value < 512; value++ {
+		job := model.JobID{byte(value), byte(value >> 8)}
+		candidate, err = model.BuildAssignmentSet(job, fixture.assignment.Topology.Digest(), 1, fixture.assignment.Topology, workers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if localTaskCount(candidate, fixture.repository.localNode, fixture.repository.localEpoch) != 0 {
+			break
+		}
+	}
+	over := protocol.AssignmentSetInstall{Assignment: candidate, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: 1, SchedulingState: model.Running, CoordinatorEpoch: fixture.epoch}
+	before, _ := durable.RecoverWork()
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, over)); !errors.Is(err, ErrControlCapacity) {
+		t.Fatalf("aggregate capacity error = %v", err)
+	}
+	after, _ := durable.RecoverWork()
+	if !reflect.DeepEqual(after, before) || len(after.Assignments) != 1 {
+		t.Fatal("capacity rejection mutated durable Store")
+	}
+}
+
+func TestControlInventoryAndLocalStatusRejectStaleOrUnrequestedDurableState(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	stale := fixture.assignment
+	stale.CoordinatorEpoch.Term--
+	fixture.repository.work.Assignments = []store.InstalledAssignment{stale}
+	query := fixture.inventoryQuery(t)
+	fixture.repository.work.Sources = []store.SourceCursor{fixture.sourceCursor(t, query.Checkpoints[0], 11)}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 1, Inventory: &query})); !errors.Is(err, ErrControlStaleAssignment) {
+		t.Fatalf("old-fence inventory error = %v", err)
+	}
+
+	fixture.repository.work.Assignments[0] = fixture.assignment
+	grant := fixture.repairGrant(t, query)
+	oldRepair := store.ResultRepairRecord{Instruction: protocolRepairDefinition(grant.Instruction), InstructionDigest: grant.Instruction.InstructionDigest, Role: grant.Role, State: store.RepairPending, ContentDigest: model.EmptyResultInventoryDigest(grant.Instruction.InstructionDigest)}
+	oldRepair.Instruction.CoordinatorEpoch.Term--
+	fixture.repository.work.Repairs = []store.ResultRepairRecord{oldRepair}
+	status, err := fixture.owner.localStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Repair != nil {
+		t.Fatalf("unrequested old repair leaked into local status: %#v", status.Repair)
+	}
+}
+
+func TestControlResultRecordRequiresExactSharedGatePermit(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	chunk := validControlResultChunk(t, fixture)
+	fixture.transfer.ack = protocol.ResultRecordAck{TransferID: chunk.Transfer.TransferID, NodeID: chunk.DestinationNodeID, WorkerEpoch: chunk.DestinationWorkerEpoch, NextOffset: chunk.Transfer.TotalLength, TotalLength: chunk.Transfer.TotalLength, Checksum: chunk.Transfer.Checksum, Complete: true, CoordinatorEpoch: chunk.Provenance.CoordinatorEpoch}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, chunk)); !errors.Is(err, admission.ErrClosed) {
+		t.Fatalf("closed-gate 212 error = %v", err)
+	}
+	if fixture.transfer.calls != 0 {
+		t.Fatalf("closed-gate 212 reached transfer owner %d times", fixture.transfer.calls)
+	}
+	if err := fixture.gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if response, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, chunk)); err != nil {
+		t.Fatalf("open-gate 212: %v", err)
+	} else if _, ok := response.(protocol.ResultRecordAck); !ok {
+		t.Fatalf("open-gate 212 response = %#v", response)
+	}
+}
+
+func TestControlOwnerDeepClonesConfiguredVoters(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.configuration.RaftVoters[0].NodeID = 99
+	fixture.repository.work.Fence = fixture.epoch
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.FenceRequest{CoordinatorEpoch: fixture.epoch})); err != nil {
+		t.Fatalf("caller mutation changed voter authorization: %v", err)
+	}
+}
+
+func validControlResultChunk(t *testing.T, fixture *controlFixture) protocol.ResultRecordChunk {
+	t.Helper()
+	base, sink, replica := workerFixtureWithLocalPrimarySink(t)
+	fixture.assignment = base.assignment
+	fixture.epoch = base.epoch
+	fixture.repository.work.Fence = base.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{base.assignment}
+	role := model.PrimaryReplica
+	if replica.PrimaryNodeID != fixture.repository.localNode || replica.PrimaryEpoch != fixture.repository.localEpoch {
+		role = model.SecondaryReplica
+	}
+	record, provenance := base.result(t, sink, replica, 1, role)
+	chunk, err := buildResultRecordChunk(TransferNormalReplication, record, provenance, fixture.repository.localNode, fixture.repository.localEpoch, [16]byte{}, [32]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return chunk
 }
 
 type controlFixture struct {
@@ -369,6 +603,22 @@ func (fixture *controlFixture) inventoryQuery(t *testing.T) protocol.ResultInven
 	return query
 }
 
+func (fixture *controlFixture) sourceCursor(t *testing.T, checkpoint protocol.SourceCheckpoint, raftIndex uint64) store.SourceCursor {
+	t.Helper()
+	var source model.AssignmentToken
+	for _, token := range fixture.assignment.Assignment.Tasks {
+		if token.Task == checkpoint.Source {
+			source = token
+			break
+		}
+	}
+	if source == (model.AssignmentToken{}) {
+		t.Fatal("missing source token")
+	}
+	authority := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, SourceToken: source, CoordinatorEpoch: fixture.epoch}
+	return store.SourceCursor{Source: checkpoint.Source, Watermark: checkpoint.Watermark, RaftIndex: raftIndex, CheckpointAuthority: authority}
+}
+
 func (fixture *controlFixture) repairGrant(t *testing.T, query protocol.ResultInventoryQuery) protocol.RepairGrant {
 	t.Helper()
 	var replica model.ResultReplicaSet
@@ -395,6 +645,7 @@ type controlTestRepository struct {
 	transactionID uint64
 	fenceCalls    int
 	installCalls  int
+	observeCalls  int
 	fenceStarted  chan struct{}
 	log           []string
 }
@@ -463,8 +714,25 @@ func (repository *controlTestRepository) UpsertRepair(repair store.ResultRepairR
 	repository.log = append(repository.log, "repair")
 	return nil
 }
+func (repository *controlTestRepository) ObserveCheckpoint(notice protocol.CheckpointNotice) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	repository.observeCalls++
+	repository.work.Checkpoints = []store.CommittedCheckpoint{{Notice: notice.Notice, JobControlRevision: notice.JobControlRevision, AssignmentRevision: notice.AssignmentRevision, AssignmentDigest: notice.AssignmentDigest}}
+	repository.transactionID++
+	repository.log = append(repository.log, "observation")
+	return nil
+}
 
 type controlTestEngine struct{ repository *controlTestRepository }
+
+type controlNoopEngine struct{}
+
+func (*controlNoopEngine) ReconcileAssignment(context.Context, model.JobID) error { return nil }
+func (*controlNoopEngine) ApplyCheckpoint(context.Context, protocol.CheckpointNotice) error {
+	return nil
+}
+func (*controlNoopEngine) AcknowledgeEvents(context.Context, uint64) error { return nil }
 
 func (engine *controlTestEngine) ReconcileAssignment(_ context.Context, _ model.JobID) error {
 	engine.repository.mu.Lock()
@@ -481,9 +749,11 @@ func (engine *controlTestEngine) ApplyCheckpoint(_ context.Context, _ protocol.C
 func (engine *controlTestEngine) AcknowledgeEvents(context.Context, uint64) error { return nil }
 
 type controlTestTransfer struct {
-	calls int
-	peer  TransferPeer
-	ack   protocol.ResultRecordAck
+	calls         int
+	artifactCalls int
+	fetchCalls    int
+	peer          TransferPeer
+	ack           protocol.ResultRecordAck
 }
 
 func (transfer *controlTestTransfer) ReceiveResultRecord(_ context.Context, peer TransferPeer, _ protocol.ResultRecordChunk) (protocol.ResultRecordAck, error) {
@@ -492,9 +762,11 @@ func (transfer *controlTestTransfer) ReceiveResultRecord(_ context.Context, peer
 	return transfer.ack, nil
 }
 func (transfer *controlTestTransfer) ReceiveResultArtifact(context.Context, TransferPeer, protocol.ResultArtifactChunk) (protocol.ResultArtifactAck, error) {
+	transfer.artifactCalls++
 	return protocol.ResultArtifactAck{}, ErrResultArtifactUnavailable
 }
 func (transfer *controlTestTransfer) OpenResultFetch(context.Context, TransferPeer, protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error) {
+	transfer.fetchCalls++
 	return protocol.ResultFetchChunk{}, ErrResultFetchUnavailable
 }
 

@@ -46,6 +46,7 @@ type controlRepository interface {
 	InstallAssignment(model.AssignmentSet, model.TopologySpec, uint64, model.SchedulingState, model.CoordinatorEpoch) error
 	PendingEvents(uint64, uint16) ([]model.WorkerEvent, uint64, bool, error)
 	UpsertRepair(store.ResultRepairRecord) error
+	ObserveCheckpoint(protocol.CheckpointNotice) error
 }
 
 type controlEngine interface {
@@ -117,12 +118,16 @@ type ControlSession struct {
 	owner  *ControlOwner
 	remote net.Addr
 	close  func() error
+	done   context.Context
+	cancel context.CancelFunc
 
 	mu            sync.Mutex
 	authenticated bool
 	closed        bool
 	peer          controlPeer
 	member        swim.Member
+	lastCommand   model.CoordinatorEpoch
+	lifecycle     sync.RWMutex
 	closeOnce     sync.Once
 }
 
@@ -161,13 +166,19 @@ func NewControlOwner(options ControlOptions) (*ControlOwner, error) {
 	if node != options.Config.NodeID || epoch.Validate() != nil {
 		return nil, errors.New("worker control repository identity mismatch")
 	}
+	configuration := cloneWorkerNodeConfig(options.Config)
 	return &ControlOwner{
-		configuration: options.Config, clusterID: options.ClusterID, repository: options.Repository, engine: options.Engine,
+		configuration: configuration, clusterID: options.ClusterID, repository: options.Repository, engine: options.Engine,
 		transfer: options.Transfer, gate: options.Gate, membership: options.Membership,
 		replay:      newControlReplay(options.Clock, window, config.ReplayFutureSkewAllowance, options.MaxReplayEntries, options.MaxReplayEntriesPerPeer),
 		maxSessions: options.MaxSessions, maxPerPeer: options.MaxSessionsPerPeer, work: make(chan struct{}, options.MaxQueuedWork),
 		sessions: make(map[*ControlSession]struct{}), perPeer: make(map[controlPeer]int), localNode: node, localEpoch: epoch,
 	}, nil
+}
+
+func cloneWorkerNodeConfig(configuration config.NodeConfig) config.NodeConfig {
+	configuration.RaftVoters = append([]config.RaftVoter(nil), configuration.RaftVoters...)
+	return configuration
 }
 
 // NewSession reserves one bounded connection-scoped session. Per-peer capacity
@@ -184,7 +195,8 @@ func (owner *ControlOwner) NewSession(remote net.Addr, closeConnection func() er
 	if len(owner.sessions) >= owner.maxSessions {
 		return nil, ErrControlCapacity
 	}
-	session := &ControlSession{owner: owner, remote: remote, close: closeConnection}
+	done, cancel := context.WithCancel(context.Background())
+	session := &ControlSession{owner: owner, remote: remote, close: closeConnection, done: done, cancel: cancel}
 	owner.sessions[session] = struct{}{}
 	return session, nil
 }
@@ -196,6 +208,9 @@ func (session *ControlSession) Close() error {
 		return nil
 	}
 	owner := session.owner
+	session.cancel()
+	session.lifecycle.Lock()
+	defer session.lifecycle.Unlock()
 	owner.mu.Lock()
 	session.mu.Lock()
 	if !session.closed {
@@ -240,7 +255,13 @@ func (session *ControlSession) Handle(ctx context.Context, frame wire.Frame) (pr
 	if ctx == nil {
 		return nil, errors.New("nil worker control context")
 	}
-	if err := session.owner.acquireWork(ctx); err != nil {
+	operationContext, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(session.done, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+	if err := session.owner.acquireWork(operationContext); err != nil {
 		return nil, err
 	}
 	defer session.owner.releaseWork()
@@ -299,7 +320,7 @@ func (session *ControlSession) Handle(ctx context.Context, frame wire.Frame) (pr
 	session.mu.Lock()
 	peer := session.peer
 	session.mu.Unlock()
-	response, err := session.owner.dispatch(ctx, session, peer, message)
+	response, err := session.owner.dispatch(operationContext, session, peer, message)
 	if err != nil {
 		return nil, err
 	}
@@ -347,8 +368,11 @@ func (session *ControlSession) authenticate(sender uint16, handshake protocol.Wo
 
 func (session *ControlSession) revalidate(sender uint16) error {
 	session.mu.Lock()
-	peer, prior := session.peer, session.member
+	peer, prior, closed, authenticated := session.peer, session.member, session.closed, session.authenticated
 	session.mu.Unlock()
+	if closed || !authenticated {
+		return ErrControlClosed
+	}
 	if sender != peer.node || session.owner.membership.AuthorizeTCP(sender, session.remote) != nil {
 		return ErrControlUnauthorized
 	}
@@ -387,33 +411,90 @@ func (owner *ControlOwner) releaseWork() { <-owner.work }
 func (owner *ControlOwner) dispatch(ctx context.Context, session *ControlSession, peer controlPeer, message protocol.WorkerMessage) (protocol.WorkerMessage, error) {
 	owner.mutations.Lock()
 	defer owner.mutations.Unlock()
+	session.lifecycle.RLock()
+	defer session.lifecycle.RUnlock()
+	if err := session.revalidate(peer.node); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var response protocol.WorkerMessage
+	var err error
 	switch request := message.(type) {
 	case protocol.FenceRequest:
-		return owner.handleFence(ctx, session, peer, request)
+		response, err = owner.handleFence(ctx, session, peer, request)
 	case protocol.AssignmentSetInstall:
-		return owner.handleAssignment(ctx, peer, request)
+		response, err = owner.handleAssignment(ctx, session, peer, request)
 	case protocol.WorkerStatusRequest:
-		return owner.handleStatus(ctx, peer, request)
+		response, err = owner.handleStatus(ctx, session, peer, request)
 	case protocol.CheckpointNotice:
-		return owner.handleCheckpoint(ctx, peer, request)
+		response, err = owner.handleCheckpoint(ctx, session, peer, request)
 	case protocol.ResultRecordChunk:
 		role := TransferNormalReplication
 		if request.RepairID != ([16]byte{}) || request.RepairInstructionDigest != ([32]byte{}) {
 			role = TransferHistoricalRepair
 		}
-		return owner.transfer.ReceiveResultRecord(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: role}, request)
+		response, err = owner.handleResultRecord(ctx, session, peer, role, request)
 	case protocol.ResultArtifactChunk:
-		return owner.transfer.ReceiveResultArtifact(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferNormalReplication}, request)
+		response, err = owner.transfer.ReceiveResultArtifact(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferNormalReplication}, request)
 	case protocol.ResultFetchRequest:
 		if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
 			return nil, err
 		}
-		return owner.transfer.OpenResultFetch(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferLeaderFetch}, request)
+		response, err = owner.transfer.OpenResultFetch(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferLeaderFetch}, request)
 	case protocol.WorkerRegisterRequest, protocol.WorkerRegisterResponse, protocol.ResultRecordAck, protocol.ResultArtifactAck, protocol.ResultFetchChunk, protocol.WorkerError, protocol.WorkerHandshakeAck, protocol.FenceResponse, protocol.AssignmentSetInstallAck, protocol.WorkerStatus, protocol.CheckpointAck:
 		return nil, protocol.ErrUnexpectedWorkerMessage
 	default:
 		return nil, protocol.ErrUnexpectedWorkerMessage
 	}
+	if err != nil {
+		return nil, err
+	}
+	if generation, ok := controlMessageGeneration(message); ok {
+		session.mu.Lock()
+		if !session.closed {
+			session.lastCommand = generation
+		}
+		session.mu.Unlock()
+	}
+	return response, nil
+}
+
+func controlMessageGeneration(message protocol.WorkerMessage) (model.CoordinatorEpoch, bool) {
+	switch request := message.(type) {
+	case protocol.FenceRequest:
+		return request.CoordinatorEpoch, true
+	case protocol.AssignmentSetInstall:
+		return request.CoordinatorEpoch, true
+	case protocol.WorkerStatusRequest:
+		return request.CoordinatorEpoch, true
+	case protocol.CheckpointNotice:
+		return request.Notice.Epoch, true
+	case protocol.ResultRecordChunk:
+		return request.Provenance.CoordinatorEpoch, true
+	case protocol.ResultArtifactChunk:
+		return request.CoordinatorEpoch, true
+	case protocol.ResultFetchRequest:
+		return request.CoordinatorEpoch, true
+	default:
+		return model.CoordinatorEpoch{}, false
+	}
+}
+
+func (owner *ControlOwner) handleResultRecord(ctx context.Context, session *ControlSession, peer controlPeer, role TransferRole, request protocol.ResultRecordChunk) (protocol.WorkerMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	release, err := owner.gate.Enter()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := session.revalidate(peer.node); err != nil {
+		return nil, err
+	}
+	return owner.transfer.ReceiveResultRecord(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: role}, request)
 }
 
 func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSession, peer controlPeer, request protocol.FenceRequest) (protocol.WorkerMessage, error) {
@@ -435,6 +516,25 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 	}
 	if err := owner.gate.CloseAndWait(ctx); err != nil {
 		return nil, err
+	}
+	if err := session.revalidate(peer.node); err != nil {
+		return nil, err
+	}
+	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, false); err != nil {
+		return nil, err
+	}
+	work, err = owner.repository.RecoverWork()
+	if err != nil {
+		return nil, err
+	}
+	if work.Fence != (model.CoordinatorEpoch{}) {
+		comparison := compareControlEpoch(request.CoordinatorEpoch, work.Fence)
+		if comparison <= 0 {
+			if comparison == 0 && request.CoordinatorEpoch == work.Fence {
+				return owner.fenceResponse(work.Fence), nil
+			}
+			return nil, ErrControlStaleEpoch
+		}
 	}
 	if err := owner.repository.Fence(request.CoordinatorEpoch); err != nil {
 		return nil, err
@@ -459,7 +559,7 @@ func (owner *ControlOwner) authorizeCoordinator(peer controlPeer, epoch model.Co
 	return nil
 }
 
-func (owner *ControlOwner) closeOlderCoordinatorSessions(current *ControlSession, _ model.CoordinatorEpoch) {
+func (owner *ControlOwner) closeOlderCoordinatorSessions(current *ControlSession, generation model.CoordinatorEpoch) {
 	owner.mu.Lock()
 	sessions := make([]*ControlSession, 0)
 	for session := range owner.sessions {
@@ -467,11 +567,11 @@ func (owner *ControlOwner) closeOlderCoordinatorSessions(current *ControlSession
 			continue
 		}
 		session.mu.Lock()
-		peer := session.peer
+		peer, lastCommand := session.peer, session.lastCommand
 		authenticated := session.authenticated
 		session.mu.Unlock()
 		if authenticated {
-			if _, voter := owner.configuration.RaftVoterByID(peer.node); voter {
+			if _, voter := owner.configuration.RaftVoterByID(peer.node); voter && (lastCommand == (model.CoordinatorEpoch{}) || compareControlEpoch(lastCommand, generation) < 0) {
 				sessions = append(sessions, session)
 			}
 		}
@@ -502,12 +602,25 @@ func compareControlEpoch(left, right model.CoordinatorEpoch) int {
 	return 0
 }
 
-func (owner *ControlOwner) handleAssignment(ctx context.Context, peer controlPeer, request protocol.AssignmentSetInstall) (protocol.WorkerMessage, error) {
+func (owner *ControlOwner) handleAssignment(ctx context.Context, session *ControlSession, peer controlPeer, request protocol.AssignmentSetInstall) (protocol.WorkerMessage, error) {
 	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
 	if !assignmentTargetsWorker(request.Assignment, owner.localNode, owner.localEpoch) {
 		return nil, ErrControlStaleAssignment
+	}
+	work, err := owner.repository.RecoverWork()
+	if err != nil {
+		return nil, err
+	}
+	if err := owner.validateLocalSlots(work, request.Assignment, request.SchedulingState); err != nil {
+		return nil, err
+	}
+	if err := session.revalidate(peer.node); err != nil {
+		return nil, err
+	}
+	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
+		return nil, err
 	}
 	if err := owner.repository.InstallAssignment(request.Assignment, request.Specification, request.JobControlRevision, request.SchedulingState, request.CoordinatorEpoch); err != nil {
 		return nil, err
@@ -521,6 +634,41 @@ func (owner *ControlOwner) handleAssignment(ctx context.Context, peer controlPee
 		}
 	}
 	return protocol.AssignmentSetInstallAck{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, JobID: request.Assignment.JobID, AssignmentRevision: request.Assignment.Revision, AssignmentDigest: request.Assignment.Digest, JobControlRevision: request.JobControlRevision, SchedulingState: request.SchedulingState, CoordinatorEpoch: request.CoordinatorEpoch}, nil
+}
+
+func (owner *ControlOwner) validateLocalSlots(work store.RecoveredWork, candidate model.AssignmentSet, scheduling model.SchedulingState) error {
+	var used uint64
+	for _, assignment := range work.Assignments {
+		if assignment.Assignment.JobID == candidate.JobID || assignment.SchedulingState == model.Closed {
+			continue
+		}
+		local := localTaskCount(assignment.Assignment, owner.localNode, owner.localEpoch)
+		if used > ^uint64(0)-local {
+			return ErrControlCapacity
+		}
+		used += local
+	}
+	if scheduling != model.Closed {
+		local := localTaskCount(candidate, owner.localNode, owner.localEpoch)
+		if used > ^uint64(0)-local {
+			return ErrControlCapacity
+		}
+		used += local
+	}
+	if used > uint64(owner.configuration.Crane.WorkerSlots) {
+		return ErrControlCapacity
+	}
+	return nil
+}
+
+func localTaskCount(set model.AssignmentSet, node uint16, epoch model.WorkerEpoch) uint64 {
+	var count uint64
+	for _, token := range set.Tasks {
+		if token.WorkerID == node && token.WorkerEpoch == epoch {
+			count++
+		}
+	}
+	return count
 }
 
 func assignmentTargetsWorker(set model.AssignmentSet, node uint16, epoch model.WorkerEpoch) bool {
@@ -537,11 +685,17 @@ func assignmentTargetsWorker(set model.AssignmentSet, node uint16, epoch model.W
 	return false
 }
 
-func (owner *ControlOwner) handleStatus(ctx context.Context, peer controlPeer, request protocol.WorkerStatusRequest) (protocol.WorkerMessage, error) {
+func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSession, peer controlPeer, request protocol.WorkerStatusRequest) (protocol.WorkerMessage, error) {
 	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
 	if request.AfterTransactionID != 0 {
+		if err := session.revalidate(peer.node); err != nil {
+			return nil, err
+		}
+		if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
+			return nil, err
+		}
 		if err := owner.engine.AcknowledgeEvents(ctx, request.AfterTransactionID); err != nil {
 			return nil, err
 		}
@@ -552,7 +706,7 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, peer controlPeer, r
 	}
 	var repair *protocol.ResultRepairStatus
 	if request.Repair != nil {
-		repair, err = owner.installRepair(work, *request.Repair)
+		repair, err = owner.installRepair(session, peer, work, *request.Repair)
 		if err != nil {
 			return nil, err
 		}
@@ -581,7 +735,7 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, peer controlPeer, r
 		return bytes.Compare(status.Assignments[i].JobID[:], status.Assignments[j].JobID[:]) < 0
 	})
 	if request.Inventory != nil {
-		summary, inventoryErr := controlInventory(work, *request.Inventory)
+		summary, inventoryErr := owner.controlInventory(work, *request.Inventory)
 		if inventoryErr != nil {
 			return nil, inventoryErr
 		}
@@ -601,9 +755,11 @@ func cloneControlEvents(events []model.WorkerEvent) []model.WorkerEvent {
 	return result
 }
 
-func controlInventory(work store.RecoveredWork, query protocol.ResultInventoryQuery) (protocol.ResultInventorySummary, error) {
+func (owner *ControlOwner) controlInventory(work store.RecoveredWork, query protocol.ResultInventoryQuery) (protocol.ResultInventorySummary, error) {
 	assignment, ok := controlAssignment(work, query.JobID)
-	if !ok || assignment.Assignment.Revision != query.AssignmentRevision || assignment.Assignment.Digest != query.AssignmentDigest || assignment.Topology.Digest() != query.SpecificationHash {
+	replica, replicaOK := controlReplica(assignment.Assignment, query.SinkTask)
+	localReplica := replicaOK && (replica.PrimaryNodeID == owner.localNode && replica.PrimaryEpoch == owner.localEpoch || replica.SecondaryNodeID == owner.localNode && replica.SecondaryEpoch == owner.localEpoch)
+	if !ok || assignment.CoordinatorEpoch != work.Fence || assignment.Assignment.Revision != query.AssignmentRevision || assignment.Assignment.Digest != query.AssignmentDigest || assignment.Topology.Digest() != query.SpecificationHash || !localReplica {
 		return protocol.ResultInventorySummary{}, ErrControlStaleAssignment
 	}
 	want := make([]protocol.SourceCheckpoint, 0)
@@ -612,11 +768,11 @@ func controlInventory(work store.RecoveredWork, query protocol.ResultInventoryQu
 		if !stageOK || stage.Role != model.StageSource {
 			continue
 		}
-		cursor, cursorOK := controlSource(work, token.Task)
-		if !cursorOK || cursor.RaftIndex == 0 {
+		watermark, proofOK := owner.controlCheckpointProof(work, assignment, token)
+		if !proofOK {
 			return protocol.ResultInventorySummary{}, ErrControlStaleAssignment
 		}
-		want = append(want, protocol.SourceCheckpoint{Source: token.Task, Watermark: cursor.Watermark})
+		want = append(want, protocol.SourceCheckpoint{Source: token.Task, Watermark: watermark})
 	}
 	sort.Slice(want, func(i, j int) bool { return controlTaskLess(want[i].Source, want[j].Source) })
 	if !reflectSourceCheckpoints(want, query.Checkpoints) || protocol.CheckpointVectorDigest(want) != query.CheckpointDigest || protocol.InventoryQueryDigest(query) != query.QueryDigest {
@@ -645,11 +801,25 @@ func controlInventory(work store.RecoveredWork, query protocol.ResultInventoryQu
 	return protocol.ResultInventorySummary{QueryDigest: query.QueryDigest, RecordCount: count, TotalBytes: total, ContentDigest: digest}, nil
 }
 
-func (owner *ControlOwner) installRepair(work store.RecoveredWork, grant protocol.RepairGrant) (*protocol.ResultRepairStatus, error) {
+func (owner *ControlOwner) controlCheckpointProof(work store.RecoveredWork, assignment store.InstalledAssignment, token model.AssignmentToken) (uint64, bool) {
+	if token.WorkerID == owner.localNode && token.WorkerEpoch == owner.localEpoch {
+		cursor, ok := controlSource(work, token.Task)
+		authority := cursor.CheckpointAuthority
+		return cursor.Watermark, ok && cursor.RaftIndex != 0 && authority.JobControlRevision == assignment.JobControlRevision && authority.AssignmentRevision == assignment.Assignment.Revision && authority.AssignmentDigest == assignment.Assignment.Digest && authority.SourceToken == token && authority.CoordinatorEpoch == work.Fence
+	}
+	for _, observation := range work.Checkpoints {
+		if observation.Notice.Source == token.Task && observation.Notice.JobID == assignment.Assignment.JobID && observation.Notice.Epoch == work.Fence && observation.JobControlRevision == assignment.JobControlRevision && observation.AssignmentRevision == assignment.Assignment.Revision && observation.AssignmentDigest == assignment.Assignment.Digest && observation.Notice.RaftIndex != 0 {
+			return observation.Notice.Watermark, true
+		}
+	}
+	return 0, false
+}
+
+func (owner *ControlOwner) installRepair(session *ControlSession, peer controlPeer, work store.RecoveredWork, grant protocol.RepairGrant) (*protocol.ResultRepairStatus, error) {
 	if grant.Instruction.CoordinatorEpoch != work.Fence {
 		return nil, ErrControlStaleEpoch
 	}
-	summary, err := controlInventory(work, protocol.ResultInventoryQuery{JobID: grant.Instruction.JobID, SinkTask: grant.Instruction.SinkTask, SpecificationHash: grant.Instruction.SpecificationHash, AssignmentRevision: grant.Instruction.AssignmentRevision, AssignmentDigest: grant.Instruction.AssignmentDigest, Checkpoints: append([]protocol.SourceCheckpoint(nil), grant.Instruction.Checkpoints...), CheckpointDigest: grant.Instruction.CheckpointDigest, QueryDigest: grant.Instruction.InventoryQueryDigest})
+	summary, err := owner.controlInventory(work, protocol.ResultInventoryQuery{JobID: grant.Instruction.JobID, SinkTask: grant.Instruction.SinkTask, SpecificationHash: grant.Instruction.SpecificationHash, AssignmentRevision: grant.Instruction.AssignmentRevision, AssignmentDigest: grant.Instruction.AssignmentDigest, Checkpoints: append([]protocol.SourceCheckpoint(nil), grant.Instruction.Checkpoints...), CheckpointDigest: grant.Instruction.CheckpointDigest, QueryDigest: grant.Instruction.InventoryQueryDigest})
 	if err != nil {
 		return nil, err
 	}
@@ -683,6 +853,12 @@ func (owner *ControlOwner) installRepair(work store.RecoveredWork, grant protoco
 	}
 	definition := protocolRepairDefinition(grant.Instruction)
 	repair := store.ResultRepairRecord{Instruction: definition, InstructionDigest: grant.Instruction.InstructionDigest, Role: grant.Role, State: store.RepairPending, ContentDigest: model.EmptyResultInventoryDigest(grant.Instruction.InstructionDigest)}
+	if err := session.revalidate(peer.node); err != nil {
+		return nil, err
+	}
+	if err := owner.authorizeCoordinator(peer, grant.Instruction.CoordinatorEpoch, true); err != nil {
+		return nil, err
+	}
 	if err := owner.repository.UpsertRepair(repair); err != nil {
 		return nil, err
 	}
@@ -759,11 +935,47 @@ func controlTaskLess(left, right model.TaskID) bool {
 	return left.Partition < right.Partition
 }
 
-func (owner *ControlOwner) handleCheckpoint(ctx context.Context, peer controlPeer, request protocol.CheckpointNotice) (protocol.WorkerMessage, error) {
+func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *ControlSession, peer controlPeer, request protocol.CheckpointNotice) (protocol.WorkerMessage, error) {
 	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
 		return nil, err
 	}
-	if err := owner.engine.ApplyCheckpoint(ctx, request); err != nil {
+	if err := session.revalidate(peer.node); err != nil {
+		return nil, err
+	}
+	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
+		return nil, err
+	}
+	work, err := owner.repository.RecoverWork()
+	if err != nil {
+		return nil, err
+	}
+	assignment, ok := controlAssignment(work, request.Notice.JobID)
+	if !ok || assignment.CoordinatorEpoch != work.Fence || request.Notice.Epoch != work.Fence || request.JobControlRevision != assignment.JobControlRevision || request.AssignmentRevision != assignment.Assignment.Revision || request.AssignmentDigest != assignment.Assignment.Digest || !assignmentTargetsWorker(assignment.Assignment, owner.localNode, owner.localEpoch) {
+		return nil, ErrControlStaleAssignment
+	}
+	var source model.AssignmentToken
+	for _, token := range assignment.Assignment.Tasks {
+		if token.Task == request.Notice.Source {
+			source = token
+			break
+		}
+	}
+	stage, stageOK := controlStage(assignment.Topology.Spec(), request.Notice.Source.StageID)
+	if source == (model.AssignmentToken{}) || !stageOK || stage.Role != model.StageSource {
+		return nil, ErrControlStaleAssignment
+	}
+	if err := session.revalidate(peer.node); err != nil {
+		return nil, err
+	}
+	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
+		return nil, err
+	}
+	if source.WorkerID == owner.localNode && source.WorkerEpoch == owner.localEpoch {
+		err = owner.engine.ApplyCheckpoint(ctx, request)
+	} else {
+		err = owner.repository.ObserveCheckpoint(request)
+	}
+	if err != nil {
 		return nil, err
 	}
 	return protocol.CheckpointAck{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, JobID: request.Notice.JobID, Source: request.Notice.Source, Watermark: request.Notice.Watermark, RaftIndex: request.Notice.RaftIndex, JobControlRevision: request.JobControlRevision, AssignmentRevision: request.AssignmentRevision, AssignmentDigest: request.AssignmentDigest, CoordinatorEpoch: request.Notice.Epoch}, nil

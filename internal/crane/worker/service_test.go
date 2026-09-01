@@ -2,7 +2,9 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 	"github.com/aaditya/cs425mp3/internal/crane/store"
+	"github.com/aaditya/cs425mp3/internal/swim"
 	"github.com/aaditya/cs425mp3/internal/transport"
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
@@ -119,7 +122,16 @@ func TestWorkerServiceReadyOrdersStoreRecoveryAndComposesExactGateEndpointAndSoc
 	}
 
 	install := protocol.AssignmentSetInstall{Assignment: fixture.worker.assignment.Assignment, Specification: fixture.worker.assignment.Topology.Spec(), SpecificationDigest: fixture.worker.assignment.Topology.Digest(), JobControlRevision: fixture.worker.assignment.JobControlRevision, SchedulingState: model.Running, CoordinatorEpoch: fixture.worker.epoch}
-	if _, err := service.control.handleAssignment(context.Background(), controlPeer{node: fixture.worker.epoch.Coordinator, epoch: model.WorkerEpoch{2}}, install); err != nil {
+	controlMembers := &controlTestMembership{view: membership.View{Members: []swim.Member{{NodeID: fixture.configuration.NodeID, Host: "127.0.0.1", BasePort: fixture.configuration.BasePort, Incarnation: 1, Status: swim.Alive}, {NodeID: fixture.worker.epoch.Coordinator, Host: "127.0.0.2", BasePort: fixture.configuration.BasePort, Incarnation: 1, Status: swim.Alive}}}}
+	service.control.membership = controlMembers
+	controlSession, err := service.control.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 40000}, func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controlSession.authenticate(fixture.worker.epoch.Coordinator, protocol.WorkerHandshake{NodeID: fixture.worker.epoch.Coordinator, WorkerEpoch: model.WorkerEpoch{2}, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.control.handleAssignment(context.Background(), controlSession, controlPeer{node: fixture.worker.epoch.Coordinator, epoch: model.WorkerEpoch{2}}, install); err != nil {
 		t.Fatalf("exact-current Running reinstall: %v", err)
 	}
 	if release, err := fixture.gate.Enter(); err != nil {
@@ -224,6 +236,247 @@ func TestWorkerServiceControlTransportRequiresHandshakeAndKeepsServing(t *testin
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run cancellation = %v", err)
+	}
+}
+
+func TestWorkerServiceDeepClonesConfigAndMapsUnavailableTransferSeams(t *testing.T) {
+	fixture := newWorkerServiceFixture(t, false)
+	options := fixture.options()
+	service, err := NewService(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range options.Config.RaftVoters {
+		if options.Config.RaftVoters[index].NodeID == fixture.worker.epoch.Coordinator {
+			options.Config.RaftVoters[index].NodeID = 99
+		}
+	}
+	service.listen = fixture.listen
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	select {
+	case <-service.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker service did not become ready")
+	}
+	if err := service.control.authorizeCoordinator(controlPeer{node: fixture.worker.epoch.Coordinator, epoch: model.WorkerEpoch{2}}, fixture.worker.epoch, false); err != nil {
+		t.Fatalf("caller config mutation changed service voter authorization: %v", err)
+	}
+	for _, test := range []struct {
+		message wire.MessageType
+		err     error
+	}{
+		{message: wire.MessageCraneResultArtifactChunk, err: ErrResultArtifactUnavailable},
+		{message: wire.MessageCraneResultFetchRequest, err: ErrResultFetchUnavailable},
+	} {
+		response, ok := service.controlError(test.message, test.err).(protocol.WorkerError)
+		if !ok || response.Code != protocol.WorkerErrorUnavailable || !response.Retryable {
+			t.Fatalf("unavailable seam %d response = %#v", test.message, response)
+		}
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run cancellation = %v", err)
+	}
+}
+
+func TestWorkerControlWireTypesArtifactAndFetchUnavailableAndRejectsResponses(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	path := filepath.Join(t.TempDir(), "worker")
+	durable, err := store.Open(path, store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	if err := durable.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	authenticator := wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901"))
+	repository := &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}
+	service := &Service{configuration: fixture.configuration, authenticator: authenticator, clock: clock.NewManual(time.Unix(100, 0)), clusterID: fixture.cluster, store: durable, repository: repository}
+	client, server := net.Pipe()
+	session, err := fixture.owner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 40000}, server.Close)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.handleControlConnection(ctx, server, session) }()
+	limits := wire.DefaultLimits()
+	limits.MaxFrameSize = int(model.WorkerControlMaxFrameBytesV1)
+	limits.ExpectedClusterID = &fixture.cluster
+	stream := wire.NewTCPFrameStream(client, authenticator, limits, time.Second)
+	requestID := byte(1)
+	roundTrip := func(message protocol.WorkerMessage) protocol.WorkerMessage {
+		t.Helper()
+		frame := fixture.frame(t, 2, requestID, message)
+		requestID++
+		if err := stream.WriteFrame(context.Background(), frame); err != nil {
+			t.Fatal(err)
+		}
+		response, err := stream.ReadFrame(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := protocol.UnmarshalWorkerMessage(response.Header.Message, response.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	if _, ok := roundTrip(fixture.handshake(2)).(protocol.WorkerHandshakeAck); !ok {
+		t.Fatal("handshake did not succeed")
+	}
+	var sink model.TaskID
+	for _, replica := range fixture.assignment.Assignment.ResultReplicas {
+		sink = replica.SinkTask
+		break
+	}
+	data := []byte{1, 2}
+	checksum := sha256.Sum256(data)
+	artifact := protocol.ResultArtifact{JobID: fixture.assignment.Assignment.JobID, SinkTask: sink, SpecificationHash: fixture.assignment.Topology.Digest(), RecordCount: 1, TotalLength: uint64(len(data)), Checksum: checksum}
+	transfer := protocol.TransferChunk{TransferID: protocol.TransferID{1}, JobID: artifact.JobID, TotalLength: uint64(len(data)), Checksum: checksum, Data: data, Final: true}
+	chunk := protocol.ResultArtifactChunk{Transfer: transfer, Artifact: artifact, DestinationNodeID: fixture.repository.localNode, DestinationWorkerEpoch: fixture.repository.localEpoch, CoordinatorEpoch: fixture.epoch}
+	fetch := protocol.ResultFetchRequest{Artifact: artifact, ReplicaNodeID: fixture.repository.localNode, ReplicaWorkerEpoch: fixture.repository.localEpoch, CoordinatorEpoch: fixture.epoch}
+	for _, message := range []protocol.WorkerMessage{chunk, fetch} {
+		response, ok := roundTrip(message).(protocol.WorkerError)
+		if !ok || response.Code != protocol.WorkerErrorUnavailable || !response.Retryable || response.RelatedMessage != message.MessageType() {
+			t.Fatalf("unavailable wire response = %#v", response)
+		}
+	}
+	ack := protocol.ResultArtifactAck{TransferID: transfer.TransferID, NodeID: fixture.repository.localNode, WorkerEpoch: fixture.repository.localEpoch, Artifact: artifact, NextOffset: uint64(len(data)), Complete: true, CoordinatorEpoch: fixture.epoch}
+	fetchChunk := protocol.ResultFetchChunk{Transfer: transfer, Artifact: artifact, SourceNodeID: fixture.repository.localNode, SourceWorkerEpoch: fixture.repository.localEpoch, CoordinatorEpoch: fixture.epoch}
+	for _, message := range []protocol.WorkerMessage{ack, fetchChunk} {
+		response, ok := roundTrip(message).(protocol.WorkerError)
+		if !ok || response.Code == protocol.WorkerErrorUnavailable {
+			t.Fatalf("unsolicited response accepted/unavailable = %#v", response)
+		}
+	}
+	if fixture.transfer.artifactCalls != 1 || fixture.transfer.fetchCalls != 1 {
+		t.Fatalf("unexpected storage effects: artifact=%d fetch=%d", fixture.transfer.artifactCalls, fixture.transfer.fetchCalls)
+	}
+	cancel()
+	_ = stream.Close()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("connection shutdown = %v", err)
+	}
+}
+
+func TestWorkerServiceStoreAuthorityFailureIsFatal(t *testing.T) {
+	fixture := newWorkerServiceFixture(t, false)
+	service, err := NewService(fixture.options())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.listen = fixture.listen
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	select {
+	case <-service.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker service did not become ready")
+	}
+	if err := service.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.LocalStatus(context.Background()); !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("LocalStatus after store close = %v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, store.ErrClosed) {
+			t.Fatalf("fatal store authority error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("store authority failure did not stop worker service")
+	}
+}
+
+func TestWorkerServiceCancellationWaitsForExactGateDrain(t *testing.T) {
+	fixture := newWorkerServiceFixture(t, false)
+	fixture.configuration.Crane.WorkerControlTimeout = config.Duration(100 * time.Millisecond)
+	fixture.configuration.Crane.FailureGracePeriod = config.Duration(200 * time.Millisecond)
+	service, err := NewService(fixture.options())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.listen = fixture.listen
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	select {
+	case <-service.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker service did not become ready")
+	}
+	if err := fixture.gate.Open(fixture.worker.epoch); err != nil {
+		t.Fatal(err)
+	}
+	release, err := fixture.gate.Enter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before admitted work drained: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run cancellation = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not join after gate drain")
+	}
+}
+
+func TestWorkerControlListenerDoesNotAcceptBeforeEngineAndTupleReady(t *testing.T) {
+	fixture := newControlFixture(t)
+	listener := newServicePipeListener()
+	authenticator := wire.NewHMACAuthenticator([]byte("01234567890123456789012345678901"))
+	service := &Service{configuration: fixture.configuration, authenticator: authenticator, clock: clock.NewManual(time.Unix(100, 0)), clusterID: fixture.cluster}
+	ownershipReady := make(chan struct{})
+	dispatchReady := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.runControl(ctx, listener, fixture.owner, ownershipReady, dispatchReady) }()
+	<-ownershipReady
+	client, server := net.Pipe()
+	listener.connections <- server
+	limits := wire.DefaultLimits()
+	limits.MaxFrameSize = int(model.WorkerControlMaxFrameBytesV1)
+	limits.ExpectedClusterID = &fixture.cluster
+	stream := wire.NewTCPFrameStream(client, authenticator, limits, time.Second)
+	frame := fixture.frame(t, 2, 1, fixture.handshake(2))
+	written := make(chan error, 1)
+	go func() { written <- stream.WriteFrame(context.Background(), frame) }()
+	select {
+	case err := <-written:
+		t.Fatalf("pre-ready listener accepted frame: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if fixture.repository.fenceCalls != 0 {
+		t.Fatal("pre-ready control mutated durable state")
+	}
+	close(dispatchReady)
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	response, err := stream.ReadFrame(context.Background())
+	if err != nil || response.Header.Message != wire.MessageCraneWorkerHandshakeAck {
+		t.Fatalf("post-ready handshake = %#v, %v", response.Header, err)
+	}
+	_ = stream.Close()
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("control shutdown = %v", err)
 	}
 }
 
