@@ -99,7 +99,7 @@ func (transaction Transaction) Validate() error {
 	return nil
 }
 
-// RecoveredState is a complete owned replay foundation for Task14+.
+// RecoveredState is bounded WAL metadata published only after complete validation.
 type RecoveredState struct {
 	// Identity is the exact on-disk cluster/member binding.
 	Identity Identity
@@ -109,17 +109,12 @@ type RecoveredState struct {
 	LastSequence uint64
 	// WALBytes is the exact durable WAL length after safe tail truncation.
 	WALBytes uint64
-	// Transactions are the committed, ordered, independently owned mutations.
-	Transactions []Transaction
+	// TransactionCount is the number of complete validated transactions.
+	TransactionCount uint64
 }
 
-// Clone returns a completely independently owned recovered state.
+// Clone returns an independently owned recovered metadata value.
 func (state RecoveredState) Clone() RecoveredState {
-	source := state.Transactions
-	state.Transactions = make([]Transaction, len(source))
-	for i := range source {
-		state.Transactions[i] = source[i].Clone()
-	}
 	return state
 }
 

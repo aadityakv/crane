@@ -97,6 +97,16 @@ func validateRootAnchor(root *os.Root, directory *os.File, path string) error {
 	return nil
 }
 
+func lockDirectory(directory *os.File) error {
+	if err := syscall.Flock(int(directory.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return ErrLocked
+		}
+		return fmt.Errorf("acquire worker directory lock: %w", err)
+	}
+	return nil
+}
+
 func openLockedFile(root *os.Root, name string) (*os.File, error) {
 	file, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {

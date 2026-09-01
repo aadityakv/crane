@@ -204,3 +204,74 @@ func TestStoreRuntimeWritesStayOnAnchoredDirectoryAfterPathReplacement(t *testin
 		t.Fatalf("replacement directory was touched: %v", entries)
 	}
 }
+
+func TestLiveLockReplacementCannotCreateSecondStoreOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
+	first := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
+	defer first.Close()
+	lockPath := filepath.Join(path, WorkerLockFilename)
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	replacement := []byte("replacement-lock")
+	if err := os.WriteFile(lockPath, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	epochCalls := 0
+	second, err := Open(path, identity, Options{MaxBytes: 1 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) {
+		epochCalls++
+		return model.WorkerEpoch{4}, nil
+	}})
+	if second != nil {
+		defer second.Close()
+	}
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Open error=%v, want ErrLocked", err)
+	}
+	if epochCalls != 0 {
+		t.Fatalf("second owner generated epoch %d times", epochCalls)
+	}
+	after, readErr := os.ReadFile(lockPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(replacement) {
+		t.Fatalf("replacement lock mutated: %q", after)
+	}
+	if err := first.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("first-owner")}}}); err != nil {
+		t.Fatalf("first owner became unsafe: %v", err)
+	}
+}
+
+func TestLiveWALReplacementCannotBeOpenedOrMutatedBySecondOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
+	first := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
+	defer first.Close()
+	walPath := filepath.Join(path, WorkerWALFilename)
+	if err := os.Remove(walPath); err != nil {
+		t.Fatal(err)
+	}
+	replacement := []byte("replacement-wal")
+	if err := os.WriteFile(walPath, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(path, identity, Options{MaxBytes: 1 << 20})
+	if second != nil {
+		defer second.Close()
+	}
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Open error=%v, want ErrLocked", err)
+	}
+	if err := first.Commit(Transaction{Records: []Record{{Type: 100, Payload: []byte("anchored-wal")}}}); err != nil {
+		t.Fatalf("first owner became unsafe: %v", err)
+	}
+	after, readErr := os.ReadFile(walPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(after) != string(replacement) {
+		t.Fatalf("replacement WAL mutated: %q", after)
+	}
+}

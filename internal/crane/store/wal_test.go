@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"hash/crc32"
 	"math"
 	"os"
@@ -197,7 +200,7 @@ func TestStoreCommitValidatesBeforeAppendAndIsConcurrencyBounded(t *testing.T) {
 	}
 	wait.Wait()
 	recovered := store.Recovered()
-	if len(recovered.Transactions) != 20 || recovered.LastSequence == 0 {
+	if recovered.TransactionCount != 20 || recovered.LastSequence == 0 {
 		t.Fatalf("recovered=%#v", recovered)
 	}
 }
@@ -235,6 +238,36 @@ func TestStoreConcurrentAccessAndCloseAreRaceSafeAndBounded(t *testing.T) {
 	}
 	if err := store.Commit(Transaction{Records: []Record{{Type: 100}}}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("post-close Commit error=%v", err)
+	}
+}
+
+func TestStoreExportedAPIsHaveUtilityDocumentation(t *testing.T) {
+	files := []string{"errors.go", "types.go", "store.go", "store_lock_unix.go"}
+	for _, filename := range files {
+		parsed, err := parser.ParseFile(token.NewFileSet(), filename, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, declaration := range parsed.Decls {
+			switch declaration := declaration.(type) {
+			case *ast.FuncDecl:
+				if declaration.Name.IsExported() && declaration.Doc == nil {
+					t.Errorf("%s: exported function %s lacks utility documentation", filename, declaration.Name.Name)
+				}
+			case *ast.GenDecl:
+				for _, specification := range declaration.Specs {
+					value, ok := specification.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for _, name := range value.Names {
+						if name.IsExported() && declaration.Doc == nil && value.Doc == nil {
+							t.Errorf("%s: exported value %s lacks utility documentation", filename, name.Name)
+						}
+					}
+				}
+			}
+		}
 	}
 }
 

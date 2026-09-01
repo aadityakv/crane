@@ -1,12 +1,14 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -123,7 +125,7 @@ func TestRecoveryTruncatesEveryIncompleteFinalTransactionButRejectsCommittedCorr
 				t.Fatal(err)
 			}
 			defer reopened.Close()
-			if len(reopened.Recovered().Transactions) != 1 {
+			if reopened.Recovered().TransactionCount != 1 {
 				t.Fatalf("transactions=%#v", reopened.Recovered())
 			}
 			after, _ := os.ReadFile(walPath)
@@ -145,19 +147,32 @@ func TestRecoveryTruncatesEveryIncompleteFinalTransactionButRejectsCommittedCorr
 	}
 }
 
-func TestRecoveryReturnsOwnedTransactions(t *testing.T) {
+func TestCommitAndRecoveryConsumerOwnTransactionPayloads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "worker")
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
 	store := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
-	defer store.Close()
 	payload := []byte("owned")
 	if err := store.Commit(Transaction{Records: []Record{{Type: 100, Payload: payload}}}); err != nil {
 		t.Fatal(err)
 	}
 	payload[0] = 'X'
-	first := store.Recovered()
-	first.Transactions[0].Records[0].Payload[0] = 'Y'
-	if got := string(store.Recovered().Transactions[0].Records[0].Payload); got != "owned" {
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := os.Open(filepath.Join(path, WorkerWALFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	info, err := wal.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := &collectingRecoveryConsumer{}
+	if _, _, err := recoverWALReader(wal, info.Size(), identity, consumer); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(consumer.records[0].Payload); got != "owned" {
 		t.Fatalf("payload=%q", got)
 	}
 }
@@ -263,6 +278,155 @@ func TestRecoveryRejectsSchemaSequenceLengthAndCrossReferenceCorruption(t *testi
 	}
 }
 
+func TestRecoveryRejectsCountImpossibleSpanBeforePartialTailClassification(t *testing.T) {
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
+	identityFrame, err := encodeIdentity(identity, model.WorkerEpoch{3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	minimum := uint64(2*(walHeaderBytes+boundaryPayloadBytes+walChecksumBytes) + walHeaderBytes + dataPrefixBytes + walChecksumBytes)
+	maximum := minimum + MaxRecordPayloadBytes
+	for _, test := range []struct {
+		name      string
+		span      uint64
+		wantError bool
+	}{
+		{name: "minimum minus one", span: minimum - 1, wantError: true},
+		{name: "minimum", span: minimum},
+		{name: "maximum", span: maximum},
+		{name: "maximum plus one", span: maximum + 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			boundary := make([]byte, boundaryPayloadBytes)
+			binary.BigEndian.PutUint32(boundary[:4], 1)
+			binary.BigEndian.PutUint64(boundary[4:12], test.span)
+			boundary[12] = 1
+			begin, encodeErr := encodeRecord(recordTransactionBegin, 2, boundary)
+			if encodeErr != nil {
+				t.Fatal(encodeErr)
+			}
+			wal := append(append([]byte(nil), identityFrame...), begin...)
+			state, truncateAt, recoverErr := recoverWAL(wal, identity)
+			if test.wantError {
+				if !errors.Is(recoverErr, ErrCorrupt) {
+					t.Fatalf("span=%d error=%v, want ErrCorrupt", test.span, recoverErr)
+				}
+				return
+			}
+			if recoverErr != nil || truncateAt != len(identityFrame) || state.LastSequence != 1 {
+				t.Fatalf("span=%d state=%#v truncate=%d error=%v", test.span, state, truncateAt, recoverErr)
+			}
+		})
+	}
+	for _, payloadBytes := range []int{0, MaxRecordPayloadBytes} {
+		transaction, err := encodeTransaction(2, Transaction{Records: []Record{{Type: 100, Payload: make([]byte, payloadBytes)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wal := append(append([]byte(nil), identityFrame...), transaction...)
+		if _, truncateAt, err := recoverWAL(wal, identity); err != nil || truncateAt != len(wal) {
+			t.Fatalf("canonical payload=%d truncate=%d error=%v", payloadBytes, truncateAt, err)
+		}
+	}
+}
+
+func TestRecoveryTruncatesEveryCanonicalFinalTransactionPrefix(t *testing.T) {
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
+	identityFrame, _ := encodeIdentity(identity, model.WorkerEpoch{3})
+	committed, _ := encodeTransaction(2, Transaction{Records: []Record{{Type: 100, Payload: []byte("committed")}}})
+	tail, _ := encodeTransaction(5, Transaction{Records: []Record{{Type: 101, Payload: []byte("tail")}}})
+	base := append(append([]byte(nil), identityFrame...), committed...)
+	for cut := 1; cut < len(tail); cut++ {
+		wal := append(append([]byte(nil), base...), tail[:cut]...)
+		state, truncateAt, err := recoverWAL(wal, identity)
+		if err != nil || truncateAt != len(base) || state.TransactionCount != 1 || state.LastSequence != 4 {
+			t.Fatalf("cut=%d state=%#v truncate=%d want=%d error=%v", cut, state, truncateAt, len(base), err)
+		}
+	}
+}
+
+func TestOpenRejectsLargeEarlyCorruptSparseWALWithoutWholeFileAllocation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
+	store := mustOpen(t, path, identity, 1<<20, model.WorkerEpoch{3})
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	const sparseBytes = int64(64 << 20)
+	wal, err := os.OpenFile(filepath.Join(path, WorkerWALFilename), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Truncate(sparseBytes); err != nil {
+		wal.Close()
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	opened, openErr := Open(path, identity, Options{MaxBytes: uint64(sparseBytes)})
+	runtime.ReadMemStats(&after)
+	if opened != nil {
+		opened.Close()
+	}
+	if !errors.Is(openErr, ErrCorrupt) {
+		t.Fatalf("Open error=%v, want ErrCorrupt", openErr)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+		t.Fatalf("early corrupt sparse WAL allocated %d bytes, want <=%d", allocated, 8<<20)
+	}
+}
+
+func TestRecoveryConsumerRunsOnlyAfterFullValidationAndReceivesOwnedRecords(t *testing.T) {
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
+	identityFrame, _ := encodeIdentity(identity, model.WorkerEpoch{3})
+	transaction, _ := encodeTransaction(2, Transaction{Records: []Record{{Type: 100, Payload: []byte("owned")}}})
+	valid := append(append([]byte(nil), identityFrame...), transaction...)
+	corrupt := append(append([]byte(nil), valid...), make([]byte, walHeaderBytes)...)
+	consumer := &collectingRecoveryConsumer{}
+	if _, _, err := recoverWALReader(bytes.NewReader(corrupt), int64(len(corrupt)), identity, consumer); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("corrupt replay error=%v, want ErrCorrupt", err)
+	}
+	if consumer.beginCalls != 0 || len(consumer.records) != 0 || consumer.commitCalls != 0 {
+		t.Fatalf("consumer ran before full validation: %#v", consumer)
+	}
+	consumer = &collectingRecoveryConsumer{}
+	state, truncateAt, err := recoverWALReader(bytes.NewReader(valid), int64(len(valid)), identity, consumer)
+	if err != nil || truncateAt != int64(len(valid)) || state.TransactionCount != 1 {
+		t.Fatalf("state=%#v truncate=%d error=%v", state, truncateAt, err)
+	}
+	for i := range valid {
+		valid[i] = 0
+	}
+	if consumer.beginCalls != 1 || consumer.commitCalls != 1 || len(consumer.records) != 1 || string(consumer.records[0].Payload) != "owned" {
+		t.Fatalf("consumer output=%#v", consumer)
+	}
+}
+
+type collectingRecoveryConsumer struct {
+	beginCalls  int
+	commitCalls int
+	records     []Record
+}
+
+func (consumer *collectingRecoveryConsumer) BeginTransaction(uint32) error {
+	consumer.beginCalls++
+	return nil
+}
+
+func (consumer *collectingRecoveryConsumer) ConsumeRecord(record Record) error {
+	consumer.records = append(consumer.records, record)
+	return nil
+}
+
+func (consumer *collectingRecoveryConsumer) CommitTransaction() error {
+	consumer.commitCalls++
+	return nil
+}
+
 func FuzzRecoverWAL(f *testing.F) {
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}
 	identityFrame, _ := encodeIdentity(identity, model.WorkerEpoch{3})
@@ -277,11 +441,6 @@ func FuzzRecoverWAL(f *testing.F) {
 		}
 		if truncateAt < 0 || truncateAt > len(data) || state.Identity != identity || state.WorkerEpoch == (model.WorkerEpoch{}) {
 			t.Fatalf("invalid successful recovery: truncate=%d bytes=%d state=%#v", truncateAt, len(data), state)
-		}
-		for _, transaction := range state.Transactions {
-			if err := transaction.Validate(); err != nil {
-				t.Fatalf("published invalid transaction: %v", err)
-			}
 		}
 	})
 }

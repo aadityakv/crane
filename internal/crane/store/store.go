@@ -15,16 +15,17 @@ import (
 
 // Store is the exclusive process-lifetime owner of one worker WAL.
 type Store struct {
-	mu         sync.Mutex
-	options    Options
-	operations storeOperations
-	wal        *os.File
-	lock       *os.File
-	directory  *os.File
-	root       *os.Root
-	state      RecoveredState
-	closed     bool
-	failed     bool
+	mu              sync.Mutex
+	options         Options
+	operations      storeOperations
+	wal             *os.File
+	lock            *os.File
+	directory       *os.File
+	directoryLocked bool
+	root            *os.Root
+	state           RecoveredState
+	closed          bool
+	failed          bool
 }
 
 type storeOperations struct {
@@ -41,6 +42,7 @@ func defaultStoreOperations() storeOperations {
 	}
 }
 
+// Open exclusively locks, initializes or validates, and recovers one worker store.
 func Open(path string, identity Identity, options Options) (result *Store, resultErr error) {
 	return openWithOperations(path, identity, options, defaultStoreOperations())
 }
@@ -71,6 +73,10 @@ func openWithOperations(path string, identity Identity, options Options, operati
 			resultErr = errors.Join(resultErr, store.release())
 		}
 	}()
+	if err := lockDirectory(directory); err != nil {
+		return nil, err
+	}
+	store.directoryLocked = true
 	root, err := operations.openRoot(path)
 	if err != nil {
 		return nil, fmt.Errorf("anchor worker directory: %w", err)
@@ -130,16 +136,12 @@ func openWithOperations(path string, identity Identity, options Options, operati
 	if info.Size() <= 0 || uint64(info.Size()) > options.MaxBytes || uint64(info.Size()) > uint64(math.MaxInt) {
 		return nil, fmt.Errorf("%w: WAL size %d", ErrCorrupt, info.Size())
 	}
-	data := make([]byte, int(info.Size()))
-	if _, err := io.ReadFull(wal, data); err != nil {
-		return nil, err
-	}
-	state, truncateAt, err := recoverWAL(data, identity)
+	state, truncateAt, err := recoverWALReader(wal, info.Size(), identity, nil)
 	if err != nil {
 		return nil, err
 	}
-	if truncateAt != len(data) {
-		if err := wal.Truncate(int64(truncateAt)); err != nil {
+	if truncateAt != info.Size() {
+		if err := wal.Truncate(truncateAt); err != nil {
 			return nil, err
 		}
 		if err := operations.syncFile(wal); err != nil {
@@ -240,7 +242,7 @@ func (store *Store) Commit(transaction Transaction) error {
 		store.failed = true
 		return err
 	}
-	store.state.Transactions = append(store.state.Transactions, transaction)
+	store.state.TransactionCount++
 	store.state.LastSequence += uint64(len(transaction.Records)) + 2
 	store.state.WALBytes += uint64(len(encoded))
 	return nil
@@ -263,19 +265,24 @@ func (store *Store) release() error {
 		walErr = store.wal.Close()
 		store.wal = nil
 	}
-	dirErr := error(nil)
-	if store.directory != nil {
-		dirErr = store.directory.Close()
-		store.directory = nil
-	}
+	lockErr := unlockAndClose(store.lock)
+	store.lock = nil
 	rootErr := error(nil)
 	if store.root != nil {
 		rootErr = store.root.Close()
 		store.root = nil
 	}
-	lockErr := unlockAndClose(store.lock)
-	store.lock = nil
-	return errors.Join(walErr, dirErr, rootErr, lockErr)
+	dirErr := error(nil)
+	if store.directory != nil {
+		if store.directoryLocked {
+			dirErr = unlockAndClose(store.directory)
+			store.directoryLocked = false
+		} else {
+			dirErr = store.directory.Close()
+		}
+		store.directory = nil
+	}
+	return errors.Join(walErr, lockErr, rootErr, dirErr)
 }
 
 func writeFull(file *os.File, data []byte) error {

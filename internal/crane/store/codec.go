@@ -1,10 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"math"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -37,6 +39,7 @@ type walRecord struct {
 	kind     walRecordType
 	sequence uint64
 	payload  []byte
+	frame    []byte
 }
 
 func encodeRecord(kind walRecordType, sequence uint64, payload []byte) ([]byte, error) {
@@ -148,11 +151,22 @@ func writeRecordHeader(destination []byte, kind walRecordType, sequence uint64, 
 }
 
 func decodeRecord(data []byte, offset int) (walRecord, int, bool, error) {
-	remaining := len(data) - offset
+	record, next, partial, err := decodeRecordAt(bytes.NewReader(data), int64(len(data)), int64(offset))
+	return record, int(next), partial, err
+}
+
+func decodeRecordAt(reader io.ReaderAt, size int64, offset int64) (walRecord, int64, bool, error) {
+	if offset < 0 || offset > size {
+		return walRecord{}, offset, false, fmt.Errorf("%w: record offset %d outside WAL size %d", ErrCorrupt, offset, size)
+	}
+	remaining := size - offset
 	if remaining < walHeaderBytes {
 		return walRecord{}, offset, true, nil
 	}
-	header := data[offset : offset+walHeaderBytes]
+	header := make([]byte, walHeaderBytes)
+	if err := readAtFull(reader, header, offset); err != nil {
+		return walRecord{}, offset, false, fmt.Errorf("%w: read WAL header: %v", ErrCorrupt, err)
+	}
 	if string(header[:4]) != string(walMagic[:]) || binary.BigEndian.Uint16(header[4:6]) != walSchemaVersion {
 		return walRecord{}, offset, false, fmt.Errorf("%w: WAL magic/schema", ErrCorrupt)
 	}
@@ -183,11 +197,26 @@ func decodeRecord(data []byte, offset int) (walRecord, int, bool, error) {
 	if total > uint64(math.MaxInt) || total > uint64(remaining) {
 		return walRecord{}, offset, true, nil
 	}
-	end := offset + int(total)
-	want := binary.BigEndian.Uint32(data[end-4 : end])
-	if crc32.Checksum(data[offset:end-4], walCRC) != want {
+	frame := make([]byte, int(total))
+	if err := readAtFull(reader, frame, offset); err != nil {
+		return walRecord{}, offset, false, fmt.Errorf("%w: read WAL record: %v", ErrCorrupt, err)
+	}
+	end := offset + int64(total)
+	want := binary.BigEndian.Uint32(frame[len(frame)-walChecksumBytes:])
+	if crc32.Checksum(frame[:len(frame)-walChecksumBytes], walCRC) != want {
 		return walRecord{}, offset, false, fmt.Errorf("%w: checksum", ErrCorrupt)
 	}
-	payload := append([]byte(nil), data[offset+walHeaderBytes:end-4]...)
-	return walRecord{kind: kind, sequence: sequence, payload: payload}, end, false, nil
+	payload := frame[walHeaderBytes : len(frame)-walChecksumBytes]
+	return walRecord{kind: kind, sequence: sequence, payload: payload, frame: frame}, end, false, nil
+}
+
+func readAtFull(reader io.ReaderAt, destination []byte, offset int64) error {
+	read, err := reader.ReadAt(destination, offset)
+	if read != len(destination) {
+		return io.ErrUnexpectedEOF
+	}
+	if err != nil && err != io.EOF {
+		return err
+	}
+	return nil
 }
