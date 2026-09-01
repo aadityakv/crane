@@ -2279,7 +2279,7 @@ func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch m
 	}
 	for _, observation := range work.Checkpoints {
 		assignment, ok := findAssignment(&work, observation.Notice.JobID)
-		if !ok || !assignmentTargetsWorker(assignment.Assignment, nodeID, workerEpoch) {
+		if !ok || !assignmentTargetsWorker(assignment.Assignment, nodeID, workerEpoch) && !historicalResultHolder(work, assignment, nodeID, workerEpoch) {
 			return errors.New("recovered checkpoint observation is not local assignment participation")
 		}
 	}
@@ -2330,6 +2330,21 @@ func provenanceTargets(provenance model.ResultCopyProvenance, nodeID uint16, wor
 	default:
 		return false
 	}
+}
+
+func historicalResultHolder(work RecoveredWork, assignment InstalledAssignment, nodeID uint16, workerEpoch model.WorkerEpoch) bool {
+	if assignment.SchedulingState == model.Running {
+		return false
+	}
+	found := false
+	visitResults(work, func(result StoredResult) bool {
+		if result.Record.TupleID.JobID == assignment.Assignment.JobID && result.Record.SpecificationHash == assignment.Topology.Digest() && result.Provenance.AssignmentRevision < assignment.Assignment.Revision && result.Provenance.AssignmentDigest != assignment.Assignment.Digest && result.Provenance.Validate(result.Record) == nil && provenanceTargets(result.Provenance, nodeID, workerEpoch) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 func repairTargets(repair ResultRepairRecord, nodeID uint16, workerEpoch model.WorkerEpoch) bool {
 	switch repair.Role {

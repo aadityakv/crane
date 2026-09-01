@@ -59,7 +59,7 @@ func WorkerStoreContractV1() WorkerStoreContract {
 		Rules: []string{
 			"v1 snapshot admits kinds 1..8 only; v2 admits kinds 1..9",
 			"domain registry v1 admits record types 1..13; v2 checkpoint observation is type 14 with payload schema 2",
-			"checkpoint observation requires exact current fence, assignment revision/digest, job-control revision, source EOF and local assignment ownership",
+			"checkpoint observation requires exact current fence, assignment revision/digest, job-control revision, source EOF and local assignment participation or Closed/Draining retained historical-result ownership",
 			"checkpoint observations are sorted and keyed by exact JobID+Source TaskID; exact retry is metadata-inert; changed same RaftIndex and stale RaftIndex/watermark reject before mutation",
 		},
 	}

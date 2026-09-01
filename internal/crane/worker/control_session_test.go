@@ -532,6 +532,414 @@ func TestControlAssignmentCapacityIsAtomicAndExactReplacementRetriesWithRealStor
 	}
 }
 
+func TestControlAssignmentAdmitsOnlyClosedHistoricalHolderAndRejectsRevisionGap(t *testing.T) {
+	fixture := newControlFixture(t)
+	base := workerFixture(t)
+	var sink model.AssignmentToken
+	var replica model.ResultReplicaSet
+	for _, candidate := range base.assignment.Assignment.ResultReplicas {
+		if candidate.PrimaryNodeID != base.localNode && candidate.SecondaryNodeID != base.localNode {
+			continue
+		}
+		replica = candidate
+		for _, token := range base.assignment.Assignment.Tasks {
+			if token.Task == candidate.SinkTask {
+				sink = token
+				break
+			}
+		}
+		break
+	}
+	if sink == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no locally retained result replica")
+	}
+	fixture.assignment = base.assignment
+	fixture.epoch = base.epoch
+	fixture.repository.work.Fence = base.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{base.assignment}
+	role := model.PrimaryReplica
+	if replica.PrimaryNodeID != base.localNode || replica.PrimaryEpoch != base.localEpoch {
+		role = model.SecondaryReplica
+	}
+	record, provenance := base.result(t, sink, replica, 1, role)
+	fixture.repository.work.Results = []store.StoredResult{{Record: record, Provenance: provenance}}
+
+	next := nonTargetAssignmentForControlTest(t, base, base.assignment.Assignment.Revision+1)
+	install := protocol.AssignmentSetInstall{Assignment: next, Specification: base.assignment.Topology.Spec(), SpecificationDigest: base.assignment.Topology.Digest(), JobControlRevision: base.assignment.JobControlRevision + 1, SchedulingState: model.Closed, CoordinatorEpoch: base.epoch}
+	if !fixture.owner.historicalResultsAuthorizeAssignment(fixture.repository.work, next, install.SpecificationDigest) {
+		t.Fatalf("valid retained result not recognized: record=%+v provenance=%+v local=%d", record, provenance, base.localNode)
+	}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, install)); err != nil {
+		t.Fatalf("closed historical-holder assignment rejected: %v", err)
+	}
+	if fixture.repository.installCalls != 1 || !reflect.DeepEqual(fixture.repository.work.Assignments[0].Assignment, next) {
+		t.Fatalf("historical assignment not durably installed: calls=%d assignment=%+v", fixture.repository.installCalls, fixture.repository.work.Assignments)
+	}
+	if _, err := fixture.gate.Enter(); !errors.Is(err, admission.ErrClosed) {
+		t.Fatalf("historical audit assignment opened gate: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*controlFixture, *protocol.AssignmentSetInstall)
+	}{
+		{name: "random holder", mutate: func(f *controlFixture, _ *protocol.AssignmentSetInstall) { f.repository.work.Results = nil }},
+		{name: "wrong provenance node", mutate: func(f *controlFixture, _ *protocol.AssignmentSetInstall) {
+			if f.repository.work.Results[0].Provenance.DestinationRole == model.PrimaryReplica {
+				f.repository.work.Results[0].Provenance.ReplicaSet.PrimaryNodeID = 99
+			} else {
+				f.repository.work.Results[0].Provenance.ReplicaSet.SecondaryNodeID = 99
+			}
+		}},
+		{name: "running non-target", mutate: func(_ *controlFixture, candidate *protocol.AssignmentSetInstall) {
+			candidate.SchedulingState = model.Running
+		}},
+		{name: "revision gap", mutate: func(_ *controlFixture, candidate *protocol.AssignmentSetInstall) {
+			candidate.Assignment = nonTargetAssignmentForControlTest(t, base, base.assignment.Assignment.Revision+2)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidateFixture := newControlFixture(t)
+			candidateFixture.assignment = base.assignment
+			candidateFixture.epoch = base.epoch
+			candidateFixture.repository.work.Fence = base.epoch
+			candidateFixture.repository.work.Assignments = []store.InstalledAssignment{base.assignment}
+			candidateFixture.repository.work.Results = []store.StoredResult{{Record: record, Provenance: provenance}}
+			candidate := install
+			test.mutate(candidateFixture, &candidate)
+			candidateSession := candidateFixture.session(t, 2)
+			candidateFixture.authenticate(t, candidateSession, 2, 1)
+			if _, err := candidateSession.Handle(context.Background(), candidateFixture.frame(t, 2, 2, candidate)); !errors.Is(err, ErrControlStaleAssignment) {
+				t.Fatalf("rejection error = %v", err)
+			}
+			if candidateFixture.repository.installCalls != 0 {
+				t.Fatalf("rejected candidate mutated Store %d times", candidateFixture.repository.installCalls)
+			}
+		})
+	}
+}
+
+func nonTargetAssignmentForControlTest(t *testing.T, fixture workerTestFixture, revision uint64) model.AssignmentSet {
+	t.Helper()
+	tasks := append([]model.AssignmentToken(nil), fixture.assignment.Assignment.Tasks...)
+	for index := range tasks {
+		tasks[index].WorkerID = 2 + uint16(index%2)
+		tasks[index].WorkerEpoch = model.WorkerEpoch{byte(tasks[index].WorkerID)}
+		tasks[index].Attempt++
+		tasks[index].AssignmentRevision = revision
+	}
+	replicas := append([]model.ResultReplicaSet(nil), fixture.assignment.Assignment.ResultReplicas...)
+	for index := range replicas {
+		replicas[index].PrimaryNodeID, replicas[index].PrimaryEpoch = 2, model.WorkerEpoch{2}
+		replicas[index].SecondaryNodeID, replicas[index].SecondaryEpoch = 3, model.WorkerEpoch{3}
+	}
+	set, err := model.NewAssignmentSet(fixture.assignment.Assignment.JobID, revision, tasks, replicas, fixture.assignment.Topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return set
+}
+
+func TestControlHistoricalSourceObservesInventoryAndInstallsExactRepairGrant(t *testing.T) {
+	fixture := newControlFixture(t)
+	base := workerFixture(t)
+	var sink model.AssignmentToken
+	var oldReplica model.ResultReplicaSet
+	for _, candidate := range base.assignment.Assignment.ResultReplicas {
+		if candidate.PrimaryNodeID != base.localNode && candidate.SecondaryNodeID != base.localNode {
+			continue
+		}
+		oldReplica = candidate
+		for _, token := range base.assignment.Assignment.Tasks {
+			if token.Task == candidate.SinkTask {
+				sink = token
+				break
+			}
+		}
+		break
+	}
+	if sink == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no historical result")
+	}
+	role := model.PrimaryReplica
+	if oldReplica.PrimaryNodeID != base.localNode {
+		role = model.SecondaryReplica
+	}
+	record, provenance := base.result(t, sink, oldReplica, 1, role)
+	current := nonTargetAssignmentForControlTest(t, base, base.assignment.Assignment.Revision+1)
+	fixture.assignment = base.assignment
+	fixture.epoch = base.epoch
+	fixture.repository.work.Fence = base.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{{Assignment: current, SpecificationBytes: base.assignment.Topology.CanonicalBytes(), Topology: base.assignment.Topology, JobControlRevision: 2, SchedulingState: model.Closed, CoordinatorEpoch: base.epoch}}
+	fixture.repository.work.Results = []store.StoredResult{{Record: record, Provenance: provenance}}
+
+	var source model.AssignmentToken
+	for _, token := range current.Tasks {
+		stage, _ := controlStage(base.assignment.Topology.Spec(), token.Task.StageID)
+		if stage.Role == model.StageSource {
+			source = token
+			break
+		}
+	}
+	if source == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no current source")
+	}
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: current.JobID, Source: source.Task, Watermark: 1, RaftIndex: 11, Epoch: base.epoch}, JobControlRevision: 2, AssignmentRevision: current.Revision, AssignmentDigest: current.Digest}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, notice)); err != nil {
+		t.Fatalf("historical holder checkpoint rejected: %v", err)
+	}
+
+	query := protocol.ResultInventoryQuery{JobID: current.JobID, SinkTask: record.SinkTask, SpecificationHash: base.assignment.Topology.Digest(), AssignmentRevision: current.Revision, AssignmentDigest: current.Digest, Checkpoints: []protocol.SourceCheckpoint{{Source: source.Task, Watermark: 1}}}
+	query.CheckpointDigest = protocol.CheckpointVectorDigest(query.Checkpoints)
+	query.QueryDigest = protocol.InventoryQueryDigest(query)
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Inventory: &query}))
+	if err != nil {
+		t.Fatalf("historical inventory rejected: %v", err)
+	}
+	summary := response.(protocol.WorkerStatus).Inventory
+	if summary == nil || summary.RecordCount != 1 {
+		t.Fatalf("historical inventory = %#v", summary)
+	}
+	currentReplica, ok := controlReplica(current, record.SinkTask)
+	if !ok {
+		t.Fatal("missing current destination replica")
+	}
+	instruction := protocol.RepairResultPartition{CoordinatorEpoch: base.epoch, JobID: current.JobID, AssignmentRevision: current.Revision, AssignmentDigest: current.Digest, SourceNodeID: base.localNode, SourceWorkerEpoch: base.localEpoch, DestinationNodeID: currentReplica.PrimaryNodeID, DestinationWorkerEpoch: currentReplica.PrimaryEpoch, SinkTask: record.SinkTask, SpecificationHash: base.assignment.Topology.Digest(), Checkpoints: append([]protocol.SourceCheckpoint(nil), query.Checkpoints...), CheckpointDigest: query.CheckpointDigest, InventoryQueryDigest: query.QueryDigest, ExpectedRecordCount: summary.RecordCount, ExpectedTotalBytes: summary.TotalBytes, ExpectedContentDigest: summary.ContentDigest}
+	instruction.RepairID = protocol.DeriveRepairID(instruction)
+	instruction.InstructionDigest = protocol.RepairInstructionDigest(instruction)
+	grant := protocol.RepairGrant{Instruction: instruction, Role: protocol.RepairSource}
+	response, err = session.Handle(context.Background(), fixture.frame(t, 2, 4, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &grant}))
+	if err != nil {
+		t.Fatalf("historical source grant rejected: %v", err)
+	}
+	status := response.(protocol.WorkerStatus).Repair
+	if status == nil || status.Role != protocol.RepairSource || fixture.repository.log[len(fixture.repository.log)-1] != "repair" {
+		t.Fatalf("historical repair status=%#v log=%v", status, fixture.repository.log)
+	}
+	for index, test := range []struct {
+		name   string
+		mutate func(*protocol.RepairGrant)
+	}{
+		{name: "source epoch", mutate: func(candidate *protocol.RepairGrant) { candidate.Instruction.SourceWorkerEpoch[0]++ }},
+		{name: "destination role", mutate: func(candidate *protocol.RepairGrant) { candidate.Role = protocol.RepairDestination }},
+		{name: "destination epoch", mutate: func(candidate *protocol.RepairGrant) { candidate.Instruction.DestinationWorkerEpoch[0]++ }},
+		{name: "checkpoint vector", mutate: func(candidate *protocol.RepairGrant) { candidate.Instruction.Checkpoints[0].Watermark++ }},
+		{name: "content digest", mutate: func(candidate *protocol.RepairGrant) { candidate.Instruction.ExpectedContentDigest[0]++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := grant
+			candidate.Instruction.Checkpoints = append([]protocol.SourceCheckpoint(nil), grant.Instruction.Checkpoints...)
+			test.mutate(&candidate)
+			candidate.Instruction.CheckpointDigest = protocol.CheckpointVectorDigest(candidate.Instruction.Checkpoints)
+			candidate.Instruction.InventoryQueryDigest = protocol.InventoryQueryDigest(protocol.ResultInventoryQuery{JobID: candidate.Instruction.JobID, SinkTask: candidate.Instruction.SinkTask, SpecificationHash: candidate.Instruction.SpecificationHash, AssignmentRevision: candidate.Instruction.AssignmentRevision, AssignmentDigest: candidate.Instruction.AssignmentDigest, Checkpoints: candidate.Instruction.Checkpoints, CheckpointDigest: candidate.Instruction.CheckpointDigest})
+			candidate.Instruction.RepairID = protocol.DeriveRepairID(candidate.Instruction)
+			candidate.Instruction.InstructionDigest = protocol.RepairInstructionDigest(candidate.Instruction)
+			if _, err := session.Handle(context.Background(), fixture.frame(t, 2, byte(index+5), protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &candidate})); err == nil {
+				t.Fatal("invalid historical grant accepted")
+			}
+			if countControlLog(fixture.repository.log, "repair") != 1 {
+				t.Fatalf("invalid grant mutated repair state: %v", fixture.repository.log)
+			}
+		})
+	}
+}
+
+func countControlLog(log []string, target string) int {
+	count := 0
+	for _, entry := range log {
+		if entry == target {
+			count++
+		}
+	}
+	return count
+}
+
+func TestControlHistoricalRepairRealStoresGrantOrderRestartAndTransferProgress(t *testing.T) {
+	seed := newControlFixture(t)
+	base := workerFixture(t)
+	var sink model.AssignmentToken
+	var oldReplica model.ResultReplicaSet
+	for _, candidate := range base.assignment.Assignment.ResultReplicas {
+		if candidate.PrimaryNodeID != base.localNode && candidate.SecondaryNodeID != base.localNode {
+			continue
+		}
+		oldReplica = candidate
+		for _, token := range base.assignment.Assignment.Tasks {
+			if token.Task == candidate.SinkTask {
+				sink = token
+			}
+		}
+		break
+	}
+	if sink == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no historical result")
+	}
+	oldRole := model.PrimaryReplica
+	if oldReplica.PrimaryNodeID != base.localNode {
+		oldRole = model.SecondaryReplica
+	}
+	record, provenance := base.result(t, sink, oldReplica, 1, oldRole)
+	current := nonTargetAssignmentForControlTest(t, base, base.assignment.Assignment.Revision+1)
+	currentInstall := protocol.AssignmentSetInstall{Assignment: current, Specification: base.assignment.Topology.Spec(), SpecificationDigest: base.assignment.Topology.Digest(), JobControlRevision: 2, SchedulingState: model.Closed, CoordinatorEpoch: base.epoch}
+	currentReplica, ok := controlReplica(current, record.SinkTask)
+	if !ok {
+		t.Fatal("missing current result replica")
+	}
+	destinationNode, destinationEpoch := currentReplica.SecondaryNodeID, currentReplica.SecondaryEpoch
+	if destinationNode == base.epoch.Coordinator {
+		destinationNode, destinationEpoch = currentReplica.PrimaryNodeID, currentReplica.PrimaryEpoch
+	}
+
+	sourcePath, destinationPath := filepath.Join(t.TempDir(), "source"), filepath.Join(t.TempDir(), "destination")
+	sourceIdentity := store.Identity{ClusterID: seed.cluster, NodeID: base.localNode}
+	sourceOptions := store.Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return base.localEpoch, nil }}
+	sourceStore, err := store.Open(sourcePath, sourceIdentity, sourceOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceStore.Fence(base.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceStore.InstallAssignment(base.assignment.Assignment, base.assignment.Topology.Spec(), base.assignment.JobControlRevision, model.Running, base.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceStore.UpsertResult(record, provenance); err != nil {
+		t.Fatal(err)
+	}
+	sourceRepository := &serviceRepository{Store: sourceStore, node: base.localNode, fatal: make(chan error, 1)}
+	sourceOwner, err := NewControlOwner(ControlOptions{Config: seed.configuration, ClusterID: seed.cluster, Repository: sourceRepository, Engine: &controlNoopEngine{}, Transfer: seed.transfer, Gate: admission.NewGate(), Membership: seed.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed.owner = sourceOwner
+	sourceSession := seed.session(t, base.epoch.Coordinator)
+	seed.authenticate(t, sourceSession, base.epoch.Coordinator, 1)
+	if _, err := sourceSession.Handle(context.Background(), seed.frame(t, base.epoch.Coordinator, 2, currentInstall)); err != nil {
+		t.Fatalf("install source audit assignment: %v", err)
+	}
+
+	var sourceTask model.AssignmentToken
+	for _, token := range current.Tasks {
+		stage, _ := controlStage(base.assignment.Topology.Spec(), token.Task.StageID)
+		if stage.Role == model.StageSource {
+			sourceTask = token
+			break
+		}
+	}
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: current.JobID, Source: sourceTask.Task, Watermark: 1, RaftIndex: 17, Epoch: base.epoch}, JobControlRevision: 2, AssignmentRevision: current.Revision, AssignmentDigest: current.Digest}
+	if _, err := sourceSession.Handle(context.Background(), seed.frame(t, base.epoch.Coordinator, 3, notice)); err != nil {
+		t.Fatalf("source checkpoint observation: %v", err)
+	}
+	query := protocol.ResultInventoryQuery{JobID: current.JobID, SinkTask: record.SinkTask, SpecificationHash: base.assignment.Topology.Digest(), AssignmentRevision: current.Revision, AssignmentDigest: current.Digest, Checkpoints: []protocol.SourceCheckpoint{{Source: sourceTask.Task, Watermark: 1}}}
+	query.CheckpointDigest = protocol.CheckpointVectorDigest(query.Checkpoints)
+	query.QueryDigest = protocol.InventoryQueryDigest(query)
+	sourceResponse, err := sourceSession.Handle(context.Background(), seed.frame(t, base.epoch.Coordinator, 4, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Inventory: &query}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := sourceResponse.(protocol.WorkerStatus).Inventory
+	if summary == nil || summary.RecordCount != 1 {
+		t.Fatalf("source inventory=%#v", summary)
+	}
+
+	destinationIdentity := store.Identity{ClusterID: seed.cluster, NodeID: destinationNode}
+	destinationOptions := store.Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return destinationEpoch, nil }}
+	destinationStore, err := store.Open(destinationPath, destinationIdentity, destinationOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationStore.Fence(base.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationStore.InstallAssignment(current, base.assignment.Topology.Spec(), 2, model.Closed, base.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationStore.ObserveCheckpoint(notice); err != nil {
+		t.Fatal(err)
+	}
+	destinationRepository := &serviceRepository{Store: destinationStore, node: destinationNode, fatal: make(chan error, 1)}
+	destinationConfig := seed.configuration
+	destinationConfig.NodeID = destinationNode
+	destinationOwner, err := NewControlOwner(ControlOptions{Config: destinationConfig, ClusterID: seed.cluster, Repository: destinationRepository, Engine: &controlNoopEngine{}, Transfer: seed.transfer, Gate: admission.NewGate(), Membership: seed.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationSession, err := destinationOwner.NewSession(&net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 40000}, func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = destinationSession.Close() })
+	if _, err := destinationSession.Handle(context.Background(), seed.frame(t, base.epoch.Coordinator, 5, seed.handshake(base.epoch.Coordinator))); err != nil {
+		t.Fatal(err)
+	}
+	instruction := protocol.RepairResultPartition{CoordinatorEpoch: base.epoch, JobID: current.JobID, AssignmentRevision: current.Revision, AssignmentDigest: current.Digest, SourceNodeID: base.localNode, SourceWorkerEpoch: base.localEpoch, DestinationNodeID: destinationNode, DestinationWorkerEpoch: destinationEpoch, SinkTask: record.SinkTask, SpecificationHash: base.assignment.Topology.Digest(), Checkpoints: append([]protocol.SourceCheckpoint(nil), query.Checkpoints...), CheckpointDigest: query.CheckpointDigest, InventoryQueryDigest: query.QueryDigest, ExpectedRecordCount: summary.RecordCount, ExpectedTotalBytes: summary.TotalBytes, ExpectedContentDigest: summary.ContentDigest}
+	instruction.RepairID = protocol.DeriveRepairID(instruction)
+	instruction.InstructionDigest = protocol.RepairInstructionDigest(instruction)
+	destinationGrant := protocol.RepairGrant{Instruction: instruction, Role: protocol.RepairDestination}
+	destinationResponse, err := destinationSession.Handle(context.Background(), seed.frame(t, base.epoch.Coordinator, 6, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &destinationGrant}))
+	if err != nil {
+		t.Fatalf("destination-first grant: %v", err)
+	}
+	destinationStatus := destinationResponse.(protocol.WorkerStatus).Repair
+	sourceGrant := destinationGrant
+	sourceGrant.Role = protocol.RepairSource
+	if _, err := sourceSession.Handle(context.Background(), seed.frame(t, base.epoch.Coordinator, 7, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &sourceGrant})); err != nil {
+		t.Fatalf("source-second grant: %v", err)
+	}
+	if err := sourceSession.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationSession.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sourceStore, err = store.Open(sourcePath, sourceIdentity, sourceOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceStore.Close()
+	destinationStore, err = store.Open(destinationPath, destinationIdentity, destinationOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destinationStore.Close()
+	sourceRepository = &serviceRepository{Store: sourceStore, node: base.localNode, fatal: make(chan error, 1)}
+	destinationRepository = &serviceRepository{Store: destinationStore, node: destinationNode, fatal: make(chan error, 1)}
+	sourceTransfer, err := NewTransferOwner(TransferOptions{Repository: sourceRepository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationTransfer, err := NewTransferOwner(TransferOptions{Repository: destinationRepository})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, complete, err := sourceTransfer.NextRepairRecord(context.Background(), TransferPeer{NodeID: destinationNode, WorkerEpoch: destinationEpoch, Role: TransferHistoricalRepair}, instruction.RepairID, *destinationStatus)
+	if err != nil || complete || chunk.Record.TupleID != record.TupleID {
+		t.Fatalf("restarted source 212: record=%+v complete=%t err=%v", chunk.Record.TupleID, complete, err)
+	}
+	ack, err := destinationTransfer.ReceiveResultRecord(context.Background(), TransferPeer{NodeID: base.localNode, WorkerEpoch: base.localEpoch, Role: TransferHistoricalRepair}, chunk)
+	if err != nil {
+		t.Fatalf("destination 213: %v", err)
+	}
+	if err := sourceTransfer.AcknowledgeRepairRecord(context.Background(), TransferPeer{NodeID: destinationNode, WorkerEpoch: destinationEpoch, Role: TransferHistoricalRepair}, chunk, ack); err != nil {
+		t.Fatalf("source 213 progression: %v", err)
+	}
+	sourceWork, _ := sourceStore.RecoverWork()
+	destinationWork, _ := destinationStore.RecoverWork()
+	if len(sourceWork.Repairs) != 1 || sourceWork.Repairs[0].State != store.RepairComplete || len(destinationWork.Results) != 1 {
+		t.Fatalf("repair progression source=%+v destination results=%d", sourceWork.Repairs, len(destinationWork.Results))
+	}
+}
+
 func TestControlInventoryAndLocalStatusRejectStaleOrUnrequestedDurableState(t *testing.T) {
 	fixture := newControlFixture(t)
 	fixture.repository.work.Fence = fixture.epoch

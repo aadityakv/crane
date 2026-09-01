@@ -652,12 +652,17 @@ func (owner *ControlOwner) handleAssignment(ctx context.Context, session *Contro
 	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
-	if !assignmentTargetsWorker(request.Assignment, owner.localNode, owner.localEpoch) {
-		return nil, ErrControlStaleAssignment
-	}
 	work, err := owner.repository.RecoverWork()
 	if err != nil {
 		return nil, err
+	}
+	if prior, ok := controlAssignment(work, request.Assignment.JobID); ok && request.Assignment.Revision > prior.Assignment.Revision && request.Assignment.Revision-prior.Assignment.Revision > 1 {
+		return nil, ErrControlStaleAssignment
+	}
+	if !assignmentTargetsWorker(request.Assignment, owner.localNode, owner.localEpoch) {
+		if request.SchedulingState == model.Running || !owner.historicalResultsAuthorizeAssignment(work, request.Assignment, request.SpecificationDigest) {
+			return nil, ErrControlStaleAssignment
+		}
 	}
 	if err := owner.validateLocalSlots(work, request.Assignment, request.SchedulingState); err != nil {
 		return nil, err
@@ -683,6 +688,23 @@ func (owner *ControlOwner) handleAssignment(ctx context.Context, session *Contro
 		}
 	}
 	return protocol.AssignmentSetInstallAck{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, JobID: request.Assignment.JobID, AssignmentRevision: request.Assignment.Revision, AssignmentDigest: request.Assignment.Digest, JobControlRevision: request.JobControlRevision, SchedulingState: request.SchedulingState, CoordinatorEpoch: request.CoordinatorEpoch}, nil
+}
+
+func (owner *ControlOwner) historicalResultsAuthorizeAssignment(work store.RecoveredWork, candidate model.AssignmentSet, specification [32]byte) bool {
+	for _, stored := range work.Results {
+		if stored.Record.TupleID.JobID != candidate.JobID || stored.Record.SpecificationHash != specification || stored.Provenance.AssignmentRevision >= candidate.Revision || stored.Provenance.AssignmentDigest == candidate.Digest || stored.Provenance.Validate(stored.Record) != nil {
+			continue
+		}
+		node, _, _, _, ok := endpointsForRole(stored.Provenance.ReplicaSet, stored.Provenance.DestinationRole)
+		if ok && node == owner.localNode {
+			return true
+		}
+	}
+	return false
+}
+
+func (owner *ControlOwner) historicalResultHolder(work store.RecoveredWork, assignment store.InstalledAssignment) bool {
+	return assignment.SchedulingState != model.Running && owner.historicalResultsAuthorizeAssignment(work, assignment.Assignment, assignment.Topology.Digest())
 }
 
 func (owner *ControlOwner) validateLocalSlots(work store.RecoveredWork, candidate model.AssignmentSet, scheduling model.SchedulingState) error {
@@ -805,7 +827,8 @@ func (owner *ControlOwner) controlInventory(work store.RecoveredWork, query prot
 	assignment, ok := controlAssignment(work, query.JobID)
 	replica, replicaOK := controlReplica(assignment.Assignment, query.SinkTask)
 	localReplica := replicaOK && (replica.PrimaryNodeID == owner.localNode && replica.PrimaryEpoch == owner.localEpoch || replica.SecondaryNodeID == owner.localNode && replica.SecondaryEpoch == owner.localEpoch)
-	if !ok || assignment.CoordinatorEpoch != work.Fence || assignment.Assignment.Revision != query.AssignmentRevision || assignment.Assignment.Digest != query.AssignmentDigest || assignment.Topology.Digest() != query.SpecificationHash || !localReplica {
+	historical := ok && !localReplica && owner.historicalResultHolder(work, assignment)
+	if !ok || assignment.CoordinatorEpoch != work.Fence || assignment.Assignment.Revision != query.AssignmentRevision || assignment.Assignment.Digest != query.AssignmentDigest || assignment.Topology.Digest() != query.SpecificationHash || !localReplica && !historical {
 		return protocol.ResultInventorySummary{}, ErrControlStaleAssignment
 	}
 	want := make([]protocol.SourceCheckpoint, 0)
@@ -829,16 +852,27 @@ func (owner *ControlOwner) controlInventory(work store.RecoveredWork, query prot
 		watermarks[checkpoint.Source] = checkpoint.Watermark
 	}
 	records := make([]model.ResultRecord, 0)
+	historicalRecord := false
 	for _, stored := range work.Results {
 		if stored.Record.SinkTask != query.SinkTask || stored.Record.SpecificationHash != query.SpecificationHash {
 			continue
 		}
 		watermark, covered := watermarks[stored.Record.TupleID.SourceTask]
 		if covered && stored.Record.TupleID.SourceSequence <= watermark {
+			if historical {
+				node, _, _, _, endpointOK := endpointsForRole(stored.Provenance.ReplicaSet, stored.Provenance.DestinationRole)
+				if stored.Record.TupleID.JobID != query.JobID || stored.Provenance.AssignmentRevision >= query.AssignmentRevision || stored.Provenance.AssignmentDigest == query.AssignmentDigest || stored.Provenance.Validate(stored.Record) != nil || !endpointOK || node != owner.localNode {
+					return protocol.ResultInventorySummary{}, ErrControlStaleAssignment
+				}
+				historicalRecord = true
+			}
 			record := stored.Record
 			record.Value = append([]byte(nil), record.Value...)
 			records = append(records, record)
 		}
+	}
+	if historical && !historicalRecord {
+		return protocol.ResultInventorySummary{}, ErrControlStaleAssignment
 	}
 	count, total, digest, err := ResultInventoryAggregate(query.QueryDigest, records)
 	if err != nil {
@@ -875,6 +909,9 @@ func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSe
 	}
 	replica, ok := controlReplica(assignment.Assignment, grant.Instruction.SinkTask)
 	if !ok || grant.Instruction.DestinationNodeID != replica.PrimaryNodeID && grant.Instruction.DestinationNodeID != replica.SecondaryNodeID || grant.Instruction.DestinationNodeID == replica.PrimaryNodeID && grant.Instruction.DestinationWorkerEpoch != replica.PrimaryEpoch || grant.Instruction.DestinationNodeID == replica.SecondaryNodeID && grant.Instruction.DestinationWorkerEpoch != replica.SecondaryEpoch {
+		return nil, ErrControlStaleAssignment
+	}
+	if grant.Role == protocol.RepairDestination && !(replica.PrimaryNodeID == owner.localNode && replica.PrimaryEpoch == owner.localEpoch || replica.SecondaryNodeID == owner.localNode && replica.SecondaryEpoch == owner.localEpoch) {
 		return nil, ErrControlStaleAssignment
 	}
 	localRole := grant.Role == protocol.RepairSource && grant.Instruction.SourceNodeID == owner.localNode && grant.Instruction.SourceWorkerEpoch == owner.localEpoch || grant.Role == protocol.RepairDestination && grant.Instruction.DestinationNodeID == owner.localNode && grant.Instruction.DestinationWorkerEpoch == owner.localEpoch
@@ -987,7 +1024,7 @@ func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *Contro
 		return nil, err
 	}
 	assignment, ok := controlAssignment(work, request.Notice.JobID)
-	if !ok || assignment.CoordinatorEpoch != work.Fence || request.Notice.Epoch != work.Fence || request.JobControlRevision != assignment.JobControlRevision || request.AssignmentRevision != assignment.Assignment.Revision || request.AssignmentDigest != assignment.Assignment.Digest || !assignmentTargetsWorker(assignment.Assignment, owner.localNode, owner.localEpoch) {
+	if !ok || assignment.CoordinatorEpoch != work.Fence || request.Notice.Epoch != work.Fence || request.JobControlRevision != assignment.JobControlRevision || request.AssignmentRevision != assignment.Assignment.Revision || request.AssignmentDigest != assignment.Assignment.Digest || !assignmentTargetsWorker(assignment.Assignment, owner.localNode, owner.localEpoch) && !owner.historicalResultHolder(work, assignment) {
 		return nil, ErrControlStaleAssignment
 	}
 	var source model.AssignmentToken

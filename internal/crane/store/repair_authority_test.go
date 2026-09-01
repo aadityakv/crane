@@ -4,7 +4,78 @@ import (
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 )
+
+func TestStoreHistoricalResultHolderPersistsCurrentCheckpointVectorAcrossRestart(t *testing.T) {
+	path := t.TempDir() + "/historical-holder"
+	identity := Identity{ClusterID: [16]byte{43}, NodeID: 1}
+	options := Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }}
+	workerStore, err := Open(path, identity, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workerStore.Close() })
+	topology, prior, epoch := domainAssignment(t, workerStore.WorkerEpoch(), identity.NodeID)
+	if err := workerStore.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.InstallAssignment(prior, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	record, provenance := domainResult(t, topology, prior, epoch, 0)
+	if err := workerStore.UpsertResult(record, provenance); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := model.BuildAssignmentSet(prior.JobID, topology.Digest(), prior.Revision+1, topology, []model.WorkerPlacement{{NodeID: 2, WorkerEpoch: model.WorkerEpoch{8}, SlotCapacity: 8}, {NodeID: 3, WorkerEpoch: model.WorkerEpoch{9}, SlotCapacity: 8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentTasks := append([]model.AssignmentToken(nil), current.Tasks...)
+	for index := range currentTasks {
+		currentTasks[index].Attempt = 2
+	}
+	current, err = model.NewAssignmentSet(current.JobID, current.Revision, currentTasks, current.ResultReplicas, topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignmentTargetsWorker(current, identity.NodeID, workerStore.WorkerEpoch()) {
+		t.Fatal("current fixture still targets historical holder")
+	}
+	if err := workerStore.InstallAssignment(current, topology.Spec(), 2, model.Closed, epoch); err != nil {
+		t.Fatalf("install current audit assignment: %v", err)
+	}
+	var notices []protocol.CheckpointNotice
+	for _, token := range current.Tasks {
+		stage, ok := findStage(topology, token.Task.StageID)
+		if !ok || stage.Role != model.StageSource {
+			continue
+		}
+		notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: current.JobID, Source: token.Task, Watermark: 1, RaftIndex: uint64(len(notices) + 11), Epoch: epoch}, JobControlRevision: 2, AssignmentRevision: current.Revision, AssignmentDigest: current.Digest}
+		if err := workerStore.ObserveCheckpoint(notice); err != nil {
+			t.Fatalf("historical holder checkpoint %v: %v", token.Task, err)
+		}
+		notices = append(notices, notice)
+	}
+	if len(notices) == 0 {
+		t.Fatal("fixture has no source checkpoints")
+	}
+	if _, err := workerStore.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	workerStore, err = Open(path, identity, options)
+	if err != nil {
+		t.Fatalf("reopen historical holder: %v", err)
+	}
+	work, err := workerStore.RecoverWork()
+	if err != nil || len(work.Results) != 1 || len(work.Checkpoints) != len(notices) || work.Assignments[0].Assignment.Digest != current.Digest {
+		t.Fatalf("recovered historical holder: results=%d checkpoints=%d assignment=%+v err=%v", len(work.Results), len(work.Checkpoints), work.Assignments, err)
+	}
+}
 
 func TestRepairAuthorityPersistsHistoricalSourceToCurrentDestinationAcrossSnapshotReopen(t *testing.T) {
 	topology, assignment, epoch, replica := historicalRepairAssignment(t)

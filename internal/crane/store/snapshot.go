@@ -1321,7 +1321,7 @@ func validateSnapshotWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch mo
 	}
 	for _, observation := range work.Checkpoints {
 		assignment, ok := findAssignment(&work, observation.Notice.JobID)
-		if !ok || !assignmentTargetsWorker(assignment.Assignment, nodeID, workerEpoch) {
+		if !ok || !assignmentTargetsWorker(assignment.Assignment, nodeID, workerEpoch) && !historicalResultHolder(work, assignment, nodeID, workerEpoch) {
 			return errors.New("snapshot checkpoint observation is not local assignment participation")
 		}
 	}

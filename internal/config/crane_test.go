@@ -17,7 +17,7 @@ func TestDefaultCraneConfigPinsOperationalDefaultsAndCompiledFingerprint(t *test
 		TupleCompletionRetryInterval: Duration(time.Second),
 		FailureGracePeriod:           Duration(5 * time.Second),
 		MaxWorkerStoreBytes:          1 << 30,
-		ConsensusFingerprint:         "317e9c580bae7578225cb2ed674ad5c1ac3056f970f4e93658e71393a65e167e",
+		ConsensusFingerprint:         "18021a3e64c2aa95a94ffb0611bdccf0f41ff975ddabfc6166c48ed39cf65995",
 	}
 	if got := DefaultCraneConfig(); got != want {
 		t.Fatalf("DefaultCraneConfig() = %#v, want %#v", got, want)
