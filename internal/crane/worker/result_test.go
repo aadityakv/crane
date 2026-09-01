@@ -926,3 +926,38 @@ func TestArtifactStoreInstallResumesAcrossRestartAndVerifiesFinalChecksum(t *tes
 		t.Fatalf("empty install next=%d complete=%t err=%v", next, complete, err)
 	}
 }
+
+// TestFinalCheckpointVectorAcceptsHistoricalCheckpointProof pins the defect
+// #2 ruling seal-path half for terminal result sealing: a durable retained
+// checkpoint proof under a historical coordinator epoch, JobControlRevision,
+// and assignment binding still proves its committed watermark, so
+// FinalCheckpointVector must accept it instead of demanding current-authority
+// equality and blocking sealing forever after any authority advance.
+func TestFinalCheckpointVectorAcceptsHistoricalCheckpointProof(t *testing.T) {
+	fixture := workerFixture(t)
+	eof, err := model.SourceEOF(fixture.topology, fixture.source.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eof == 0 {
+		t.Fatal("fixture requires a nonzero source EOF")
+	}
+	olderEpoch := fixture.epoch
+	olderEpoch.Term--
+	olderEpoch.BeginIndex--
+	olderEpoch.Nonce[0]++
+	// Any retained proof whose authority differs from the current
+	// installation is historical once the coordinator advances.
+	historical := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision + 7, AssignmentRevision: fixture.assignment.Assignment.Revision + 3, AssignmentDigest: [32]byte{9}, SourceToken: fixture.source, CoordinatorEpoch: olderEpoch}
+	work := store.RecoveredWork{Fence: fixture.epoch, Assignments: []store.InstalledAssignment{fixture.assignment}, Sources: []store.SourceCursor{{
+		Source: fixture.source.Task, NextSequence: eof + 1, EOF: eof,
+		Watermark: eof, RaftIndex: 21, CheckpointRevision: 4, CheckpointAuthority: historical,
+	}}}
+	vector, ok := FinalCheckpointVector(work, fixture.assignment)
+	if !ok {
+		t.Fatal("final checkpoint vector refused a historical durable proof")
+	}
+	if len(vector) != 1 || vector[0].Source != fixture.source.Task || vector[0].Watermark != eof {
+		t.Fatalf("final vector = %+v", vector)
+	}
+}

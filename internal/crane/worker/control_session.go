@@ -896,8 +896,13 @@ func (owner *ControlOwner) controlCheckpointProof(work store.RecoveredWork, assi
 			// any nonzero claim for it.
 			return 0, true
 		}
-		authority := cursor.CheckpointAuthority
-		return cursor.Watermark, cursor.RaftIndex != 0 && authority.JobControlRevision == assignment.JobControlRevision && authority.AssignmentRevision == assignment.Assignment.Revision && authority.AssignmentDigest == assignment.Assignment.Digest && authority.SourceToken == token && authority.CoordinatorEpoch == work.Fence
+		// Task 24 defect #2 ruling: the retained durable checkpoint proof is
+		// itself valid committed-watermark evidence — the watermark was
+		// committed, an immutable historical fact — so a proof whose
+		// epoch/JobControlRevision/assignment binding is historical still
+		// proves it; only proof integrity (nonzero committed Raft index, source
+		// binding) is required, not current-authority equality.
+		return cursor.Watermark, cursor.RaftIndex != 0 && cursor.CheckpointAuthority.SourceToken.Task == token.Task
 	}
 	for _, observation := range work.Checkpoints {
 		if observation.Notice.Source == token.Task && observation.Notice.JobID == assignment.Assignment.JobID && observation.Notice.Epoch == work.Fence && observation.JobControlRevision == assignment.JobControlRevision && observation.AssignmentRevision == assignment.Assignment.Revision && observation.AssignmentDigest == assignment.Assignment.Digest && observation.Notice.RaftIndex != 0 {

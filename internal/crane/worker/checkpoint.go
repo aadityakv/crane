@@ -153,12 +153,19 @@ func (engine *Engine) pendingCompletion(source model.TaskID) bool {
 	return ok
 }
 
+// applyCheckpoint applies one authenticated committed-watermark notice on the
+// serialized owner under the Task 24 defect #2 ruling. The notice arrived over
+// a valid current-fence authenticated +5 session, so it is the current
+// coordinator's authoritative statement of the replicated committed watermark:
+// CONFIRM (equal) answers an equal-watermark resend without mutation
+// regardless of authority age, CONFIRM (below) answers a stale resend without
+// mutation, byte-exact duplicates still flow through the durable store, and
+// ADOPT persists a strictly higher watermark (or a first watermark for a
+// reassigned owner) under the current authority proof with no pending
+// CompletionReport required.
 func (engine *Engine) applyCheckpoint(notice protocol.CheckpointNotice) error {
-	cursor, ok := engine.sources[notice.Notice.Source]
-	if !ok {
-		return errors.New("checkpoint notice references unknown source")
-	}
-	if notice.Notice.Watermark == cursor.Watermark {
+	cursor, hasCursor := engine.sources[notice.Notice.Source]
+	if hasCursor && notice.Notice.Watermark == cursor.Watermark {
 		proof := cursor.CheckpointAuthority
 		if cursor.CheckpointRevision == 0 && proof == (store.CheckpointAuthority{}) {
 			assignment, current := engine.repository.InstalledAssignment(notice.Notice.JobID)
@@ -178,29 +185,76 @@ func (engine *Engine) applyCheckpoint(notice protocol.CheckpointNotice) error {
 			engine.sources[cursor.Source] = cursor
 			return nil
 		}
-		if notice.Notice.RaftIndex != cursor.RaftIndex || notice.Notice.Epoch != proof.CoordinatorEpoch || notice.JobControlRevision != proof.JobControlRevision || notice.AssignmentRevision != proof.AssignmentRevision || notice.AssignmentDigest != proof.AssignmentDigest || proof.SourceToken.Task != notice.Notice.Source {
-			return model.ErrIdentityReuse
+		if notice.Notice.RaftIndex == cursor.RaftIndex && notice.Notice.Epoch == proof.CoordinatorEpoch && notice.JobControlRevision == proof.JobControlRevision && notice.AssignmentRevision == proof.AssignmentRevision && notice.AssignmentDigest == proof.AssignmentDigest && proof.SourceToken.Task == notice.Notice.Source {
+			return engine.repository.ApplyCheckpoint(notice.Notice)
 		}
-		return engine.repository.ApplyCheckpoint(notice.Notice)
+		// CONFIRM (equal): the committed watermark is already durable; the
+		// resent send-time authority may legitimately differ from the retained
+		// proof, so the notice is confirmed without any mutation.
+		return nil
+	}
+	if hasCursor && notice.Notice.Watermark < cursor.Watermark {
+		// CONFIRM (below): a stale resend under the durable committed cursor.
+		return nil
 	}
 	assignment, ok := engine.repository.InstalledAssignment(notice.Notice.JobID)
 	if !ok || assignment.CoordinatorEpoch != engine.repository.CurrentFence() || notice.Notice.Epoch != assignment.CoordinatorEpoch || notice.JobControlRevision != assignment.JobControlRevision || notice.AssignmentRevision != assignment.Assignment.Revision || notice.AssignmentDigest != assignment.Assignment.Digest {
 		return errors.New("checkpoint notice authority does not match durable installation")
 	}
-	event, exists := engine.completionReports[notice.Notice.Source]
-	report := event.Completion
-	if !exists || report == nil || report.Digest != model.CompletionReportDigest(*report) || report.JobID != notice.Notice.JobID || report.JobControlRevision != notice.JobControlRevision || report.AssignmentRevision != notice.AssignmentRevision || report.Token.Task != notice.Notice.Source || report.Token.WorkerID != engine.localNode || report.Token.WorkerEpoch != engine.localEpoch || report.Epoch != notice.Notice.Epoch || report.ExpectedCheckpointRevision != cursor.CheckpointRevision || report.Prior != cursor.Watermark || report.New != notice.Notice.Watermark || report.EOF != cursor.EOF {
-		return errors.New("checkpoint notice lacks exact pending completion proof")
+	token, tokenOK := findAssignmentToken(assignment.Assignment, notice.Notice.Source)
+	if !tokenOK {
+		return errors.New("checkpoint notice source is not installed")
+	}
+	eof, err := model.SourceEOF(assignment.Topology, notice.Notice.Source)
+	if err != nil || notice.Notice.Watermark > eof {
+		return errors.New("checkpoint notice watermark is outside the installed topology")
+	}
+	if notice.Notice.Watermark == 0 {
+		// The zero watermark is trivially committed (Task 19 ruling): nothing
+		// to persist or compact.
+		return nil
+	}
+	if !hasCursor {
+		cursor = store.SourceCursor{Source: notice.Notice.Source, NextSequence: 1, EOF: eof}
+	}
+	if event, exists := engine.completionReports[notice.Notice.Source]; exists && event.Completion != nil {
+		report := event.Completion
+		if report.Digest == model.CompletionReportDigest(*report) && report.JobID == notice.Notice.JobID && report.JobControlRevision == notice.JobControlRevision && report.AssignmentRevision == notice.AssignmentRevision && report.Token.Task == notice.Notice.Source && report.Token.WorkerID == engine.localNode && report.Token.WorkerEpoch == engine.localEpoch && report.Epoch == notice.Notice.Epoch && report.ExpectedCheckpointRevision == cursor.CheckpointRevision && report.Prior == cursor.Watermark && report.New == notice.Notice.Watermark && report.EOF == cursor.EOF {
+			if err := engine.repository.ApplyCheckpoint(notice.Notice); err != nil {
+				return engine.ownerError("persist checkpoint notice", err)
+			}
+			cursor.Watermark = notice.Notice.Watermark
+			cursor.RaftIndex = notice.Notice.RaftIndex
+			cursor.CheckpointRevision = report.ExpectedCheckpointRevision + 1
+			cursor.CheckpointAuthority = store.CheckpointAuthority{JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: notice.AssignmentDigest, SourceToken: report.Token, CoordinatorEpoch: report.Epoch}
+			engine.sources[cursor.Source] = cursor
+			delete(engine.completionReports, cursor.Source)
+			engine.compactCheckpoint(cursor.Source, cursor.Watermark)
+			return nil
+		}
+	}
+	// ADOPT: the notice watermark strictly exceeds the durable cursor (or no
+	// cursor exists), so the coordinator's fail-closed committed-watermark
+	// validation is the commit proof; the cursor persists under the current
+	// authority with no pending CompletionReport required.
+	if cursor.CheckpointRevision == math.MaxUint64 {
+		return errors.New("checkpoint revision exhausted")
 	}
 	if err := engine.repository.ApplyCheckpoint(notice.Notice); err != nil {
 		return engine.ownerError("persist checkpoint notice", err)
 	}
+	pending, pendingExists := engine.completionReports[notice.Notice.Source]
 	cursor.Watermark = notice.Notice.Watermark
 	cursor.RaftIndex = notice.Notice.RaftIndex
 	cursor.CheckpointRevision++
-	cursor.CheckpointAuthority = store.CheckpointAuthority{JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: notice.AssignmentDigest, SourceToken: report.Token, CoordinatorEpoch: report.Epoch}
+	cursor.CheckpointAuthority = store.CheckpointAuthority{JobControlRevision: notice.JobControlRevision, AssignmentRevision: notice.AssignmentRevision, AssignmentDigest: notice.AssignmentDigest, SourceToken: token, CoordinatorEpoch: notice.Notice.Epoch}
+	if cursor.NextSequence <= cursor.Watermark {
+		cursor.NextSequence = cursor.Watermark + 1
+	}
 	engine.sources[cursor.Source] = cursor
-	delete(engine.completionReports, cursor.Source)
+	if pendingExists && pending.Completion != nil && pending.Completion.New <= notice.Notice.Watermark {
+		delete(engine.completionReports, cursor.Source)
+	}
 	engine.compactCheckpoint(cursor.Source, cursor.Watermark)
 	return nil
 }

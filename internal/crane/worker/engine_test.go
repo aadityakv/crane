@@ -818,13 +818,33 @@ func (repository *fakeRepository) ApplyCheckpoint(notice model.CheckpointNotice)
 	defer repository.mu.Unlock()
 	repository.applyCheckpointCalls++
 	cursor, ok := repository.sources[notice.Source]
-	if !ok {
-		return errors.New("unknown source")
-	}
-	if notice.Watermark == cursor.Watermark && notice.RaftIndex == cursor.RaftIndex {
+	if ok && notice.Watermark == cursor.Watermark && notice.RaftIndex == cursor.RaftIndex {
 		return nil
 	}
-	if notice.Watermark <= cursor.Watermark || cursor.CheckpointRevision == ^uint64(0) {
+	assignment, assignmentOK := repository.assignments[notice.JobID]
+	if !assignmentOK || assignment.CoordinatorEpoch != notice.Epoch || notice.Epoch != repository.work.Fence {
+		return errors.New("checkpoint coordinator fence mismatch")
+	}
+	var token model.AssignmentToken
+	tokenOK := false
+	for _, candidate := range assignment.Assignment.Tasks {
+		if candidate.Task == notice.Source {
+			token = candidate
+			tokenOK = true
+			break
+		}
+	}
+	if !tokenOK {
+		return errors.New("checkpoint source has no installed token")
+	}
+	eof, eofErr := model.SourceEOF(assignment.Topology, notice.Source)
+	if eofErr != nil || notice.Watermark > eof || notice.Watermark == 0 {
+		return errors.New("checkpoint source or watermark is outside installed topology")
+	}
+	if !ok {
+		cursor = store.SourceCursor{Source: notice.Source, NextSequence: 1, EOF: eof}
+	}
+	if notice.Watermark <= cursor.Watermark || notice.RaftIndex <= cursor.RaftIndex || cursor.CheckpointRevision == ^uint64(0) {
 		return model.ErrIdentityReuse
 	}
 	var report *model.CompletionReport
@@ -835,13 +855,20 @@ func (repository *fakeRepository) ApplyCheckpoint(notice model.CheckpointNotice)
 			break
 		}
 	}
-	if report == nil || report.ExpectedCheckpointRevision != cursor.CheckpointRevision || report.Prior != cursor.Watermark || report.Epoch != notice.Epoch {
-		return errors.New("checkpoint lacks exact durable completion proof")
+	if report != nil && report.ExpectedCheckpointRevision == cursor.CheckpointRevision && report.Prior == cursor.Watermark && report.Epoch == notice.Epoch {
+		cursor.CheckpointRevision = report.ExpectedCheckpointRevision + 1
+		cursor.CheckpointAuthority = store.CheckpointAuthority{JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: assignment.Assignment.Digest, SourceToken: report.Token, CoordinatorEpoch: report.Epoch}
+	} else {
+		// Committed-watermark adoption mirrors the durable store contract
+		// (Task 24 defect #2 ruling): current-fence notice, no report needed.
+		cursor.CheckpointRevision++
+		cursor.CheckpointAuthority = store.CheckpointAuthority{JobControlRevision: assignment.JobControlRevision, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, SourceToken: token, CoordinatorEpoch: notice.Epoch}
 	}
 	cursor.Watermark = notice.Watermark
 	cursor.RaftIndex = notice.RaftIndex
-	cursor.CheckpointRevision++
-	cursor.CheckpointAuthority = store.CheckpointAuthority{JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: repository.assignments[notice.JobID].Assignment.Digest, SourceToken: report.Token, CoordinatorEpoch: report.Epoch}
+	if cursor.NextSequence <= notice.Watermark {
+		cursor.NextSequence = notice.Watermark + 1
+	}
 	repository.sources[notice.Source] = cursor
 	repository.work.Sources = upsertTestSource(repository.work.Sources, cursor)
 	repository.log = append(repository.log, "checkpoint")

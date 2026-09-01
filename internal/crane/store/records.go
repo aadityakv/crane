@@ -587,26 +587,26 @@ func applyAssignment(work *RecoveredWork, installed InstalledAssignment) error {
 		if installed.Assignment.Revision < prior.Assignment.Revision {
 			return errors.New("stale assignment revision")
 		}
-	if installed.Assignment.Revision == prior.Assignment.Revision {
-		if equalInstalledAssignment(prior, installed) {
-			return nil
-		}
-		contentEqual := equalInstalledAssignmentContent(prior, installed)
-		if contentEqual && compareEpochOrder(installed.CoordinatorEpoch, prior.CoordinatorEpoch) > 0 {
-			// Leadership rebind: content identical under strictly newer
-			// committed authority durably rebinds the fence owner and
-			// records the incoming worker-local scheduling state.
-			work.Assignments[index] = cloneInstalled(installed)
-			return nil
-		}
-		if contentEqual && installed.CoordinatorEpoch == prior.CoordinatorEpoch && admissionSchedulingProgression(prior.SchedulingState, installed.SchedulingState) {
-			// Admission progressions at the equal current fence: verified
-			// activation (Closed→Running) and re-fence before
-			// re-verification (Running→Closed) change only worker-local
-			// admission state, never attempts or custody.
-			work.Assignments[index] = cloneInstalled(installed)
-			return nil
-		}
+		if installed.Assignment.Revision == prior.Assignment.Revision {
+			if equalInstalledAssignment(prior, installed) {
+				return nil
+			}
+			contentEqual := equalInstalledAssignmentContent(prior, installed)
+			if contentEqual && compareEpochOrder(installed.CoordinatorEpoch, prior.CoordinatorEpoch) > 0 {
+				// Leadership rebind: content identical under strictly newer
+				// committed authority durably rebinds the fence owner and
+				// records the incoming worker-local scheduling state.
+				work.Assignments[index] = cloneInstalled(installed)
+				return nil
+			}
+			if contentEqual && installed.CoordinatorEpoch == prior.CoordinatorEpoch && admissionSchedulingProgression(prior.SchedulingState, installed.SchedulingState) {
+				// Admission progressions at the equal current fence: verified
+				// activation (Closed→Running) and re-fence before
+				// re-verification (Running→Closed) change only worker-local
+				// admission state, never attempts or custody.
+				work.Assignments[index] = cloneInstalled(installed)
+				return nil
+			}
 			if installed.Assignment.Digest != prior.Assignment.Digest || !bytes.Equal(installed.SpecificationBytes, prior.SpecificationBytes) || !equalTokens(installed.Assignment.Tasks, prior.Assignment.Tasks) || !equalReplicas(installed.Assignment.ResultReplicas, prior.Assignment.ResultReplicas) || installed.JobControlRevision <= prior.JobControlRevision {
 				return model.ErrIdentityReuse
 			}
@@ -863,20 +863,32 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 	if notice.Watermark == 0 || notice.Watermark >= math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences || prior.CheckpointRevision == math.MaxUint64 {
 		return errors.New("checkpoint watermark or revision outside v1 bounds")
 	}
-	report, err := matchingCompletionReport(work, assignment, notice, prior, eof)
-	if err != nil {
-		if prior.Watermark != 0 && prior.CheckpointRevision == 0 {
-			return errors.Join(ErrCheckpointAuthorityUnavailable, err)
-		}
-		return err
-	}
+	// Committed-watermark adoption (Task 24 defect #2 ruling): the notice
+	// arrived over the current fence (validated above), so the coordinator's
+	// fail-closed committed-watermark validation is the commit proof. When no
+	// exact pending CompletionReport correlates, the strictly higher watermark
+	// (or first watermark of a reassigned owner) persists under the CURRENT
+	// authority proof derived from the durable installed assignment.
+	report, _ := matchingCompletionReport(work, assignment, notice, prior, eof)
 	updated := prior
 	updated.Watermark, updated.RaftIndex = notice.Watermark, notice.RaftIndex
-	if report.ExpectedCheckpointRevision == math.MaxUint64 {
-		return ErrCapacity
+	if report != nil {
+		if report.ExpectedCheckpointRevision == math.MaxUint64 {
+			return ErrCapacity
+		}
+		updated.CheckpointRevision = report.ExpectedCheckpointRevision + 1
+		updated.CheckpointAuthority = checkpointAuthority(assignment, report)
+	} else {
+		token, tokenOK := findToken(assignment.Assignment, notice.Source)
+		if !tokenOK {
+			return errors.New("checkpoint source has no installed token")
+		}
+		if prior.CheckpointRevision == math.MaxUint64 {
+			return ErrCapacity
+		}
+		updated.CheckpointRevision = prior.CheckpointRevision + 1
+		updated.CheckpointAuthority = CheckpointAuthority{JobControlRevision: assignment.JobControlRevision, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, SourceToken: token, CoordinatorEpoch: notice.Epoch}
 	}
-	updated.CheckpointRevision = report.ExpectedCheckpointRevision + 1
-	updated.CheckpointAuthority = checkpointAuthority(assignment, report)
 	if updated.NextSequence <= notice.Watermark {
 		updated.NextSequence = notice.Watermark + 1
 	}
@@ -3882,6 +3894,7 @@ func equalInstalledAssignment(a, b InstalledAssignment) bool {
 func equalInstalledAssignmentContent(a, b InstalledAssignment) bool {
 	return a.Assignment.JobID == b.Assignment.JobID && a.Assignment.Revision == b.Assignment.Revision && a.Assignment.Digest == b.Assignment.Digest && a.JobControlRevision == b.JobControlRevision && bytes.Equal(a.SpecificationBytes, b.SpecificationBytes) && equalTokens(a.Assignment.Tasks, b.Assignment.Tasks) && equalReplicas(a.Assignment.ResultReplicas, b.Assignment.ResultReplicas)
 }
+
 // admissionSchedulingProgression reports whether one scheduling change at an
 // equal fence and revision is one of the two admitted worker-local admission
 // progressions of the current coordinator's install protocol.

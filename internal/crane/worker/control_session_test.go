@@ -1506,6 +1506,49 @@ func TestControlCheckpointHigherIndexDuplicateConfirmsWithoutRemutation(t *testi
 	}
 }
 
+// TestControlInventoryAcceptsHistoricalCheckpointProof pins the defect #2
+// ruling seal-path half: a durable retained checkpoint proof is valid
+// committed-watermark evidence even when its coordinator epoch,
+// JobControlRevision, and assignment binding are all historical — the
+// watermark was committed, an immutable historical fact — so the inventory
+// answer must not demand current-authority equality from the proof.
+func TestControlInventoryAcceptsHistoricalCheckpointProof(t *testing.T) {
+	fixture := newControlFixture(t)
+	fixture.repository.work.Fence = fixture.epoch
+	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+	var sourceToken model.AssignmentToken
+	for _, token := range fixture.assignment.Assignment.Tasks {
+		stage, ok := controlStage(fixture.assignment.Topology.Spec(), token.Task.StageID)
+		if ok && stage.Role == model.StageSource && token.WorkerID == fixture.repository.localNode && token.WorkerEpoch == fixture.repository.localEpoch {
+			sourceToken = token
+			break
+		}
+	}
+	if sourceToken == (model.AssignmentToken{}) {
+		t.Fatal("fixture requires a local source token")
+	}
+	olderEpoch := fixture.epoch
+	olderEpoch.Term--
+	olderEpoch.BeginIndex--
+	olderEpoch.Nonce[0]++
+	historical := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision - 1, AssignmentRevision: fixture.assignment.Assignment.Revision - 1, AssignmentDigest: [32]byte{9}, SourceToken: sourceToken, CoordinatorEpoch: olderEpoch}
+	cursor := fixture.sourceCursor(t, protocol.SourceCheckpoint{Source: sourceToken.Task, Watermark: 1}, 9)
+	cursor.CheckpointRevision = 1
+	cursor.CheckpointAuthority = historical
+	fixture.repository.work.Sources = []store.SourceCursor{cursor}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	query := fixture.inventoryQuery(t)
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 1, Inventory: &query}))
+	if err != nil {
+		t.Fatalf("inventory with a historical durable proof: %v", err)
+	}
+	status := response.(protocol.WorkerStatus)
+	if status.Inventory == nil || status.Inventory.QueryDigest != query.QueryDigest {
+		t.Fatalf("historical-proof inventory summary = %#v", status.Inventory)
+	}
+}
+
 func TestControlInventoryTreatsZeroCheckpointVectorAsTriviallyCommitted(t *testing.T) {
 	t.Run("local source without cursor", func(t *testing.T) {
 		fixture := newControlFixture(t)

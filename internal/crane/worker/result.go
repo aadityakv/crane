@@ -320,8 +320,11 @@ func FinalCheckpointVector(work store.RecoveredWork, assignment store.InstalledA
 }
 
 // finalSourceWatermark proves one source task's committed watermark from
-// durable local state. A local source cursor with exact assignment authority
-// is authoritative; otherwise a matching committed-checkpoint observation
+// durable local state. A local source cursor with a retained durable
+// checkpoint proof is authoritative committed-watermark evidence — the
+// watermark was committed, an immutable historical fact, so the proof's
+// epoch/JobControlRevision/assignment binding may be historical (Task 24
+// defect #2 ruling) — otherwise a matching committed-checkpoint observation
 // proves the watermark. Without either, only the trivially committed zero
 // watermark of an untouched source is provable; an unproven existing cursor
 // proves nothing.
@@ -336,9 +339,7 @@ func finalSourceWatermark(work store.RecoveredWork, assignment store.InstalledAs
 			return 0, true
 		}
 		authority := cursor.CheckpointAuthority
-		if cursor.RaftIndex != 0 && authority.JobControlRevision == assignment.JobControlRevision &&
-			authority.AssignmentRevision == assignment.Assignment.Revision && authority.AssignmentDigest == assignment.Assignment.Digest &&
-			authority.CoordinatorEpoch == work.Fence {
+		if cursor.RaftIndex != 0 && authority.SourceToken.Task == task {
 			return cursor.Watermark, true
 		}
 	}

@@ -142,8 +142,15 @@ func TestCheckpointNoticeRequiresExactPendingReportAndCompactsAfterPersistence(t
 	}
 	changed := notice
 	changed.Notice.RaftIndex++
-	if err := engine.ApplyCheckpoint(ctx, changed); err == nil {
-		t.Fatal("changed duplicate checkpoint notice accepted")
+	// A redelivered notice with the same committed watermark and a strictly
+	// higher Raft index (a later leadership pass) is an idempotent confirm
+	// without any engine or store mutation (defect #2 ruling).
+	beforeConfirm := engine.sources[report.Source]
+	if err := engine.ApplyCheckpoint(ctx, changed); err != nil {
+		t.Fatalf("higher-index equal-watermark resend rejected: %v", err)
+	}
+	if engine.sources[report.Source] != beforeConfirm {
+		t.Fatalf("idempotent confirm mutated the cursor: %+v", engine.sources[report.Source])
 	}
 	tokens := append([]model.AssignmentToken(nil), fixture.assignment.Assignment.Tasks...)
 	for index := range tokens {
@@ -170,8 +177,20 @@ func TestCheckpointNoticeRequiresExactPendingReportAndCompactsAfterPersistence(t
 	}
 	changedWrapper := notice
 	changedWrapper.AssignmentDigest[0]++
-	if err := engine.ApplyCheckpoint(ctx, changedWrapper); err == nil {
-		t.Fatal("historical checkpoint accepted changed protocol authority")
+	// An equal-watermark resend whose wrapper authority differs from the
+	// retained proof confirms idempotently without mutation regardless of
+	// authority age (defect #2 ruling); the durable store is not consulted.
+	repository.mu.Lock()
+	callsBeforeWrapper := repository.applyCheckpointCalls
+	repository.mu.Unlock()
+	if err := engine.ApplyCheckpoint(ctx, changedWrapper); err != nil {
+		t.Fatalf("changed-authority equal-watermark resend rejected: %v", err)
+	}
+	repository.mu.Lock()
+	callsAfterWrapper := repository.applyCheckpointCalls
+	repository.mu.Unlock()
+	if callsAfterWrapper != callsBeforeWrapper {
+		t.Fatalf("changed-authority confirm consulted the durable store: %d -> %d", callsBeforeWrapper, callsAfterWrapper)
 	}
 	cancel()
 	<-done
@@ -573,4 +592,219 @@ func TestCheckpointFailureEventAcknowledgmentRequiresDurableClosedInstallation(t
 	}
 	cancel()
 	<-done
+}
+
+// newerCheckpointAuthority installs one strictly newer committed authority
+// (coordinator epoch, JobControlRevision, assignment revision, digest) over
+// the fixture, exactly as a leadership change plus lifecycle transition does,
+// and returns the resend notice wrapper fields of that current authority.
+func newerCheckpointAuthority(t *testing.T, repository *fakeRepository, fixture workerTestFixture, watermark, raftIndex uint64) protocol.CheckpointNotice {
+	t.Helper()
+	tokens := append([]model.AssignmentToken(nil), fixture.assignment.Assignment.Tasks...)
+	for index := range tokens {
+		tokens[index].AssignmentRevision++
+	}
+	replacement, err := model.NewAssignmentSet(fixture.assignment.Assignment.JobID, fixture.assignment.Assignment.Revision+1, tokens, fixture.assignment.Assignment.ResultReplicas, fixture.topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newEpoch := fixture.epoch
+	newEpoch.Term++
+	newEpoch.BeginIndex++
+	newEpoch.Nonce[0]++
+	installed := fixture.assignment
+	installed.Assignment = replacement
+	installed.JobControlRevision++
+	installed.CoordinatorEpoch = newEpoch
+	repository.mu.Lock()
+	repository.assignments[replacement.JobID] = installed
+	repository.work.Fence = newEpoch
+	repository.mu.Unlock()
+	return protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: replacement.JobID, Source: fixture.source.Task, Watermark: watermark, RaftIndex: raftIndex, Epoch: newEpoch}, JobControlRevision: installed.JobControlRevision, AssignmentRevision: replacement.Revision, AssignmentDigest: replacement.Digest}
+}
+
+// TestCheckpointNoticeEqualWatermarkUnderNewerAuthorityConfirmsWithoutMutation
+// pins the defect #2 ruling CONFIRM (equal) branch: the coordinator's resend
+// carries send-time authority, so once any authority component advances past
+// the retained durable proof the equal-watermark notice is an idempotent
+// confirm with no store mutation, never identity reuse.
+func TestCheckpointNoticeEqualWatermarkUnderNewerAuthorityConfirmsWithoutMutation(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "3")
+	repository := newFakeRepository(fixture)
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	source := fixture.source.Task
+	proof := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, SourceToken: fixture.source, CoordinatorEpoch: fixture.epoch}
+	cursor := store.SourceCursor{Source: source, NextSequence: 2, EOF: 2, Watermark: 1, RaftIndex: 9, CheckpointRevision: 1, CheckpointAuthority: proof}
+	engine.sources[source] = cursor
+	repository.mu.Lock()
+	repository.sources[source] = cursor
+	repository.mu.Unlock()
+
+	resend := newerCheckpointAuthority(t, repository, fixture, 1, 18)
+	if err := engine.applyCheckpoint(resend); err != nil {
+		t.Fatalf("equal-watermark resend under newer authority rejected: %v", err)
+	}
+	repository.mu.Lock()
+	calls := repository.applyCheckpointCalls
+	repository.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("idempotent confirm mutated the durable store: %d calls", calls)
+	}
+	if engine.sources[source] != cursor {
+		t.Fatalf("idempotent confirm mutated the in-memory cursor: %+v", engine.sources[source])
+	}
+	// A byte-exact duplicate of the retained proof still flows through the
+	// serialized engine so the durable store answers it.
+	exact := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: cursor.Source.JobID, Source: source, Watermark: 1, RaftIndex: 9, Epoch: fixture.epoch}, JobControlRevision: proof.JobControlRevision, AssignmentRevision: proof.AssignmentRevision, AssignmentDigest: proof.AssignmentDigest}
+	if err := engine.applyCheckpoint(exact); err != nil {
+		t.Fatalf("byte-exact duplicate rejected: %v", err)
+	}
+	repository.mu.Lock()
+	calls = repository.applyCheckpointCalls
+	repository.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("byte-exact duplicate bypassed the durable store: %d calls", calls)
+	}
+}
+
+// TestCheckpointNoticeBelowDurableCursorConfirmsWithoutMutation pins the
+// ruling CONFIRM (below) branch: a stale resend below the durable committed
+// cursor confirms without mutation instead of demanding a completion proof.
+func TestCheckpointNoticeBelowDurableCursorConfirmsWithoutMutation(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "3")
+	repository := newFakeRepository(fixture)
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	source := fixture.source.Task
+	proof := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, SourceToken: fixture.source, CoordinatorEpoch: fixture.epoch}
+	cursor := store.SourceCursor{Source: source, NextSequence: 3, EOF: 2, Watermark: 2, RaftIndex: 9, CheckpointRevision: 1, CheckpointAuthority: proof}
+	engine.sources[source] = cursor
+	repository.mu.Lock()
+	repository.sources[source] = cursor
+	repository.mu.Unlock()
+	stale := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: cursor.Source.JobID, Source: source, Watermark: 1, RaftIndex: 20, Epoch: fixture.epoch}, JobControlRevision: proof.JobControlRevision, AssignmentRevision: proof.AssignmentRevision, AssignmentDigest: proof.AssignmentDigest}
+	if err := engine.applyCheckpoint(stale); err != nil {
+		t.Fatalf("below-cursor resend rejected: %v", err)
+	}
+	repository.mu.Lock()
+	calls := repository.applyCheckpointCalls
+	repository.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("below-cursor confirm mutated the durable store: %d calls", calls)
+	}
+	if engine.sources[source] != cursor {
+		t.Fatalf("below-cursor confirm mutated the in-memory cursor: %+v", engine.sources[source])
+	}
+}
+
+// TestCheckpointNoticeAboveCursorAdoptsCommittedWatermarkWithoutPendingReport
+// pins the ruling ADOPT branch over an existing cursor: a strictly higher
+// watermark under the current fence persists under the current authority proof
+// with no pending CompletionReport, bumps the revision, resumes above the
+// watermark, and applies the compaction rules.
+func TestCheckpointNoticeAboveCursorAdoptsCommittedWatermarkWithoutPendingReport(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "3")
+	repository := newFakeRepository(fixture)
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	source := fixture.source.Task
+	proof := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, SourceToken: fixture.source, CoordinatorEpoch: fixture.epoch}
+	cursor := store.SourceCursor{Source: source, NextSequence: 2, EOF: 2, Watermark: 1, RaftIndex: 9, CheckpointRevision: 1, CheckpointAuthority: proof}
+	engine.sources[source] = cursor
+	repository.mu.Lock()
+	repository.sources[source] = cursor
+	repository.mu.Unlock()
+	makeID := func(sequence uint64) model.DeliveryID {
+		return model.DeliveryID{Tuple: model.TupleID{JobID: source.JobID, SourceTask: source, SourceSequence: sequence}, EdgeID: 1, DestinationTask: fixture.transform.Task}
+	}
+	engine.deliveries[makeID(1)] = store.DeliveryRecord{ID: makeID(1)}
+	engine.outboxes[makeID(1)] = &ownedOutbox{record: store.OutboxRecord{ID: makeID(1), Completed: true}}
+
+	adopt := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: cursor.Source.JobID, Source: source, Watermark: 2, RaftIndex: 18, Epoch: fixture.epoch}, JobControlRevision: proof.JobControlRevision, AssignmentRevision: proof.AssignmentRevision, AssignmentDigest: proof.AssignmentDigest}
+
+	// Adoption never weakens authority validation: a wrapper from a different
+	// current authority is rejected before any mutation.
+	wrongAuthority := adopt
+	wrongAuthority.JobControlRevision++
+	if err := engine.applyCheckpoint(wrongAuthority); err == nil {
+		t.Fatal("adoption accepted a wrapper from a different current authority")
+	}
+	if err := engine.applyCheckpoint(adopt); err != nil {
+		t.Fatalf("committed-watermark adoption above the cursor: %v", err)
+	}
+	adopted := engine.sources[source]
+	if adopted.Watermark != 2 || adopted.RaftIndex != 18 || adopted.CheckpointRevision != 2 || adopted.NextSequence != 3 || adopted.EOF != 2 {
+		t.Fatalf("adopted cursor = %+v", adopted)
+	}
+	if adopted.CheckpointAuthority != proof {
+		t.Fatalf("adopted authority = %+v", adopted.CheckpointAuthority)
+	}
+	if _, retained := engine.deliveries[makeID(1)]; retained {
+		t.Fatal("adoption did not compact the covered delivery")
+	}
+	if _, retained := engine.outboxes[makeID(1)]; retained {
+		t.Fatal("adoption did not compact the covered outbox")
+	}
+	repository.mu.Lock()
+	durable := repository.sources[source]
+	calls := repository.applyCheckpointCalls
+	repository.mu.Unlock()
+	if calls != 1 || durable != adopted {
+		t.Fatalf("durable adoption calls=%d cursor=%+v", calls, durable)
+	}
+
+	// Adoption never weakens bounds validation.
+	beyondEOF := adopt
+	beyondEOF.Notice.Watermark = 3
+	if err := engine.applyCheckpoint(beyondEOF); err == nil {
+		t.Fatal("adoption accepted a watermark beyond the installed EOF")
+	}
+}
+
+// TestCheckpointNoticeAdoptsCommittedWatermarkForReassignedOwnerWithoutCursor
+// pins the ruling ADOPT branch for a reassigned source owner: with no local
+// cursor and no CompletionReport at all, the committed-watermark notice
+// creates the durable cursor at the committed watermark so emission resumes
+// strictly above it.
+func TestCheckpointNoticeAdoptsCommittedWatermarkForReassignedOwnerWithoutCursor(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "3")
+	repository := newFakeRepository(fixture)
+	repository.mu.Lock()
+	repository.work.Sources = nil
+	repository.sources = make(map[model.TaskID]store.SourceCursor)
+	repository.mu.Unlock()
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	source := fixture.source.Task
+	if _, exists := engine.sources[source]; exists {
+		t.Fatal("reassigned-owner fixture must start without a local cursor")
+	}
+	adopt := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: fixture.assignment.Assignment.JobID, Source: source, Watermark: 2, RaftIndex: 18, Epoch: fixture.epoch}, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	if err := engine.applyCheckpoint(adopt); err != nil {
+		t.Fatalf("reassigned-owner adoption: %v", err)
+	}
+	adopted := engine.sources[source]
+	proof := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, SourceToken: fixture.source, CoordinatorEpoch: fixture.epoch}
+	if adopted.Watermark != 2 || adopted.RaftIndex != 18 || adopted.CheckpointRevision != 1 || adopted.NextSequence != 3 || adopted.EOF != 2 || adopted.CheckpointAuthority != proof {
+		t.Fatalf("reassigned-owner adopted cursor = %+v", adopted)
+	}
+	repository.mu.Lock()
+	durable, durableOK := repository.sources[source]
+	repository.mu.Unlock()
+	if !durableOK || durable != adopted {
+		t.Fatalf("reassigned-owner durable cursor = %+v ok=%v", durable, durableOK)
+	}
 }

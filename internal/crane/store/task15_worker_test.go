@@ -319,14 +319,25 @@ func TestTask15CheckpointRequiresDurableCompletionAndAdvancesRevisionOnce(t *tes
 		return model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: delivery.ID.Tuple.SourceSequence, RaftIndex: 11, Epoch: epoch}
 	}
 
-	t.Run("uncorrelated", func(t *testing.T) {
-		store, assignment, epoch, delivery, _ := newCompleted(t)
-		before := mustRecoverWork(t, store)
-		if err := store.ApplyCheckpoint(noticeFor(assignment, epoch, delivery)); err == nil {
-			t.Fatal("checkpoint without durable completion event accepted")
+	t.Run("adopted without completion event", func(t *testing.T) {
+		store, assignment, epoch, delivery, source := newCompleted(t)
+		// A current-fence notice whose watermark strictly exceeds the (absent)
+		// durable cursor is the coordinator's authoritative committed-watermark
+		// statement (Task 24 defect #2 ruling): the store adopts it under the
+		// current authority proof with no local CompletionReport and compacts.
+		if err := store.ApplyCheckpoint(noticeFor(assignment, epoch, delivery)); err != nil {
+			t.Fatalf("committed watermark without a durable completion event was not adopted: %v", err)
 		}
-		if after := mustRecoverWork(t, store); !reflect.DeepEqual(after, before) {
-			t.Fatal("uncorrelated checkpoint mutated durable work")
+		work := mustRecoverWork(t, store)
+		if len(work.Sources) != 1 || work.Sources[0].Watermark != delivery.ID.Tuple.SourceSequence || work.Sources[0].RaftIndex != 11 || work.Sources[0].CheckpointRevision != 1 {
+			t.Fatalf("adopted cursor = %+v", work.Sources)
+		}
+		wantAuthority := CheckpointAuthority{JobControlRevision: 1, AssignmentRevision: assignment.Revision, AssignmentDigest: assignment.Digest, SourceToken: source, CoordinatorEpoch: epoch}
+		if work.Sources[0].CheckpointAuthority != wantAuthority {
+			t.Fatalf("adopted authority=%+v want %+v", work.Sources[0].CheckpointAuthority, wantAuthority)
+		}
+		if len(work.Deliveries) != 0 {
+			t.Fatalf("adoption must compact the covered delivery: %+v", work.Deliveries)
 		}
 	})
 
