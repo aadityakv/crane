@@ -223,14 +223,14 @@ type resultKey struct {
 type workIndexes struct {
 	results          *resultNode
 	resultBytesByJob map[model.JobID]uint64
+	resultCount      uint64
 }
 
 type resultNode struct {
-	key      resultKey
-	value    StoredResult
-	priority uint64
-	left     *resultNode
-	right    *resultNode
+	key         resultKey
+	value       StoredResult
+	height      uint16
+	left, right *resultNode
 }
 
 // Clone returns a deeply owned high-level state.
@@ -572,6 +572,11 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 		work.Deliveries = append(work.Deliveries, delivery.Clone())
 		return nil
 	}
+	if index >= 0 {
+		if err := validateProcessedOutputs(work.Deliveries[index], delivery.Outputs, assignment); err != nil {
+			return err
+		}
+	}
 	if index >= 0 && (work.Deliveries[index].State == Processed || work.Deliveries[index].State == Completed) {
 		prior := work.Deliveries[index]
 		if !equalDeliveryDefinition(prior, delivery) || !equalTuples(prior.Outputs, delivery.Outputs) || len(prior.OutboxIDs) != len(outboxes) {
@@ -633,6 +638,49 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 	return nil
 }
 
+func validateProcessedOutputs(delivery DeliveryRecord, outputs []model.Tuple, assignment InstalledAssignment) error {
+	canonical, err := validateOutputTupleBounds(outputs)
+	if err != nil {
+		return err
+	}
+	stage, ok := findStage(assignment.Topology, delivery.Destination.Task.StageID)
+	if !ok {
+		return errors.New("processed delivery destination stage is absent")
+	}
+	expected, err := model.ExecuteOperator(stage.Operator, delivery.Tuple)
+	if err != nil {
+		return fmt.Errorf("execute installed operator: %w", err)
+	}
+	if uint64(len(expected)) > model.LimitsV1().MaxOperatorOutputs || len(expected) != len(canonical) {
+		return errors.New("processed outputs do not match installed operator count")
+	}
+	for index := range expected {
+		encoded, err := model.MarshalTuple(expected[index])
+		if err != nil {
+			return fmt.Errorf("installed operator output %d: %w", index, err)
+		}
+		if !bytes.Equal(encoded, canonical[index]) {
+			return errors.New("processed outputs do not match installed operator bytes and order")
+		}
+	}
+	return nil
+}
+
+func validateOutputTupleBounds(outputs []model.Tuple) ([][]byte, error) {
+	if uint64(len(outputs)) > model.LimitsV1().MaxOperatorOutputs {
+		return nil, errors.New("processed output count exceeds v1 bound")
+	}
+	canonical := make([][]byte, len(outputs))
+	for index := range outputs {
+		encoded, err := model.MarshalTuple(outputs[index])
+		if err != nil {
+			return nil, fmt.Errorf("processed output %d: %w", index, err)
+		}
+		canonical[index] = encoded
+	}
+	return canonical, nil
+}
+
 func applyCompleted(work *RecoveredWork, id model.DeliveryID) error {
 	index := deliveryIndex(work.Deliveries, id)
 	if index < 0 {
@@ -687,30 +735,20 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 		work.Sources = append(work.Sources, SourceCursor{Source: notice.Source, NextSequence: notice.Watermark + 1, EOF: eof, Watermark: notice.Watermark, RaftIndex: notice.RaftIndex})
 	}
 	for i := range work.Deliveries {
-		delivery := &work.Deliveries[i]
+		delivery := work.Deliveries[i]
 		if delivery.ID.Tuple.SourceTask == notice.Source && delivery.ID.Tuple.SourceSequence <= notice.Watermark {
 			if delivery.State != Completed && delivery.State != Compacted {
 				return errors.New("checkpoint covers incomplete delivery")
 			}
-			if delivery.definitionDigest == ([32]byte{}) {
-				delivery.definitionDigest, err = deliveryDefinitionDigest(*delivery)
-				if err != nil {
-					return err
-				}
-			}
-			delivery.State, delivery.Reservation, delivery.Outputs, delivery.OutboxIDs = Compacted, 0, nil, nil
-			delivery.Tuple = model.Tuple{}
 		}
 	}
-	if notice.Watermark == eof {
-		keptDeliveries := work.Deliveries[:0]
-		for _, delivery := range work.Deliveries {
-			if delivery.ID.Tuple.SourceTask != notice.Source || delivery.State != Compacted {
-				keptDeliveries = append(keptDeliveries, delivery)
-			}
+	keptDeliveries := work.Deliveries[:0]
+	for _, delivery := range work.Deliveries {
+		if delivery.ID.Tuple.SourceTask != notice.Source || delivery.ID.Tuple.SourceSequence > notice.Watermark {
+			keptDeliveries = append(keptDeliveries, delivery)
 		}
-		work.Deliveries = keptDeliveries
 	}
+	work.Deliveries = keptDeliveries
 	kept := work.Outboxes[:0]
 	for _, outbox := range work.Outboxes {
 		if outbox.ID.Tuple.SourceTask != notice.Source || outbox.ID.Tuple.SourceSequence > notice.Watermark {
@@ -758,9 +796,17 @@ func applyResult(work *RecoveredWork, result StoredResult) error {
 	if jobBytes > model.LimitsV1().MaxResultRecordsBytesPerJob || uint64(len(result.canonical)) > model.LimitsV1().MaxResultRecordsBytesPerJob-jobBytes {
 		return ErrCapacity
 	}
+	if work.indexes.resultCount >= maxStoredResultCount() {
+		return ErrCapacity
+	}
 	result.Record.Value = append([]byte(nil), result.Record.Value...)
-	work.indexes.results = insertResultNode(work.indexes.results, &resultNode{key: key, value: result, priority: resultPriority(key)})
+	inserted, err := insertResultNode(work.indexes.results, &resultNode{key: key, value: result, height: 1})
+	if err != nil {
+		return err
+	}
+	work.indexes.results = inserted
 	work.indexes.resultBytesByJob[result.Record.TupleID.JobID] = jobBytes + uint64(len(result.canonical))
+	work.indexes.resultCount++
 	return nil
 }
 
@@ -1350,7 +1396,7 @@ func (store *Store) Receive(record DeliveryRecord) (DeliveryState, error) {
 	}
 	if cursor := sourceIndex(store.work.Sources, record.ID.Tuple.SourceTask); cursor >= 0 {
 		checkpoint := store.work.Sources[cursor]
-		if checkpoint.EOF != 0 && checkpoint.Watermark == checkpoint.EOF && record.ID.Tuple.SourceSequence <= checkpoint.Watermark {
+		if record.ID.Tuple.SourceSequence <= checkpoint.Watermark {
 			assignment, ok := findAssignment(&store.work, record.ID.Tuple.JobID)
 			if !ok {
 				return 0, model.ErrIdentityReuse
@@ -1394,12 +1440,22 @@ func (store *Store) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, ou
 	if index < 0 {
 		return errors.New("unknown delivery")
 	}
-	record := store.work.Deliveries[index].Clone()
-	if record.State == Processed {
-		if !equalTuples(record.Outputs, outputs) || len(record.OutboxIDs) != len(outboxes) {
+	if uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
+		return errors.New("processed outbox count exceeds v1 bounds")
+	}
+	assignment, ok := findAssignment(&store.work, id.Tuple.JobID)
+	if !ok {
+		return errors.New("processed delivery references unknown assignment")
+	}
+	if _, err := validateOutputTupleBounds(outputs); err != nil {
+		return err
+	}
+	stored := store.work.Deliveries[index]
+	if stored.State == Processed {
+		if !equalTuples(stored.Outputs, outputs) || len(stored.OutboxIDs) != len(outboxes) {
 			return model.ErrIdentityReuse
 		}
-		for outIndex, id := range record.OutboxIDs {
+		for outIndex, id := range stored.OutboxIDs {
 			storedIndex := outboxIndex(store.work.Outboxes, id)
 			if storedIndex < 0 || !equalOutboxDefinition(store.work.Outboxes[storedIndex], outboxes[outIndex]) {
 				return model.ErrIdentityReuse
@@ -1407,13 +1463,14 @@ func (store *Store) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, ou
 		}
 		return nil
 	}
+	if err := validateProcessedOutputs(stored, outputs, assignment); err != nil {
+		return err
+	}
+	record := stored.Clone()
 	if record.State != Received {
 		return errors.New("delivery not received")
 	}
 	record.State = Processed
-	if uint64(len(outputs)) > model.LimitsV1().MaxOperatorOutputs || uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
-		return errors.New("processed output/outbox count exceeds v1 bounds")
-	}
 	record.Outputs = cloneTuples(outputs)
 	payload, err := encodeDeliveryRecord(record, outboxes)
 	if err != nil {
@@ -1422,9 +1479,6 @@ func (store *Store) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, ou
 	tx := Transaction{Records: []Record{{Type: recordDeliveryProcessed, Payload: payload}}}
 	prospective, err := store.reduceWorkLocked(tx)
 	if err != nil {
-		return err
-	}
-	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
 		return err
 	}
 	return store.commitWorkLocked(tx, prospective)
@@ -1632,6 +1686,9 @@ func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
 	return reducer.current, nil
 }
 func (store *Store) commitWorkLocked(tx Transaction, prospective RecoveredWork) error {
+	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
+		return err
+	}
 	encodedBytes, err := transactionEncodedSize(tx)
 	if err != nil {
 		return err
@@ -2779,7 +2836,7 @@ func ensureWorkIndexes(work *RecoveredWork) error {
 	}
 	indexes := &workIndexes{resultBytesByJob: make(map[model.JobID]uint64)}
 	for index := range work.Results {
-		result := &work.Results[index]
+		result := work.Results[index]
 		if result.canonical == nil {
 			encoded, err := model.MarshalResultRecord(result.Record)
 			if err != nil {
@@ -2791,7 +2848,15 @@ func ensureWorkIndexes(work *RecoveredWork) error {
 		if findResultNode(indexes.results, key) != nil {
 			return model.ErrIdentityReuse
 		}
-		indexes.results = insertResultNode(indexes.results, &resultNode{key: key, value: *result, priority: resultPriority(key)})
+		if indexes.resultCount >= maxStoredResultCount() {
+			return ErrCapacity
+		}
+		inserted, err := insertResultNode(indexes.results, &resultNode{key: key, value: result, height: 1})
+		if err != nil {
+			return err
+		}
+		indexes.results = inserted
+		indexes.resultCount++
 		prior := indexes.resultBytesByJob[result.Record.TupleID.JobID]
 		if prior > math.MaxUint64-uint64(len(result.canonical)) {
 			return ErrCapacity
@@ -2807,7 +2872,7 @@ func cloneWorkIndexes(indexes *workIndexes) *workIndexes {
 	if indexes == nil {
 		return nil
 	}
-	result := &workIndexes{results: indexes.results, resultBytesByJob: make(map[model.JobID]uint64, len(indexes.resultBytesByJob))}
+	result := &workIndexes{results: indexes.results, resultBytesByJob: make(map[model.JobID]uint64, len(indexes.resultBytesByJob)), resultCount: indexes.resultCount}
 	for job, total := range indexes.resultBytesByJob {
 		result.resultBytesByJob[job] = total
 	}
@@ -2844,68 +2909,135 @@ func findResultNode(root *resultNode, key resultKey) *resultNode {
 	return nil
 }
 
-func insertResultNode(root, inserted *resultNode) *resultNode {
+func insertResultNode(root, inserted *resultNode) (*resultNode, error) {
 	if root == nil {
-		return inserted
+		return inserted, nil
 	}
 	copyRoot := *root
-	if compareResultKey(inserted.key, root.key) < 0 {
-		copyRoot.left = insertResultNode(root.left, inserted)
-		if copyRoot.left.priority < copyRoot.priority {
-			left := *copyRoot.left
-			copyRoot.left = left.right
-			left.right = &copyRoot
-			return &left
-		}
-	} else {
-		copyRoot.right = insertResultNode(root.right, inserted)
-		if copyRoot.right.priority < copyRoot.priority {
-			right := *copyRoot.right
-			copyRoot.right = right.left
-			right.left = &copyRoot
-			return &right
-		}
+	comparison := compareResultKey(inserted.key, root.key)
+	if comparison == 0 {
+		return nil, model.ErrIdentityReuse
 	}
-	return &copyRoot
+	var err error
+	if comparison < 0 {
+		copyRoot.left, err = insertResultNode(root.left, inserted)
+	} else {
+		copyRoot.right, err = insertResultNode(root.right, inserted)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return rebalanceResultNode(&copyRoot)
 }
 
-func resultPriority(key resultKey) uint64 {
-	var encoded [100]byte
-	offset := copy(encoded[:], key.SinkTask.JobID[:])
-	binary.BigEndian.PutUint16(encoded[offset:], key.SinkTask.StageID)
-	offset += 2
-	binary.BigEndian.PutUint16(encoded[offset:], key.SinkTask.Partition)
-	offset += 2
-	offset += copy(encoded[offset:], key.TupleID.JobID[:])
-	offset += copy(encoded[offset:], key.TupleID.SourceTask.JobID[:])
-	binary.BigEndian.PutUint16(encoded[offset:], key.TupleID.SourceTask.StageID)
-	offset += 2
-	binary.BigEndian.PutUint16(encoded[offset:], key.TupleID.SourceTask.Partition)
-	offset += 2
-	binary.BigEndian.PutUint64(encoded[offset:], key.TupleID.SourceSequence)
-	offset += 8
-	copy(encoded[offset:], key.TupleID.PathDigest[:])
-	digest := sha256.Sum256(encoded[:])
-	return binary.BigEndian.Uint64(digest[:8])
+func rebalanceResultNode(node *resultNode) (*resultNode, error) {
+	if err := updateResultNodeHeight(node); err != nil {
+		return nil, err
+	}
+	balance := int(resultNodeHeight(node.left)) - int(resultNodeHeight(node.right))
+	if balance > 1 {
+		if resultNodeHeight(node.left.left) < resultNodeHeight(node.left.right) {
+			rotated, err := rotateResultNodeLeft(node.left)
+			if err != nil {
+				return nil, err
+			}
+			node.left = rotated
+		}
+		return rotateResultNodeRight(node)
+	}
+	if balance < -1 {
+		if resultNodeHeight(node.right.right) < resultNodeHeight(node.right.left) {
+			rotated, err := rotateResultNodeRight(node.right)
+			if err != nil {
+				return nil, err
+			}
+			node.right = rotated
+		}
+		return rotateResultNodeLeft(node)
+	}
+	return node, nil
+}
+
+func rotateResultNodeRight(root *resultNode) (*resultNode, error) {
+	if root == nil || root.left == nil {
+		return nil, errors.New("invalid result index right rotation")
+	}
+	newRoot, moved := *root.left, root.left.right
+	oldRoot := *root
+	oldRoot.left = moved
+	if err := updateResultNodeHeight(&oldRoot); err != nil {
+		return nil, err
+	}
+	newRoot.right = &oldRoot
+	if err := updateResultNodeHeight(&newRoot); err != nil {
+		return nil, err
+	}
+	return &newRoot, nil
+}
+
+func rotateResultNodeLeft(root *resultNode) (*resultNode, error) {
+	if root == nil || root.right == nil {
+		return nil, errors.New("invalid result index left rotation")
+	}
+	newRoot, moved := *root.right, root.right.left
+	oldRoot := *root
+	oldRoot.right = moved
+	if err := updateResultNodeHeight(&oldRoot); err != nil {
+		return nil, err
+	}
+	newRoot.left = &oldRoot
+	if err := updateResultNodeHeight(&newRoot); err != nil {
+		return nil, err
+	}
+	return &newRoot, nil
+}
+
+func resultNodeHeight(node *resultNode) uint16 {
+	if node == nil {
+		return 0
+	}
+	return node.height
+}
+
+func updateResultNodeHeight(node *resultNode) error {
+	height := resultNodeHeight(node.left)
+	if right := resultNodeHeight(node.right); right > height {
+		height = right
+	}
+	if height == math.MaxUint16 {
+		return ErrCapacity
+	}
+	node.height = height + 1
+	return nil
+}
+
+func maxStoredResultCount() uint64 {
+	jobs := model.LimitsV1().MaxRetainedJobs
+	if jobs > math.MaxUint64/model.ResultArtifactMaxRecordCountV1 {
+		return math.MaxUint64
+	}
+	return jobs * model.ResultArtifactMaxRecordCountV1
 }
 
 func appendOwnedResults(indexes *workIndexes, destination *[]StoredResult) {
 	if indexes == nil {
 		return
 	}
-	var visit func(*resultNode)
-	visit = func(node *resultNode) {
-		if node == nil {
-			return
+	stack := make([]*resultNode, 0, resultNodeHeight(indexes.results))
+	current := indexes.results
+	for current != nil || len(stack) != 0 {
+		for current != nil {
+			stack = append(stack, current)
+			current = current.left
 		}
-		visit(node.left)
-		owned := node.value
+		current = stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		owned := current.value
 		owned.Record.Value = append([]byte(nil), owned.Record.Value...)
 		owned.canonical = nil
 		*destination = append(*destination, owned)
-		visit(node.right)
+		current = current.right
 	}
-	visit(indexes.results)
 }
 
 func visitResults(work RecoveredWork, visit func(StoredResult) bool) bool {
@@ -2917,11 +3049,20 @@ func visitResults(work RecoveredWork, visit func(StoredResult) bool) bool {
 		}
 		return true
 	}
-	var walk func(*resultNode) bool
-	walk = func(node *resultNode) bool {
-		return node == nil || walk(node.left) && visit(node.value) && walk(node.right)
+	stack := make([]*resultNode, 0, resultNodeHeight(work.indexes.results))
+	current := work.indexes.results
+	for current != nil || len(stack) != 0 {
+		for current != nil {
+			stack, current = append(stack, current), current.left
+		}
+		current = stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if !visit(current.value) {
+			return false
+		}
+		current = current.right
 	}
-	return walk(work.indexes.results)
+	return true
 }
 func repairIndex(v []ResultRepairRecord, id [16]byte) int {
 	for i := range v {
