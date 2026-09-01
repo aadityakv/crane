@@ -69,7 +69,7 @@ func prepareDirectory(path string, syncFile func(*os.File) error) (bool, *os.Fil
 		fresh = len(entries) == 0
 	}
 	for _, name := range entries {
-		if name != WorkerWALFilename && name != WorkerLockFilename {
+		if !recognizedStoreFilename(name) {
 			directory.Close()
 			return false, nil, fmt.Errorf("%w: unexpected worker file %q", ErrCorrupt, name)
 		}

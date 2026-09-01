@@ -39,10 +39,90 @@ const (
 	FaultBeforeAppend FaultPoint = 1
 	// FaultBeforeSync occurs after a complete append and before fsync.
 	FaultBeforeSync FaultPoint = 2
+	// FaultSnapshotTempCreate occurs before creating a snapshot temporary file.
+	FaultSnapshotTempCreate FaultPoint = 3
+	// FaultSnapshotTempWrite occurs before writing snapshot bytes.
+	FaultSnapshotTempWrite FaultPoint = 4
+	// FaultSnapshotTempSync occurs before syncing snapshot bytes.
+	FaultSnapshotTempSync FaultPoint = 5
+	// FaultSnapshotTempClose occurs after closing the snapshot temporary file.
+	FaultSnapshotTempClose FaultPoint = 6
+	// FaultSnapshotRename occurs before publishing the immutable snapshot file.
+	FaultSnapshotRename FaultPoint = 7
+	// FaultSnapshotDirectorySync occurs before the snapshot rename directory barrier.
+	FaultSnapshotDirectorySync FaultPoint = 8
+	// FaultReplacementWALCreate occurs before creating the replacement WAL temporary file.
+	FaultReplacementWALCreate FaultPoint = 9
+	// FaultReplacementWALWrite occurs before writing the replacement WAL anchor.
+	FaultReplacementWALWrite FaultPoint = 10
+	// FaultReplacementWALSync occurs before syncing the replacement WAL anchor.
+	FaultReplacementWALSync FaultPoint = 11
+	// FaultReplacementWALClose occurs after closing the replacement WAL temporary file.
+	FaultReplacementWALClose FaultPoint = 12
+	// FaultReplacementWALRename occurs before publishing the immutable replacement WAL.
+	FaultReplacementWALRename FaultPoint = 13
+	// FaultReplacementWALDirectorySync occurs before the replacement WAL rename directory barrier.
+	FaultReplacementWALDirectorySync FaultPoint = 14
+	// FaultCurrentTempCreate occurs before creating the current-generation marker temporary file.
+	FaultCurrentTempCreate FaultPoint = 15
+	// FaultCurrentTempWrite occurs before writing the current-generation marker.
+	FaultCurrentTempWrite FaultPoint = 16
+	// FaultCurrentTempSync occurs before syncing the current-generation marker.
+	FaultCurrentTempSync FaultPoint = 17
+	// FaultCurrentTempClose occurs after closing the current-generation marker temporary file.
+	FaultCurrentTempClose FaultPoint = 18
+	// FaultCurrentRename occurs before atomically replacing the current-generation marker.
+	FaultCurrentRename FaultPoint = 19
+	// FaultCurrentDirectorySync occurs before the current-generation commit directory barrier.
+	FaultCurrentDirectorySync FaultPoint = 20
+	// FaultPreviousWALClose occurs after closing the previous generation WAL.
+	FaultPreviousWALClose FaultPoint = 21
+	// FaultObsoleteCleanup occurs before removing obsolete durable generations.
+	FaultObsoleteCleanup FaultPoint = 22
+	// FaultObsoleteDirectorySync occurs before syncing obsolete-generation cleanup.
+	FaultObsoleteDirectorySync FaultPoint = 23
+	// FaultCloseWAL occurs after closing the active WAL during Store.Close.
+	FaultCloseWAL FaultPoint = 24
+	// FaultCloseLock occurs after unlocking and closing the lock file during Store.Close.
+	FaultCloseLock FaultPoint = 25
+	// FaultCloseRoot occurs after closing the anchored root during Store.Close.
+	FaultCloseRoot FaultPoint = 26
+	// FaultCloseDirectory occurs after unlocking and closing the directory during Store.Close.
+	FaultCloseDirectory FaultPoint = 27
 )
 
 // FaultInjector injects failures at explicit durable boundaries.
 type FaultInjector interface{ Inject(FaultPoint) error }
+
+// NoopFaultInjector is the production-safe default fault injector.
+type NoopFaultInjector struct{}
+
+// Inject never fails a durable boundary.
+func (NoopFaultInjector) Inject(FaultPoint) error { return nil }
+
+// String returns the stable diagnostic name of a durable boundary.
+func (point FaultPoint) String() string {
+	names := [...]string{
+		"", "before-append", "before-sync", "snapshot-temp-create", "snapshot-temp-write",
+		"snapshot-temp-sync", "snapshot-temp-close", "snapshot-rename", "snapshot-directory-sync",
+		"replacement-wal-create", "replacement-wal-write", "replacement-wal-sync", "replacement-wal-close",
+		"replacement-wal-rename", "replacement-wal-directory-sync", "current-temp-create", "current-temp-write",
+		"current-temp-sync", "current-temp-close", "current-rename", "current-directory-sync", "previous-wal-close",
+		"obsolete-cleanup", "obsolete-directory-sync", "close-wal", "close-lock", "close-root", "close-directory",
+	}
+	if int(point) >= len(names) {
+		return fmt.Sprintf("fault-%d", point)
+	}
+	return names[point]
+}
+
+func allFaultPoints() []FaultPoint {
+	result := make([]FaultPoint, FaultCloseDirectory)
+	for i := range result {
+		result[i] = FaultPoint(i + 1)
+	}
+	return result
+}
 
 // Options fixes store bounds and new-store epoch creation for one lifetime.
 type Options struct {
@@ -111,6 +191,10 @@ type RecoveredState struct {
 	WALBytes uint64
 	// TransactionCount is the number of complete validated transactions.
 	TransactionCount uint64
+	// SnapshotGeneration is the current committed snapshot generation, or zero for a legacy WAL-only store.
+	SnapshotGeneration uint64
+	// SnapshotBytes is the exact current committed snapshot length.
+	SnapshotBytes uint64
 }
 
 // Clone returns an independently owned recovered metadata value.

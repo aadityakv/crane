@@ -1697,7 +1697,8 @@ func (store *Store) commitWorkLocked(tx Transaction, prospective RecoveredWork) 
 	if err != nil {
 		return err
 	}
-	if store.state.WALBytes > store.options.MaxBytes || encodedBytes > store.options.MaxBytes-store.state.WALBytes || reserved > store.options.MaxBytes-store.state.WALBytes-encodedBytes {
+	used, ok := checkedAdd(store.state.SnapshotBytes, store.state.WALBytes)
+	if !ok || used > store.options.MaxBytes || encodedBytes > store.options.MaxBytes-used || reserved > store.options.MaxBytes-used-encodedBytes {
 		return ErrCapacity
 	}
 	if err := store.commitLocked(tx); err != nil {
@@ -1705,6 +1706,13 @@ func (store *Store) commitWorkLocked(tx Transaction, prospective RecoveredWork) 
 	}
 	store.work = prospective
 	return nil
+}
+
+func checkedAdd(left, right uint64) (uint64, bool) {
+	if left > math.MaxUint64-right {
+		return 0, false
+	}
+	return left + right, true
 }
 
 func validateRegisteredTransaction(transaction Transaction) error {

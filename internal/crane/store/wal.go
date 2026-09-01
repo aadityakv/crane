@@ -27,11 +27,19 @@ func recoverWAL(data []byte, expected Identity) (RecoveredState, int, error) {
 // second bounded streaming pass. The consumer therefore never observes a WAL
 // whose existing bytes were already known to be corrupt.
 func recoverWALReader(reader io.ReaderAt, size int64, expected Identity, consumer recoveryConsumer) (RecoveredState, int64, error) {
-	state, truncateAt, err := scanWAL(reader, size, expected, nil)
+	return recoverWALReaderWithAnchor(reader, size, expected, nil, 0, consumer)
+}
+
+func recoverSnapshotWALReader(reader io.ReaderAt, size int64, expected Identity, anchor walSnapshotAnchor, transactionCount uint64, consumer recoveryConsumer) (RecoveredState, int64, error) {
+	return recoverWALReaderWithAnchor(reader, size, expected, &anchor, transactionCount, consumer)
+}
+
+func recoverWALReaderWithAnchor(reader io.ReaderAt, size int64, expected Identity, anchor *walSnapshotAnchor, transactionCount uint64, consumer recoveryConsumer) (RecoveredState, int64, error) {
+	state, truncateAt, err := scanWAL(reader, size, expected, nil, anchor, transactionCount)
 	if err != nil || consumer == nil {
 		return state, truncateAt, err
 	}
-	replayed, replayEnd, err := scanWAL(reader, truncateAt, expected, consumer)
+	replayed, replayEnd, err := scanWAL(reader, truncateAt, expected, consumer, anchor, transactionCount)
 	if err != nil {
 		return RecoveredState{}, 0, err
 	}
@@ -41,23 +49,41 @@ func recoverWALReader(reader io.ReaderAt, size int64, expected Identity, consume
 	return state, truncateAt, nil
 }
 
-func scanWAL(reader io.ReaderAt, size int64, expected Identity, consumer recoveryConsumer) (RecoveredState, int64, error) {
+func scanWAL(reader io.ReaderAt, size int64, expected Identity, consumer recoveryConsumer, expectedAnchor *walSnapshotAnchor, transactionCount uint64) (RecoveredState, int64, error) {
 	state := RecoveredState{Identity: expected}
 	record, offset, incomplete, err := decodeRecordAt(reader, size, 0)
-	if err != nil || incomplete || record.kind != recordIdentity || record.sequence != 1 || len(record.payload) != identityPayloadBytes {
+	if err != nil || incomplete {
 		return RecoveredState{}, 0, fmt.Errorf("%w: invalid identity record: %v", ErrCorrupt, err)
 	}
 	var identity Identity
-	copy(identity.ClusterID[:], record.payload[:16])
-	identity.NodeID = binary.BigEndian.Uint16(record.payload[16:18])
-	copy(state.WorkerEpoch[:], record.payload[18:34])
+	if expectedAnchor == nil {
+		if record.kind != recordIdentity || record.sequence != 1 || len(record.payload) != identityPayloadBytes {
+			return RecoveredState{}, 0, fmt.Errorf("%w: invalid identity record", ErrCorrupt)
+		}
+		copy(identity.ClusterID[:], record.payload[:16])
+		identity.NodeID = binary.BigEndian.Uint16(record.payload[16:18])
+		copy(state.WorkerEpoch[:], record.payload[18:34])
+		state.LastSequence = 1
+	} else {
+		if record.kind != recordSnapshotIdentity {
+			return RecoveredState{}, 0, fmt.Errorf("%w: missing snapshot WAL anchor", ErrCorrupt)
+		}
+		anchor, anchorErr := decodeSnapshotAnchor(record.payload)
+		if anchorErr != nil || anchor != *expectedAnchor || record.sequence != anchor.BaseSequence {
+			return RecoveredState{}, 0, fmt.Errorf("%w: snapshot WAL anchor mismatch", ErrCorrupt)
+		}
+		identity = anchor.Identity
+		state.WorkerEpoch = anchor.WorkerEpoch
+		state.LastSequence = anchor.BaseSequence
+		state.TransactionCount = transactionCount
+		state.SnapshotGeneration = anchor.Generation
+	}
 	if identity != expected {
 		return RecoveredState{}, 0, fmt.Errorf("%w: disk cluster=%x node=%d", ErrIdentityMismatch, identity.ClusterID, identity.NodeID)
 	}
 	if err := validateEpoch(state.WorkerEpoch); err != nil {
 		return RecoveredState{}, 0, fmt.Errorf("%w: zero epoch", ErrCorrupt)
 	}
-	state.LastSequence = 1
 	for offset < size {
 		beginAt := offset
 		begin, next, partial, err := decodeRecordAt(reader, size, offset)

@@ -30,8 +30,9 @@ type Store struct {
 }
 
 type storeOperations struct {
-	openRoot func(string) (*os.Root, error)
-	syncFile func(*os.File) error
+	openRoot  func(string) (*os.Root, error)
+	syncFile  func(*os.File) error
+	writeFile func(*os.File, []byte) (int, error)
 }
 
 func defaultStoreOperations() storeOperations {
@@ -40,6 +41,7 @@ func defaultStoreOperations() storeOperations {
 		syncFile: func(file *os.File) error {
 			return file.Sync()
 		},
+		writeFile: func(file *os.File, data []byte) (int, error) { return file.Write(data) },
 	}
 }
 
@@ -61,7 +63,7 @@ func openWithOperations(path string, identity Identity, options Options, operati
 	if options.MaxBytes < uint64(walHeaderBytes+identityPayloadBytes+walChecksumBytes) {
 		return nil, fmt.Errorf("%w: MaxBytes too small", ErrInvalidOptions)
 	}
-	if operations.openRoot == nil || operations.syncFile == nil {
+	if operations.openRoot == nil || operations.syncFile == nil || operations.writeFile == nil {
 		return nil, fmt.Errorf("%w: incomplete file operations", ErrInvalidOptions)
 	}
 	fresh, directory, err := prepareDirectory(path, operations.syncFile)
@@ -113,7 +115,7 @@ func openWithOperations(path string, identity Identity, options Options, operati
 		if uint64(len(encoded)) > options.MaxBytes {
 			return nil, ErrCapacity
 		}
-		if err := writeFull(wal, encoded); err != nil {
+		if err := writeFullWith(wal, encoded, operations.writeFile); err != nil {
 			return nil, err
 		}
 		if err := operations.syncFile(wal); err != nil {
@@ -126,42 +128,9 @@ func openWithOperations(path string, identity Identity, options Options, operati
 		store.work = newRecoveredWork()
 		return store, nil
 	}
-	wal, err := openWAL(root, WorkerWALFilename, false)
-	if err != nil {
-		return nil, fmt.Errorf("%w: open existing WAL: %v", ErrCorrupt, err)
-	}
-	store.wal = wal
-	info, err := wal.Stat()
-	if err != nil {
+	if err := store.recoverExisting(identity); err != nil {
 		return nil, err
 	}
-	if info.Size() <= 0 || uint64(info.Size()) > options.MaxBytes || uint64(info.Size()) > uint64(math.MaxInt) {
-		return nil, fmt.Errorf("%w: WAL size %d", ErrCorrupt, info.Size())
-	}
-	reducer := newWorkReducer()
-	state, truncateAt, err := recoverWALReader(wal, info.Size(), identity, reducer)
-	if err != nil {
-		if !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrIdentityMismatch) {
-			return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
-		}
-		return nil, err
-	}
-	if truncateAt != info.Size() {
-		if err := wal.Truncate(truncateAt); err != nil {
-			return nil, err
-		}
-		if err := operations.syncFile(wal); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := wal.Seek(0, io.SeekEnd); err != nil {
-		return nil, err
-	}
-	if err := validateRecoveredWorkLocal(reducer.current, state.Identity.NodeID, state.WorkerEpoch); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
-	}
-	store.state = state
-	store.work = reducer.current
 	return store, nil
 }
 
@@ -241,7 +210,8 @@ func (store *Store) commitLocked(transaction Transaction) error {
 	if err != nil {
 		return err
 	}
-	if store.state.WALBytes > store.options.MaxBytes || encodedBytes > store.options.MaxBytes-store.state.WALBytes {
+	used, ok := checkedAdd(store.state.SnapshotBytes, store.state.WALBytes)
+	if !ok || used > store.options.MaxBytes || encodedBytes > store.options.MaxBytes-used {
 		return ErrCapacity
 	}
 	transaction = transaction.Clone()
@@ -258,7 +228,7 @@ func (store *Store) commitLocked(transaction Transaction) error {
 			return err
 		}
 	}
-	if err := writeFull(store.wal, encoded); err != nil {
+	if err := writeFullWith(store.wal, encoded, store.operations.writeFile); err != nil {
 		store.failed = true
 		return err
 	}
@@ -293,13 +263,16 @@ func (store *Store) release() error {
 	walErr := error(nil)
 	if store.wal != nil {
 		walErr = store.wal.Close()
+		walErr = errors.Join(walErr, store.inject(FaultCloseWAL))
 		store.wal = nil
 	}
 	lockErr := unlockAndClose(store.lock)
+	lockErr = errors.Join(lockErr, store.inject(FaultCloseLock))
 	store.lock = nil
 	rootErr := error(nil)
 	if store.root != nil {
 		rootErr = store.root.Close()
+		rootErr = errors.Join(rootErr, store.inject(FaultCloseRoot))
 		store.root = nil
 	}
 	dirErr := error(nil)
@@ -310,18 +283,30 @@ func (store *Store) release() error {
 		} else {
 			dirErr = store.directory.Close()
 		}
+		dirErr = errors.Join(dirErr, store.inject(FaultCloseDirectory))
 		store.directory = nil
 	}
 	return errors.Join(walErr, lockErr, rootErr, dirErr)
 }
 
+func (store *Store) inject(point FaultPoint) error {
+	if store.options.Faults == nil {
+		return nil
+	}
+	return store.options.Faults.Inject(point)
+}
+
 func writeFull(file *os.File, data []byte) error {
+	return writeFullWith(file, data, func(file *os.File, data []byte) (int, error) { return file.Write(data) })
+}
+
+func writeFullWith(file *os.File, data []byte, write func(*os.File, []byte) (int, error)) error {
 	for len(data) > 0 {
-		written, err := file.Write(data)
+		written, err := write(file, data)
 		if err != nil {
 			return err
 		}
-		if written == 0 {
+		if written <= 0 || written > len(data) {
 			return io.ErrShortWrite
 		}
 		data = data[written:]

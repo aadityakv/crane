@@ -13,12 +13,13 @@ import (
 )
 
 const (
-	walSchemaVersion     uint16 = 1
-	walHeaderBytes              = 20
-	walChecksumBytes            = 4
-	identityPayloadBytes        = 34
-	boundaryPayloadBytes        = 44
-	dataPrefixBytes             = 6
+	walSchemaVersion           uint16 = 1
+	walHeaderBytes                    = 20
+	walChecksumBytes                  = 4
+	identityPayloadBytes              = 34
+	boundaryPayloadBytes              = 44
+	dataPrefixBytes                   = 6
+	snapshotAnchorPayloadBytes        = 84
 )
 
 var walMagic = [4]byte{'C', 'W', 'W', 'L'}
@@ -33,7 +34,16 @@ const (
 	recordTransactionBegin  walRecordType = 2
 	recordTransactionData   walRecordType = 3
 	recordTransactionCommit walRecordType = 4
+	recordSnapshotIdentity  walRecordType = 5
 )
+
+type walSnapshotAnchor struct {
+	Identity       Identity
+	WorkerEpoch    model.WorkerEpoch
+	Generation     uint64
+	BaseSequence   uint64
+	SnapshotDigest [32]byte
+}
 
 type walRecord struct {
 	kind     walRecordType
@@ -43,7 +53,7 @@ type walRecord struct {
 }
 
 func encodeRecord(kind walRecordType, sequence uint64, payload []byte) ([]byte, error) {
-	if kind < recordIdentity || kind > recordTransactionCommit || sequence == 0 || uint64(len(payload)) > math.MaxUint32 {
+	if kind < recordIdentity || kind > recordSnapshotIdentity || sequence == 0 || uint64(len(payload)) > math.MaxUint32 {
 		return nil, fmt.Errorf("%w: invalid WAL record", ErrInvalidTransaction)
 	}
 	total := uint64(walHeaderBytes+walChecksumBytes) + uint64(len(payload))
@@ -69,6 +79,44 @@ func encodeIdentity(identity Identity, epoch model.WorkerEpoch) ([]byte, error) 
 	binary.BigEndian.PutUint16(payload[16:18], identity.NodeID)
 	copy(payload[18:], epoch[:])
 	return encodeRecord(recordIdentity, 1, payload)
+}
+
+func encodeSnapshotAnchor(anchor walSnapshotAnchor) ([]byte, error) {
+	if err := anchor.Identity.Validate(); err != nil {
+		return nil, err
+	}
+	if err := validateEpoch(anchor.WorkerEpoch); err != nil {
+		return nil, err
+	}
+	if anchor.Generation == 0 || anchor.BaseSequence == 0 || anchor.SnapshotDigest == ([32]byte{}) {
+		return nil, fmt.Errorf("%w: invalid snapshot WAL anchor", ErrInvalidTransaction)
+	}
+	payload := make([]byte, snapshotAnchorPayloadBytes)
+	binary.BigEndian.PutUint16(payload[:2], 1)
+	copy(payload[2:18], anchor.Identity.ClusterID[:])
+	binary.BigEndian.PutUint16(payload[18:20], anchor.Identity.NodeID)
+	copy(payload[20:36], anchor.WorkerEpoch[:])
+	binary.BigEndian.PutUint64(payload[36:44], anchor.Generation)
+	binary.BigEndian.PutUint64(payload[44:52], anchor.BaseSequence)
+	copy(payload[52:84], anchor.SnapshotDigest[:])
+	return encodeRecord(recordSnapshotIdentity, anchor.BaseSequence, payload)
+}
+
+func decodeSnapshotAnchor(payload []byte) (walSnapshotAnchor, error) {
+	if len(payload) != snapshotAnchorPayloadBytes || binary.BigEndian.Uint16(payload[:2]) != 1 {
+		return walSnapshotAnchor{}, fmt.Errorf("%w: invalid snapshot WAL anchor schema", ErrCorrupt)
+	}
+	var anchor walSnapshotAnchor
+	copy(anchor.Identity.ClusterID[:], payload[2:18])
+	anchor.Identity.NodeID = binary.BigEndian.Uint16(payload[18:20])
+	copy(anchor.WorkerEpoch[:], payload[20:36])
+	anchor.Generation = binary.BigEndian.Uint64(payload[36:44])
+	anchor.BaseSequence = binary.BigEndian.Uint64(payload[44:52])
+	copy(anchor.SnapshotDigest[:], payload[52:84])
+	if anchor.Identity.Validate() != nil || validateEpoch(anchor.WorkerEpoch) != nil || anchor.Generation == 0 || anchor.BaseSequence == 0 || anchor.SnapshotDigest == ([32]byte{}) {
+		return walSnapshotAnchor{}, fmt.Errorf("%w: invalid snapshot WAL anchor", ErrCorrupt)
+	}
+	return anchor, nil
 }
 
 func encodeTransaction(firstSequence uint64, transaction Transaction) ([]byte, error) {
@@ -171,7 +219,7 @@ func decodeRecordAt(reader io.ReaderAt, size int64, offset int64) (walRecord, in
 		return walRecord{}, offset, false, fmt.Errorf("%w: WAL magic/schema", ErrCorrupt)
 	}
 	kind := walRecordType(binary.BigEndian.Uint16(header[6:8]))
-	if kind < recordIdentity || kind > recordTransactionCommit {
+	if kind < recordIdentity || kind > recordSnapshotIdentity {
 		return walRecord{}, offset, false, fmt.Errorf("%w: record type %d", ErrCorrupt, kind)
 	}
 	sequence := binary.BigEndian.Uint64(header[12:20])
@@ -191,6 +239,10 @@ func decodeRecordAt(reader io.ReaderAt, size int64, offset int64) (walRecord, in
 	case recordTransactionData:
 		if length < dataPrefixBytes || length > dataPrefixBytes+MaxRecordPayloadBytes {
 			return walRecord{}, offset, false, fmt.Errorf("%w: data length %d", ErrCorrupt, length)
+		}
+	case recordSnapshotIdentity:
+		if length != snapshotAnchorPayloadBytes {
+			return walRecord{}, offset, false, fmt.Errorf("%w: snapshot anchor length %d", ErrCorrupt, length)
 		}
 	}
 	total := uint64(walHeaderBytes+walChecksumBytes) + length
