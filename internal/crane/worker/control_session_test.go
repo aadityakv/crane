@@ -381,6 +381,82 @@ func TestControlQueuedCommandRevalidatesClosedSessionAndMembershipUnderMutationL
 	}
 }
 
+func TestControlClosePublishesBeforeEveryFinalMutationBoundaryAndJoins(t *testing.T) {
+	for _, kind := range []string{"fence", "assignment", "checkpoint", "repair", "result-record"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newControlFixture(t)
+			session := fixture.session(t, 2)
+			fixture.authenticate(t, session, 2, 1)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			fixture.owner.beforeMutation = func(candidate string) {
+				if candidate == kind {
+					close(entered)
+					<-release
+				}
+			}
+			var message protocol.WorkerMessage
+			switch kind {
+			case "fence":
+				prior := fixture.epoch
+				prior.Term--
+				prior.BeginIndex--
+				fixture.repository.work.Fence = prior
+				message = protocol.FenceRequest{CoordinatorEpoch: fixture.epoch}
+			case "assignment":
+				fixture.repository.work.Fence = fixture.epoch
+				message = protocol.AssignmentSetInstall{Assignment: fixture.assignment.Assignment, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: fixture.assignment.JobControlRevision, SchedulingState: model.Running, CoordinatorEpoch: fixture.epoch}
+			case "checkpoint":
+				fixture.repository.work.Fence = fixture.epoch
+				fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+				message = protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: fixture.assignment.Assignment.JobID, Source: fixture.assignment.Assignment.Tasks[0].Task, Watermark: 1, RaftIndex: 7, Epoch: fixture.epoch}, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+			case "repair":
+				fixture.repository.work.Fence = fixture.epoch
+				fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
+				query := fixture.inventoryQuery(t)
+				fixture.repository.work.Sources = []store.SourceCursor{fixture.sourceCursor(t, query.Checkpoints[0], 11)}
+				grant := fixture.repairGrant(t, query)
+				message = protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 1, Repair: &grant}
+			case "result-record":
+				chunk := validControlResultChunk(t, fixture)
+				if err := fixture.gate.Open(fixture.epoch); err != nil {
+					t.Fatal(err)
+				}
+				message = chunk
+			}
+			type outcome struct {
+				response protocol.WorkerMessage
+				err      error
+			}
+			handled := make(chan outcome, 1)
+			go func() {
+				response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, message))
+				handled <- outcome{response: response, err: err}
+			}()
+			<-entered
+			closed := make(chan error, 1)
+			go func() { closed <- session.Close() }()
+			<-session.done.Done()
+			select {
+			case err := <-closed:
+				t.Fatalf("Close returned before handler joined: %v", err)
+			default:
+			}
+			close(release)
+			result := <-handled
+			if result.response != nil || result.err == nil {
+				t.Fatalf("closing handler response/error = %#v/%v", result.response, result.err)
+			}
+			if err := <-closed; err != nil {
+				t.Fatal(err)
+			}
+			if fixture.repository.fenceCalls != 0 || fixture.repository.installCalls != 0 || fixture.repository.observeCalls != 0 || fixture.transfer.calls != 0 || len(fixture.repository.log) != 0 {
+				t.Fatalf("closing handler mutated state: repo=%v fence=%d install=%d observe=%d transfer=%d", fixture.repository.log, fixture.repository.fenceCalls, fixture.repository.installCalls, fixture.repository.observeCalls, fixture.transfer.calls)
+			}
+		})
+	}
+}
+
 func TestControlAssignmentRejectsAggregateLocalTaskSlotsBeforeMutation(t *testing.T) {
 	fixture := newControlFixture(t)
 	fixture.configuration.Crane.WorkerSlots = 1

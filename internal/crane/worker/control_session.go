@@ -106,6 +106,9 @@ type ControlOwner struct {
 	mutations  sync.Mutex
 	localNode  uint16
 	localEpoch model.WorkerEpoch
+	// beforeMutation is a deterministic test seam invoked at the final
+	// serialized boundary; production owners leave it nil.
+	beforeMutation func(string)
 }
 
 type controlPeer struct {
@@ -123,6 +126,7 @@ type ControlSession struct {
 
 	mu            sync.Mutex
 	authenticated bool
+	closing       bool
 	closed        bool
 	peer          controlPeer
 	member        swim.Member
@@ -208,6 +212,11 @@ func (session *ControlSession) Close() error {
 		return nil
 	}
 	owner := session.owner
+	session.mu.Lock()
+	if !session.closed {
+		session.closing = true
+	}
+	session.mu.Unlock()
 	session.cancel()
 	session.lifecycle.Lock()
 	defer session.lifecycle.Unlock()
@@ -280,7 +289,7 @@ func (session *ControlSession) Handle(ctx context.Context, frame wire.Frame) (pr
 
 	session.mu.Lock()
 	authenticated := session.authenticated
-	closed := session.closed
+	closed := session.closing || session.closed
 	session.mu.Unlock()
 	if closed {
 		return nil, ErrControlClosed
@@ -350,7 +359,7 @@ func (session *ControlSession) authenticate(sender uint16, handshake protocol.Wo
 	defer session.owner.mu.Unlock()
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if session.closed || session.owner.closed {
+	if session.closing || session.closed || session.owner.closed {
 		return ErrControlClosed
 	}
 	if session.authenticated {
@@ -368,7 +377,7 @@ func (session *ControlSession) authenticate(sender uint16, handshake protocol.Wo
 
 func (session *ControlSession) revalidate(sender uint16) error {
 	session.mu.Lock()
-	peer, prior, closed, authenticated := session.peer, session.member, session.closed, session.authenticated
+	peer, prior, closed, authenticated := session.peer, session.member, session.closing || session.closed, session.authenticated
 	session.mu.Unlock()
 	if closed || !authenticated {
 		return ErrControlClosed
@@ -437,12 +446,13 @@ func (owner *ControlOwner) dispatch(ctx context.Context, session *ControlSession
 		}
 		response, err = owner.handleResultRecord(ctx, session, peer, role, request)
 	case protocol.ResultArtifactChunk:
-		response, err = owner.transfer.ReceiveResultArtifact(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferNormalReplication}, request)
-	case protocol.ResultFetchRequest:
-		if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
-			return nil, err
+		if err = owner.finalCurrentSession(ctx, session, peer, "result-artifact", request.CoordinatorEpoch); err == nil {
+			response, err = owner.transfer.ReceiveResultArtifact(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferNormalReplication}, request)
 		}
-		response, err = owner.transfer.OpenResultFetch(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferLeaderFetch}, request)
+	case protocol.ResultFetchRequest:
+		if err = owner.finalMutation(ctx, session, peer, "result-fetch", request.CoordinatorEpoch, true); err == nil {
+			response, err = owner.transfer.OpenResultFetch(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferLeaderFetch}, request)
+		}
 	case protocol.WorkerRegisterRequest, protocol.WorkerRegisterResponse, protocol.ResultRecordAck, protocol.ResultArtifactAck, protocol.ResultFetchChunk, protocol.WorkerError, protocol.WorkerHandshakeAck, protocol.FenceResponse, protocol.AssignmentSetInstallAck, protocol.WorkerStatus, protocol.CheckpointAck:
 		return nil, protocol.ErrUnexpectedWorkerMessage
 	default:
@@ -491,10 +501,49 @@ func (owner *ControlOwner) handleResultRecord(ctx context.Context, session *Cont
 		return nil, err
 	}
 	defer release()
-	if err := session.revalidate(peer.node); err != nil {
+	if err := owner.finalCurrentSession(ctx, session, peer, "result-record", request.Provenance.CoordinatorEpoch); err != nil {
 		return nil, err
 	}
 	return owner.transfer.ReceiveResultRecord(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: role}, request)
+}
+
+func (owner *ControlOwner) finalCurrentSession(ctx context.Context, session *ControlSession, peer controlPeer, kind string, epoch model.CoordinatorEpoch) error {
+	if owner.beforeMutation != nil {
+		owner.beforeMutation(kind)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := session.done.Err(); err != nil {
+		return ErrControlClosed
+	}
+	if err := session.revalidate(peer.node); err != nil {
+		return err
+	}
+	work, err := owner.repository.RecoverWork()
+	if err != nil {
+		return err
+	}
+	if work.Fence == (model.CoordinatorEpoch{}) || epoch != work.Fence {
+		return ErrControlStaleEpoch
+	}
+	return nil
+}
+
+func (owner *ControlOwner) finalMutation(ctx context.Context, session *ControlSession, peer controlPeer, kind string, epoch model.CoordinatorEpoch, exact bool) error {
+	if owner.beforeMutation != nil {
+		owner.beforeMutation(kind)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := session.done.Err(); err != nil {
+		return ErrControlClosed
+	}
+	if err := session.revalidate(peer.node); err != nil {
+		return err
+	}
+	return owner.authorizeCoordinator(peer, epoch, exact)
 }
 
 func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSession, peer controlPeer, request protocol.FenceRequest) (protocol.WorkerMessage, error) {
@@ -517,12 +566,6 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 	if err := owner.gate.CloseAndWait(ctx); err != nil {
 		return nil, err
 	}
-	if err := session.revalidate(peer.node); err != nil {
-		return nil, err
-	}
-	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, false); err != nil {
-		return nil, err
-	}
 	work, err = owner.repository.RecoverWork()
 	if err != nil {
 		return nil, err
@@ -535,6 +578,9 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 			}
 			return nil, ErrControlStaleEpoch
 		}
+	}
+	if err := owner.finalMutation(ctx, session, peer, "fence", request.CoordinatorEpoch, false); err != nil {
+		return nil, err
 	}
 	if err := owner.repository.Fence(request.CoordinatorEpoch); err != nil {
 		return nil, err
@@ -616,19 +662,22 @@ func (owner *ControlOwner) handleAssignment(ctx context.Context, session *Contro
 	if err := owner.validateLocalSlots(work, request.Assignment, request.SchedulingState); err != nil {
 		return nil, err
 	}
-	if err := session.revalidate(peer.node); err != nil {
-		return nil, err
-	}
-	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
+	if err := owner.finalMutation(ctx, session, peer, "assignment", request.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
 	if err := owner.repository.InstallAssignment(request.Assignment, request.Specification, request.JobControlRevision, request.SchedulingState, request.CoordinatorEpoch); err != nil {
+		return nil, err
+	}
+	if err := owner.finalMutation(ctx, session, peer, "assignment-reconcile", request.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
 	if err := owner.engine.ReconcileAssignment(ctx, request.Assignment.JobID); err != nil {
 		return nil, err
 	}
 	if request.SchedulingState == model.Running {
+		if err := owner.finalMutation(ctx, session, peer, "assignment-gate", request.CoordinatorEpoch, true); err != nil {
+			return nil, err
+		}
 		if err := owner.gate.Open(request.CoordinatorEpoch); err != nil {
 			return nil, err
 		}
@@ -690,10 +739,7 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSes
 		return nil, err
 	}
 	if request.AfterTransactionID != 0 {
-		if err := session.revalidate(peer.node); err != nil {
-			return nil, err
-		}
-		if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
+		if err := owner.finalMutation(ctx, session, peer, "event-ack", request.CoordinatorEpoch, true); err != nil {
 			return nil, err
 		}
 		if err := owner.engine.AcknowledgeEvents(ctx, request.AfterTransactionID); err != nil {
@@ -706,7 +752,7 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSes
 	}
 	var repair *protocol.ResultRepairStatus
 	if request.Repair != nil {
-		repair, err = owner.installRepair(session, peer, work, *request.Repair)
+		repair, err = owner.installRepair(ctx, session, peer, work, *request.Repair)
 		if err != nil {
 			return nil, err
 		}
@@ -815,7 +861,7 @@ func (owner *ControlOwner) controlCheckpointProof(work store.RecoveredWork, assi
 	return 0, false
 }
 
-func (owner *ControlOwner) installRepair(session *ControlSession, peer controlPeer, work store.RecoveredWork, grant protocol.RepairGrant) (*protocol.ResultRepairStatus, error) {
+func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSession, peer controlPeer, work store.RecoveredWork, grant protocol.RepairGrant) (*protocol.ResultRepairStatus, error) {
 	if grant.Instruction.CoordinatorEpoch != work.Fence {
 		return nil, ErrControlStaleEpoch
 	}
@@ -853,10 +899,7 @@ func (owner *ControlOwner) installRepair(session *ControlSession, peer controlPe
 	}
 	definition := protocolRepairDefinition(grant.Instruction)
 	repair := store.ResultRepairRecord{Instruction: definition, InstructionDigest: grant.Instruction.InstructionDigest, Role: grant.Role, State: store.RepairPending, ContentDigest: model.EmptyResultInventoryDigest(grant.Instruction.InstructionDigest)}
-	if err := session.revalidate(peer.node); err != nil {
-		return nil, err
-	}
-	if err := owner.authorizeCoordinator(peer, grant.Instruction.CoordinatorEpoch, true); err != nil {
+	if err := owner.finalMutation(ctx, session, peer, "repair", grant.Instruction.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
 	if err := owner.repository.UpsertRepair(repair); err != nil {
@@ -939,12 +982,6 @@ func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *Contro
 	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
 		return nil, err
 	}
-	if err := session.revalidate(peer.node); err != nil {
-		return nil, err
-	}
-	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
-		return nil, err
-	}
 	work, err := owner.repository.RecoverWork()
 	if err != nil {
 		return nil, err
@@ -964,10 +1001,7 @@ func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *Contro
 	if source == (model.AssignmentToken{}) || !stageOK || stage.Role != model.StageSource {
 		return nil, ErrControlStaleAssignment
 	}
-	if err := session.revalidate(peer.node); err != nil {
-		return nil, err
-	}
-	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
+	if err := owner.finalMutation(ctx, session, peer, "checkpoint", request.Notice.Epoch, true); err != nil {
 		return nil, err
 	}
 	if source.WorkerID == owner.localNode && source.WorkerEpoch == owner.localEpoch {
