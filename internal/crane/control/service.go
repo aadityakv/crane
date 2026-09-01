@@ -23,6 +23,10 @@ import (
 const (
 	// DefaultMaxControlConnections bounds concurrently served +6 connections.
 	DefaultMaxControlConnections = 128
+	// DefaultMaxControlConnectionsPerPeer bounds concurrently served +6
+	// connections from one peer source address, so a single peer cannot
+	// consume the shared global connection budget.
+	DefaultMaxControlConnectionsPerPeer = 4
 	// DefaultMaxControlReplayEntries bounds retained request-replay identities.
 	DefaultMaxControlReplayEntries = 8192
 	// DefaultMaxControlReplayEntriesPerPeer bounds per-sender replay identities.
@@ -99,8 +103,12 @@ type Service struct {
 	listen         func(string, string) (net.Listener, error)
 	replay         *serviceReplay
 	maxConnections int
-	maxCommand     atomic.Uint64
-	timeout        time.Duration
+	// peerMu guards peerConnections for the per-peer connection bound.
+	peerMu                sync.Mutex
+	peerConnections       map[string]int
+	maxConnectionsPerPeer int
+	maxCommand            atomic.Uint64
+	timeout               time.Duration
 
 	ready   chan struct{}
 	started atomic.Bool
@@ -144,10 +152,12 @@ func NewService(options ServiceOptions) (*Service, error) {
 		membership: options.Membership, raft: options.Raft, machine: options.Machine, gate: options.Gate,
 		results: options.Results, wake: options.WakeCoordinator, clusterID: clusterID, bind: bind,
 		voter: voter, voterEndpoints: voterEndpoints, listen: net.Listen,
-		replay:         newServiceReplay(options.Clock, window, config.ReplayFutureSkewAllowance, DefaultMaxControlReplayEntries, DefaultMaxControlReplayEntriesPerPeer),
-		maxConnections: DefaultMaxControlConnections,
-		timeout:        time.Duration(configuration.Crane.WorkerControlTimeout),
-		ready:          make(chan struct{}),
+		replay:                newServiceReplay(options.Clock, window, config.ReplayFutureSkewAllowance, DefaultMaxControlReplayEntries, DefaultMaxControlReplayEntriesPerPeer),
+		maxConnections:        DefaultMaxControlConnections,
+		peerConnections:       make(map[string]int),
+		maxConnectionsPerPeer: DefaultMaxControlConnectionsPerPeer,
+		timeout:               time.Duration(configuration.Crane.WorkerControlTimeout),
+		ready:                 make(chan struct{}),
 	}
 	service.maxCommand.Store(config.MaxRaftCommandBytes)
 	return service, nil
@@ -204,9 +214,19 @@ func (service *Service) Run(ctx context.Context) error {
 			_ = connection.Close()
 			continue
 		}
+		peer := controlPeerAddress(connection.RemoteAddr())
+		if !service.reservePeerConnection(peer) {
+			// The peer already holds its bounded share: close fail-closed
+			// before reading or admitting any frame, with no mutation, no
+			// replay eviction, and no response.
+			_ = connection.Close()
+			<-slots
+			continue
+		}
 		handlers.Add(1)
 		go func() {
 			defer handlers.Done()
+			defer service.releasePeerConnection(peer)
 			defer func() { <-slots }()
 			stopConnection := context.AfterFunc(ctx, func() { _ = connection.Close() })
 			defer stopConnection()
@@ -231,6 +251,61 @@ func decodeControlClusterID(value string) ([16]byte, error) {
 	var result [16]byte
 	copy(result[:], decoded)
 	return result, nil
+}
+
+// controlPeerAddress extracts the per-peer connection identity from one
+// accepted remote: the source address that request admission binds to the
+// authenticated sender. A remote without a usable source address is not
+// attributable to any peer and is never counted per-peer, mirroring the
+// worker control sessions that count only identified peers.
+func controlPeerAddress(remote net.Addr) string {
+	var address net.Addr = remote
+	if address == nil {
+		return ""
+	}
+	var ip net.IP
+	if tcp, ok := address.(*net.TCPAddr); ok {
+		ip = tcp.IP
+	} else if host, _, err := net.SplitHostPort(address.String()); err == nil {
+		ip = net.ParseIP(host)
+	} else {
+		ip = net.ParseIP(address.String())
+	}
+	if ip == nil {
+		return ""
+	}
+	return string(ip.To16())
+}
+
+// reservePeerConnection takes one per-peer connection slot for the peer,
+// reporting false when that peer already holds its bounded share of the
+// global connection budget.
+func (service *Service) reservePeerConnection(peer string) bool {
+	if peer == "" {
+		return true
+	}
+	service.peerMu.Lock()
+	defer service.peerMu.Unlock()
+	if service.peerConnections[peer] >= service.maxConnectionsPerPeer {
+		return false
+	}
+	service.peerConnections[peer]++
+	return true
+}
+
+// releasePeerConnection returns one per-peer connection slot taken by
+// reservePeerConnection, on every connection termination path.
+func (service *Service) releasePeerConnection(peer string) {
+	if peer == "" {
+		return
+	}
+	service.peerMu.Lock()
+	defer service.peerMu.Unlock()
+	if service.peerConnections[peer] <= 1 {
+		delete(service.peerConnections, peer)
+		return
+	}
+	service.peerConnections[peer]--
 }
 
 // serviceReplay pairs one global and bounded per-sender replay guards so no

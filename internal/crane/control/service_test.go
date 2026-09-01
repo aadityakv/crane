@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -616,34 +617,272 @@ func TestControlServiceBoundsConcurrentConnections(t *testing.T) {
 	fixture := newServiceFixture(t, state.NewMachine())
 	fixture.seedEpochAndOpenGate()
 	fixture.service.maxConnections = 1
+	listener := fixture.usePeerListener()
 	fixture.start()
 
-	held, err := net.Dial("tcp", fixture.address())
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The held connection occupies the sole global slot without sending a
+	// frame; the budget is shared across peers, so a different peer's
+	// connection is also refused.
+	held := dialControlPeer(listener, "10.0.0.2")
 	defer held.Close()
-	// The held connection occupies the sole slot without sending a frame.
-	time.Sleep(50 * time.Millisecond)
-	overflow, err := net.Dial("tcp", fixture.address())
-	if err != nil {
-		t.Fatal(err)
-	}
+	overflow := dialControlPeer(listener, "10.0.0.3")
 	defer overflow.Close()
-	assertConnectionClosedWithoutResponse(t, overflow)
+	requireConnectionClosedBeforeRead(t, overflow)
 
 	_ = held.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if response, err := fixture.exchangeFrame(2, testRequestID(t), statusRequest(model.JobID{0x36})); err == nil {
+		response, err := fixture.exchangeOverConn(dialControlPeer(listener, "10.0.0.2"), 2, testRequestID(t), statusRequest(model.JobID{0x36}))
+		if err == nil {
 			requireControlError(t, response, protocol.ControlErrorNotFound)
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("released connection slot never served a request")
+			t.Fatalf("released connection slot never served a request: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// peerConn binds one end of an in-memory pipe to a scripted source address so
+// per-peer admission is testable without any network.
+type peerConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (connection *peerConn) RemoteAddr() net.Addr { return connection.remote }
+
+// SetReadDeadline and SetWriteDeadline emulate TCP semantics: unlike a raw
+// net.Pipe, a deadline on a TCP connection never fails merely because the
+// remote end closed, so the frame stream's deadline bookkeeping cannot turn a
+// completed exchange into an error.
+func (connection *peerConn) SetReadDeadline(value time.Time) error {
+	if err := connection.Conn.SetReadDeadline(value); errors.Is(err, io.ErrClosedPipe) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (connection *peerConn) SetWriteDeadline(value time.Time) error {
+	if err := connection.Conn.SetWriteDeadline(value); errors.Is(err, io.ErrClosedPipe) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+// peerListener is one deterministic net.Listener seam handing scripted peer
+// connections to the +6 accept loop.
+type peerListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newPeerListener() *peerListener {
+	return &peerListener{conns: make(chan net.Conn), closed: make(chan struct{})}
+}
+
+func (listener *peerListener) Accept() (net.Conn, error) {
+	select {
+	case connection := <-listener.conns:
+		return connection, nil
+	case <-listener.closed:
+		return nil, errors.New("peer listener closed")
+	}
+}
+
+func (listener *peerListener) Close() error {
+	listener.once.Do(func() { close(listener.closed) })
+	return nil
+}
+
+func (*peerListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 19106}
+}
+
+// usePeerListener installs the deterministic in-memory listener seam before
+// the service starts.
+func (f *serviceFixture) usePeerListener() *peerListener {
+	f.t.Helper()
+	listener := newPeerListener()
+	f.service.listen = func(string, string) (net.Listener, error) { return listener, nil }
+	return listener
+}
+
+// dialControlPeer offers the listener one connection from the given source
+// host. The dial completes only once the accept loop has taken it, so every
+// later dial observes all earlier admission decisions.
+func dialControlPeer(listener *peerListener, host string) net.Conn {
+	client, server := net.Pipe()
+	listener.conns <- &peerConn{Conn: server, remote: &net.TCPAddr{IP: net.ParseIP(host), Port: 40000}}
+	return &peerConn{Conn: client, remote: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 19106}}
+}
+
+// requireConnectionClosedBeforeRead asserts the service closed the connection
+// before reading any frame: the client observes the server-side close itself,
+// not a local read deadline on a connection left waiting for its frame.
+func requireConnectionClosedBeforeRead(t *testing.T, connection net.Conn) {
+	t.Helper()
+	// Setting the deadline may itself report the peer's close; only the read
+	// outcome distinguishes a fail-closed connection from one left waiting.
+	_ = connection.SetReadDeadline(time.Now().Add(750 * time.Millisecond))
+	buffer := make([]byte, 1)
+	_, err := connection.Read(buffer)
+	switch {
+	case err == nil:
+		t.Fatal("connection produced bytes before its admission decision")
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		t.Fatal("connection stayed open waiting for a frame instead of being closed fail-closed")
+	}
+}
+
+// exchangeOverConn performs one full request/response round over one
+// already-established client connection.
+func (f *serviceFixture) exchangeOverConn(connection net.Conn, sender uint16, requestID wire.RequestID, message protocol.ControlMessage) (protocol.ControlMessage, error) {
+	f.t.Helper()
+	payload, err := protocol.MarshalControlMessage(message)
+	if err != nil {
+		f.t.Fatalf("marshal request: %v", err)
+	}
+	stream := wire.NewTCPFrameStream(connection, f.authenticator, controlClientLimits(f.service.clusterID), 2*time.Second)
+	frame := wire.Frame{Header: wire.Header{
+		Version: wire.Version1, Message: message.MessageType(), ClusterID: f.service.clusterID, SenderID: sender,
+		RequestID: requestID, TimestampMillis: f.clock.Now().UnixMilli(), Codec: wire.CodecBinary,
+	}, Payload: payload}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := stream.WriteFrame(ctx, frame); err != nil {
+		return nil, err
+	}
+	response, err := stream.ReadFrame(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if response.Header.RequestID != requestID || response.Header.SenderID != f.configuration.NodeID {
+		f.t.Fatalf("response correlation header = %#v", response.Header)
+	}
+	return protocol.UnmarshalControlMessage(response.Header.Message, response.Payload)
+}
+
+// requirePeerSlotsDrained waits until every per-peer connection slot has been
+// released.
+func requirePeerSlotsDrained(t *testing.T, service *Service) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		service.peerMu.Lock()
+		remaining := len(service.peerConnections)
+		service.peerMu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("per-peer accounting retained %d peers after connection close", remaining)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestControlServiceBoundsConnectionsPerPeer(t *testing.T) {
+	fixture := newServiceFixture(t, state.NewMachine())
+	fixture.seedEpochAndOpenGate()
+	listener := fixture.usePeerListener()
+	fixture.start()
+
+	held := make([]net.Conn, 0, DefaultMaxControlConnectionsPerPeer)
+	defer func() {
+		for _, connection := range held {
+			_ = connection.Close()
+		}
+	}()
+	for index := 0; index < DefaultMaxControlConnectionsPerPeer; index++ {
+		held = append(held, dialControlPeer(listener, "10.0.0.2"))
+	}
+
+	// The peer already holds its full per-peer bound: its next connection is
+	// closed fail-closed before any frame is read, with no mutation, no
+	// replay eviction, and no response.
+	overflow := dialControlPeer(listener, "10.0.0.2")
+	defer overflow.Close()
+	requireConnectionClosedBeforeRead(t, overflow)
+
+	// A different peer stays admissible within the same global budget.
+	response, err := fixture.exchangeOverConn(dialControlPeer(listener, "10.0.0.3"), 2, testRequestID(t), statusRequest(model.JobID{0x37}))
+	if err != nil {
+		t.Fatalf("different peer exchange failed: %v", err)
+	}
+	requireControlError(t, response, protocol.ControlErrorNotFound)
+}
+
+func TestControlServiceReleasesPerPeerSlotsOnConnectionClose(t *testing.T) {
+	t.Run("ClientClose", func(t *testing.T) {
+		fixture := newServiceFixture(t, state.NewMachine())
+		fixture.seedEpochAndOpenGate()
+		listener := fixture.usePeerListener()
+		fixture.start()
+		held := make([]net.Conn, 0, DefaultMaxControlConnectionsPerPeer)
+		for index := 0; index < DefaultMaxControlConnectionsPerPeer; index++ {
+			held = append(held, dialControlPeer(listener, "10.0.0.2"))
+		}
+		for _, connection := range held {
+			_ = connection.Close()
+		}
+		requirePeerSlotsDrained(t, fixture.service)
+		response, err := fixture.exchangeOverConn(dialControlPeer(listener, "10.0.0.2"), 2, testRequestID(t), statusRequest(model.JobID{0x38}))
+		if err != nil {
+			t.Fatalf("client-closed peer connections never released their per-peer slots: %v", err)
+		}
+		requireControlError(t, response, protocol.ControlErrorNotFound)
+	})
+
+	t.Run("HandlerCompletion", func(t *testing.T) {
+		fixture := newServiceFixture(t, state.NewMachine())
+		fixture.seedEpochAndOpenGate()
+		listener := fixture.usePeerListener()
+		fixture.start()
+		// One more sequential full exchange than the per-peer bound proves
+		// each completed handler returns its peer's slot.
+		for index := 0; index <= DefaultMaxControlConnectionsPerPeer; index++ {
+			response, err := fixture.exchangeOverConn(dialControlPeer(listener, "10.0.0.2"), 2, testRequestID(t), statusRequest(model.JobID{0x39}))
+			if err != nil {
+				t.Fatalf("sequential exchange %d failed: %v", index, err)
+			}
+			requireControlError(t, response, protocol.ControlErrorNotFound)
+			requirePeerSlotsDrained(t, fixture.service)
+		}
+	})
+
+	t.Run("Cancellation", func(t *testing.T) {
+		fixture := newServiceFixture(t, state.NewMachine())
+		fixture.seedEpochAndOpenGate()
+		listener := fixture.usePeerListener()
+		fixture.start()
+		for index := 0; index < DefaultMaxControlConnectionsPerPeer; index++ {
+			connection := dialControlPeer(listener, "10.0.0.2")
+			defer connection.Close()
+		}
+		fixture.cancelRun()
+		select {
+		case err := <-fixture.runErr:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run returned %v", err)
+			}
+			fixture.runErr <- err
+		case <-time.After(2 * time.Second):
+			t.Fatal("Run did not join after cancellation with open peer connections")
+		}
+		fixture.service.peerMu.Lock()
+		remaining := len(fixture.service.peerConnections)
+		fixture.service.peerMu.Unlock()
+		if remaining != 0 {
+			t.Fatalf("per-peer accounting retained %d peers after cancellation", remaining)
+		}
+	})
 }
 
 func TestControlServiceCancellationClosesSlowClientsAndJoins(t *testing.T) {
