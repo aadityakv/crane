@@ -161,6 +161,10 @@ func (engine *Engine) applyCheckpoint(notice protocol.CheckpointNotice) error {
 	if notice.Notice.Watermark == cursor.Watermark {
 		proof := cursor.CheckpointAuthority
 		if cursor.CheckpointRevision == 0 && proof == (store.CheckpointAuthority{}) {
+			assignment, current := engine.repository.InstalledAssignment(notice.Notice.JobID)
+			if !current || assignment.CoordinatorEpoch != engine.repository.CurrentFence() || notice.Notice.Epoch != assignment.CoordinatorEpoch || notice.JobControlRevision != assignment.JobControlRevision || notice.AssignmentRevision != assignment.Assignment.Revision || notice.AssignmentDigest != assignment.Assignment.Digest {
+				return errors.New("legacy checkpoint authority does not match durable installation")
+			}
 			event, exists := engine.completionReports[notice.Notice.Source]
 			report := event.Completion
 			if !exists || report == nil || report.ExpectedCheckpointRevision == math.MaxUint64 || report.New != cursor.Watermark || report.EOF != cursor.EOF || report.JobControlRevision != notice.JobControlRevision || report.AssignmentRevision != notice.AssignmentRevision || report.Token.Task != notice.Notice.Source || report.Epoch != notice.Notice.Epoch || report.Digest != model.CompletionReportDigest(*report) {

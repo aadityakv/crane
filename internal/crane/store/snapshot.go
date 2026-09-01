@@ -155,11 +155,15 @@ func writeSnapshotChunk(file *os.File, data []byte, write func(*os.File, []byte)
 }
 
 func snapshotMetadata(state RecoveredState, work RecoveredWork, generation uint64) (Snapshot, []byte, error) {
+	return snapshotMetadataWithSourceSchemas(state, work, generation, nil)
+}
+
+func snapshotMetadataWithSourceSchemas(state RecoveredState, work RecoveredWork, generation uint64, sourceSchemas map[model.TaskID]uint16) (Snapshot, []byte, error) {
 	if generation == 0 || !validSnapshotTransactionMetadata(state.LastSequence, state.TransactionCount) || !validSnapshotEventMetadata(work.NextTransactionID, state.LastSequence, state.TransactionCount) || state.WorkerEpoch.Validate() != nil || state.Identity.Validate() != nil {
 		return Snapshot{}, nil, fmt.Errorf("%w: invalid snapshot metadata", ErrInvalidTransaction)
 	}
 	var count, body uint64
-	err := visitSnapshotRecords(work, func(_ snapshotRecordKind, payload []byte) error {
+	err := visitSnapshotRecordsWithSourceSchemas(work, sourceSchemas, func(_ snapshotRecordKind, payload []byte) error {
 		if len(payload) > MaxRecordPayloadBytes {
 			return fmt.Errorf("%w: snapshot record exceeds bound", ErrCapacity)
 		}
@@ -214,6 +218,10 @@ func encodeSnapshotFrame(kind snapshotRecordKind, payload []byte) ([]byte, error
 }
 
 func visitSnapshotRecords(work RecoveredWork, visit func(snapshotRecordKind, []byte) error) error {
+	return visitSnapshotRecordsWithSourceSchemas(work, nil, visit)
+}
+
+func visitSnapshotRecordsWithSourceSchemas(work RecoveredWork, sourceSchemas map[model.TaskID]uint16, visit func(snapshotRecordKind, []byte) error) error {
 	if work.Fence != (model.CoordinatorEpoch{}) {
 		payload, err := encodeFence(work.Fence)
 		if err != nil {
@@ -239,7 +247,11 @@ func visitSnapshotRecords(work RecoveredWork, visit func(snapshotRecordKind, []b
 	sources := append([]SourceCursor(nil), work.Sources...)
 	sort.Slice(sources, func(i, j int) bool { return taskLess(sources[i].Source, sources[j].Source) })
 	for _, source := range sources {
-		payload, err := encodeSource(source, nil)
+		schema := sourceRecordSchema
+		if sourceSchemas != nil && sourceSchemas[source.Source] != 0 {
+			schema = sourceSchemas[source.Source]
+		}
+		payload, err := encodeSourceSchema(source, nil, schema)
 		if err != nil {
 			return err
 		}
@@ -376,13 +388,13 @@ func recoverSnapshotReader(reader io.ReaderAt, size int64, expected Identity, cu
 		return RecoveredWork{}, Snapshot{}, fmt.Errorf("%w: snapshot state: %v", ErrCorrupt, err)
 	}
 	canonicalState := RecoveredState{Identity: expected, WorkerEpoch: current.WorkerEpoch, LastSequence: metadata.BaseSequence, TransactionCount: metadata.TransactionCount}
-	canonical, canonicalHeader, err := snapshotMetadata(canonicalState, decoder.work, metadata.Generation)
+	canonical, canonicalHeader, err := snapshotMetadataWithSourceSchemas(canonicalState, decoder.work, metadata.Generation, decoder.sourceSchemas)
 	if err != nil || canonical != metadata {
 		return RecoveredWork{}, Snapshot{}, fmt.Errorf("%w: noncanonical snapshot metadata", ErrCorrupt)
 	}
 	canonicalHasher := sha256.New()
 	_, _ = canonicalHasher.Write(canonicalHeader)
-	err = visitSnapshotRecords(decoder.work, func(kind snapshotRecordKind, payload []byte) error {
+	err = visitSnapshotRecordsWithSourceSchemas(decoder.work, decoder.sourceSchemas, func(kind snapshotRecordKind, payload []byte) error {
 		frame, frameErr := encodeSnapshotFrame(kind, payload)
 		if frameErr == nil {
 			_, _ = canonicalHasher.Write(frame)
@@ -524,18 +536,19 @@ func verifySnapshotFrame(reader io.ReaderAt, offset int64, header []byte, length
 }
 
 type snapshotDecoder struct {
-	work        RecoveredWork
-	initialized bool
-	fences      uint64
-	assignments uint64
-	sources     uint64
-	deliveries  uint64
-	outboxes    uint64
-	results     uint64
-	repairs     uint64
-	events      uint64
-	resultBytes map[model.JobID]uint64
-	maxOutboxes uint64
+	work          RecoveredWork
+	initialized   bool
+	fences        uint64
+	assignments   uint64
+	sources       uint64
+	deliveries    uint64
+	outboxes      uint64
+	results       uint64
+	repairs       uint64
+	events        uint64
+	resultBytes   map[model.JobID]uint64
+	maxOutboxes   uint64
+	sourceSchemas map[model.TaskID]uint16
 }
 
 func (decoder *snapshotDecoder) consume(kind snapshotRecordKind, payload []byte) error {
@@ -546,7 +559,7 @@ func (decoder *snapshotDecoder) consume(kind snapshotRecordKind, payload []byte)
 }
 
 func newSnapshotDecoder(work RecoveredWork, bodyBytes uint64) *snapshotDecoder {
-	decoder := &snapshotDecoder{work: work}
+	decoder := &snapshotDecoder{work: work, sourceSchemas: make(map[model.TaskID]uint16)}
 	if snapshotFrameOverhead != 0 {
 		decoder.maxOutboxes = bodyBytes / snapshotFrameOverhead
 	}
@@ -660,6 +673,7 @@ func (decoder *snapshotDecoder) consumeReserved(kind snapshotRecordKind, payload
 		if err != nil || len(outboxes) != 0 {
 			return errors.New("invalid snapshot source")
 		}
+		decoder.sourceSchemas[cursor.Source] = binary.BigEndian.Uint16(payload[:2])
 		decoder.work.Sources = append(decoder.work.Sources, cursor)
 		return nil
 	case snapshotDelivery:

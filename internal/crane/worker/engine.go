@@ -261,7 +261,7 @@ func (engine *Engine) Run(ctx context.Context) (runErr error) {
 		var eventOutput chan model.WorkerEvent
 		var nextEvent model.WorkerEvent
 		if len(engine.eventQueue) > 0 {
-			eventOutput, nextEvent = engine.events, engine.eventQueue[0]
+			eventOutput, nextEvent = engine.events, cloneWorkerEvent(engine.eventQueue[0])
 		}
 		select {
 		case <-ctx.Done():
@@ -322,25 +322,32 @@ func (engine *Engine) consumeRecovery(work store.RecoveredWork) error {
 		engine.outboxes[owned.ID] = &ownedOutbox{record: owned}
 	}
 	for _, stored := range work.Results {
-		owned := &ownedResult{record: stored.Record, provenance: stored.Provenance}
-		for id, delivery := range engine.deliveries {
-			if id.Tuple == stored.Record.TupleID && delivery.Destination.Task == stored.Record.SinkTask {
-				owned.parent = id
-				break
-			}
-		}
+		owned := &ownedResult{record: cloneResultRecord(stored.Record), provenance: stored.Provenance}
 		engine.results[resultID(stored.Record)] = owned
 	}
-	engine.eventQueue = append(engine.eventQueue, work.PendingEvents...)
 	for _, event := range work.PendingEvents {
-		if event.Completion != nil {
-			engine.completionReports[event.Completion.Source] = event
+		owned := cloneWorkerEvent(event)
+		engine.eventQueue = append(engine.eventQueue, owned)
+		if owned.Completion != nil {
+			engine.completionReports[owned.Completion.Source] = owned
 		}
-		if event.Failure != nil {
-			engine.failedTasks[event.Failure.Task.Task] = struct{}{}
+		if owned.Failure != nil {
+			engine.failedTasks[owned.Failure.Task.Task] = struct{}{}
 		}
 	}
 	return nil
+}
+
+func cloneWorkerEvent(event model.WorkerEvent) model.WorkerEvent {
+	if event.Completion != nil {
+		completion := *event.Completion
+		event.Completion = &completion
+	}
+	if event.Failure != nil {
+		failure := *event.Failure
+		event.Failure = &failure
+	}
+	return event
 }
 
 func (engine *Engine) startWorkers(ctx context.Context) {

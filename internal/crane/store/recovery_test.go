@@ -177,6 +177,121 @@ func TestCommitAndRecoveryConsumerOwnTransactionPayloads(t *testing.T) {
 	}
 }
 
+func TestTask15RecoveryAcceptsLegacyCheckpointWithoutCompletionProof(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+	options := Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }}
+	workerStore, err := Open(path, identity, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topology, assignment, epoch := domainAssignmentWithRange(t, workerStore.WorkerEpoch(), identity.NodeID, 3)
+	if err := workerStore.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	delivery := domainDeliverySequence(t, topology, assignment, epoch, 1)
+	if _, err := workerStore.Receive(delivery); err != nil {
+		t.Fatal(err)
+	}
+	outputs, outboxes := exactProcessedRecords(t, topology, assignment, delivery)
+	if err := workerStore.MarkProcessed(delivery.ID, outputs, outboxes); err != nil {
+		t.Fatal(err)
+	}
+	for _, outbox := range outboxes {
+		if err := workerStore.MarkOutboxCompleted(outbox.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := workerStore.MarkCompleted(delivery.ID); err != nil {
+		t.Fatal(err)
+	}
+	firstSequence := workerStore.Recovered().LastSequence + 1
+	if err := workerStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	notice := model.CheckpointNotice{JobID: assignment.JobID, Source: delivery.ID.Tuple.SourceTask, Watermark: 1, RaftIndex: 9, Epoch: epoch}
+	payload, err := encodeCheckpoint(notice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint16(payload[:2], domainRecordSchema)
+	appendLegacyTransactionForTest(t, path, firstSequence, Transaction{Records: []Record{{Type: recordCheckpoint, Payload: payload}}})
+	reopened, err := Open(path, identity, Options{MaxBytes: options.MaxBytes})
+	if err != nil {
+		t.Fatalf("legacy checkpoint WAL did not reopen: %v", err)
+	}
+	defer reopened.Close()
+	work := mustRecoverWork(t, reopened)
+	if len(work.Sources) != 1 || work.Sources[0].Watermark != 1 || work.Sources[0].CheckpointRevision != 0 || work.Sources[0].CheckpointAuthority != (CheckpointAuthority{}) || len(work.Deliveries) != 0 {
+		t.Fatalf("legacy checkpoint recovery=%+v", work)
+	}
+}
+
+func TestTask15RecoveryAcceptsLegacyEventAckBeforeCheckpointProof(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+	options := Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }}
+	workerStore, err := Open(path, identity, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topology, assignment, epoch := domainAssignmentWithRange(t, workerStore.WorkerEpoch(), identity.NodeID, 3)
+	if err := workerStore.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	work := mustRecoverWork(t, workerStore)
+	source := assignment.Tasks[0].Task
+	for _, token := range assignment.Tasks {
+		if token.Task.StageID == 1 {
+			source = token.Task
+			break
+		}
+	}
+	notice := model.CheckpointNotice{JobID: assignment.JobID, Source: source, Watermark: 1, RaftIndex: 9, Epoch: epoch}
+	event := completionEventForCheckpoint(t, work, notice)
+	if err := workerStore.PersistEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	firstSequence := workerStore.Recovered().LastSequence + 1
+	if err := workerStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	payload := encodeUint64Payload(event.TransactionID)
+	binary.BigEndian.PutUint16(payload[:2], domainRecordSchema)
+	appendLegacyTransactionForTest(t, path, firstSequence, Transaction{Records: []Record{{Type: recordEventAck, Payload: payload}}})
+	reopened, err := Open(path, identity, Options{MaxBytes: options.MaxBytes})
+	if err != nil {
+		t.Fatalf("legacy event-ack WAL did not reopen: %v", err)
+	}
+	defer reopened.Close()
+	if pending := mustRecoverWork(t, reopened).PendingEvents; len(pending) != 0 {
+		t.Fatalf("legacy acknowledged events=%+v", pending)
+	}
+}
+
+func appendLegacyTransactionForTest(t *testing.T, path string, firstSequence uint64, transaction Transaction) {
+	t.Helper()
+	encoded, err := encodeTransaction(firstSequence, transaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(path, WorkerWALFilename), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.Write(encoded)
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecoveryRejectsCommittedInnerLengthInflatedPastEOF(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "worker")
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 2}

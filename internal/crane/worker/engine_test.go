@@ -139,6 +139,29 @@ func TestEngineRecoveredPendingEventRetainsTransactionIdentity(t *testing.T) {
 	<-done
 }
 
+func TestEngineRecoveryDeepOwnsFailureEventBody(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	event := fixture.failureEvent(1)
+	work := repository.work.Clone()
+	work.PendingEvents = []model.WorkerEvent{event}
+	work.NextTransactionID = 2
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.consumeRecovery(work); err != nil {
+		t.Fatal(err)
+	}
+	want := *event.Failure
+	work.PendingEvents[0].Failure.Code++
+	work.PendingEvents[0].Failure.DetailDigest[0]++
+	got := engine.eventQueue[0].Failure
+	if got == nil || *got != want {
+		t.Fatalf("recovery caller mutated owned failure event: got=%+v want=%+v", got, want)
+	}
+}
+
 func TestEngineReconcileAssignmentObservesPostReadyDurableInstall(t *testing.T) {
 	fixture := workerFixture(t)
 	repository := newFakeRepository(fixture)
@@ -568,6 +591,7 @@ type fakeRepository struct {
 	receiveCalls          int
 	probeCalls            int
 	persistEventCalls     int
+	applyCheckpointCalls  int
 	localNode             uint16
 	localEpoch            model.WorkerEpoch
 	receiveStarted        chan struct{}
@@ -792,6 +816,7 @@ func (repository *fakeRepository) UpsertResult(record model.ResultRecord, proven
 func (repository *fakeRepository) ApplyCheckpoint(notice model.CheckpointNotice) error {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	repository.applyCheckpointCalls++
 	cursor, ok := repository.sources[notice.Source]
 	if !ok {
 		return errors.New("unknown source")

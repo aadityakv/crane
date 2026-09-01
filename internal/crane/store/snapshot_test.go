@@ -70,6 +70,139 @@ func TestSnapshotPersistsCompleteStateReclaimsWALAndContinuesSequence(t *testing
 	}
 }
 
+func TestTask15SnapshotRecoveryAcceptsCanonicalLegacySourceFrame(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker")
+	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
+	options := Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }}
+	workerStore, err := Open(path, identity, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	topology, assignment, epoch := domainAssignmentWithRange(t, workerStore.WorkerEpoch(), identity.NodeID, 3)
+	if err := workerStore.Fence(epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.InstallAssignment(assignment, topology.Spec(), 1, model.Running, epoch); err != nil {
+		t.Fatal(err)
+	}
+	var source model.AssignmentToken
+	for _, token := range assignment.Tasks {
+		if token.Task.StageID == 1 && token.WorkerID == identity.NodeID {
+			source = token
+			break
+		}
+	}
+	if source == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no local source")
+	}
+	outbox := domainSourceOutbox(t, topology, assignment, epoch, source, 1)
+	eof, err := model.SourceEOF(topology, source.Task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor := SourceCursor{Source: source.Task, NextSequence: 2, EOF: eof}
+	if err := workerStore.AdvanceSource(cursor, []OutboxRecord{outbox}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := workerStore.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rewriteSnapshotSourceAsLegacyForTest(t, path, identity, snapshot.Generation)
+	reopened, err := Open(path, identity, Options{MaxBytes: options.MaxBytes})
+	if err != nil {
+		t.Fatalf("legacy source snapshot did not reopen: %v", err)
+	}
+	defer reopened.Close()
+	work := mustRecoverWork(t, reopened)
+	if len(work.Sources) != 1 || work.Sources[0] != cursor {
+		t.Fatalf("legacy source cursor=%+v want=%+v", work.Sources, cursor)
+	}
+}
+
+func rewriteSnapshotSourceAsLegacyForTest(t *testing.T, path string, identity Identity, generation uint64) {
+	t.Helper()
+	snapshotPath := filepath.Join(path, snapshotFilename(generation))
+	data, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyEnd := len(data) - snapshotFooterBytes
+	replaced := false
+	for offset := snapshotHeaderBytes; offset < bodyEnd; {
+		kind := snapshotRecordKind(binary.BigEndian.Uint16(data[offset : offset+2]))
+		length := int(binary.BigEndian.Uint32(data[offset+2 : offset+6]))
+		end := offset + snapshotFrameOverhead + length
+		if kind != snapshotSource {
+			offset = end
+			continue
+		}
+		cursor, outboxes, decodeErr := decodeSource(data[offset+snapshotFrameHeaderBytes : offset+snapshotFrameHeaderBytes+length])
+		if decodeErr != nil || len(outboxes) != 0 {
+			t.Fatalf("decode source frame: outboxes=%d err=%v", len(outboxes), decodeErr)
+		}
+		legacy := newRecordWriter()
+		legacy.u16(domainRecordSchema)
+		legacy.task(cursor.Source)
+		legacy.u64(cursor.NextSequence)
+		legacy.u64(cursor.EOF)
+		legacy.u64(cursor.Watermark)
+		legacy.u64(cursor.RaftIndex)
+		legacy.u16(0)
+		frame, frameErr := encodeSnapshotFrame(snapshotSource, legacy.bytes())
+		if frameErr != nil {
+			t.Fatal(frameErr)
+		}
+		updated := make([]byte, 0, len(data)-end+offset+len(frame))
+		updated = append(updated, data[:offset]...)
+		updated = append(updated, frame...)
+		updated = append(updated, data[end:]...)
+		data = updated
+		bodyEnd = len(data) - snapshotFooterBytes
+		replaced = true
+		break
+	}
+	if !replaced {
+		t.Fatal("snapshot contained no source frame")
+	}
+	binary.BigEndian.PutUint64(data[8:16], uint64(len(data)))
+	binary.BigEndian.PutUint64(data[90:98], uint64(len(data)-snapshotHeaderBytes-snapshotFooterBytes))
+	binary.BigEndian.PutUint32(data[100:104], crc32.Checksum(data[:100], walCRC))
+	digest := sha256.Sum256(data[:len(data)-snapshotFooterBytes])
+	copy(data[len(data)-snapshotFooterBytes:], digest[:])
+	if err := os.WriteFile(snapshotPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(path, currentFilename)
+	markerBytes, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := decodeCurrentGeneration(markerBytes, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.SnapshotBytes = uint64(len(data))
+	current.SnapshotDigest = digest
+	markerBytes, err = encodeCurrentGeneration(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, markerBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := encodeSnapshotAnchor(walSnapshotAnchor{Identity: identity, WorkerEpoch: current.WorkerEpoch, Generation: current.Generation, BaseSequence: current.BaseSequence, TransactionCount: current.TransactionCount, SnapshotDigest: digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, generationWALFilename(generation)), anchor, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSnapshotSchemaIsDeterministicChecksummedAndOwned(t *testing.T) {
 	path, identity, options, store, _ := populatedSnapshotStore(t)
 	first, firstSnapshot, firstDigest := snapshotImageForTest(t, store.state, store.work, 1)

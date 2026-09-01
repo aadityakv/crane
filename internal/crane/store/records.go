@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	domainRecordSchema uint16 = 1
-	outboxRecordSchema uint16 = 2
-	sourceRecordSchema uint16 = 2
+	domainRecordSchema     uint16 = 1
+	outboxRecordSchema     uint16 = 2
+	sourceRecordSchema     uint16 = 2
+	checkpointRecordSchema uint16 = 2
+	eventAckRecordSchema   uint16 = 2
 )
 
 const (
@@ -450,9 +452,16 @@ func applyDomainRecord(work *RecoveredWork, record Record) error {
 		}
 		return applyCompleted(work, id)
 	case recordCheckpoint:
+		schema := recordPayloadSchema(record.Payload)
 		notice, err := decodeCheckpoint(record.Payload)
 		if err != nil {
 			return err
+		}
+		if schema == domainRecordSchema {
+			if hasCheckpointCompletionIdentity(work, notice) {
+				return applyCheckpoint(work, notice)
+			}
+			return applyLegacyCheckpoint(work, notice)
 		}
 		return applyCheckpoint(work, notice)
 	case recordResult:
@@ -468,9 +477,13 @@ func applyDomainRecord(work *RecoveredWork, record Record) error {
 		}
 		return applyEvent(work, event)
 	case recordEventAck:
+		schema := recordPayloadSchema(record.Payload)
 		through, err := decodeUint64Payload(record.Payload)
 		if err != nil {
 			return err
+		}
+		if schema == domainRecordSchema {
+			return applyLegacyEventAck(work, through)
 		}
 		return applyEventAck(work, through)
 	case recordRepair:
@@ -848,6 +861,71 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 	return nil
 }
 
+// applyLegacyCheckpoint replays only an already-durable schema-v1 Task14
+// checkpoint. New writes use schema v2 and always enter applyCheckpoint.
+func applyLegacyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
+	if err := notice.Validate(); err != nil {
+		return err
+	}
+	if notice.Epoch != work.Fence {
+		return errors.New("checkpoint coordinator fence mismatch")
+	}
+	assignment, ok := findAssignment(work, notice.JobID)
+	if !ok {
+		return errors.New("checkpoint references unknown assignment")
+	}
+	eof, err := model.SourceEOF(assignment.Topology, notice.Source)
+	if err != nil || notice.Watermark > eof {
+		return errors.New("checkpoint source or watermark is outside installed topology")
+	}
+	index := sourceIndex(work.Sources, notice.Source)
+	if index >= 0 {
+		prior := work.Sources[index]
+		if notice.Watermark < prior.Watermark || notice.RaftIndex < prior.RaftIndex {
+			return errors.New("checkpoint regression")
+		}
+		if notice.Watermark == prior.Watermark && notice.RaftIndex == prior.RaftIndex {
+			return nil
+		}
+		prior.Watermark, prior.RaftIndex = notice.Watermark, notice.RaftIndex
+		work.Sources[index] = prior
+	} else {
+		if notice.Watermark >= math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences {
+			return errors.New("checkpoint watermark outside v1 bounds")
+		}
+		work.Sources = append(work.Sources, SourceCursor{Source: notice.Source, NextSequence: notice.Watermark + 1, EOF: eof, Watermark: notice.Watermark, RaftIndex: notice.RaftIndex})
+	}
+	for _, delivery := range work.Deliveries {
+		if delivery.ID.Tuple.SourceTask == notice.Source && delivery.ID.Tuple.SourceSequence <= notice.Watermark && delivery.State != Completed && delivery.State != Compacted {
+			return errors.New("checkpoint covers incomplete delivery")
+		}
+	}
+	keptDeliveries := work.Deliveries[:0]
+	for _, delivery := range work.Deliveries {
+		if delivery.ID.Tuple.SourceTask != notice.Source || delivery.ID.Tuple.SourceSequence > notice.Watermark {
+			keptDeliveries = append(keptDeliveries, delivery)
+		}
+	}
+	work.Deliveries = keptDeliveries
+	keptOutboxes := work.Outboxes[:0]
+	for _, outbox := range work.Outboxes {
+		if outbox.ID.Tuple.SourceTask != notice.Source || outbox.ID.Tuple.SourceSequence > notice.Watermark {
+			keptOutboxes = append(keptOutboxes, outbox)
+		}
+	}
+	work.Outboxes = keptOutboxes
+	return nil
+}
+
+func hasCheckpointCompletionIdentity(work *RecoveredWork, notice model.CheckpointNotice) bool {
+	for _, event := range work.PendingEvents {
+		if event.Completion != nil && event.Completion.JobID == notice.JobID && event.Completion.Source == notice.Source && event.Completion.New == notice.Watermark {
+			return true
+		}
+	}
+	return false
+}
+
 func matchingCompletionReport(work *RecoveredWork, assignment InstalledAssignment, notice model.CheckpointNotice, prior SourceCursor, eof uint64) (*model.CompletionReport, error) {
 	source, exists := findToken(assignment.Assignment, notice.Source)
 	if !exists {
@@ -1024,6 +1102,20 @@ func applyEventAck(work *RecoveredWork, through uint64) error {
 				return errors.New("failure event acknowledged before durable job closure")
 			}
 		}
+		index++
+	}
+	work.PendingEvents = append([]model.WorkerEvent(nil), work.PendingEvents[index:]...)
+	return nil
+}
+
+// applyLegacyEventAck replays only an already-durable schema-v1 Task14 event
+// acknowledgment. New schema-v2 writes require checkpoint/terminal proof.
+func applyLegacyEventAck(work *RecoveredWork, through uint64) error {
+	if through >= work.NextTransactionID {
+		return errors.New("event ack exceeds durable sequence")
+	}
+	index := 0
+	for index < len(work.PendingEvents) && work.PendingEvents[index].TransactionID <= through {
 		index++
 	}
 	work.PendingEvents = append([]model.WorkerEvent(nil), work.PendingEvents[index:]...)
@@ -2386,7 +2478,7 @@ func encodeCheckpoint(n model.CheckpointNotice) ([]byte, error) {
 		return nil, err
 	}
 	w := newRecordWriter()
-	w.u16(domainRecordSchema)
+	w.u16(checkpointRecordSchema)
 	w.job(n.JobID)
 	w.task(n.Source)
 	w.u64(n.Watermark)
@@ -2396,11 +2488,14 @@ func encodeCheckpoint(n model.CheckpointNotice) ([]byte, error) {
 }
 func decodeCheckpoint(payload []byte) (model.CheckpointNotice, error) {
 	r := newRecordReader(payload)
-	if err := r.schema(); err != nil {
+	schema, err := r.u16()
+	if err != nil {
 		return model.CheckpointNotice{}, err
 	}
+	if schema != domainRecordSchema && schema != checkpointRecordSchema {
+		return model.CheckpointNotice{}, errors.New("unsupported checkpoint record schema")
+	}
 	var n model.CheckpointNotice
-	var err error
 	if n.JobID, err = r.job(); err != nil {
 		return n, err
 	}
@@ -2535,20 +2630,31 @@ func decodeEvent(payload []byte) (model.WorkerEvent, error) {
 
 func encodeUint64Payload(v uint64) []byte {
 	w := newRecordWriter()
-	w.u16(domainRecordSchema)
+	w.u16(eventAckRecordSchema)
 	w.u64(v)
 	return w.bytes()
 }
 func decodeUint64Payload(payload []byte) (uint64, error) {
 	r := newRecordReader(payload)
-	if err := r.schema(); err != nil {
+	schema, err := r.u16()
+	if err != nil {
 		return 0, err
+	}
+	if schema != domainRecordSchema && schema != eventAckRecordSchema {
+		return 0, errors.New("unsupported event acknowledgement schema")
 	}
 	v, err := r.u64()
 	if err != nil || !r.done() {
 		return 0, errors.New("invalid uint64 record")
 	}
 	return v, nil
+}
+
+func recordPayloadSchema(payload []byte) uint16 {
+	if len(payload) < 2 {
+		return 0
+	}
+	return binary.BigEndian.Uint16(payload[:2])
 }
 
 func encodeRepair(repair ResultRepairRecord) ([]byte, error) {
@@ -2616,25 +2722,34 @@ func decodeRepair(payload []byte) (ResultRepairRecord, error) {
 }
 
 func encodeSource(cursor SourceCursor, outboxes []OutboxRecord) ([]byte, error) {
+	return encodeSourceSchema(cursor, outboxes, sourceRecordSchema)
+}
+
+func encodeSourceSchema(cursor SourceCursor, outboxes []OutboxRecord, schema uint16) ([]byte, error) {
 	if err := cursor.Source.Validate(); err != nil {
 		return nil, err
+	}
+	if schema != domainRecordSchema && schema != sourceRecordSchema {
+		return nil, errors.New("unsupported source record schema")
 	}
 	if uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
 		return nil, errors.New("too many source outboxes")
 	}
 	w := newRecordWriter()
-	w.u16(sourceRecordSchema)
+	w.u16(schema)
 	w.task(cursor.Source)
 	w.u64(cursor.NextSequence)
 	w.u64(cursor.EOF)
 	w.u64(cursor.Watermark)
 	w.u64(cursor.RaftIndex)
-	w.u64(cursor.CheckpointRevision)
-	w.u64(cursor.CheckpointAuthority.JobControlRevision)
-	w.u64(cursor.CheckpointAuthority.AssignmentRevision)
-	w.fixed32(cursor.CheckpointAuthority.AssignmentDigest)
-	w.token(cursor.CheckpointAuthority.SourceToken)
-	w.epoch(cursor.CheckpointAuthority.CoordinatorEpoch)
+	if schema == sourceRecordSchema {
+		w.u64(cursor.CheckpointRevision)
+		w.u64(cursor.CheckpointAuthority.JobControlRevision)
+		w.u64(cursor.CheckpointAuthority.AssignmentRevision)
+		w.fixed32(cursor.CheckpointAuthority.AssignmentDigest)
+		w.token(cursor.CheckpointAuthority.SourceToken)
+		w.epoch(cursor.CheckpointAuthority.CoordinatorEpoch)
+	}
 	w.u16(uint16(len(outboxes)))
 	for _, outbox := range outboxes {
 		b, e := encodeOutbox(outbox)

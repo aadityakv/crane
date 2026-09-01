@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sort"
@@ -12,7 +13,7 @@ import (
 type ownedResult struct {
 	record     model.ResultRecord
 	provenance model.ResultCopyProvenance
-	parent     model.DeliveryID
+	parents    []model.DeliveryID
 	sending    bool
 }
 
@@ -40,7 +41,7 @@ func resultID(record model.ResultRecord) resultIdentity {
 func (engine *Engine) resultWorker(ctx context.Context) {
 	defer engine.workers.Done()
 	for job := range engine.resultJobs {
-		receipt, err := engine.replicator.ReplicateRecord(ctx, job.record, job.provenance)
+		receipt, err := engine.replicator.ReplicateRecord(ctx, cloneResultRecord(job.record), job.provenance)
 		select {
 		case engine.resultResponses <- resultResponse{key: job.key, receipt: receipt, err: err}:
 		case <-ctx.Done():
@@ -49,6 +50,9 @@ func (engine *Engine) resultWorker(ctx context.Context) {
 }
 
 func (engine *Engine) reconcileResults(ctx context.Context) error {
+	for _, result := range engine.results {
+		result.parents = result.parents[:0]
+	}
 	deliveryIDs := make([]model.DeliveryID, 0, len(engine.deliveries))
 	for id := range engine.deliveries {
 		deliveryIDs = append(deliveryIDs, id)
@@ -65,10 +69,6 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 		}
 		stage, ok := findStage(assignment.Topology, delivery.Destination.Task.StageID)
 		if !ok || stage.Role != model.StageSink {
-			continue
-		}
-		key := resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
-		if _, exists := engine.results[key]; exists {
 			continue
 		}
 		if !engine.currentSinkAuthority(assignment, delivery) {
@@ -92,10 +92,18 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 			return errors.New("sink task is not the exact local primary result replica")
 		}
 		provenance := model.ResultCopyProvenance{AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, ReplicaSet: replica, DestinationRole: model.PrimaryReplica, CoordinatorEpoch: assignment.CoordinatorEpoch}
-		if err := engine.repository.UpsertResult(record, provenance); err != nil {
-			return engine.ownerError("persist primary result", err)
+		key := resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
+		owned, exists := engine.results[key]
+		if !exists {
+			if err := engine.repository.UpsertResult(record, provenance); err != nil {
+				return engine.ownerError("persist primary result", err)
+			}
+			owned = &ownedResult{record: cloneResultRecord(record), provenance: provenance}
+			engine.results[key] = owned
+		} else if !equalOwnedResult(owned, record, provenance) {
+			return model.ErrIdentityReuse
 		}
-		engine.results[key] = &ownedResult{record: record, provenance: provenance, parent: id}
+		owned.parents = append(owned.parents, id)
 	}
 
 	type scheduledResult struct {
@@ -104,17 +112,17 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 	}
 	ordered := make([]scheduledResult, 0, len(engine.results))
 	for key, result := range engine.results {
-		if result.parent != (model.DeliveryID{}) {
-			ordered = append(ordered, scheduledResult{key: key, parent: result.parent})
+		if len(result.parents) > 0 {
+			ordered = append(ordered, scheduledResult{key: key, parent: result.parents[0]})
 		}
 	}
 	sort.Slice(ordered, func(i, j int) bool { return deliveryIDLess(ordered[i].parent, ordered[j].parent) })
 	for _, candidate := range ordered {
 		key, result := candidate.key, engine.results[candidate.key]
-		if result.sending || result.parent == (model.DeliveryID{}) {
+		if result.sending || len(result.parents) == 0 {
 			continue
 		}
-		parent, ok := engine.deliveries[result.parent]
+		parent, ok := engine.deliveries[result.parents[0]]
 		if !ok || parent.State != store.Processed {
 			continue
 		}
@@ -127,7 +135,7 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 		target := result.provenance
 		target.DestinationRole = model.SecondaryReplica
 		select {
-		case engine.resultJobs <- resultJob{key: key, record: result.record, provenance: target}:
+		case engine.resultJobs <- resultJob{key: key, record: cloneResultRecord(result.record), provenance: target}:
 			result.sending = true
 		default:
 			return nil
@@ -163,12 +171,23 @@ func (engine *Engine) handleResultResponse(response resultResponse) error {
 	if response.receipt.DestinationNodeID != replica.SecondaryNodeID || response.receipt.DestinationWorkerEpoch != replica.SecondaryEpoch || response.receipt.StreamChecksum != model.ResultRecordStreamChecksum(result.record) || response.receipt.StreamLength != uint64(len(encoded)) || response.receipt.CoordinatorEpoch != assignment.CoordinatorEpoch {
 		return errors.New("result replication receipt does not bind exact durable secondary copy")
 	}
-	if err := engine.repository.MarkCompleted(result.parent); err != nil {
-		return engine.ownerError("complete replicated sink delivery", err)
+	parents := append([]model.DeliveryID(nil), result.parents...)
+	for _, parentID := range parents {
+		parent, exists := engine.deliveries[parentID]
+		if !exists || parent.State != store.Processed || !engine.currentSinkAuthority(assignment, parent) {
+			// An authority change between dispatch and receipt retains every
+			// parent for later authorized reconciliation.
+			return nil
+		}
 	}
-	parent := engine.deliveries[result.parent]
-	parent.State = store.Completed
-	engine.deliveries[result.parent] = parent
+	for _, parentID := range parents {
+		if err := engine.repository.MarkCompleted(parentID); err != nil {
+			return engine.ownerError("complete replicated sink delivery", err)
+		}
+		parent := engine.deliveries[parentID]
+		parent.State = store.Completed
+		engine.deliveries[parentID] = parent
+	}
 	return nil
 }
 
@@ -188,4 +207,13 @@ func findResultReplica(set model.AssignmentSet, task model.TaskID) (model.Result
 		}
 	}
 	return model.ResultReplicaSet{}, false
+}
+
+func cloneResultRecord(record model.ResultRecord) model.ResultRecord {
+	record.Value = append([]byte(nil), record.Value...)
+	return record
+}
+
+func equalOwnedResult(owned *ownedResult, record model.ResultRecord, provenance model.ResultCopyProvenance) bool {
+	return owned != nil && owned.record.TupleID == record.TupleID && owned.record.SinkTask == record.SinkTask && owned.record.SpecificationHash == record.SpecificationHash && owned.record.Checksum == record.Checksum && bytes.Equal(owned.record.Value, record.Value) && owned.provenance == provenance
 }

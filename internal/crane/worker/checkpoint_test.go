@@ -55,6 +55,49 @@ func TestCheckpointPublishesOnlyContiguousDurableSourceCompletion(t *testing.T) 
 	<-done
 }
 
+func TestCheckpointEventConsumerCannotMutateOwnedCompletionProof(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "2")
+	repository := newFakeRepository(fixture)
+	repository.work.Sources = []store.SourceCursor{{Source: fixture.source.Task, NextSequence: 2, EOF: 1}}
+	tuple, exists, err := model.SourceTuple(fixture.topology, fixture.source.Task, 1)
+	if err != nil || !exists {
+		t.Fatalf("source tuple: exists=%v err=%v", exists, err)
+	}
+	outboxes, err := deriveSourceOutboxes(fixture.assignment, fixture.source, 1, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, outbox := range outboxes {
+		outbox.Completed = true
+		repository.outboxes[outbox.ID] = outbox
+		repository.work.Outboxes = append(repository.work.Outboxes, outbox)
+	}
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	published := <-engine.Events()
+	exact := *published.Completion
+	published.Completion.New++
+	published.Completion.Digest[0]++
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: exact.JobID, Source: exact.Source, Watermark: exact.New, RaftIndex: 9, Epoch: exact.Epoch}, JobControlRevision: exact.JobControlRevision, AssignmentRevision: exact.AssignmentRevision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	if err := engine.ApplyCheckpoint(ctx, notice); err != nil {
+		t.Fatalf("consumer mutation corrupted owner checkpoint proof: %v", err)
+	}
+	if err := engine.AcknowledgeEvents(ctx, exact.WorkerTransactionID); err != nil {
+		t.Fatalf("consumer mutation corrupted event acknowledgement: %v", err)
+	}
+	cancel()
+	<-done
+}
+
 func TestCheckpointNoticeRequiresExactPendingReportAndCompactsAfterPersistence(t *testing.T) {
 	fixture := workerFixtureWithRange(t, "1", "3")
 	repository := newFakeRepository(fixture)
@@ -129,6 +172,54 @@ func TestCheckpointNoticeRequiresExactPendingReportAndCompactsAfterPersistence(t
 	changedWrapper.AssignmentDigest[0]++
 	if err := engine.ApplyCheckpoint(ctx, changedWrapper); err == nil {
 		t.Fatal("historical checkpoint accepted changed protocol authority")
+	}
+	cancel()
+	<-done
+}
+
+func TestCheckpointLegacyProofMigrationRequiresExactInstalledDigestBeforeMutation(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "3")
+	repository := newFakeRepository(fixture)
+	cursor := store.SourceCursor{Source: fixture.source.Task, NextSequence: 3, EOF: 2, Watermark: 1, RaftIndex: 9}
+	repository.work.Sources = []store.SourceCursor{cursor}
+	repository.sources = map[model.TaskID]store.SourceCursor{cursor.Source: cursor}
+	report := model.CompletionReport{JobID: fixture.assignment.Assignment.JobID, JobControlRevision: 1, AssignmentRevision: fixture.assignment.Assignment.Revision, Source: fixture.source.Task, Token: fixture.source, Epoch: fixture.epoch, ExpectedCheckpointRevision: 0, Prior: 0, New: 1, EOF: 2, WorkerTransactionID: 1}
+	report.Digest = model.CompletionReportDigest(report)
+	repository.work.PendingEvents = []model.WorkerEvent{{WorkerID: fixture.localNode, WorkerEpoch: fixture.localEpoch, TransactionID: 1, Kind: model.WorkerEventCompletion, Completion: &report}}
+	repository.work.NextTransactionID = 2
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+
+	exact := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: report.JobID, Source: report.Source, Watermark: 1, RaftIndex: 9, Epoch: fixture.epoch}, JobControlRevision: 1, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	changed := exact
+	changed.AssignmentDigest[0]++
+	if err := engine.ApplyCheckpoint(ctx, changed); err == nil {
+		t.Fatal("legacy migration accepted a changed assignment digest")
+	}
+	repository.mu.Lock()
+	storeCalls := repository.applyCheckpointCalls
+	durable := repository.sources[cursor.Source]
+	repository.mu.Unlock()
+	if storeCalls != 0 || durable != cursor || engine.sources[cursor.Source] != cursor {
+		t.Fatalf("rejected migration mutated state: calls=%d durable=%+v memory=%+v", storeCalls, durable, engine.sources[cursor.Source])
+	}
+	if err := engine.ApplyCheckpoint(ctx, exact); err != nil {
+		t.Fatalf("exact legacy migration: %v", err)
+	}
+	repository.mu.Lock()
+	storeCalls = repository.applyCheckpointCalls
+	repository.mu.Unlock()
+	if storeCalls != 1 || engine.sources[cursor.Source].CheckpointAuthority.AssignmentDigest != exact.AssignmentDigest {
+		t.Fatalf("exact migration calls=%d cursor=%+v", storeCalls, engine.sources[cursor.Source])
 	}
 	cancel()
 	<-done
