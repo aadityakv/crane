@@ -1967,11 +1967,30 @@ func (store *Store) ApplyCheckpoint(notice model.CheckpointNotice) error {
 // a local participant that does not own the source cursor.
 func (store *Store) ObserveCheckpoint(notice protocol.CheckpointNotice) error {
 	observation := CommittedCheckpoint{Notice: notice.Notice, JobControlRevision: notice.JobControlRevision, AssignmentRevision: notice.AssignmentRevision, AssignmentDigest: notice.AssignmentDigest}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	if store.failed {
+		return ErrUnavailable
+	}
+	if index := checkpointObservationIndex(store.work.Checkpoints, observation.Notice.Source); index >= 0 && store.work.Checkpoints[index].Notice.RaftIndex == observation.Notice.RaftIndex {
+		if store.work.Checkpoints[index] == observation {
+			return nil
+		}
+		return model.ErrIdentityReuse
+	}
 	payload, err := encodeCheckpointObservation(observation)
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordCheckpointObservation, Payload: payload}}}, 0)
+	tx := Transaction{Records: []Record{{Type: recordCheckpointObservation, Payload: payload}}}
+	prospective, err := store.reduceWorkLocked(tx)
+	if err != nil {
+		return err
+	}
+	return store.commitWorkLocked(tx, prospective)
 }
 
 // UpsertResult idempotently persists one logical record and exact current-copy provenance.

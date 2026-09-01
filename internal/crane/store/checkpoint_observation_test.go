@@ -40,11 +40,15 @@ func TestCommittedCheckpointObservationIsAtomicOwnedAndSurvivesSnapshotReopen(t 
 		t.Fatal(err)
 	}
 	before, err := workerStore.RecoverWork()
+	beforeState := workerStore.Recovered()
 	if err != nil || len(before.Checkpoints) != 1 || before.Checkpoints[0].Notice != notice.Notice {
 		t.Fatalf("observation = %#v, %v", before.Checkpoints, err)
 	}
 	if err := workerStore.ObserveCheckpoint(notice); err != nil {
 		t.Fatalf("exact retry: %v", err)
+	}
+	if state := workerStore.Recovered(); state != beforeState {
+		t.Fatalf("exact retry mutated durable metadata: before=%+v after=%+v", beforeState, state)
 	}
 	changed := notice
 	changed.Notice.Watermark++
