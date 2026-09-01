@@ -301,13 +301,25 @@ func (machine *Machine) replicaWorkersCurrent(replica model.ResultReplicaSet) bo
 	return primaryOK && secondaryOK && primary.State != WorkerOffline && secondary.State != WorkerOffline && primary.Epoch == replica.PrimaryEpoch && secondary.Epoch == replica.SecondaryEpoch
 }
 
+// allCheckpointsFinal reports whether every committed source sits exactly at
+// its immutable EOF. A source whose committed EOF is zero is empty and
+// trivially finally checkpointed: no checkpoint record is constructible for it
+// (progress requires a strictly increasing watermark), so a missing entry
+// counts as final exactly for that case. Every nonzero-EOF source still
+// requires a materialized final checkpoint at its EOF.
 func allCheckpointsFinal(record JobRecord) bool {
-	if len(record.SourceEOFs) == 0 || len(record.Checkpoints) != len(record.SourceEOFs) {
+	if len(record.SourceEOFs) == 0 {
 		return false
 	}
 	for source, eof := range record.SourceEOFs {
 		checkpoint, ok := record.Checkpoints[source]
-		if !ok || checkpoint.Revision == 0 || checkpoint.Watermark != eof.EOF {
+		if !ok {
+			if eof.EOF == 0 {
+				continue
+			}
+			return false
+		}
+		if checkpoint.Revision == 0 || checkpoint.Watermark != eof.EOF {
 			return false
 		}
 	}

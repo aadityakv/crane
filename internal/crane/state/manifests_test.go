@@ -208,6 +208,103 @@ func TestLifecycleEveryNormalTransitionPairAndSpecialTerminalPath(t *testing.T) 
 	}
 }
 
+// emptySourceRunningJob commits one Running job with two source partitions
+// over one range of the given exclusive end. With end 1 the second partition
+// commits the legal EOF zero; with end 2 both partitions commit EOF one.
+func emptySourceRunningJob(t *testing.T, end int64) (*Machine, model.JobID, model.ValidatedTopology, model.AssignmentSet) {
+	t.Helper()
+	machine := NewMachine()
+	epochCommand, _ := NewBeginCoordinatorEpoch(InternalCommandID{0xe1}, 0, 1, [16]byte{0xe1})
+	applyTask10(t, machine, 1, epochCommand)
+	for index := 1; index <= 2; index++ {
+		record := WorkerRecord{NodeID: uint16(index), Epoch: model.WorkerEpoch{byte(index), 0x46}, State: WorkerEligible, Revision: 1, Slots: 16, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
+		register, _ := NewRegisterWorker(InternalCommandID{byte(index), 0x46}, 0, record, machine.coordinatorEpoch)
+		applyTask10(t, machine, uint64(index), register)
+	}
+	spec := task10Topology(0)
+	spec.Stages[0].Parallelism = 2
+	spec.Stages[0].Operator.Settings[0].Value = decimal(end)
+	topology, err := model.ValidateTopology(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xe2}, Sequence: 1}, topology.Spec(), machine.coordinatorEpoch)
+	applyTask10(t, machine, 4, submit)
+	job := submit.JobID()
+	for partition := uint16(0); partition < 2; partition++ {
+		source := model.TaskID{JobID: job, StageID: 1, Partition: partition}
+		eof, _ := model.SourceEOF(topology, source)
+		command, _ := NewRecordSourceEOF(InternalCommandID{0xe3, byte(partition)}, 0, source, eof, machine.coordinatorEpoch)
+		applyTask10(t, machine, uint64(5+partition), command)
+	}
+	assignment, err := model.BuildAssignmentSet(job, topology.Digest(), 1, topology, task10EligiblePlacements(machine))
+	if err != nil {
+		t.Fatal(err)
+	}
+	install, _ := NewInstallAssignments(InternalCommandID{0xe4}, 1, assignment, machine.coordinatorEpoch)
+	applyTask10(t, machine, 10, install)
+	running, _ := NewTransitionJob(InternalCommandID{0xe5}, 2, job, JobDeploying, JobRunning, machine.coordinatorEpoch)
+	applyTask10(t, machine, 11, running)
+	return machine, job, topology, assignment
+}
+
+// commitFinalCheckpoint advances one source exactly to its committed EOF.
+func commitFinalCheckpoint(t *testing.T, machine *Machine, job model.JobID, assignment model.AssignmentSet, partition uint16, transaction uint64) {
+	t.Helper()
+	var token model.AssignmentToken
+	for _, candidate := range assignment.Tasks {
+		if candidate.Task.StageID == 1 && candidate.Task.Partition == partition {
+			token = candidate
+			break
+		}
+	}
+	if token == (model.AssignmentToken{}) {
+		t.Fatalf("partition %d token missing", partition)
+	}
+	eof := machine.jobs[job].SourceEOFs[token.Task].EOF
+	report := model.CompletionReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Source: token.Task, Token: token, Epoch: machine.coordinatorEpoch, ExpectedCheckpointRevision: 0, Prior: 0, New: eof, EOF: eof, WorkerTransactionID: transaction}
+	report.Digest = model.CompletionReportDigest(report)
+	advance, _ := NewAdvanceCheckpoint(InternalCommandID{0xe6, byte(partition), byte(transaction)}, 0, report)
+	if got := applyTask10(t, machine, 40+transaction, advance); got.Code != ResultSuccess {
+		t.Fatalf("final checkpoint partition %d = %#v", partition, got)
+	}
+}
+
+func TestEmptySourceCheckpointIsTriviallyFinalThroughDrainSealSucceed(t *testing.T) {
+	machine, job, topology, assignment := emptySourceRunningJob(t, 1)
+	empty := model.TaskID{JobID: job, StageID: 1, Partition: 1}
+	if machine.jobs[job].SourceEOFs[empty].EOF != 0 {
+		t.Fatalf("fixture requires an EOF-zero source: %#v", machine.jobs[job].SourceEOFs)
+	}
+	// Only the nonzero-EOF source can ever materialize a final checkpoint.
+	commitFinalCheckpoint(t, machine, job, assignment, 0, 1)
+
+	draining, _ := NewTransitionJob(InternalCommandID{0xe7}, machine.jobs[job].JobControlRevision, job, JobRunning, JobDraining)
+	if got := applyTask10(t, machine, 50, draining); got.Code != ResultSuccess {
+		t.Fatalf("draining with an EOF-zero source = %#v", got)
+	}
+	replica := assignment.ResultReplicas[0]
+	manifest := ResultManifest{JobID: job, SinkTask: replica.SinkTask, ManifestRevision: 1, SpecificationHash: topology.Digest(), RecordCount: 1, TotalBytes: model.ResultArtifactMinRecordBytesV1, Checksum: [32]byte{0xe8}, Replicas: replica}
+	seal, _ := NewSealManifest(InternalCommandID{0xe8}, 0, manifest)
+	if got := applyTask10(t, machine, 51, seal); got.Code != ResultSuccess {
+		t.Fatalf("seal with an EOF-zero source = %#v", got)
+	}
+	succeed, _ := NewTransitionJob(InternalCommandID{0xe9}, machine.jobs[job].JobControlRevision, job, JobDraining, JobSucceeded)
+	if got := applyTask10(t, machine, 52, succeed); got.Code != ResultSuccess || machine.jobs[job].Lifecycle != JobSucceeded {
+		t.Fatalf("succeed with an EOF-zero source = %#v lifecycle=%d", got, machine.jobs[job].Lifecycle)
+	}
+	assertCanonicalSnapshotEstimate(t, machine)
+}
+
+func TestNonEmptySourceStillRequiresMaterializedFinalCheckpoint(t *testing.T) {
+	machine, job, _, _ := emptySourceRunningJob(t, 2)
+	commitFinalCheckpoint(t, machine, job, *machine.jobs[job].Assignment, 0, 1)
+	draining, _ := NewTransitionJob(InternalCommandID{0xea}, machine.jobs[job].JobControlRevision, job, JobRunning, JobDraining)
+	if got := applyTask10(t, machine, 53, draining); got.Code != ResultInvalidTransition || machine.jobs[job].Lifecycle != JobRunning {
+		t.Fatalf("draining without the nonzero-EOF checkpoint = %#v lifecycle=%d", got, machine.jobs[job].Lifecycle)
+	}
+}
+
 func TestManifestAggregateResultBytesBound(t *testing.T) {
 	job := model.JobID{1}
 	first := model.TaskID{JobID: job, StageID: 2, Partition: 0}

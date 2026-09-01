@@ -31,13 +31,22 @@ func terminalHarness(t *testing.T, sinkPartitions uint16) (*harness, model.JobID
 
 func terminalHarnessAt(t *testing.T, sinkPartitions uint16, watermarkDelta uint64) (*harness, model.JobID, model.ValidatedTopology, model.AssignmentSet) {
 	t.Helper()
+	return terminalHarnessSpec(t, terminalTopologySpec(sinkPartitions), watermarkDelta)
+}
+
+// terminalHarnessSpec seeds one Running job for one topology whose every
+// nonzero-EOF source checkpoint is committed at EOF minus watermarkDelta (zero
+// commits exactly final checkpoints). Sources committing EOF zero are skipped:
+// no checkpoint record is constructible for an empty source.
+func terminalHarnessSpec(t *testing.T, spec model.TopologySpec, watermarkDelta uint64) (*harness, model.JobID, model.ValidatedTopology, model.AssignmentSet) {
+	t.Helper()
 	h := newHarness(t)
 	h.seedEpoch()
 	h.seedWorker(2, model.WorkerEpoch{2}, 8)
 	h.seedWorker(3, model.WorkerEpoch{3}, 8)
 	h.addWorkerMember(2, model.WorkerEpoch{2}, 8)
 	h.addWorkerMember(3, model.WorkerEpoch{3}, 8)
-	topology, err := model.ValidateTopology(terminalTopologySpec(sinkPartitions))
+	topology, err := model.ValidateTopology(spec)
 	if err != nil {
 		t.Fatalf("validate topology: %v", err)
 	}
@@ -87,6 +96,9 @@ func terminalHarnessAt(t *testing.T, sinkPartitions uint16, watermarkDelta uint6
 	transaction := uint64(1)
 	for _, token := range sources {
 		eof := record.SourceEOFs[token.Task].EOF
+		if eof == 0 {
+			continue
+		}
 		watermark := eof
 		if watermark > watermarkDelta {
 			watermark -= watermarkDelta
@@ -471,6 +483,74 @@ func TestManifestBoundRejectsMoreThanTwoFiftySixPartitions(t *testing.T) {
 	}
 	if !manifestPartitionBound(257) {
 		t.Fatal("257 partitions accepted")
+	}
+}
+
+func TestJobCheckpointsFinalTreatsEmptySourceAsTriviallyFinal(t *testing.T) {
+	normal := model.TaskID{JobID: model.JobID{1}, StageID: 1, Partition: 0}
+	empty := model.TaskID{JobID: model.JobID{1}, StageID: 1, Partition: 1}
+	final := state.JobRecord{
+		SourceEOFs:  map[model.TaskID]state.SourceEOFRecord{normal: {EOF: 4, Revision: 1}, empty: {EOF: 0, Revision: 1}},
+		Checkpoints: map[model.TaskID]state.CheckpointRecord{normal: {Watermark: 4, Revision: 1}},
+	}
+	if !jobCheckpointsFinal(final) {
+		t.Fatal("EOF-zero source without a checkpoint blocked finality")
+	}
+	nonzero := state.JobRecord{
+		SourceEOFs:  map[model.TaskID]state.SourceEOFRecord{normal: {EOF: 4, Revision: 1}, empty: {EOF: 3, Revision: 1}},
+		Checkpoints: map[model.TaskID]state.CheckpointRecord{normal: {Watermark: 4, Revision: 1}},
+	}
+	if jobCheckpointsFinal(nonzero) {
+		t.Fatal("nonzero-EOF source without a checkpoint passed finality")
+	}
+	incomplete := state.JobRecord{
+		SourceEOFs:  map[model.TaskID]state.SourceEOFRecord{normal: {EOF: 4, Revision: 1}},
+		Checkpoints: map[model.TaskID]state.CheckpointRecord{normal: {Watermark: 2, Revision: 1}},
+	}
+	if jobCheckpointsFinal(incomplete) {
+		t.Fatal("watermark below EOF passed finality")
+	}
+}
+
+// emptySourceTerminalHarness seeds one Running job whose second source
+// partition commits the legal EOF zero, so only the first source can ever
+// materialize a final checkpoint.
+func emptySourceTerminalHarness(t *testing.T) (*harness, model.JobID, model.ValidatedTopology, model.AssignmentSet) {
+	t.Helper()
+	spec := terminalTopologySpec(1)
+	spec.Stages[0].Parallelism = 2
+	spec.Stages[0].Operator.Settings[0].Value = "1"
+	return terminalHarnessSpec(t, spec, 0)
+}
+
+func TestTerminalWorkflowSucceedsWithEmptySourceMissingCheckpoint(t *testing.T) {
+	h, job, topology, assignment := emptySourceTerminalHarness(t)
+	empty := model.TaskID{JobID: job, StageID: 1, Partition: 1}
+	record, ok := h.job(job)
+	if !ok || record.SourceEOFs[empty].EOF != 0 {
+		t.Fatalf("fixture requires an EOF-zero source: %#v", record.SourceEOFs)
+	}
+	if _, exists := record.Checkpoints[empty]; exists {
+		t.Fatalf("fixture must not checkpoint the empty source: %#v", record.Checkpoints)
+	}
+	replica := assignment.ResultReplicas[0]
+	records := terminalRecords(t, job, topology, assignment, 1)
+	h.seedResultRecords(replica.PrimaryNodeID, records[replica.SinkTask]...)
+	h.seedResultRecords(replica.SecondaryNodeID, records[replica.SinkTask]...)
+
+	h.start()
+	h.markReady()
+	h.lead(2)
+	record = waitForSucceeded(t, h, job)
+	if len(record.Checkpoints) != 1 || record.Checkpoints[model.TaskID{JobID: job, StageID: 1, Partition: 0}].Watermark != 1 {
+		t.Fatalf("checkpoints = %#v", record.Checkpoints)
+	}
+	manifest, ok := record.Manifests[replica.SinkTask]
+	if !ok {
+		t.Fatalf("empty-source job sealed no manifest: %#v", record.Manifests)
+	}
+	if manifest.RecordCount != 1 {
+		t.Fatalf("manifest = %#v", manifest)
 	}
 }
 

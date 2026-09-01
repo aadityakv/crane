@@ -98,14 +98,22 @@ func (actor *Actor) driveTerminalResults(ctx context.Context, epoch model.Coordi
 }
 
 // jobCheckpointsFinal mirrors the replicated final-checkpoint classification:
-// every committed source checkpoint sits exactly at its immutable EOF.
+// every committed source checkpoint sits exactly at its immutable EOF, and a
+// source whose committed EOF is zero is empty and trivially finally
+// checkpointed without any materialized record.
 func jobCheckpointsFinal(record state.JobRecord) bool {
-	if len(record.SourceEOFs) == 0 || len(record.Checkpoints) != len(record.SourceEOFs) {
+	if len(record.SourceEOFs) == 0 {
 		return false
 	}
 	for source, eof := range record.SourceEOFs {
 		checkpoint, ok := record.Checkpoints[source]
-		if !ok || checkpoint.Revision == 0 || checkpoint.Watermark != eof.EOF {
+		if !ok {
+			if eof.EOF == 0 {
+				continue
+			}
+			return false
+		}
+		if checkpoint.Revision == 0 || checkpoint.Watermark != eof.EOF {
 			return false
 		}
 	}
