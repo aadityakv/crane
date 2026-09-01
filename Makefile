@@ -1,8 +1,12 @@
-.PHONY: build clean-build test race integration vet staticcheck fmt-check verify
+.PHONY: build crane clean-build test race integration vet staticcheck fmt-check verify
 
 build: | bin
 	go build -o bin/cs425-node ./cmd/node
 	go build -o bin/cs425-cluster ./cmd/cluster
+	go build -o bin/cs425-crane ./cmd/crane
+
+crane: | bin
+	go build -o bin/cs425-crane ./cmd/crane
 
 bin:
 	mkdir -p $@
