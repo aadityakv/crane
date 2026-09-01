@@ -83,6 +83,109 @@ func TestTransferIDBindsRoleRecordProvenanceDestinationAndFence(t *testing.T) {
 	}
 }
 
+func TestTransferInventoryUsesCanonicalLengthPrefixedEntries(t *testing.T) {
+	fixture := newTransferFixture(t)
+	logical, err := model.MarshalResultRecord(fixture.records[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, total, _, err := ResultInventoryAggregate(fixture.repair.Instruction.InventoryQueryDigest, fixture.records[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || total != uint64(len(logical)+4) {
+		t.Fatalf("inventory count/bytes=%d/%d want=1/%d", count, total, len(logical)+4)
+	}
+}
+
+func TestTransferRealStoreUsesEntryBoundsAndRecoversProgress(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value func(*testing.T) []byte
+		want  uint64
+	}{
+		{name: "minimum", value: func(t *testing.T) []byte {
+			encoded, err := model.MarshalTuple(model.Tuple{Fields: []model.Field{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return encoded
+		}, want: model.ResultArtifactMinRecordBytesV1},
+		{name: "maximum", value: func(t *testing.T) []byte {
+			encoded, err := model.MarshalTuple(model.Tuple{Fields: []model.Field{{Name: "x", Value: model.Value{Type: model.ValueBytes, Bytes: make([]byte, 504)}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return encoded
+		}, want: model.ResultArtifactMaxRecordBytesV1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newTransferFixture(t)
+			record, err := model.NewResultRecord(fixture.records[0].TupleID, fixture.replica.SinkTask, fixture.records[0].SpecificationHash, test.value(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.records = []model.ResultRecord{record}
+			count, total, digest, err := ResultInventoryAggregate(fixture.repair.Instruction.InventoryQueryDigest, fixture.records)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if total != test.want {
+				t.Fatalf("entry bytes=%d want=%d", total, test.want)
+			}
+			fixture.repair.Instruction.ExpectedRecordCount, fixture.repair.Instruction.ExpectedTotalBytes, fixture.repair.Instruction.ExpectedContentDigest = count, total, digest
+			rebindTransferRepair(&fixture.repair)
+			path := t.TempDir() + "/worker"
+			repository := openRealTransferRepository(t, path, fixture)
+			if err := repository.UpsertRepair(fixture.repair); err != nil {
+				t.Fatalf("real Store grant: %v", err)
+			}
+			owner := mustTransferOwner(t, repository)
+			if _, err := owner.ReceiveResultRecord(context.Background(), fixture.repairSourcePeer(), fixture.repairChunk(t, record)); err != nil {
+				t.Fatalf("real Store receive: %v", err)
+			}
+			if err := repository.workerStore.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := store.Open(path, repository.identity, repository.options)
+			if err != nil {
+				t.Fatalf("reopen real Store: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+			work, err := reopened.RecoverWork()
+			if err != nil || len(work.Repairs) != 1 || work.Repairs[0].State != store.RepairComplete || work.Repairs[0].NextOffset != test.want || work.Repairs[0].TotalBytes != test.want {
+				t.Fatalf("recovered real progress=%+v err=%v", work.Repairs, err)
+			}
+		})
+	}
+}
+
+func TestTransferRealStoreAcceptsExactPerJobRepairBoundary(t *testing.T) {
+	fixture := newTransferFixture(t)
+	const exact = uint64(64 << 20)
+	fixture.repair.Instruction.ExpectedRecordCount = 100_000
+	fixture.repair.Instruction.ExpectedTotalBytes = exact
+	fixture.repair.Instruction.ExpectedContentDigest = sha256.Sum256([]byte("exact-64-mib-inventory"))
+	rebindTransferRepair(&fixture.repair)
+	path := t.TempDir() + "/worker"
+	repository := openRealTransferRepository(t, path, fixture)
+	if err := repository.UpsertRepair(fixture.repair); err != nil {
+		t.Fatalf("exact boundary grant: %v", err)
+	}
+	if err := repository.workerStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(path, repository.identity, repository.options)
+	if err != nil {
+		t.Fatalf("reopen exact boundary grant: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	work, err := reopened.RecoverWork()
+	if err != nil || len(work.Repairs) != 1 || work.Repairs[0].Instruction.ExpectedTotalBytes != exact {
+		t.Fatalf("recovered exact boundary=%+v err=%v", work.Repairs, err)
+	}
+}
+
 func TestTransferHistoricalRepairPersistsRecordThenProgressAndResumesWholeRecord(t *testing.T) {
 	fixture := newTransferFixture(t)
 	fixture.installRepair(t)
@@ -101,7 +204,7 @@ func TestTransferHistoricalRepairPersistsRecordThenProgressAndResumesWholeRecord
 	}
 	progress := fixture.destination.repairs[0]
 	stream, _ := model.MarshalResultRecord(fixture.records[0])
-	if progress.State != store.RepairStreaming || progress.NextRecord != 1 || progress.NextOffset != uint64(len(stream)) {
+	if progress.State != store.RepairStreaming || progress.NextRecord != 1 || progress.NextOffset != uint64(len(stream)+4) {
 		t.Fatalf("durable progress=%+v", progress)
 	}
 
@@ -111,7 +214,7 @@ func TestTransferHistoricalRepairPersistsRecordThenProgressAndResumesWholeRecord
 	if _, err = restarted.ReceiveResultRecord(context.Background(), fixture.repairSourcePeer(), chunk); err != nil {
 		t.Fatalf("exact recovered duplicate: %v", err)
 	}
-	if got := fixture.destination.repairs[0]; got.NextRecord != 1 || got.NextOffset != uint64(len(stream)) {
+	if got := fixture.destination.repairs[0]; got.NextRecord != 1 || got.NextOffset != uint64(len(stream)+4) {
 		t.Fatalf("duplicate advanced repair twice: %+v", got)
 	}
 	changed := chunk
@@ -164,6 +267,168 @@ func TestTransferRepairRecoversResultDurableBeforeLaterProgress(t *testing.T) {
 	}
 	if fixture.destination.repairs[0].State != store.RepairComplete || fixture.destination.repairs[0].NextRecord != 2 {
 		t.Fatalf("recovered terminal progress=%+v", fixture.destination.repairs[0])
+	}
+}
+
+func TestTransferSerializesWholeDestinationRepairTransition(t *testing.T) {
+	fixture := newTransferFixture(t)
+	fixture.installRepair(t)
+	owner := mustTransferOwner(t, fixture.destination)
+	firstBlocked := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	fixture.destination.beforeResult = func(record model.ResultRecord) {
+		if record.TupleID == fixture.records[0].TupleID {
+			select {
+			case <-firstBlocked:
+			default:
+				close(firstBlocked)
+			}
+			<-releaseFirst
+		}
+	}
+	firstChunk := fixture.repairChunk(t, fixture.records[0])
+	secondChunk := fixture.repairChunk(t, fixture.records[1])
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := owner.ReceiveResultRecord(context.Background(), fixture.repairSourcePeer(), firstChunk)
+		firstDone <- err
+	}()
+	<-firstBlocked
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := owner.ReceiveResultRecord(context.Background(), fixture.repairSourcePeer(), secondChunk)
+		secondDone <- err
+	}()
+	for index := 0; index < 1000; index++ {
+		runtime.Gosched()
+	}
+	fixture.destination.mu.Lock()
+	beforeReleaseResults := len(fixture.destination.results)
+	fixture.destination.mu.Unlock()
+	if beforeReleaseResults != 0 {
+		t.Fatalf("later repair record mutated while prior transition blocked: results=%d", beforeReleaseResults)
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := fixture.destination.repairs[0]; got.State != store.RepairComplete || got.NextRecord != 2 || got.NextOffset != got.Instruction.ExpectedTotalBytes {
+		t.Fatalf("serialized repair outcome=%+v", got)
+	}
+}
+
+func TestTransferSerializesDuplicateSourceProgressACKs(t *testing.T) {
+	fixture := newTransferFixture(t)
+	fixture.installSourceRepair(t)
+	owner := mustTransferOwner(t, fixture.source)
+	chunk, complete, err := owner.NextRepairRecord(context.Background(), fixture.destinationPeer(), fixture.repair.Instruction.RepairID, fixture.destinationRepairStatus())
+	if err != nil || complete {
+		t.Fatalf("next record complete=%t err=%v", complete, err)
+	}
+	ack := fixture.ack(chunk)
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	fixture.source.beforeRepair = func(repair store.ResultRepairRecord) {
+		if repair.NextRecord == 1 {
+			entered <- struct{}{}
+			<-release
+		}
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- owner.AcknowledgeRepairRecord(context.Background(), fixture.destinationPeer(), chunk, ack)
+	}()
+	<-entered
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- owner.AcknowledgeRepairRecord(context.Background(), fixture.destinationPeer(), chunk, ack)
+	}()
+	for index := 0; index < 1000; index++ {
+		runtime.Gosched()
+	}
+	select {
+	case <-entered:
+		t.Fatal("duplicate source progress entered durable transition concurrently")
+	default:
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := fixture.source.repairs[0]; got.NextRecord != 1 || got.NextOffset == 0 {
+		t.Fatalf("duplicate ACK progress=%+v", got)
+	}
+}
+
+func TestTransferRepairRejectsRecordsOutsideCheckpointVectorBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		record func(transferFixture) model.ResultRecord
+	}{
+		{name: "above watermark", record: func(f transferFixture) model.ResultRecord {
+			tuple := f.records[1].TupleID
+			tuple.SourceSequence++
+			tuple.PathDigest = sha256.Sum256([]byte("above-repair-watermark"))
+			record, err := model.NewResultRecord(tuple, f.records[1].SinkTask, f.records[1].SpecificationHash, f.records[1].Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return record
+		}},
+		{name: "absent source", record: func(f transferFixture) model.ResultRecord {
+			tuple := f.records[1].TupleID
+			tuple.SourceTask.StageID = 2
+			record, err := model.NewResultRecord(tuple, f.records[1].SinkTask, f.records[1].SpecificationHash, f.records[1].Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return record
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, repositoryKind := range []string{"fake", "real"} {
+				t.Run(repositoryKind, func(t *testing.T) {
+					fixture := newTransferFixture(t)
+					fixture.repair.Instruction.Checkpoints = []model.SourceCheckpoint{{Source: fixture.records[1].TupleID.SourceTask, Watermark: fixture.records[1].TupleID.SourceSequence}}
+					fixture.repair.Instruction.CheckpointDigest = model.CheckpointVectorDigest(fixture.repair.Instruction.Checkpoints)
+					fixture.repair.Instruction.InventoryQueryDigest = model.ResultInventoryQueryDigest(model.ResultInventoryQueryDefinition{JobID: fixture.repair.Instruction.JobID, SinkTask: fixture.repair.Instruction.SinkTask, SpecificationHash: fixture.repair.Instruction.SpecificationHash, AssignmentRevision: fixture.repair.Instruction.AssignmentRevision, AssignmentDigest: fixture.repair.Instruction.AssignmentDigest, Checkpoints: fixture.repair.Instruction.Checkpoints, CheckpointDigest: fixture.repair.Instruction.CheckpointDigest})
+					count, total, digest, err := ResultInventoryAggregate(fixture.repair.Instruction.InventoryQueryDigest, fixture.records)
+					if err != nil {
+						t.Fatal(err)
+					}
+					fixture.repair.Instruction.ExpectedRecordCount, fixture.repair.Instruction.ExpectedTotalBytes, fixture.repair.Instruction.ExpectedContentDigest = count, total, digest
+					rebindTransferRepair(&fixture.repair)
+					var repository TransferRepository
+					if repositoryKind == "fake" {
+						fixture.installRepair(t)
+						repository = fixture.destination
+					} else {
+						realRepository := openRealTransferRepository(t, t.TempDir()+"/worker", fixture)
+						if err := realRepository.UpsertRepair(fixture.repair); err != nil {
+							t.Fatal(err)
+						}
+						repository = realRepository
+					}
+					owner := mustTransferOwner(t, repository)
+					if _, err = owner.ReceiveResultRecord(context.Background(), fixture.repairSourcePeer(), fixture.repairChunk(t, test.record(fixture))); err == nil {
+						t.Fatal("out-of-vector record accepted")
+					}
+					work, recoverErr := repository.RecoverWork()
+					if recoverErr != nil || len(work.Results) != 0 || len(work.Repairs) != 1 || work.Repairs[0].NextRecord != 0 {
+						t.Fatalf("out-of-vector record mutated state: results=%d repairs=%+v err=%v", len(work.Results), work.Repairs, recoverErr)
+					}
+					if _, err = owner.ReceiveResultRecord(context.Background(), fixture.repairSourcePeer(), fixture.repairChunk(t, fixture.records[0])); err != nil {
+						t.Fatalf("valid covered prefix failed after rejection: %v", err)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -312,6 +577,61 @@ type transferRepository struct {
 	resultRelease chan struct{}
 	recoverErr    error
 	repairErrOnce error
+	beforeResult  func(model.ResultRecord)
+	beforeRepair  func(store.ResultRepairRecord)
+}
+
+type realTransferRepository struct {
+	workerStore *store.Store
+	identity    store.Identity
+	options     store.Options
+	node        uint16
+	epoch       model.WorkerEpoch
+}
+
+func openRealTransferRepository(t *testing.T, path string, fixture transferFixture) *realTransferRepository {
+	t.Helper()
+	identity := store.Identity{ClusterID: [16]byte{51}, NodeID: fixture.destination.localNode}
+	options := store.Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.destination.localEpoch, nil }}
+	workerStore, err := store.Open(path, identity, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = workerStore.Close() })
+	if err := workerStore.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.InstallAssignment(fixture.assignment.Assignment, fixture.assignment.Topology.Spec(), fixture.assignment.JobControlRevision, fixture.assignment.SchedulingState, fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	return &realTransferRepository{workerStore: workerStore, identity: identity, options: options, node: identity.NodeID, epoch: fixture.destination.localEpoch}
+}
+
+func (r *realTransferRepository) RecoverWork() (store.RecoveredWork, error) {
+	return r.workerStore.RecoverWork()
+}
+func (r *realTransferRepository) LocalIdentity() (uint16, model.WorkerEpoch) { return r.node, r.epoch }
+func (r *realTransferRepository) CurrentFence() model.CoordinatorEpoch {
+	work, _ := r.workerStore.RecoverWork()
+	return work.Fence
+}
+func (r *realTransferRepository) InstalledAssignment(job model.JobID) (store.InstalledAssignment, bool) {
+	work, err := r.workerStore.RecoverWork()
+	if err != nil {
+		return store.InstalledAssignment{}, false
+	}
+	for _, assignment := range work.Assignments {
+		if assignment.Assignment.JobID == job {
+			return assignment, true
+		}
+	}
+	return store.InstalledAssignment{}, false
+}
+func (r *realTransferRepository) UpsertResult(record model.ResultRecord, provenance model.ResultCopyProvenance) error {
+	return r.workerStore.UpsertResult(record, provenance)
+}
+func (r *realTransferRepository) UpsertRepair(repair store.ResultRepairRecord) error {
+	return r.workerStore.UpsertRepair(repair)
 }
 
 func (r *transferRepository) clone() *transferRepository {
@@ -343,6 +663,9 @@ func (r *transferRepository) InstalledAssignment(job model.JobID) (store.Install
 	return v, ok
 }
 func (r *transferRepository) UpsertResult(record model.ResultRecord, provenance model.ResultCopyProvenance) error {
+	if r.beforeResult != nil {
+		r.beforeResult(record)
+	}
 	if r.resultStarted != nil {
 		select {
 		case <-r.resultStarted:
@@ -370,6 +693,9 @@ func (r *transferRepository) UpsertResult(record model.ResultRecord, provenance 
 	return nil
 }
 func (r *transferRepository) UpsertRepair(repair store.ResultRepairRecord) error {
+	if r.beforeRepair != nil {
+		r.beforeRepair(repair)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.repairErrOnce != nil {
@@ -499,6 +825,13 @@ func (f transferFixture) destinationRepairStatus() protocol.ResultRepairStatus {
 }
 func (f transferFixture) ack(chunk protocol.ResultRecordChunk) protocol.ResultRecordAck {
 	return protocol.ResultRecordAck{TransferID: chunk.Transfer.TransferID, NodeID: chunk.DestinationNodeID, WorkerEpoch: chunk.DestinationWorkerEpoch, RepairID: chunk.RepairID, RepairInstructionDigest: chunk.RepairInstructionDigest, NextOffset: chunk.Transfer.TotalLength, TotalLength: chunk.Transfer.TotalLength, Checksum: chunk.Transfer.Checksum, Complete: true, CoordinatorEpoch: chunk.Provenance.CoordinatorEpoch}
+}
+
+func rebindTransferRepair(repair *store.ResultRepairRecord) {
+	repair.Instruction.InventoryQueryDigest = model.ResultInventoryQueryDigest(model.ResultInventoryQueryDefinition{JobID: repair.Instruction.JobID, SinkTask: repair.Instruction.SinkTask, SpecificationHash: repair.Instruction.SpecificationHash, AssignmentRevision: repair.Instruction.AssignmentRevision, AssignmentDigest: repair.Instruction.AssignmentDigest, Checkpoints: repair.Instruction.Checkpoints, CheckpointDigest: repair.Instruction.CheckpointDigest})
+	repair.Instruction.RepairID = model.DeriveRepairID(repair.Instruction)
+	repair.InstructionDigest = model.RepairInstructionDigest(repair.Instruction)
+	repair.ContentDigest = model.EmptyResultInventoryDigest(repair.InstructionDigest)
 }
 
 func mustTransferOwner(t *testing.T, repository TransferRepository) *TransferOwner {

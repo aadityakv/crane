@@ -1018,9 +1018,7 @@ func validateSnapshotRepair(repair ResultRepairRecord, assignment InstalledAssig
 	}
 	if definition.AssignmentRevision == assignment.Assignment.Revision {
 		replica, exists := findReplica(assignment.Assignment, definition.SinkTask)
-		forward := exists && definition.SourceNodeID == replica.PrimaryNodeID && definition.SourceWorkerEpoch == replica.PrimaryEpoch && definition.DestinationNodeID == replica.SecondaryNodeID && definition.DestinationWorkerEpoch == replica.SecondaryEpoch
-		reverse := exists && definition.SourceNodeID == replica.SecondaryNodeID && definition.SourceWorkerEpoch == replica.SecondaryEpoch && definition.DestinationNodeID == replica.PrimaryNodeID && definition.DestinationWorkerEpoch == replica.PrimaryEpoch
-		if definition.AssignmentDigest != assignment.Assignment.Digest || !forward && !reverse {
+		if definition.AssignmentDigest != assignment.Assignment.Digest || !exists || !repairDestinationMatchesReplica(definition, replica) {
 			return errors.New("snapshot repair current assignment cross-reference mismatch")
 		}
 	}

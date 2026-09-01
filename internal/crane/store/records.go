@@ -1193,10 +1193,8 @@ func applyRepair(work *RecoveredWork, repair ResultRepairRecord) error {
 		return errors.New("repair sink has no installed replica set")
 	}
 	d := repair.Instruction
-	forward := d.SourceNodeID == replica.PrimaryNodeID && d.SourceWorkerEpoch == replica.PrimaryEpoch && d.DestinationNodeID == replica.SecondaryNodeID && d.DestinationWorkerEpoch == replica.SecondaryEpoch
-	reverse := d.SourceNodeID == replica.SecondaryNodeID && d.SourceWorkerEpoch == replica.SecondaryEpoch && d.DestinationNodeID == replica.PrimaryNodeID && d.DestinationWorkerEpoch == replica.PrimaryEpoch
-	if !forward && !reverse {
-		return errors.New("repair endpoints are not the current assigned replica pair")
+	if !repairDestinationMatchesReplica(d, replica) {
+		return errors.New("repair destination is not a current assigned replica")
 	}
 	for index, checkpoint := range d.Checkpoints {
 		if checkpoint.Source.JobID != d.JobID {
@@ -2233,6 +2231,10 @@ func repairTargets(repair ResultRepairRecord, nodeID uint16, workerEpoch model.W
 	default:
 		return false
 	}
+}
+
+func repairDestinationMatchesReplica(repair model.RepairResultPartitionDefinition, replica model.ResultReplicaSet) bool {
+	return repair.DestinationNodeID == replica.PrimaryNodeID && repair.DestinationWorkerEpoch == replica.PrimaryEpoch || repair.DestinationNodeID == replica.SecondaryNodeID && repair.DestinationWorkerEpoch == replica.SecondaryEpoch
 }
 
 // --- canonical record codecs ---

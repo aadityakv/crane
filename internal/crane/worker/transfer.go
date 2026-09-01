@@ -87,6 +87,7 @@ type TransferOwner struct {
 	queued  int
 	perPeer map[transferPeerIdentity]int
 	changed chan struct{}
+	repairs map[[16]byte]chan struct{}
 }
 
 type transferPeerIdentity struct {
@@ -119,7 +120,7 @@ func NewTransferOwner(options TransferOptions) (*TransferOwner, error) {
 	if _, err := options.Repository.RecoverWork(); err != nil {
 		return nil, err
 	}
-	return &TransferOwner{repository: options.Repository, localNode: node, localEpoch: epoch, maxPerPeer: options.MaxPerPeer, maxActive: options.MaxActive, maxQueued: options.MaxQueuedWork, perPeer: make(map[transferPeerIdentity]int), changed: make(chan struct{})}, nil
+	return &TransferOwner{repository: options.Repository, localNode: node, localEpoch: epoch, maxPerPeer: options.MaxPerPeer, maxActive: options.MaxActive, maxQueued: options.MaxQueuedWork, perPeer: make(map[transferPeerIdentity]int), changed: make(chan struct{}), repairs: make(map[[16]byte]chan struct{})}, nil
 }
 
 // DeriveResultRecordTransferID binds a record transfer to its complete role,
@@ -196,7 +197,7 @@ func (owner *TransferOwner) ReceiveResultRecord(ctx context.Context, peer Transf
 			return protocol.ResultRecordAck{}, err
 		}
 	case TransferHistoricalRepair:
-		if err := owner.receiveRepair(peer, chunk); err != nil {
+		if err := owner.receiveRepair(ctx, peer, chunk); err != nil {
 			return protocol.ResultRecordAck{}, err
 		}
 	default:
@@ -215,6 +216,15 @@ func (owner *TransferOwner) NextRepairRecord(ctx context.Context, peer TransferP
 	}
 	defer release()
 	work, repair, err := owner.currentRepair(repairID, store.RepairSource)
+	if err != nil {
+		return protocol.ResultRecordChunk{}, false, err
+	}
+	releaseRepair, err := owner.acquireRepair(ctx, repairID)
+	if err != nil {
+		return protocol.ResultRecordChunk{}, false, err
+	}
+	defer releaseRepair()
+	work, repair, err = owner.currentRepair(repairID, store.RepairSource)
 	if err != nil {
 		return protocol.ResultRecordChunk{}, false, err
 	}
@@ -265,6 +275,15 @@ func (owner *TransferOwner) AcknowledgeRepairRecord(ctx context.Context, peer Tr
 	}
 	defer release()
 	work, repair, err := owner.currentRepair(chunk.RepairID, store.RepairSource)
+	if err != nil {
+		return err
+	}
+	releaseRepair, err := owner.acquireRepair(ctx, chunk.RepairID)
+	if err != nil {
+		return err
+	}
+	defer releaseRepair()
+	work, repair, err = owner.currentRepair(chunk.RepairID, store.RepairSource)
 	if err != nil {
 		return err
 	}
@@ -333,8 +352,17 @@ func (owner *TransferOwner) OpenResultFetch(context.Context, TransferPeer, proto
 	return protocol.ResultFetchChunk{}, ErrResultFetchUnavailable
 }
 
-func (owner *TransferOwner) receiveRepair(peer TransferPeer, chunk protocol.ResultRecordChunk) error {
+func (owner *TransferOwner) receiveRepair(ctx context.Context, peer TransferPeer, chunk protocol.ResultRecordChunk) error {
 	_, repair, err := owner.currentRepair(chunk.RepairID, store.RepairDestination)
+	if err != nil {
+		return err
+	}
+	releaseRepair, err := owner.acquireRepair(ctx, chunk.RepairID)
+	if err != nil {
+		return err
+	}
+	defer releaseRepair()
+	_, repair, err = owner.currentRepair(chunk.RepairID, store.RepairDestination)
 	if err != nil {
 		return err
 	}
@@ -415,7 +443,7 @@ func (owner *TransferOwner) validateCurrentReplication(peer TransferPeer, chunk 
 }
 
 func (owner *TransferOwner) validateRepairDestination(repair store.ResultRepairRecord, chunk protocol.ResultRecordChunk) error {
-	if chunk.RepairID != repair.Instruction.RepairID || chunk.RepairInstructionDigest != repair.InstructionDigest || chunk.Record.TupleID.JobID != repair.Instruction.JobID || chunk.Record.SinkTask != repair.Instruction.SinkTask || chunk.Record.SpecificationHash != repair.Instruction.SpecificationHash {
+	if chunk.RepairID != repair.Instruction.RepairID || chunk.RepairInstructionDigest != repair.InstructionDigest || chunk.Record.TupleID.JobID != repair.Instruction.JobID || chunk.Record.SinkTask != repair.Instruction.SinkTask || chunk.Record.SpecificationHash != repair.Instruction.SpecificationHash || !repairCoversTuple(repair.Instruction, chunk.Record.TupleID) {
 		return ErrTransferUnauthorized
 	}
 	want, err := owner.repairDestinationProvenance(repair, chunk.Record)
@@ -478,20 +506,20 @@ func (owner *TransferOwner) currentRepair(id [16]byte, role store.RepairEndpoint
 }
 
 func (owner *TransferOwner) advanceRepair(repair store.ResultRepairRecord, record model.ResultRecord) error {
-	stream, err := model.MarshalResultRecord(record)
+	entry, err := marshalResultInventoryEntry(record)
 	if err != nil {
 		return err
 	}
-	if repair.NextOffset > ^uint64(0)-uint64(len(stream)) || repair.NextRecord == ^uint64(0) {
+	if repair.NextOffset > ^uint64(0)-uint64(len(entry)) || repair.NextRecord == ^uint64(0) {
 		return ErrTransferIdentityReuse
 	}
 	base := repair.ContentDigest
 	if repair.NextRecord == 0 {
 		base = model.EmptyResultInventoryDigest(repair.Instruction.InventoryQueryDigest)
 	}
-	repair.ContentDigest = extendInventoryDigest(base, repair.NextRecord, stream)
+	repair.ContentDigest = extendInventoryDigest(base, repair.NextRecord, entry)
 	repair.NextRecord++
-	repair.NextOffset += uint64(len(stream))
+	repair.NextOffset += uint64(len(entry))
 	repair.RecordCount = repair.NextRecord
 	repair.TotalBytes = repair.NextOffset
 	repair.State = store.RepairStreaming
@@ -505,12 +533,12 @@ func (owner *TransferOwner) advanceRepair(repair store.ResultRepairRecord, recor
 }
 
 func preflightRepairAdvance(repair store.ResultRepairRecord, record model.ResultRecord) error {
-	stream, err := model.MarshalResultRecord(record)
+	entry, err := marshalResultInventoryEntry(record)
 	if err != nil {
 		return err
 	}
 	definition := repair.Instruction
-	length := uint64(len(stream))
+	length := uint64(len(entry))
 	if repair.NextRecord >= definition.ExpectedRecordCount || repair.NextOffset > definition.ExpectedTotalBytes || length > definition.ExpectedTotalBytes-repair.NextOffset {
 		return ErrTransferIdentityReuse
 	}
@@ -519,7 +547,7 @@ func preflightRepairAdvance(repair store.ResultRepairRecord, record model.Result
 		if repair.NextRecord == 0 {
 			base = model.EmptyResultInventoryDigest(definition.InventoryQueryDigest)
 		}
-		digest := extendInventoryDigest(base, repair.NextRecord, stream)
+		digest := extendInventoryDigest(base, repair.NextRecord, entry)
 		if repair.NextOffset+length != definition.ExpectedTotalBytes || digest != definition.ExpectedContentDigest {
 			return ErrTransferIdentityReuse
 		}
@@ -579,6 +607,26 @@ func (owner *TransferOwner) begin(ctx context.Context, peer TransferPeer) (func(
 		case <-changed:
 			owner.mu.Lock()
 		}
+	}
+}
+
+func (owner *TransferOwner) acquireRepair(ctx context.Context, id [16]byte) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	owner.mu.Lock()
+	serial, ok := owner.repairs[id]
+	if !ok {
+		serial = make(chan struct{}, 1)
+		serial <- struct{}{}
+		owner.repairs[id] = serial
+	}
+	owner.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-serial:
+		return func() { serial <- struct{}{} }, nil
 	}
 }
 
@@ -725,14 +773,29 @@ func ResultInventoryAggregate(queryDigest [32]byte, records []model.ResultRecord
 		if index > 0 && !tupleTransferLess(records[index-1].TupleID, record.TupleID) {
 			return 0, 0, [32]byte{}, errors.New("result inventory is not canonical and unique")
 		}
-		stream, err := model.MarshalResultRecord(record)
-		if err != nil || total > ^uint64(0)-uint64(len(stream)) {
+		entry, err := marshalResultInventoryEntry(record)
+		if err != nil || total > ^uint64(0)-uint64(len(entry)) {
 			return 0, 0, [32]byte{}, errors.New("invalid or oversized result inventory")
 		}
-		digest = extendInventoryDigest(digest, uint64(index), stream)
-		total += uint64(len(stream))
+		digest = extendInventoryDigest(digest, uint64(index), entry)
+		total += uint64(len(entry))
 	}
 	return uint64(len(records)), total, digest, nil
+}
+
+func marshalResultInventoryEntry(record model.ResultRecord) ([]byte, error) {
+	logical, err := model.MarshalResultRecord(record)
+	if err != nil {
+		return nil, err
+	}
+	entryBytes := uint64(len(logical)) + 4
+	if entryBytes < model.ResultArtifactMinRecordBytesV1 || entryBytes > model.ResultArtifactMaxRecordBytesV1 || uint64(len(logical)) > uint64(^uint32(0)) {
+		return nil, errors.New("result logical bytes outside inventory entry bounds")
+	}
+	entry := make([]byte, int(entryBytes))
+	binary.BigEndian.PutUint32(entry[:4], uint32(len(logical)))
+	copy(entry[4:], logical)
+	return entry, nil
 }
 
 func validateRepairInventory(definition model.RepairResultPartitionDefinition, records []model.ResultRecord) error {
