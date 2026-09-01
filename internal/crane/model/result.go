@@ -189,6 +189,28 @@ func ResultRecordStreamChecksum(record ResultRecord) [32]byte {
 	return sha256.Sum256(encoded)
 }
 
+// ExtendResultInventoryDigest adds one canonical length-prefixed result record
+// to a versioned inventory chain. The returned byte count includes the four-byte
+// artifact entry prefix used by repair totals and resume offsets.
+func ExtendResultInventoryDigest(prior [32]byte, recordIndex uint64, record ResultRecord) ([32]byte, uint64, error) {
+	logical, err := MarshalResultRecord(record)
+	if err != nil {
+		return [32]byte{}, 0, err
+	}
+	entryBytes := uint64(len(logical)) + 4
+	if entryBytes < ResultArtifactMinRecordBytesV1 || entryBytes > ResultArtifactMaxRecordBytesV1 || uint64(len(logical)) > uint64(^uint32(0)) {
+		return [32]byte{}, 0, errors.New("result logical bytes outside inventory entry bounds")
+	}
+	entry := appendUint32(nil, uint32(len(logical)))
+	entry = append(entry, logical...)
+	encoded := []byte(ResultInventoryChainDomainV1 + "\x00")
+	encoded = append(encoded, prior[:]...)
+	encoded = appendUint64(encoded, recordIndex)
+	encoded = appendUint64(encoded, entryBytes)
+	encoded = append(encoded, entry...)
+	return sha256.Sum256(encoded), entryBytes, nil
+}
+
 func readResultTaskID(reader *checkedReader) (TaskID, error) {
 	if reader.remaining() < 20 {
 		return TaskID{}, errors.New("truncated result task ID")

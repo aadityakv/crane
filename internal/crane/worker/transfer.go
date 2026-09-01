@@ -506,20 +506,20 @@ func (owner *TransferOwner) currentRepair(id [16]byte, role store.RepairEndpoint
 }
 
 func (owner *TransferOwner) advanceRepair(repair store.ResultRepairRecord, record model.ResultRecord) error {
-	entry, err := marshalResultInventoryEntry(record)
-	if err != nil {
-		return err
-	}
-	if repair.NextOffset > ^uint64(0)-uint64(len(entry)) || repair.NextRecord == ^uint64(0) {
-		return ErrTransferIdentityReuse
-	}
 	base := repair.ContentDigest
 	if repair.NextRecord == 0 {
 		base = model.EmptyResultInventoryDigest(repair.Instruction.InventoryQueryDigest)
 	}
-	repair.ContentDigest = extendInventoryDigest(base, repair.NextRecord, entry)
+	digest, entryBytes, err := model.ExtendResultInventoryDigest(base, repair.NextRecord, record)
+	if err != nil {
+		return err
+	}
+	if repair.NextOffset > ^uint64(0)-entryBytes || repair.NextRecord == ^uint64(0) {
+		return ErrTransferIdentityReuse
+	}
+	repair.ContentDigest = digest
 	repair.NextRecord++
-	repair.NextOffset += uint64(len(entry))
+	repair.NextOffset += entryBytes
 	repair.RecordCount = repair.NextRecord
 	repair.TotalBytes = repair.NextOffset
 	repair.State = store.RepairStreaming
@@ -533,21 +533,19 @@ func (owner *TransferOwner) advanceRepair(repair store.ResultRepairRecord, recor
 }
 
 func preflightRepairAdvance(repair store.ResultRepairRecord, record model.ResultRecord) error {
-	entry, err := marshalResultInventoryEntry(record)
+	definition := repair.Instruction
+	base := repair.ContentDigest
+	if repair.NextRecord == 0 {
+		base = model.EmptyResultInventoryDigest(definition.InventoryQueryDigest)
+	}
+	digest, length, err := model.ExtendResultInventoryDigest(base, repair.NextRecord, record)
 	if err != nil {
 		return err
 	}
-	definition := repair.Instruction
-	length := uint64(len(entry))
 	if repair.NextRecord >= definition.ExpectedRecordCount || repair.NextOffset > definition.ExpectedTotalBytes || length > definition.ExpectedTotalBytes-repair.NextOffset {
 		return ErrTransferIdentityReuse
 	}
 	if repair.NextRecord+1 == definition.ExpectedRecordCount {
-		base := repair.ContentDigest
-		if repair.NextRecord == 0 {
-			base = model.EmptyResultInventoryDigest(definition.InventoryQueryDigest)
-		}
-		digest := extendInventoryDigest(base, repair.NextRecord, entry)
 		if repair.NextOffset+length != definition.ExpectedTotalBytes || digest != definition.ExpectedContentDigest {
 			return ErrTransferIdentityReuse
 		}
@@ -773,29 +771,14 @@ func ResultInventoryAggregate(queryDigest [32]byte, records []model.ResultRecord
 		if index > 0 && !tupleTransferLess(records[index-1].TupleID, record.TupleID) {
 			return 0, 0, [32]byte{}, errors.New("result inventory is not canonical and unique")
 		}
-		entry, err := marshalResultInventoryEntry(record)
-		if err != nil || total > ^uint64(0)-uint64(len(entry)) {
+		nextDigest, entryBytes, err := model.ExtendResultInventoryDigest(digest, uint64(index), record)
+		if err != nil || total > ^uint64(0)-entryBytes {
 			return 0, 0, [32]byte{}, errors.New("invalid or oversized result inventory")
 		}
-		digest = extendInventoryDigest(digest, uint64(index), entry)
-		total += uint64(len(entry))
+		digest = nextDigest
+		total += entryBytes
 	}
 	return uint64(len(records)), total, digest, nil
-}
-
-func marshalResultInventoryEntry(record model.ResultRecord) ([]byte, error) {
-	logical, err := model.MarshalResultRecord(record)
-	if err != nil {
-		return nil, err
-	}
-	entryBytes := uint64(len(logical)) + 4
-	if entryBytes < model.ResultArtifactMinRecordBytesV1 || entryBytes > model.ResultArtifactMaxRecordBytesV1 || uint64(len(logical)) > uint64(^uint32(0)) {
-		return nil, errors.New("result logical bytes outside inventory entry bounds")
-	}
-	entry := make([]byte, int(entryBytes))
-	binary.BigEndian.PutUint32(entry[:4], uint32(len(logical)))
-	copy(entry[4:], logical)
-	return entry, nil
 }
 
 func validateRepairInventory(definition model.RepairResultPartitionDefinition, records []model.ResultRecord) error {
@@ -807,15 +790,6 @@ func validateRepairInventory(definition model.RepairResultPartitionDefinition, r
 		return ErrTransferIdentityReuse
 	}
 	return nil
-}
-
-func extendInventoryDigest(prior [32]byte, index uint64, stream []byte) [32]byte {
-	encoded := []byte("crane-result-inventory-chain-v1\x00")
-	encoded = append(encoded, prior[:]...)
-	encoded = appendUint64Transfer(encoded, index)
-	encoded = appendUint64Transfer(encoded, uint64(len(stream)))
-	encoded = append(encoded, stream...)
-	return sha256.Sum256(encoded)
 }
 
 func endpointsForRole(replica model.ResultReplicaSet, destination model.ResultReplicaRole) (uint16, model.WorkerEpoch, uint16, model.WorkerEpoch, bool) {

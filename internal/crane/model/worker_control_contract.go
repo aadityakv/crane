@@ -12,6 +12,12 @@ const (
 	WorkerControlMaxTransferTotalV1        = 64 << 20
 	WorkerControlMaxErrorDetailV1          = 256
 	WorkerControlMaxFrameBytesV1           = 1 << 20
+	// ResultInventoryChainDomainV1 separates the ordered inventory digest
+	// chain from every other Crane identity.
+	ResultInventoryChainDomainV1 = "crane-result-inventory-chain-v1"
+	// ResultInventoryChainSchemaV1 is the exact, fingerprinted byte layout
+	// consumed by ExtendResultInventoryDigest.
+	ResultInventoryChainSchemaV1 = "ResultInventoryChain=SHA256(UTF8(Domain)||u8(0)||PriorDigest:sha256||RecordIndex:u64be||EntryLength:u64be||Entry:bytes(EntryLength));Entry=u32be(ResultRecordStreamLength)||ResultRecordStream"
 )
 
 // WorkerControlMessageDescriptor identifies one owned +5 message schema.
@@ -51,6 +57,7 @@ var workerControlIdentityDomainsV1 = []string{
 	"cs425/crane/repair-id/v1",
 	"cs425/crane/repair-instruction/v1",
 	"cs425/crane/result-record-stream/v1",
+	ResultInventoryChainDomainV1,
 }
 
 var workerControlMessageNamesV1 = []string{
@@ -114,6 +121,7 @@ var workerControlNestedSchemasV1 = []string{
 	"SourceCheckpoint=Source:TaskID,Watermark:u64",
 	"ResultInventoryQuery=JobID:JobID,SinkTask:TaskID,SpecificationHash:sha256,AssignmentRevision:u64,AssignmentDigest:sha256,Checkpoints:list(SourceCheckpoint),CheckpointDigest:sha256,QueryDigest:sha256",
 	"ResultInventorySummary=QueryDigest:sha256,RecordCount:u64,TotalBytes:u64,ContentDigest:sha256",
+	ResultInventoryChainSchemaV1,
 	"RepairResultPartition=RepairID:bytes16,CoordinatorEpoch:CoordinatorEpoch,JobID:JobID,AssignmentRevision:u64,AssignmentDigest:sha256,SourceNodeID:u16,SourceWorkerEpoch:WorkerEpoch,DestinationNodeID:u16,DestinationWorkerEpoch:WorkerEpoch,SinkTask:TaskID,SpecificationHash:sha256,Checkpoints:list(SourceCheckpoint),CheckpointDigest:sha256,InventoryQueryDigest:sha256,ExpectedRecordCount:u64,ExpectedTotalBytes:u64,ExpectedContentDigest:sha256,InstructionDigest:sha256",
 	"RepairGrant=Instruction:RepairResultPartition,Role:u8",
 	"ResultRepairStatus=Instruction:RepairResultPartition,RepairID:bytes16,InstructionDigest:sha256,Role:u8,State:u8,RecordCount:u64,TotalBytes:u64,ContentDigest:sha256,ErrorCode:u16",
