@@ -8,7 +8,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -455,6 +457,64 @@ func TestClientRedirectFollowsCheckedLeaderHint(t *testing.T) {
 	dialed := harness.dialedAddresses()
 	if len(dialed) != 2 || dialed[0] != "127.0.0.1:19106" || dialed[1] != "127.0.0.2:19206" {
 		t.Fatalf("dialed = %v, want the hinted leader's derived +6 endpoint", dialed)
+	}
+}
+
+// TestClientRedirectToUnreachableLeaderFallsBackToVoters pins the Task 24
+// leader-loss transient: a follower's checked hint names a leader that died
+// before its followers learned of a successor, so the hinted +6 endpoint
+// refuses connections. The client must not spend every remaining attempt on
+// that endpoint; it falls back to the remaining static voters, which answer
+// once leadership settles.
+func TestClientRedirectToUnreachableLeaderFallsBackToVoters(t *testing.T) {
+	harness := newClientHarness(t, true)
+	topology := clientTestTopology(t, "redirect-dead-leader")
+	harness.fixture.raft.setLeader(false, 2)
+	harness.dialErr = func(address string, _ int) error {
+		if address == "127.0.0.2:19206" {
+			return &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+		}
+		return nil
+	}
+	harness.dialHook = func(address string, attempt int) {
+		if attempt >= 3 {
+			harness.fixture.raft.setLeader(true, 0)
+		}
+	}
+
+	job, err := harness.client().Submit(testContext(t), topology)
+	if err != nil {
+		t.Fatalf("submit past a dead hinted leader: %v", err)
+	}
+	if want := expectedSubmitJobID(t, harness.store, 1, topology); job != want {
+		t.Fatalf("job = %x, want %x", job, want)
+	}
+	dialed := harness.dialedAddresses()
+	if len(dialed) != 3 || dialed[0] != "127.0.0.1:19106" || dialed[1] != "127.0.0.2:19206" || dialed[2] == "127.0.0.2:19206" {
+		t.Fatalf("dialed = %v, want the hint tried once and then a remaining static voter", dialed)
+	}
+}
+
+// TestClientAttemptsExhaustedReportsReachedEndpointError pins the diagnostic
+// half of the Task 24 leader-loss transient: when reached voters drop the
+// exchange (an unauthorized sender gets no response) and a later attempt
+// cannot dial a dead voter at all, the exhausted error names what the
+// reached endpoint did, not only the last dial failure.
+func TestClientAttemptsExhaustedReportsReachedEndpointError(t *testing.T) {
+	harness := newClientHarness(t, true)
+	harness.dialErr = func(address string, attempt int) error {
+		if attempt%2 == 1 {
+			return &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+		}
+		return nil
+	}
+	harness.connWrap = func(conn net.Conn, _ int) net.Conn {
+		_ = conn.Close()
+		return conn
+	}
+	_, err := harness.client().Status(testContext(t), model.JobID{1})
+	if !errors.Is(err, ErrClientAttemptsExhausted) || !strings.Contains(err.Error(), "last reached-endpoint error") || !strings.Contains(err.Error(), "last dial error") {
+		t.Fatalf("exhausted error = %v, want both the reached-endpoint and dial causes", err)
 	}
 }
 

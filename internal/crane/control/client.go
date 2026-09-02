@@ -48,6 +48,9 @@ var (
 // errClientRetryExchange marks one unusable attempt inside the bounded loop.
 var errClientRetryExchange = errors.New("retry Crane client exchange")
 
+// errClientDial marks an attempt that never reached its endpoint.
+var errClientDial = errors.New("dial Crane control")
+
 // RequestRejectedError is one typed terminal +6 rejection of a client request.
 type RequestRejectedError struct {
 	// Code is the stable fingerprinted rejection category.
@@ -517,7 +520,7 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 	targets := client.endpoints
 	visited := make(map[string]bool, len(client.endpoints))
 	index, redirects := 0, 0
-	var lastErr error
+	var lastErr, lastReachedErr error
 	for attempts := 0; attempts < client.maxAttempts; attempts++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -531,6 +534,18 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 				return nil, ctx.Err()
 			}
 			lastErr = err
+			if !errors.Is(err, errClientDial) {
+				lastReachedErr = err
+			}
+			if len(targets) != len(client.endpoints) {
+				// A redirected endpoint that cannot be reached is not an
+				// actionable leader hint (the hinted leader may have died
+				// before its followers learned of a successor): fall back to
+				// the remaining static voters instead of re-dialing it for
+				// every remaining attempt. It stays visited, so a repeated
+				// hint to it is reported as a redirect loop, not retried.
+				targets, index = client.endpointsExcluding(target), 0
+			}
 			if waitErr := client.waitBackoff(ctx); waitErr != nil {
 				return nil, waitErr
 			}
@@ -561,7 +576,7 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 		case acceptErr == nil:
 			return response, nil
 		case errors.Is(acceptErr, errClientRetryExchange):
-			lastErr = acceptErr
+			lastErr, lastReachedErr = acceptErr, acceptErr
 			if waitErr := client.waitBackoff(ctx); waitErr != nil {
 				return nil, waitErr
 			}
@@ -569,7 +584,28 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 			return nil, acceptErr
 		}
 	}
+	if lastReachedErr != nil && lastReachedErr != lastErr {
+		// What a reached voter answered (or how it dropped the exchange) is
+		// the actionable cause even when a later attempt could not reach
+		// another voter at all.
+		return nil, fmt.Errorf("%w: %d attempts: last reached-endpoint error: %v; last dial error: %v", ErrClientAttemptsExhausted, client.maxAttempts, lastReachedErr, lastErr)
+	}
 	return nil, fmt.Errorf("%w: %d attempts: %v", ErrClientAttemptsExhausted, client.maxAttempts, lastErr)
+}
+
+// endpointsExcluding returns the static voter endpoints without excluded, or
+// the complete set when excluded is the only endpoint.
+func (client *Client) endpointsExcluding(excluded string) []string {
+	remaining := make([]string, 0, len(client.endpoints))
+	for _, endpoint := range client.endpoints {
+		if endpoint != excluded {
+			remaining = append(remaining, endpoint)
+		}
+	}
+	if len(remaining) == 0 {
+		return client.endpoints
+	}
+	return remaining
 }
 
 // exchangeOnce performs one complete dial, authenticated request frame,
@@ -583,7 +619,7 @@ func (client *Client) exchangeOnce(ctx context.Context, target string, messageTy
 	defer cancel()
 	connection, err := client.dial(exchangeCtx, target)
 	if err != nil {
-		return nil, fmt.Errorf("dial Crane control %q: %w", target, err)
+		return nil, fmt.Errorf("%w %q: %w", errClientDial, target, err)
 	}
 	defer connection.Close()
 	// Cancellation must interrupt a blocked read immediately, not wait for
