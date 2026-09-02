@@ -1479,11 +1479,42 @@ func applyOutboxRetry(work *RecoveredWork, update outboxRetryUpdate) error {
 	return nil
 }
 
+// readoptedDeliveryAuthority reports whether one retained record published
+// under a superseded fence may re-enter under the current fence: its
+// assignment identity must still match the current installed assignment
+// byte-exactly and its retained epoch must be strictly ordered before the
+// current committed fence. Genuinely replaced assignments never re-adopt.
+func readoptedDeliveryAuthority(record DeliveryRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch) bool {
+	return compareEpochOrder(record.CoordinatorEpoch, fence) < 0 &&
+		assignment.CoordinatorEpoch == fence &&
+		record.AssignmentRevision == assignment.Assignment.Revision &&
+		record.AssignmentDigest == assignment.Assignment.Digest
+}
+
+// equalDeliveryDefinitionModuloEpoch compares one delivery definition against
+// another while ignoring only the coordinator-epoch branding.
+func equalDeliveryDefinitionModuloEpoch(a, b DeliveryRecord) bool {
+	if a.ID != b.ID || a.Producer != b.Producer || a.Destination != b.Destination || a.AssignmentRevision != b.AssignmentRevision || a.AssignmentDigest != b.AssignmentDigest || a.Reservation != b.Reservation {
+		return false
+	}
+	aa, err := model.MarshalTuple(a.Tuple)
+	if err != nil {
+		return false
+	}
+	bb, err := model.MarshalTuple(b.Tuple)
+	return err == nil && bytes.Equal(aa, bb)
+}
+
 func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch) error {
 	if record.State < Received || record.State > Compacted || record.AssignmentRevision == 0 || record.AssignmentDigest == ([32]byte{}) {
 		return errors.New("invalid delivery metadata")
 	}
-	if record.CoordinatorEpoch != fence || record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest {
+	readopted := record.CoordinatorEpoch != fence
+	if readopted {
+		if !readoptedDeliveryAuthority(record, assignment, fence) {
+			return errors.New("delivery assignment fence mismatch")
+		}
+	} else if record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest {
 		return errors.New("delivery assignment fence mismatch")
 	}
 	message := protocol.TupleDelivery{DeliveryID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: record.ID.Tuple.JobID, Revision: record.AssignmentRevision, Digest: record.AssignmentDigest}, Coordinator: record.CoordinatorEpoch}
@@ -1510,7 +1541,16 @@ func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fen
 	if err != nil {
 		return err
 	}
-	if !exists || !equalDeliveryDefinition(derived, record) {
+	if !exists {
+		return errors.New("delivery definition does not match deterministic source path")
+	}
+	if readopted {
+		// The reconstruction derives under the current fence; a re-adopted
+		// retained record differs from it only by the epoch branding.
+		if !equalDeliveryDefinitionModuloEpoch(derived, record) {
+			return errors.New("delivery definition does not match deterministic source path")
+		}
+	} else if !equalDeliveryDefinition(derived, record) {
 		return errors.New("delivery definition does not match deterministic source path")
 	}
 	return nil
@@ -1598,7 +1638,11 @@ func expectedProcessedOutboxes(delivery DeliveryRecord, assignment InstalledAssi
 				if _, duplicate := result[id]; duplicate {
 					return nil, errors.New("topology derived duplicate outbox identity")
 				}
-				result[id] = OutboxRecord{ID: id, Tuple: cloneTuple(tuple), Producer: delivery.Destination, Destination: destination, AssignmentRevision: delivery.AssignmentRevision, AssignmentDigest: delivery.AssignmentDigest, CoordinatorEpoch: delivery.CoordinatorEpoch}
+				// Emissions are always branded with the CURRENT installed
+				// assignment identity and fence: a re-adopted retained
+				// delivery derives its outboxes under the fence it re-entered
+				// through, never the superseded one it was published under.
+				result[id] = OutboxRecord{ID: id, Tuple: cloneTuple(tuple), Producer: delivery.Destination, Destination: destination, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, CoordinatorEpoch: assignment.CoordinatorEpoch}
 			}
 		}
 	}
@@ -1881,6 +1925,18 @@ func probeDelivery(work *RecoveredWork, record DeliveryRecord) (DeliveryState, b
 			return Compacted, true, nil
 		}
 		if !equalDeliveryDefinition(prior, record) {
+			// A current-fence rebrand of one's own exact retained definition
+			// re-adopts the retained custody (defect #5 ruling): the delivery
+			// re-enters under the fence it was re-validated against.
+			if assignment, ok := findAssignment(work, record.ID.Tuple.JobID); ok &&
+				record.CoordinatorEpoch == work.Fence &&
+				compareEpochOrder(prior.CoordinatorEpoch, work.Fence) < 0 &&
+				assignment.CoordinatorEpoch == work.Fence &&
+				prior.AssignmentRevision == assignment.Assignment.Revision &&
+				prior.AssignmentDigest == assignment.Assignment.Digest &&
+				equalDeliveryDefinitionModuloEpoch(prior, record) {
+				return prior.State, true, nil
+			}
 			return 0, true, model.ErrIdentityReuse
 		}
 		return prior.State, true, nil

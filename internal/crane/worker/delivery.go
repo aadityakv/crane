@@ -251,6 +251,40 @@ func (engine *Engine) scheduleRecoveredExecutions(ctx context.Context) {
 	}
 }
 
+// coordinatorEpochOrderedBefore reports the established coordinator-epoch
+// order (term, then begin index): left was committed strictly before right.
+func coordinatorEpochOrderedBefore(left, right model.CoordinatorEpoch) bool {
+	if left.Term != right.Term {
+		return left.Term < right.Term
+	}
+	return left.BeginIndex < right.BeginIndex
+}
+
+// readoptRetainedRecord re-derives one retained custody record under the
+// CURRENT fence when its delivery definition re-validates byte-exactly
+// against the current installed assignment (Task 24 defect #5 ruling): the
+// record's assignment identity must still match the installation, its
+// retained epoch must be strictly ordered before the current fence, and the
+// full delivery authority (tokens, route, source-payload reconstruction)
+// must hold. Emissions derived from the readopted record then carry the
+// current coordinator, never the stale one. Records whose assignment was
+// genuinely replaced are refused and follow the existing retirement paths.
+func (engine *Engine) readoptRetainedRecord(assignment store.InstalledAssignment, fence model.CoordinatorEpoch, record store.DeliveryRecord) (store.DeliveryRecord, bool) {
+	if record.CoordinatorEpoch == fence || !coordinatorEpochOrderedBefore(record.CoordinatorEpoch, fence) {
+		return store.DeliveryRecord{}, false
+	}
+	if assignment.CoordinatorEpoch != fence || record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest {
+		return store.DeliveryRecord{}, false
+	}
+	message := protocol.TupleDelivery{DeliveryID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: record.ID.Tuple.JobID, Revision: record.AssignmentRevision, Digest: record.AssignmentDigest}, Coordinator: fence}
+	if err := validateDeliveryAuthority(assignment, fence, message); err != nil {
+		return store.DeliveryRecord{}, false
+	}
+	readopted := record.Clone()
+	readopted.CoordinatorEpoch = fence
+	return readopted, true
+}
+
 func (engine *Engine) scheduleExecution(ctx context.Context, record store.DeliveryRecord) {
 	if _, exists := engine.executing[record.ID]; exists {
 		return
@@ -263,7 +297,21 @@ func (engine *Engine) scheduleExecution(ctx context.Context, record store.Delive
 		return
 	}
 	assignment, ok := engine.currentRunning(record.ID.Tuple.JobID)
-	if !ok || record.CoordinatorEpoch != engine.repository.CurrentFence() || record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest || record.Destination.WorkerID != engine.localNode || record.Destination.WorkerEpoch != engine.localEpoch || !containsAssignmentToken(assignment.Assignment, record.Destination) {
+	if !ok {
+		release()
+		return
+	}
+	if record.CoordinatorEpoch != engine.repository.CurrentFence() {
+		// Retained custody published under a superseded fence re-enters
+		// execution only through the byte-exact readoption above.
+		readopted, readoptedOK := engine.readoptRetainedRecord(assignment, engine.repository.CurrentFence(), record)
+		if !readoptedOK {
+			release()
+			return
+		}
+		record = readopted
+	}
+	if record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest || record.Destination.WorkerID != engine.localNode || record.Destination.WorkerEpoch != engine.localEpoch || !containsAssignmentToken(assignment.Assignment, record.Destination) {
 		release()
 		return
 	}

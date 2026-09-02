@@ -144,6 +144,15 @@ func (machine *Machine) applyRecordSourceEOFLocked(command RecordSourceEOF) ([]b
 	})
 }
 
+// coordinatorEpochOrderedBefore reports the established coordinator-epoch
+// order (term, then begin index): left was committed strictly before right.
+func coordinatorEpochOrderedBefore(left, right model.CoordinatorEpoch) bool {
+	if left.Term != right.Term {
+		return left.Term < right.Term
+	}
+	return left.BeginIndex < right.BeginIndex
+}
+
 func (machine *Machine) applyAdvanceCheckpointLocked(command AdvanceCheckpoint) ([]byte, error) {
 	report := command.Report
 	record, exists := machine.jobs[report.JobID]
@@ -162,7 +171,14 @@ func (machine *Machine) applyAdvanceCheckpointLocked(command AdvanceCheckpoint) 
 		eof, eofExists := record.SourceEOFs[report.Source]
 		token, tokenExists := assignmentToken(record.Assignment, report.Source)
 		validLifecycle := record.Lifecycle == JobRunning || record.Lifecycle == JobDraining
-		validFence := record.Assignment != nil && len(record.NeedsReassignment) == 0 && report.JobControlRevision == record.JobControlRevision && report.AssignmentRevision == record.Assignment.Revision && report.Epoch == machine.coordinatorEpoch && tokenExists && token == report.Token
+		// The epoch fence prevents a superseded coordinator from mutating
+		// replicated state; it does not invalidate work a worker durably
+		// proved under an assignment that is still current. A report whose
+		// epoch was committed at or before the current one re-enters when
+		// every other condition holds exactly; anything ordered after the
+		// committed epoch is a superseded coordinator's mutation attempt.
+		currentEpoch := report.Epoch == machine.coordinatorEpoch || coordinatorEpochOrderedBefore(report.Epoch, machine.coordinatorEpoch)
+		validFence := record.Assignment != nil && len(record.NeedsReassignment) == 0 && report.JobControlRevision == record.JobControlRevision && report.AssignmentRevision == record.Assignment.Revision && currentEpoch && tokenExists && token == report.Token
 		validAdvance := eofExists && report.EOF == eof.EOF && report.ExpectedCheckpointRevision == checkpoint.Revision && report.Prior == checkpoint.Watermark && report.New > checkpoint.Watermark && report.New <= eof.EOF
 		worker, workerExists := machine.workers[report.Token.WorkerID]
 		validWorker := workerExists && worker.Epoch == report.Token.WorkerEpoch && worker.State != WorkerOffline
