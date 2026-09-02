@@ -401,6 +401,9 @@ type fakeWorkers struct {
 	gates           map[uint16]model.CoordinatorEpoch
 	acks            map[uint16]uint64
 	grants          []protocol.RepairGrant
+	// installRule optionally models the durable store's install contract; a
+	// non-nil error rejects the install exactly as a real worker would.
+	installRule func(node uint16, install protocol.AssignmentSetInstall) error
 }
 
 func newFakeWorkers(log *opLog) *fakeWorkers {
@@ -601,6 +604,12 @@ func (w *fakeWorkers) Install(_ context.Context, node uint16, install protocol.A
 	if script.installErrs > 0 {
 		script.installErrs--
 		return errors.New("injected install failure")
+	}
+	if w.installRule != nil {
+		if err := w.installRule(node, install); err != nil {
+			w.log.add(fmt.Sprintf("install-rejected:%d:%s", node, name))
+			return err
+		}
 	}
 	if install.SchedulingState == model.Running {
 		// Only a Running install opens the process admission gate.

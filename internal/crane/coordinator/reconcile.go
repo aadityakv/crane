@@ -328,7 +328,22 @@ func (actor *Actor) propagateTerminal(ctx context.Context, epoch model.Coordinat
 // replicas, and only then installs the exact committed scheduling state so
 // source emission and replay above committed watermarks may resume.
 func (actor *Actor) activateJob(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord) bool {
-	if !actor.installAssignment(ctx, epoch, job, model.Closed, true, 0) {
+	// A Running job is re-fenced through Closed before re-verification. A
+	// Draining job is re-fenced through the Draining install itself: its
+	// workers durably hold Draining at the lifecycle-bumped
+	// JobControlRevision, and the durable store admits exactly the
+	// Closed<->Running admission progressions at an equal fence (Task 24
+	// defect #1 ruling), so a Closed pre-install would be rejected as
+	// identity reuse and the job could never be re-driven. Installing
+	// Draining first also carries the current JobControlRevision (and a new
+	// leadership epoch's rebind) to every worker before the checkpoint
+	// notices that are validated against it. Draining sources sit at EOF,
+	// so no producer can mutate during the verification.
+	scheduling, fence := model.Running, model.Closed
+	if job.Lifecycle == state.JobDraining {
+		scheduling, fence = model.Draining, model.Draining
+	}
+	if !actor.installAssignment(ctx, epoch, job, fence, true, 0) {
 		return false
 	}
 	if !actor.resendCheckpointNotices(ctx, job) {
@@ -337,9 +352,8 @@ func (actor *Actor) activateJob(ctx context.Context, epoch model.CoordinatorEpoc
 	if !actor.repairResults(ctx, epoch, job) {
 		return false
 	}
-	scheduling := model.Running
-	if job.Lifecycle == state.JobDraining {
-		scheduling = model.Draining
+	if scheduling == fence {
+		return true
 	}
 	return actor.installAssignment(ctx, epoch, job, scheduling, true, 0)
 }
