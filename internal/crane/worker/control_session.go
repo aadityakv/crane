@@ -59,6 +59,13 @@ type controlTransfer interface {
 	ReceiveResultRecord(context.Context, TransferPeer, protocol.ResultRecordChunk) (protocol.ResultRecordAck, error)
 	ReceiveResultArtifact(context.Context, TransferPeer, protocol.ResultArtifactChunk) (protocol.ResultArtifactAck, error)
 	OpenResultFetch(context.Context, TransferPeer, protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error)
+	ServeRepairPull(context.Context, TransferPeer, protocol.ResultRepairStatus) (protocol.ResultRecordChunk, bool, error)
+}
+
+// RepairScheduler receives durably installed destination-role repair grants
+// for destination-driven streaming.
+type RepairScheduler interface {
+	Schedule(store.ResultRepairRecord)
 }
 
 type controlMembership interface {
@@ -74,6 +81,7 @@ type ControlOptions struct {
 	Repository              controlRepository
 	Engine                  controlEngine
 	Transfer                controlTransfer
+	RepairScheduler         RepairScheduler
 	Gate                    *admission.Gate
 	Membership              controlMembership
 	Clock                   clock.Clock
@@ -92,6 +100,7 @@ type ControlOwner struct {
 	repository    controlRepository
 	engine        controlEngine
 	transfer      controlTransfer
+	scheduler     RepairScheduler
 	gate          *admission.Gate
 	membership    controlMembership
 	replay        *controlReplay
@@ -173,7 +182,7 @@ func NewControlOwner(options ControlOptions) (*ControlOwner, error) {
 	configuration := cloneWorkerNodeConfig(options.Config)
 	return &ControlOwner{
 		configuration: configuration, clusterID: options.ClusterID, repository: options.Repository, engine: options.Engine,
-		transfer: options.Transfer, gate: options.Gate, membership: options.Membership,
+		transfer: options.Transfer, scheduler: options.RepairScheduler, gate: options.Gate, membership: options.Membership,
 		replay:      newControlReplay(options.Clock, window, config.ReplayFutureSkewAllowance, options.MaxReplayEntries, options.MaxReplayEntriesPerPeer),
 		maxSessions: options.MaxSessions, maxPerPeer: options.MaxSessionsPerPeer, work: make(chan struct{}, options.MaxQueuedWork),
 		sessions: make(map[*ControlSession]struct{}), perPeer: make(map[controlPeer]int), localNode: node, localEpoch: epoch,
@@ -453,7 +462,9 @@ func (owner *ControlOwner) dispatch(ctx context.Context, session *ControlSession
 		if err = owner.finalMutation(ctx, session, peer, "result-fetch", request.CoordinatorEpoch, true); err == nil {
 			response, err = owner.transfer.OpenResultFetch(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferLeaderFetch}, request)
 		}
-	case protocol.WorkerRegisterRequest, protocol.WorkerRegisterResponse, protocol.ResultRecordAck, protocol.ResultArtifactAck, protocol.ResultFetchChunk, protocol.WorkerError, protocol.WorkerHandshakeAck, protocol.FenceResponse, protocol.AssignmentSetInstallAck, protocol.WorkerStatus, protocol.CheckpointAck:
+	case protocol.WorkerStatus:
+		response, err = owner.handleRepairPull(ctx, session, peer, request)
+	case protocol.WorkerRegisterRequest, protocol.WorkerRegisterResponse, protocol.ResultRecordAck, protocol.ResultArtifactAck, protocol.ResultFetchChunk, protocol.WorkerError, protocol.WorkerHandshakeAck, protocol.FenceResponse, protocol.AssignmentSetInstallAck, protocol.CheckpointAck:
 		return nil, protocol.ErrUnexpectedWorkerMessage
 	default:
 		return nil, protocol.ErrUnexpectedWorkerMessage
@@ -505,6 +516,53 @@ func (owner *ControlOwner) handleResultRecord(ctx context.Context, session *Cont
 		return nil, err
 	}
 	return owner.transfer.ReceiveResultRecord(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: role}, request)
+}
+
+// handleRepairPull serves one destination-driven repair pull from an
+// authenticated worker peer: the request is a WorkerStatus carrying the
+// destination's durable repair grant status, and the response is either the
+// source's exact next record chunk or, when the covered range is exhausted,
+// the terminal WorkerStatus carrying the source's completed repair status.
+// The process admission gate is deliberately not taken: a historical source
+// whose assignment is no longer Running still owes its retained records.
+func (owner *ControlOwner) handleRepairPull(ctx context.Context, session *ControlSession, peer controlPeer, request protocol.WorkerStatus) (protocol.WorkerMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if request.Repair == nil || request.Repair.Role != protocol.RepairDestination || request.NodeID != peer.node || request.WorkerEpoch != peer.epoch {
+		return nil, ErrControlUnauthorized
+	}
+	if request.Repair.Instruction.SourceNodeID != owner.localNode || request.Repair.Instruction.SourceWorkerEpoch != owner.localEpoch {
+		return nil, ErrControlUnauthorized
+	}
+	if err := owner.finalCurrentSession(ctx, session, peer, "repair-pull", request.Repair.Instruction.CoordinatorEpoch); err != nil {
+		return nil, err
+	}
+	chunk, complete, err := owner.transfer.ServeRepairPull(ctx, TransferPeer{NodeID: peer.node, WorkerEpoch: peer.epoch, Role: TransferHistoricalRepair}, *request.Repair)
+	if err != nil {
+		return nil, err
+	}
+	if !complete {
+		return chunk, nil
+	}
+	work, err := owner.repository.RecoverWork()
+	if err != nil {
+		return nil, err
+	}
+	transaction, err := owner.repository.DurableTransactionID()
+	if err != nil {
+		return nil, err
+	}
+	for _, repair := range work.Repairs {
+		if repair.Instruction.RepairID == request.Repair.RepairID && repair.Role == store.RepairSource {
+			if transaction == 0 {
+				return nil, ErrControlStaleAssignment
+			}
+			status := repairStatus(repair)
+			return protocol.WorkerStatus{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, CoordinatorEpoch: work.Fence, StoreTransactionID: transaction, Repair: &status}, nil
+		}
+	}
+	return nil, ErrControlStaleAssignment
 }
 
 func (owner *ControlOwner) finalCurrentSession(ctx context.Context, session *ControlSession, peer controlPeer, kind string, epoch model.CoordinatorEpoch) error {
@@ -944,6 +1002,7 @@ func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSe
 			if !equalRepairDefinition(prior.Instruction, definition) || prior.InstructionDigest != grant.Instruction.InstructionDigest || prior.Role != grant.Role {
 				return nil, model.ErrIdentityReuse
 			}
+			owner.scheduleRepair(prior)
 			status := repairStatus(prior)
 			return &status, nil
 		}
@@ -962,8 +1021,17 @@ func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSe
 	if err := owner.repository.UpsertRepair(repair); err != nil {
 		return nil, err
 	}
+	owner.scheduleRepair(repair)
 	status := repairStatus(repair)
 	return &status, nil
+}
+
+// scheduleRepair hands one durably installed destination-role grant to the
+// repair driver; the destination endpoint owns driving every bilateral grant.
+func (owner *ControlOwner) scheduleRepair(repair store.ResultRepairRecord) {
+	if owner.scheduler != nil && repair.Role == store.RepairDestination {
+		owner.scheduler.Schedule(repair)
+	}
 }
 
 func repairStatus(repair store.ResultRepairRecord) protocol.ResultRepairStatus {

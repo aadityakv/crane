@@ -1390,6 +1390,7 @@ type controlTestTransfer struct {
 	calls         int
 	artifactCalls int
 	fetchCalls    int
+	pullCalls     int
 	peer          TransferPeer
 	ack           protocol.ResultRecordAck
 }
@@ -1406,6 +1407,10 @@ func (transfer *controlTestTransfer) ReceiveResultArtifact(context.Context, Tran
 func (transfer *controlTestTransfer) OpenResultFetch(context.Context, TransferPeer, protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error) {
 	transfer.fetchCalls++
 	return protocol.ResultFetchChunk{}, ErrResultFetchUnavailable
+}
+func (transfer *controlTestTransfer) ServeRepairPull(context.Context, TransferPeer, protocol.ResultRepairStatus) (protocol.ResultRecordChunk, bool, error) {
+	transfer.pullCalls++
+	return protocol.ResultRecordChunk{}, false, ErrTransferUnauthorized
 }
 
 type controlTestMembership struct {

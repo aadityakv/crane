@@ -60,13 +60,14 @@ type Service struct {
 	controlBind       config.Endpoint
 	listen            func(string, string) (net.Listener, error)
 
-	store      *store.Store
-	repository *serviceRepository
-	engine     *Engine
-	endpoint   *TupleEndpoint
-	tuple      *TupleService
-	transfer   *TransferOwner
-	control    *ControlOwner
+	store        *store.Store
+	repository   *serviceRepository
+	engine       *Engine
+	endpoint     *TupleEndpoint
+	tuple        *TupleService
+	transfer     *TransferOwner
+	control      *ControlOwner
+	repairDriver *RepairDriver
 
 	ready      chan struct{}
 	started    atomic.Bool
@@ -171,7 +172,13 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	service.transfer = transfer
-	control, err := NewControlOwner(ControlOptions{Config: service.configuration, ClusterID: service.clusterID, Repository: repository, Engine: engine, Transfer: transfer, Gate: service.gate, Membership: service.membership, Clock: service.clock})
+	repairClient := newDialRepairSourceClient(dialRepairSourceClientOptions{ClusterID: service.clusterID, Authenticator: service.authenticator, Clock: service.clock, Membership: service.membership, Repository: repository, Timeout: time.Duration(service.configuration.Crane.WorkerControlTimeout), Dial: (&net.Dialer{}).DialContext})
+	repairDriver, err := NewRepairDriver(RepairDriverOptions{Repository: repository, Transfer: transfer, Client: repairClient, Clock: service.clock, RetryInterval: time.Duration(service.configuration.Crane.TupleRetryInterval), MaxRetryInterval: time.Duration(service.configuration.Crane.TupleCompletionRetryInterval)})
+	if err != nil {
+		return err
+	}
+	service.repairDriver = repairDriver
+	control, err := NewControlOwner(ControlOptions{Config: service.configuration, ClusterID: service.clusterID, Repository: repository, Engine: engine, Transfer: transfer, RepairScheduler: repairDriver, Gate: service.gate, Membership: service.membership, Clock: service.clock})
 	if err != nil {
 		return err
 	}
@@ -186,11 +193,12 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	}
 
 	runContext, cancel := context.WithCancel(ctx)
-	results := make(chan serviceRunResult, 3)
+	results := make(chan serviceRunResult, 4)
 	controlReady := make(chan struct{})
 	controlDispatch := make(chan struct{})
 	go func() { results <- serviceRunResult{name: "engine", err: engine.Run(runContext)} }()
 	go func() { results <- serviceRunResult{name: "tuple", err: tuple.Run(runContext)} }()
+	go func() { results <- serviceRunResult{name: "repair", err: service.repairDriver.Run(runContext)} }()
 	go func() {
 		results <- serviceRunResult{name: "control", err: service.runControl(runContext, listener, control, controlReady, controlDispatch)}
 	}()
@@ -244,7 +252,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	cancel()
 	listenerErr := listener.Close()
 	controlErr := control.Close()
-	for completedOwners < 3 {
+	for completedOwners < 4 {
 		result := <-results
 		completedOwners++
 		if runErr == nil && result.err != nil && !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, net.ErrClosed) {
