@@ -996,6 +996,18 @@ func TestScriptedFailureScenarios(t *testing.T) {
 							cluster.record("membership node=%d view=%v", id, summary)
 						}
 					}
+					// The Dead confirmation can also land between the pre-heal
+					// premise check and the heal taking effect; a Dead record is a
+					// terminal incarnation floor, so the premise is lost the same
+					// way and the scenario skips rather than waiting forever.
+					for _, id := range cluster.ids {
+						for _, member := range cluster.membershipOf(id) {
+							if member.NodeID != id && member.Status == swim.Dead {
+								cluster.record("node %d holds node %d Dead after the heal", id, member.NodeID)
+								cluster.t.Skip("false-suspicion: Dead was confirmed inside the heal window; a Dead record is a terminal incarnation floor (scenario premise)")
+							}
+						}
+					}
 					for _, member := range cluster.membershipOf(1) {
 						if member.NodeID == 4 && member.Status != swim.Alive {
 							return false
