@@ -130,12 +130,27 @@ func (service *TupleService) process(ctx context.Context, datagram transport.Sou
 		return nil
 	}
 	timestamp := time.UnixMilli(frame.Header.TimestampMillis)
+	// Every +7 handler is idempotent by construction (custody is deduplicated
+	// by durable delivery identity; ACK/NACK are idempotent transitions), so
+	// the replay guard is a cost bound, not a correctness gate. When an
+	// authenticated peer's legitimate retry rate exhausts its bounded replay
+	// cache the datagram is processed without being recorded instead of being
+	// dropped — dropping it would suppress the very ACKs that stop the
+	// retries (Task 24 defect #8).
+	recorded := true
 	if err = service.replay.preflight(frame.Header.SenderID, frame.Header.RequestID, timestamp); err != nil {
-		return nil
+		if !errors.Is(err, wire.ErrReplayCacheFull) {
+			return nil
+		}
+		recorded = false
+	}
+	replay := service.replay
+	if !recorded {
+		replay = nil
 	}
 	remoteIP := net.ParseIP(packet.From.Host)
 	if remoteIP == nil || packet.From.Port == 0 || service.endpoint.peers.AuthorizeUDP(frame.Header.SenderID, &net.UDPAddr{IP: remoteIP, Port: int(packet.From.Port)}, config.ServiceCraneTupleACK) != nil {
-		service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+		replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 		return nil
 	}
 
@@ -143,7 +158,7 @@ func (service *TupleService) process(ctx context.Context, datagram transport.Sou
 	case wire.MessageCraneTupleDelivery:
 		delivery, decodeErr := protocol.UnmarshalTupleDelivery(frame.Payload)
 		if decodeErr != nil || delivery.Producer.WorkerID != frame.Header.SenderID || delivery.Destination.WorkerID != service.endpoint.configuration.NodeID {
-			service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+			replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 			return nil
 		}
 		ack, handleErr := service.engine.HandleDelivery(ctx, delivery)
@@ -151,39 +166,39 @@ func (service *TupleService) process(ctx context.Context, datagram transport.Sou
 			if fatalTupleStoreError(ctx, handleErr) {
 				return fmt.Errorf("handle Crane tuple delivery: %w", handleErr)
 			}
-			if service.replay.commitInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
+			if replay.commitInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
 				return nil
 			}
 			_ = service.sendNACK(ctx, datagram, packet.From, delivery, tupleNACKCode(handleErr))
 			return nil
 		}
-		if service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
+		if replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp) != nil {
 			return nil
 		}
 		_ = service.sendACK(ctx, datagram, packet.From, ack)
 	case wire.MessageCraneTupleDeliveryAck:
 		ack, decodeErr := protocol.UnmarshalTupleACK(frame.Payload)
 		if decodeErr != nil || ack.Destination.WorkerID != frame.Header.SenderID {
-			service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+			replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 			return nil
 		}
 		if handleErr := service.engine.HandleACK(ctx, ack); handleErr != nil {
 			if fatalTupleStoreError(ctx, handleErr) {
 				return fmt.Errorf("handle Crane tuple ACK: %w", handleErr)
 			}
-			_ = service.replay.commitInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+			_ = replay.commitInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 			return nil
 		}
-		_ = service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+		_ = replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 	case wire.MessageCraneTupleDeliveryNack:
 		nack, decodeErr := protocol.UnmarshalTupleNACK(frame.Payload)
 		if decodeErr != nil || nack.Destination.WorkerID != frame.Header.SenderID {
-			service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+			replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 			return nil
 		}
-		_ = service.replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+		_ = replay.commit(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 	default:
-		service.replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
+		replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 	}
 	return nil
 }

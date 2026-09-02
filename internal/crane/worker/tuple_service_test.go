@@ -137,24 +137,42 @@ func TestTupleServiceRejectsTruncationAuthenticationSourceAndUnknownTaskBeforeMu
 	}
 }
 
-func TestTupleServiceReplayCapacityRejectsBeforeEngineMutationWithoutEviction(t *testing.T) {
+// TestTupleServiceReplayCapacityProcessesUnrecordedWithoutEviction pins the
+// Task 24 defect #8 ruling: a bounded replay cache exhausted by an
+// authenticated peer never suppresses idempotent +7 handling. A fresh request
+// at capacity is processed and answered without being recorded, the retained
+// identities are never evicted (their replays stay silent), and a replay of
+// the unrecorded identity is simply re-answered idempotently.
+func TestTupleServiceReplayCapacityProcessesUnrecordedWithoutEviction(t *testing.T) {
 	seams := newTupleServiceTestSeams(t)
 	defer seams.stop(t)
 	seams.service.replay = newTupleReplay(seams.clock, time.Minute, time.Second, 1, 1)
 
 	seams.inject(t, seams.fixture.message(t, 1), wire.RequestID{0x41})
 	_ = seams.nextSend(t)
-	seams.datagram.packets <- seams.deliveryPacket(t, seams.fixture.message(t, 2), wire.RequestID{0x42})
-	seams.expectNoSend(t)
-	// Full capacity must retain the first request rather than silently evicting
-	// it and reopening its replay window.
+	seams.inject(t, seams.fixture.message(t, 2), wire.RequestID{0x42})
+	unrecorded := seams.nextSend(t)
+	frame, err := wire.Decode(unrecorded.payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || frame.Header.Message != wire.MessageCraneTupleDeliveryAck {
+		t.Fatalf("fresh delivery at replay capacity = %d,%v, want ACK", frame.Header.Message, err)
+	}
+	// Full capacity retains the first request rather than evicting it and
+	// reopening its replay window.
 	seams.datagram.packets <- seams.deliveryPacket(t, seams.fixture.message(t, 1), wire.RequestID{0x41})
 	seams.expectNoSend(t)
+	// The unrecorded identity replays into idempotent custody: answered again,
+	// no further durable mutation.
+	seams.inject(t, seams.fixture.message(t, 2), wire.RequestID{0x42})
+	replayed := seams.nextSend(t)
+	frame, err = wire.Decode(replayed.payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || frame.Header.Message != wire.MessageCraneTupleDeliveryAck {
+		t.Fatalf("replayed unrecorded delivery = %d,%v, want ACK", frame.Header.Message, err)
+	}
 	seams.repository.mu.Lock()
 	receiveCalls := seams.repository.receiveCalls
 	seams.repository.mu.Unlock()
-	if receiveCalls != 1 {
-		t.Fatalf("replay pressure performed %d durable Receive calls, want 1", receiveCalls)
+	if receiveCalls != 2 {
+		t.Fatalf("replay pressure performed %d durable Receive calls, want exactly one per distinct delivery", receiveCalls)
 	}
 }
 
@@ -179,9 +197,15 @@ func TestTupleServiceSemanticInvalidReplayDoesNotConsumeAcceptedCapacity(t *test
 		t.Fatalf("valid delivery after semantic invalid = %d,%v, want ACK", validFrame.Header.Message, err)
 	}
 
-	// The strict one-entry invalid cache rejects a new invalid ID while retaining
-	// the old live ID. Neither request receives another response.
+	// At capacity a fresh invalid request is still answered (processed without
+	// being recorded, defect #8 ruling) while the retained live invalid ID is
+	// never evicted: its replay stays silent.
 	seams.inject(t, stale, wire.RequestID{0x63})
+	unrecorded := seams.nextSend(t)
+	unrecordedFrame, err := wire.Decode(unrecorded.payload, seams.authenticator, wire.Limits{ExpectedClusterID: &seams.endpoint.clusterID})
+	if err != nil || unrecordedFrame.Header.Message != wire.MessageCraneTupleDeliveryNack {
+		t.Fatalf("fresh invalid delivery at capacity = %d,%v, want NACK", unrecordedFrame.Header.Message, err)
+	}
 	seams.inject(t, stale, wire.RequestID{0x61})
 	seams.expectNoSend(t)
 	seams.clock.Advance(time.Minute)

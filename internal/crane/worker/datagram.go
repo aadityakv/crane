@@ -82,7 +82,12 @@ func (replay *tupleReplay) preflight(sender uint16, request wire.RequestID, time
 }
 
 func (replay *tupleReplay) commit(sender uint16, request wire.RequestID, timestamp time.Time) error {
-	if replay == nil || replay.global == nil {
+	if replay == nil {
+		// An unrecorded datagram (bounded cache exhausted by an authenticated
+		// peer) is processed without replay retention.
+		return nil
+	}
+	if replay.global == nil {
 		return wire.ErrReplayConfiguration
 	}
 	replay.mu.Lock()
@@ -121,7 +126,10 @@ func (replay *tupleReplay) preflightInvalidLocked(sender uint16, request wire.Re
 }
 
 func (replay *tupleReplay) commitInvalid(sender uint16, request wire.RequestID, timestamp time.Time) error {
-	if replay == nil || replay.global == nil {
+	if replay == nil {
+		return nil
+	}
+	if replay.global == nil {
 		return wire.ErrReplayConfiguration
 	}
 	replay.mu.Lock()
