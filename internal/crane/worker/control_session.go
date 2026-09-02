@@ -503,15 +503,17 @@ func controlMessageGeneration(message protocol.WorkerMessage) (model.Coordinator
 	}
 }
 
+// handleResultRecord receives one replicated result record. It does not take
+// the process admission gate (Task 24 defect #6 ruling, applied to normal
+// replication under defect #4): the gate guards admission of new work and is
+// closed from a fence until the Running install that follows, which a
+// Draining job never receives; the transfer's own validation (current fence,
+// current replica set, Running or Draining, exact endpoints) authorises the
+// record, and Closed stays refused there.
 func (owner *ControlOwner) handleResultRecord(ctx context.Context, session *ControlSession, peer controlPeer, role TransferRole, request protocol.ResultRecordChunk) (protocol.WorkerMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	release, err := owner.gate.Enter()
-	if err != nil {
-		return nil, err
-	}
-	defer release()
 	if err := owner.finalCurrentSession(ctx, session, peer, "result-record", request.Provenance.CoordinatorEpoch); err != nil {
 		return nil, err
 	}

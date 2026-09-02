@@ -1053,7 +1053,12 @@ func TestControlInventoryAndLocalStatusRejectStaleOrUnrequestedDurableState(t *t
 	}
 }
 
-func TestControlResultRecordRequiresExactSharedGatePermit(t *testing.T) {
+// TestControlResultRecordDoesNotRequireGatePermit pins the Task 24 defect #9
+// ruling (defect #6 applied to normal replication): a replicated result
+// record is authorised by the transfer's own validation, never by the
+// process admission gate, so it is received and acknowledged while the gate
+// is closed exactly as while it is open.
+func TestControlResultRecordDoesNotRequireGatePermit(t *testing.T) {
 	fixture := newControlFixture(t)
 	fixture.repository.work.Fence = fixture.epoch
 	fixture.repository.work.Assignments = []store.InstalledAssignment{fixture.assignment}
@@ -1061,11 +1066,13 @@ func TestControlResultRecordRequiresExactSharedGatePermit(t *testing.T) {
 	fixture.authenticate(t, session, 2, 1)
 	chunk := validControlResultChunk(t, fixture)
 	fixture.transfer.ack = protocol.ResultRecordAck{TransferID: chunk.Transfer.TransferID, NodeID: chunk.DestinationNodeID, WorkerEpoch: chunk.DestinationWorkerEpoch, NextOffset: chunk.Transfer.TotalLength, TotalLength: chunk.Transfer.TotalLength, Checksum: chunk.Transfer.Checksum, Complete: true, CoordinatorEpoch: chunk.Provenance.CoordinatorEpoch}
-	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, chunk)); !errors.Is(err, admission.ErrClosed) {
-		t.Fatalf("closed-gate 212 error = %v", err)
+	if response, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, chunk)); err != nil {
+		t.Fatalf("closed-gate 212: %v", err)
+	} else if _, ok := response.(protocol.ResultRecordAck); !ok {
+		t.Fatalf("closed-gate 212 response = %#v", response)
 	}
-	if fixture.transfer.calls != 0 {
-		t.Fatalf("closed-gate 212 reached transfer owner %d times", fixture.transfer.calls)
+	if fixture.transfer.calls != 1 {
+		t.Fatalf("closed-gate 212 reached transfer owner %d times, want 1", fixture.transfer.calls)
 	}
 	if err := fixture.gate.Open(fixture.epoch); err != nil {
 		t.Fatal(err)

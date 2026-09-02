@@ -416,18 +416,19 @@ func TestWorkerControlWireResultRecordClosedSuccessCancellationAndCorrelation(t 
 	if _, ok := read(1).(protocol.WorkerHandshakeAck); !ok {
 		t.Fatal("handshake did not succeed")
 	}
+	// A closed process admission gate does not withhold a replicated record
+	// (Task 24 defect #9 ruling): the transfer owner answers it.
+	fixture.transfer.ack = protocol.ResultRecordAck{TransferID: chunk.Transfer.TransferID, NodeID: chunk.DestinationNodeID, WorkerEpoch: chunk.DestinationWorkerEpoch, NextOffset: chunk.Transfer.TotalLength, TotalLength: chunk.Transfer.TotalLength, Checksum: chunk.Transfer.Checksum, Complete: true, CoordinatorEpoch: chunk.Provenance.CoordinatorEpoch}
 	write(2, chunk)
-	closed, ok := read(2).(protocol.WorkerError)
-	if !ok || closed.Code != protocol.WorkerErrorUnavailable || !closed.Retryable || closed.RelatedMessage != wire.MessageCraneResultRecordChunk || closed.CoordinatorEpoch != fixture.epoch {
-		t.Fatalf("closed-gate response=%#v", closed)
+	if ack, ok := read(2).(protocol.ResultRecordAck); !ok || ack != fixture.transfer.ack {
+		t.Fatalf("closed-gate response=%#v", ack)
 	}
-	if fixture.transfer.calls != 0 {
-		t.Fatal("closed gate reached transfer owner")
+	if fixture.transfer.calls != 1 {
+		t.Fatalf("closed gate reached transfer owner %d times, want 1", fixture.transfer.calls)
 	}
 	if err := fixture.gate.Open(fixture.epoch); err != nil {
 		t.Fatal(err)
 	}
-	fixture.transfer.ack = protocol.ResultRecordAck{TransferID: chunk.Transfer.TransferID, NodeID: chunk.DestinationNodeID, WorkerEpoch: chunk.DestinationWorkerEpoch, NextOffset: chunk.Transfer.TotalLength, TotalLength: chunk.Transfer.TotalLength, Checksum: chunk.Transfer.Checksum, Complete: true, CoordinatorEpoch: chunk.Provenance.CoordinatorEpoch}
 	write(3, chunk)
 	if ack, ok := read(3).(protocol.ResultRecordAck); !ok || ack != fixture.transfer.ack {
 		t.Fatalf("successful 212/213 response=%#v", ack)
@@ -452,7 +453,7 @@ func TestWorkerControlWireResultRecordClosedSuccessCancellationAndCorrelation(t 
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("canceled connection error=%v", err)
 	}
-	if fixture.transfer.calls != 1 {
+	if fixture.transfer.calls != 2 {
 		t.Fatalf("canceled 212 reached transfer owner: calls=%d", fixture.transfer.calls)
 	}
 }

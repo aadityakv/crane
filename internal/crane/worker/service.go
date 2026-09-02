@@ -146,6 +146,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	}
 	service.endpoint = endpoint
 	replicator := &controlResultReplicator{configuration: service.configuration, authenticator: service.authenticator, clock: service.clock, membership: service.membership, repository: repository, clusterID: service.clusterID, timeout: time.Duration(service.configuration.Crane.WorkerControlTimeout), dial: (&net.Dialer{}).DialContext}
+	defer replicator.Close()
 	engine, err := NewEngine(EngineOptions{Repository: repository, Sender: endpoint, Replicator: replicator, Gate: service.gate, Clock: service.clock, MaxExecutors: service.configuration.Crane.WorkerSlots, AcceptedRetryInterval: time.Duration(service.configuration.Crane.TupleRetryInterval), CompletedRetryInterval: time.Duration(service.configuration.Crane.TupleCompletionRetryInterval)})
 	if err != nil {
 		return err
@@ -472,7 +473,32 @@ type controlResultReplicator struct {
 	clusterID     [16]byte
 	timeout       time.Duration
 	dial          func(context.Context, string, string) (net.Conn, error)
+
+	// sessions caches one authenticated +5 session per destination
+	// incarnation. Every handshake commits a request identity into the
+	// destination's bounded per-peer replay cache, so a session per record
+	// (or per retry) exhausts it and every later handshake is refused
+	// (Task 24 defect #8, the +5 half): a session is dialed once, reused for
+	// every record and retry to that destination, and dropped on any failure.
+	mu       sync.Mutex
+	sessions map[replicaSessionKey]*replicaSession
+	closed   bool
 }
+
+type replicaSessionKey struct {
+	node  uint16
+	epoch model.WorkerEpoch
+}
+
+type replicaSession struct {
+	connection net.Conn
+	stream     *wire.TCPFrameStream
+	member     swim.Member
+}
+
+// replicationRetryCap bounds the doubling retry backoff of one record at a
+// multiple of the configured tuple retry interval.
+const replicationRetryCap = 32
 
 func (replicator *controlResultReplicator) ReplicateRecord(ctx context.Context, record model.ResultRecord, provenance model.ResultCopyProvenance) (ResultReplicationReceipt, error) {
 	if ctx == nil {
@@ -489,78 +515,165 @@ func (replicator *controlResultReplicator) ReplicateRecord(ctx context.Context, 
 	if err != nil {
 		return ResultReplicationReceipt{}, err
 	}
+	interval := time.Duration(replicator.configuration.Crane.TupleRetryInterval)
+	delay := interval
 	for {
 		current, authorityErr := replicator.currentAuthority(chunk)
 		if authorityErr != nil {
 			return ResultReplicationReceipt{}, authorityErr
 		}
 		if !current {
+			tracef("replicator node=%d: record %x for sink %d.%d no longer current (rev=%d role=%d)", replicator.localNodeID(), chunk.Record.TupleID.PathDigest[:4], chunk.Record.SinkTask.StageID, chunk.Record.SinkTask.Partition, chunk.Provenance.AssignmentRevision, chunk.Provenance.DestinationRole)
 			return ResultReplicationReceipt{}, context.Canceled
 		}
 		receipt, replicateErr := replicator.replicateChunk(ctx, chunk, destination, destinationEpoch)
 		if replicateErr == nil {
 			return receipt, nil
 		}
+		tracef("replicator node=%d: record seq=%d to node %d failed: %v", replicator.localNodeID(), chunk.Record.TupleID.SourceSequence, destination, replicateErr)
 		if err := ctx.Err(); err != nil {
 			return ResultReplicationReceipt{}, err
 		}
-		timer := replicator.clock.NewTimer(time.Duration(replicator.configuration.Crane.TupleRetryInterval))
+		// Doubling backoff bounds the request rate against a destination that
+		// keeps refusing (it may not hold the current install yet) so its
+		// bounded per-peer replay cache is never exhausted by retries.
+		timer := replicator.clock.NewTimer(delay)
 		select {
 		case <-timer.C():
 		case <-ctx.Done():
 			timer.Stop()
 			return ResultReplicationReceipt{}, ctx.Err()
 		}
+		if delay < interval*replicationRetryCap {
+			delay *= 2
+			if delay > interval*replicationRetryCap {
+				delay = interval * replicationRetryCap
+			}
+		}
 	}
 }
 
-func (replicator *controlResultReplicator) replicateChunk(ctx context.Context, chunk protocol.ResultRecordChunk, destination uint16, destinationEpoch model.WorkerEpoch) (ResultReplicationReceipt, error) {
+// session returns the cached authenticated session to one destination
+// incarnation, dialing and handshaking once when absent.
+func (replicator *controlResultReplicator) session(ctx context.Context, destination uint16, destinationEpoch model.WorkerEpoch) (*replicaSession, error) {
+	key := replicaSessionKey{node: destination, epoch: destinationEpoch}
+	replicator.mu.Lock()
+	if replicator.closed {
+		replicator.mu.Unlock()
+		return nil, ErrTransferUnauthorized
+	}
+	if cached, ok := replicator.sessions[key]; ok {
+		if sameActiveControlMember(cached.member, replicator.membership.View()) {
+			replicator.mu.Unlock()
+			return cached, nil
+		}
+		delete(replicator.sessions, key)
+		_ = cached.connection.Close()
+	}
+	replicator.mu.Unlock()
+
 	member, ok := activeControlMember(replicator.membership.View(), destination)
 	if !ok {
-		return ResultReplicationReceipt{}, ErrTransferUnauthorized
+		return nil, ErrTransferUnauthorized
 	}
 	endpoint, err := memberServiceEndpoint(member.Host, member.BasePort, config.ServiceCraneWorker)
 	if err != nil {
-		return ResultReplicationReceipt{}, err
+		return nil, err
 	}
-	operationContext, cancel := context.WithTimeout(ctx, replicator.timeout)
+	dialContext, cancel := context.WithTimeout(ctx, replicator.timeout)
 	defer cancel()
-	connection, err := replicator.dial(operationContext, "tcp", endpoint.String())
+	connection, err := replicator.dial(dialContext, "tcp", endpoint.String())
 	if err != nil {
-		return ResultReplicationReceipt{}, fmt.Errorf("dial result replica: %w", err)
+		return nil, fmt.Errorf("dial result replica: %w", err)
 	}
-	defer connection.Close()
 	if err := replicator.membership.AuthorizeTCP(destination, connection.RemoteAddr()); err != nil {
-		return ResultReplicationReceipt{}, ErrTransferUnauthorized
+		_ = connection.Close()
+		return nil, ErrTransferUnauthorized
 	}
 	limits := wire.DefaultLimits()
 	limits.MaxFrameSize = int(model.WorkerControlMaxFrameBytesV1)
 	limits.ExpectedClusterID = &replicator.clusterID
 	stream := wire.NewTCPFrameStream(connection, replicator.authenticator, limits, replicator.timeout)
-
 	node, epoch := replicator.repository.LocalIdentity()
 	handshake := protocol.WorkerHandshake{NodeID: node, WorkerEpoch: epoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-	handshakeResponse, err := replicator.exchange(operationContext, stream, handshake, destination)
+	handshakeResponse, err := replicator.exchange(dialContext, stream, handshake, destination)
 	if err != nil {
-		return ResultReplicationReceipt{}, err
+		_ = connection.Close()
+		return nil, err
 	}
 	handshakeAck, ok := handshakeResponse.(protocol.WorkerHandshakeAck)
 	if !ok || handshakeAck.NodeID != destination || handshakeAck.WorkerEpoch != destinationEpoch || handshakeAck.ConsensusFingerprint != model.ConsensusFingerprint() || handshakeAck.RegistryFingerprint != model.RegistryFingerprint() {
-		return ResultReplicationReceipt{}, ErrTransferUnauthorized
+		_ = connection.Close()
+		return nil, ErrTransferUnauthorized
 	}
 	if !sameActiveControlMember(member, replicator.membership.View()) {
-		return ResultReplicationReceipt{}, ErrTransferUnauthorized
+		_ = connection.Close()
+		return nil, ErrTransferUnauthorized
 	}
+	created := &replicaSession{connection: connection, stream: stream, member: member}
+	replicator.mu.Lock()
+	defer replicator.mu.Unlock()
+	if replicator.closed {
+		_ = connection.Close()
+		return nil, ErrTransferUnauthorized
+	}
+	if existing, ok := replicator.sessions[key]; ok {
+		// A concurrent record already established the session: keep one.
+		_ = connection.Close()
+		return existing, nil
+	}
+	if replicator.sessions == nil {
+		replicator.sessions = make(map[replicaSessionKey]*replicaSession)
+	}
+	replicator.sessions[key] = created
+	return created, nil
+}
 
-	transferResponse, err := replicator.exchange(operationContext, stream, chunk, destination)
+// dropSession forgets and closes one failed session.
+func (replicator *controlResultReplicator) dropSession(destination uint16, destinationEpoch model.WorkerEpoch, failed *replicaSession) {
+	key := replicaSessionKey{node: destination, epoch: destinationEpoch}
+	replicator.mu.Lock()
+	if replicator.sessions[key] == failed {
+		delete(replicator.sessions, key)
+	}
+	replicator.mu.Unlock()
+	_ = failed.connection.Close()
+}
+
+// Close closes every cached session; later replication attempts fail closed.
+func (replicator *controlResultReplicator) Close() {
+	replicator.mu.Lock()
+	defer replicator.mu.Unlock()
+	replicator.closed = true
+	for key, session := range replicator.sessions {
+		_ = session.connection.Close()
+		delete(replicator.sessions, key)
+	}
+}
+
+func (replicator *controlResultReplicator) replicateChunk(ctx context.Context, chunk protocol.ResultRecordChunk, destination uint16, destinationEpoch model.WorkerEpoch) (ResultReplicationReceipt, error) {
+	session, err := replicator.session(ctx, destination, destinationEpoch)
 	if err != nil {
 		return ResultReplicationReceipt{}, err
 	}
+	operationContext, cancel := context.WithTimeout(ctx, replicator.timeout)
+	defer cancel()
+	transferResponse, err := replicator.exchange(operationContext, session.stream, chunk, destination)
+	if err != nil {
+		replicator.dropSession(destination, destinationEpoch, session)
+		return ResultReplicationReceipt{}, err
+	}
 	ack, ok := transferResponse.(protocol.ResultRecordAck)
-	if !ok || protocol.ValidateResultRecordAckCorrelation(chunk, ack) != nil || !sameActiveControlMember(member, replicator.membership.View()) {
+	if !ok || protocol.ValidateResultRecordAckCorrelation(chunk, ack) != nil || !sameActiveControlMember(session.member, replicator.membership.View()) {
+		replicator.dropSession(destination, destinationEpoch, session)
 		return ResultReplicationReceipt{}, ErrTransferUnauthorized
 	}
 	return ResultReplicationReceipt{DestinationNodeID: ack.NodeID, DestinationWorkerEpoch: ack.WorkerEpoch, StreamChecksum: ack.Checksum, StreamLength: ack.TotalLength, CoordinatorEpoch: ack.CoordinatorEpoch}, nil
+}
+
+func (replicator *controlResultReplicator) localNodeID() uint16 {
+	node, _ := replicator.repository.LocalIdentity()
+	return node
 }
 
 func (replicator *controlResultReplicator) currentAuthority(chunk protocol.ResultRecordChunk) (bool, error) {
@@ -569,7 +682,7 @@ func (replicator *controlResultReplicator) currentAuthority(chunk protocol.Resul
 		return false, err
 	}
 	assignment, ok := controlAssignment(work, chunk.Transfer.JobID)
-	if !ok || assignment.SchedulingState != model.Running || assignment.CoordinatorEpoch != work.Fence || chunk.Provenance.CoordinatorEpoch != work.Fence || assignment.Assignment.Revision != chunk.Provenance.AssignmentRevision || assignment.Assignment.Digest != chunk.Provenance.AssignmentDigest || assignment.Topology.Digest() != chunk.Record.SpecificationHash {
+	if !ok || !replicationAdmitted(assignment.SchedulingState) || assignment.CoordinatorEpoch != work.Fence || chunk.Provenance.CoordinatorEpoch != work.Fence || assignment.Assignment.Revision != chunk.Provenance.AssignmentRevision || assignment.Assignment.Digest != chunk.Provenance.AssignmentDigest || assignment.Topology.Digest() != chunk.Record.SpecificationHash {
 		return false, nil
 	}
 	replica, ok := controlReplica(assignment.Assignment, chunk.Record.SinkTask)
