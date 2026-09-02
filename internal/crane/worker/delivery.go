@@ -269,20 +269,72 @@ func coordinatorEpochOrderedBefore(left, right model.CoordinatorEpoch) bool {
 // must hold. Emissions derived from the readopted record then carry the
 // current coordinator, never the stale one. Records whose assignment was
 // genuinely replaced are refused and follow the existing retirement paths.
+//
+// A record retained under a superseded assignment REVISION re-adopts the same
+// way when its own destination task incarnation is unchanged in the current
+// set (Task 24 defect #4 ruling: a revision bump caused by another task's
+// reassignment does not replace this task's custody): the record re-envelopes
+// with the current producer and destination tokens, revision, digest and
+// fence, and must re-validate byte-exactly as that current definition.
 func (engine *Engine) readoptRetainedRecord(assignment store.InstalledAssignment, fence model.CoordinatorEpoch, record store.DeliveryRecord) (store.DeliveryRecord, bool) {
-	if record.CoordinatorEpoch == fence || !coordinatorEpochOrderedBefore(record.CoordinatorEpoch, fence) {
-		return store.DeliveryRecord{}, false
-	}
-	if assignment.CoordinatorEpoch != fence || record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest {
-		return store.DeliveryRecord{}, false
-	}
-	message := protocol.TupleDelivery{DeliveryID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: record.ID.Tuple.JobID, Revision: record.AssignmentRevision, Digest: record.AssignmentDigest}, Coordinator: fence}
-	if err := validateDeliveryAuthority(assignment, fence, message); err != nil {
+	message, ok := readoptedDeliveryMessage(assignment, fence, false, record.ID, record.Tuple, record.Producer, record.Destination, record.AssignmentRevision, record.AssignmentDigest, record.CoordinatorEpoch)
+	if !ok {
 		return store.DeliveryRecord{}, false
 	}
 	readopted := record.Clone()
-	readopted.CoordinatorEpoch = fence
+	readopted.Producer, readopted.Destination = message.Producer, message.Destination
+	readopted.AssignmentRevision, readopted.AssignmentDigest, readopted.CoordinatorEpoch = message.Assignment.Revision, message.Assignment.Digest, message.Coordinator
 	return readopted, true
+}
+
+// readoptedDeliveryMessage derives the current-envelope form of one retained
+// delivery definition (custody record or outbox emission) and validates it
+// against the current installed assignment. The local side of the definition
+// (the producer of an emission when localProducer, else the destination of
+// custody) must keep its task incarnation; both tokens are re-derived from the
+// current set.
+func readoptedDeliveryMessage(assignment store.InstalledAssignment, fence model.CoordinatorEpoch, localProducer bool, id model.DeliveryID, tuple model.Tuple, producer, destination model.AssignmentToken, revision uint64, digest [32]byte, epoch model.CoordinatorEpoch) (protocol.TupleDelivery, bool) {
+	if assignment.CoordinatorEpoch != fence || epoch != fence && !coordinatorEpochOrderedBefore(epoch, fence) {
+		return protocol.TupleDelivery{}, false
+	}
+	set := assignment.Assignment
+	switch {
+	case revision == set.Revision:
+		if digest != set.Digest || epoch == fence {
+			return protocol.TupleDelivery{}, false
+		}
+	case revision < set.Revision:
+		currentProducer, producerOK := findAssignmentToken(set, producer.Task)
+		currentDestination, destinationOK := findAssignmentToken(set, destination.Task)
+		local, retained := currentDestination, destination
+		if localProducer {
+			local, retained = currentProducer, producer
+		}
+		if !producerOK || !destinationOK || !sameTokenIncarnation(local, retained) {
+			return protocol.TupleDelivery{}, false
+		}
+		producer, destination = currentProducer, currentDestination
+	default:
+		return protocol.TupleDelivery{}, false
+	}
+	message := protocol.TupleDelivery{DeliveryID: id, Tuple: tuple, Producer: producer, Destination: destination, Assignment: protocol.AssignmentSetIdentity{JobID: id.Tuple.JobID, Revision: set.Revision, Digest: set.Digest}, Coordinator: fence}
+	if err := validateDeliveryAuthority(assignment, fence, message); err != nil {
+		return protocol.TupleDelivery{}, false
+	}
+	return message, true
+}
+
+// sameTokenIncarnation reports whether two tokens place the same task on the
+// identical worker incarnation (worker, epoch, attempt, specification); only
+// the AssignmentRevision may differ.
+func sameTokenIncarnation(a, b model.AssignmentToken) bool {
+	return a.Task == b.Task && a.WorkerID == b.WorkerID && a.WorkerEpoch == b.WorkerEpoch && a.Attempt == b.Attempt && a.SpecificationHash == b.SpecificationHash
+}
+
+// retainedEnvelope reports whether a record's envelope differs from the
+// current installed assignment's (fence, revision or digest).
+func retainedEnvelope(assignment store.InstalledAssignment, fence model.CoordinatorEpoch, revision uint64, digest [32]byte, epoch model.CoordinatorEpoch) bool {
+	return epoch != fence || revision != assignment.Assignment.Revision || digest != assignment.Assignment.Digest
 }
 
 func (engine *Engine) scheduleExecution(ctx context.Context, record store.DeliveryRecord) {
@@ -301,8 +353,8 @@ func (engine *Engine) scheduleExecution(ctx context.Context, record store.Delive
 		release()
 		return
 	}
-	if record.CoordinatorEpoch != engine.repository.CurrentFence() {
-		// Retained custody published under a superseded fence re-enters
+	if retainedEnvelope(assignment, engine.repository.CurrentFence(), record.AssignmentRevision, record.AssignmentDigest, record.CoordinatorEpoch) {
+		// Retained custody published under a superseded envelope re-enters
 		// execution only through the byte-exact readoption above.
 		readopted, readoptedOK := engine.readoptRetainedRecord(assignment, engine.repository.CurrentFence(), record)
 		if !readoptedOK {

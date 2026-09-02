@@ -721,7 +721,7 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
 			return err
 		}
-		if outbox.Producer != delivery.Destination {
+		if outbox.Producer != currentProducerToken(delivery, assignment) {
 			return errors.New("outbox producer is not processed destination")
 		}
 		want, exists := expected[outbox.ID]
@@ -1134,9 +1134,19 @@ func applyResult(work *RecoveredWork, result StoredResult) error {
 	key := resultKey{SinkTask: result.Record.SinkTask, TupleID: result.Record.TupleID}
 	priorResult := findResultNode(work.indexes.results, key)
 	if priorResult != nil {
-		if !equalStoredResult(priorResult.value, result) {
+		if equalStoredResult(priorResult.value, result) {
+			return nil
+		}
+		if !rebindableResultProvenance(priorResult.value, result) {
 			return model.ErrIdentityReuse
 		}
+		// Copy-provenance rebind (Task 24 defect #4 ruling): the identical
+		// logical record retained under a superseded envelope re-binds to the
+		// current pair (validated above against the current fence, assignment
+		// and replica set). The logical record and its byte accounting are
+		// unchanged; the prospective tree is path-copied like every insert.
+		result.Record.Value = append([]byte(nil), result.Record.Value...)
+		work.indexes.results = replaceResultNode(work.indexes.results, key, result)
 		return nil
 	}
 	entryBytes, err := resultArtifactEntryBytes(uint64(len(result.canonical)))
@@ -1485,10 +1495,42 @@ func applyOutboxRetry(work *RecoveredWork, update outboxRetryUpdate) error {
 // byte-exactly and its retained epoch must be strictly ordered before the
 // current committed fence. Genuinely replaced assignments never re-adopt.
 func readoptedDeliveryAuthority(record DeliveryRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch) bool {
-	return compareEpochOrder(record.CoordinatorEpoch, fence) < 0 &&
-		assignment.CoordinatorEpoch == fence &&
-		record.AssignmentRevision == assignment.Assignment.Revision &&
-		record.AssignmentDigest == assignment.Assignment.Digest
+	if assignment.CoordinatorEpoch != fence || compareEpochOrder(record.CoordinatorEpoch, fence) > 0 {
+		return false
+	}
+	if record.AssignmentRevision == assignment.Assignment.Revision {
+		return record.AssignmentDigest == assignment.Assignment.Digest && compareEpochOrder(record.CoordinatorEpoch, fence) < 0
+	}
+	// A superseded assignment revision re-adopts only when the custody's own
+	// destination task incarnation is unchanged in the current set (Task 24
+	// defect #4 ruling: retained custody re-envelopes under the current
+	// assignment; a replaced task never re-enters).
+	return record.AssignmentRevision < assignment.Assignment.Revision && sameTaskIncarnation(assignment.Assignment, record.Destination)
+}
+
+// sameTaskIncarnation reports whether token's task is placed on the identical
+// worker incarnation (worker, epoch, attempt, specification) in set; only the
+// token's AssignmentRevision may differ.
+func sameTaskIncarnation(set model.AssignmentSet, token model.AssignmentToken) bool {
+	current, ok := findToken(set, token.Task)
+	return ok && current.WorkerID == token.WorkerID && current.WorkerEpoch == token.WorkerEpoch && current.Attempt == token.Attempt && current.SpecificationHash == token.SpecificationHash
+}
+
+// equalDeliveryDefinitionModuloEnvelope compares the logical custody of two
+// delivery definitions ignoring the assignment envelope (producer incarnation,
+// revision, digest, coordinator epoch): identity, payload bytes, reservation,
+// producer task and destination task incarnation must agree.
+func equalDeliveryDefinitionModuloEnvelope(a, b DeliveryRecord) bool {
+	if a.ID != b.ID || a.Producer.Task != b.Producer.Task || a.Reservation != b.Reservation ||
+		a.Destination.Task != b.Destination.Task || a.Destination.WorkerID != b.Destination.WorkerID || a.Destination.WorkerEpoch != b.Destination.WorkerEpoch || a.Destination.Attempt != b.Destination.Attempt || a.Destination.SpecificationHash != b.Destination.SpecificationHash {
+		return false
+	}
+	aa, err := model.MarshalTuple(a.Tuple)
+	if err != nil {
+		return false
+	}
+	bb, err := model.MarshalTuple(b.Tuple)
+	return err == nil && bytes.Equal(aa, bb)
 }
 
 // equalDeliveryDefinitionModuloEpoch compares one delivery definition against
@@ -1509,19 +1551,20 @@ func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fen
 	if record.State < Received || record.State > Compacted || record.AssignmentRevision == 0 || record.AssignmentDigest == ([32]byte{}) {
 		return errors.New("invalid delivery metadata")
 	}
-	readopted := record.CoordinatorEpoch != fence
-	if readopted {
-		if !readoptedDeliveryAuthority(record, assignment, fence) {
-			return errors.New("delivery assignment fence mismatch")
-		}
-	} else if record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest {
+	readopted := record.CoordinatorEpoch != fence || record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest
+	if readopted && !readoptedDeliveryAuthority(record, assignment, fence) {
 		return errors.New("delivery assignment fence mismatch")
 	}
 	message := protocol.TupleDelivery{DeliveryID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: record.ID.Tuple.JobID, Revision: record.AssignmentRevision, Digest: record.AssignmentDigest}, Coordinator: record.CoordinatorEpoch}
 	if _, err := protocol.MarshalTupleDelivery(message); err != nil {
 		return err
 	}
-	if !containsToken(assignment.Assignment, record.Producer) || !containsToken(assignment.Assignment, record.Destination) {
+	supersededRevision := readopted && record.AssignmentRevision != assignment.Assignment.Revision
+	if supersededRevision {
+		if _, ok := findToken(assignment.Assignment, record.Producer.Task); !ok || !sameTaskIncarnation(assignment.Assignment, record.Destination) {
+			return errors.New("delivery token not in installed assignment")
+		}
+	} else if !containsToken(assignment.Assignment, record.Producer) || !containsToken(assignment.Assignment, record.Destination) {
 		return errors.New("delivery token not in installed assignment")
 	}
 	if err := validateRoute(assignment.Topology, record.ID, record.Tuple, record.Producer.Task); err != nil {
@@ -1544,7 +1587,13 @@ func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fen
 	if !exists {
 		return errors.New("delivery definition does not match deterministic source path")
 	}
-	if readopted {
+	if supersededRevision {
+		// The reconstruction derives under the current assignment; a
+		// re-adopted retained record differs from it only by its envelope.
+		if !equalDeliveryDefinitionModuloEnvelope(derived, record) {
+			return errors.New("delivery definition does not match deterministic source path")
+		}
+	} else if readopted {
 		// The reconstruction derives under the current fence; a re-adopted
 		// retained record differs from it only by the epoch branding.
 		if !equalDeliveryDefinitionModuloEpoch(derived, record) {
@@ -1615,6 +1664,7 @@ func deliveryDefinitionDigest(record DeliveryRecord) ([32]byte, error) {
 
 func expectedProcessedOutboxes(delivery DeliveryRecord, assignment InstalledAssignment) (map[model.DeliveryID]OutboxRecord, error) {
 	result := make(map[model.DeliveryID]OutboxRecord)
+	producer := currentProducerToken(delivery, assignment)
 	for outputIndex, tuple := range delivery.Outputs {
 		for _, edge := range assignment.Topology.Spec().Edges {
 			if edge.SourceStageID != delivery.Destination.Task.StageID {
@@ -1642,7 +1692,7 @@ func expectedProcessedOutboxes(delivery DeliveryRecord, assignment InstalledAssi
 				// assignment identity and fence: a re-adopted retained
 				// delivery derives its outboxes under the fence it re-entered
 				// through, never the superseded one it was published under.
-				result[id] = OutboxRecord{ID: id, Tuple: cloneTuple(tuple), Producer: delivery.Destination, Destination: destination, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, CoordinatorEpoch: assignment.CoordinatorEpoch}
+				result[id] = OutboxRecord{ID: id, Tuple: cloneTuple(tuple), Producer: producer, Destination: destination, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, CoordinatorEpoch: assignment.CoordinatorEpoch}
 			}
 		}
 	}
@@ -1650,6 +1700,16 @@ func expectedProcessedOutboxes(delivery DeliveryRecord, assignment InstalledAssi
 		return nil, errors.New("topology-derived outboxes exceed v1 bound")
 	}
 	return result, nil
+}
+
+// currentProducerToken returns the token a retained delivery's destination
+// task carries in the current assignment — the same incarnation under the
+// current revision — falling back to the retained token when absent.
+func currentProducerToken(delivery DeliveryRecord, assignment InstalledAssignment) model.AssignmentToken {
+	if current, ok := findToken(assignment.Assignment, delivery.Destination.Task); ok && sameTaskIncarnation(assignment.Assignment, delivery.Destination) {
+		return current
+	}
+	return delivery.Destination
 }
 
 func expectedSourceOutboxes(cursor SourceCursor, source model.AssignmentToken, assignment InstalledAssignment) (map[model.DeliveryID]OutboxRecord, error) {
@@ -1928,14 +1988,32 @@ func probeDelivery(work *RecoveredWork, record DeliveryRecord) (DeliveryState, b
 			// A current-fence rebrand of one's own exact retained definition
 			// re-adopts the retained custody (defect #5 ruling): the delivery
 			// re-enters under the fence it was re-validated against.
-			if assignment, ok := findAssignment(work, record.ID.Tuple.JobID); ok &&
-				record.CoordinatorEpoch == work.Fence &&
+			assignment, ok := findAssignment(work, record.ID.Tuple.JobID)
+			if ok && record.CoordinatorEpoch == work.Fence &&
 				compareEpochOrder(prior.CoordinatorEpoch, work.Fence) < 0 &&
 				assignment.CoordinatorEpoch == work.Fence &&
 				prior.AssignmentRevision == assignment.Assignment.Revision &&
 				prior.AssignmentDigest == assignment.Assignment.Digest &&
 				equalDeliveryDefinitionModuloEpoch(prior, record) {
 				return prior.State, true, nil
+			}
+			// The current assignment's exact derivation of the same logical
+			// custody re-delivered by a (possibly replaced) producer answers
+			// from custody retained under a superseded revision when this
+			// destination task's incarnation is unchanged (Task 24 defect #4
+			// ruling: retained custody re-envelopes under the current
+			// assignment).
+			if ok && record.CoordinatorEpoch == work.Fence && assignment.CoordinatorEpoch == work.Fence &&
+				prior.AssignmentRevision < assignment.Assignment.Revision &&
+				record.AssignmentRevision == assignment.Assignment.Revision && record.AssignmentDigest == assignment.Assignment.Digest &&
+				sameTaskIncarnation(assignment.Assignment, prior.Destination) {
+				derived, exists, err := deriveDeliveryDefinition(assignment, work.Fence, record.ID)
+				if err != nil {
+					return 0, true, err
+				}
+				if exists && equalDeliveryDefinition(derived, record) && equalDeliveryDefinitionModuloEnvelope(derived, prior) {
+					return prior.State, true, nil
+				}
 			}
 			return 0, true, model.ErrIdentityReuse
 		}
@@ -3587,6 +3665,59 @@ func cloneInstalled(v InstalledAssignment) InstalledAssignment {
 	v.Topology, _ = model.DecodeTopology(v.SpecificationBytes)
 	return v
 }
+
+// rebindableResultProvenance reports whether an incoming result may re-bind
+// the copy provenance of a retained prior copy: the logical record must be
+// byte-identical and the prior provenance strictly historical against the
+// incoming (already current-validated) one — a lower assignment revision, or
+// the same revision/replica set/role under a coordinator epoch ordered
+// strictly before. Any other difference is an identity reuse.
+func rebindableResultProvenance(prior, incoming StoredResult) bool {
+	priorBytes := prior.canonical
+	if priorBytes == nil {
+		priorBytes, _ = model.MarshalResultRecord(prior.Record)
+	}
+	incomingBytes := incoming.canonical
+	if incomingBytes == nil {
+		incomingBytes, _ = model.MarshalResultRecord(incoming.Record)
+	}
+	if len(priorBytes) == 0 || !bytes.Equal(priorBytes, incomingBytes) {
+		return false
+	}
+	return ResultProvenanceOrderedBefore(prior.Provenance, incoming.Provenance)
+}
+
+// ResultProvenanceOrderedBefore reports whether prior is a strictly superseded
+// copy envelope of current: a lower assignment revision, or the identical
+// revision, digest, replica set and role under a coordinator epoch ordered
+// strictly before current's.
+func ResultProvenanceOrderedBefore(prior, current model.ResultCopyProvenance) bool {
+	if prior.AssignmentRevision < current.AssignmentRevision {
+		return true
+	}
+	return prior.AssignmentRevision == current.AssignmentRevision && prior.AssignmentDigest == current.AssignmentDigest &&
+		prior.ReplicaSet == current.ReplicaSet && prior.DestinationRole == current.DestinationRole &&
+		compareEpochOrder(prior.CoordinatorEpoch, current.CoordinatorEpoch) < 0
+}
+
+// replaceResultNode returns a path-copied tree in which the node holding key
+// carries value; shape and heights are unchanged. The key must exist.
+func replaceResultNode(root *resultNode, key resultKey, value StoredResult) *resultNode {
+	if root == nil {
+		return nil
+	}
+	copyRoot := *root
+	switch comparison := compareResultKey(key, root.key); {
+	case comparison < 0:
+		copyRoot.left = replaceResultNode(root.left, key, value)
+	case comparison > 0:
+		copyRoot.right = replaceResultNode(root.right, key, value)
+	default:
+		copyRoot.value = value
+	}
+	return &copyRoot
+}
+
 func compareEpochOrder(a, b model.CoordinatorEpoch) int {
 	if a.Term < b.Term {
 		return -1

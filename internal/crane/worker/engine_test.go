@@ -799,10 +799,25 @@ func (repository *fakeRepository) PersistEvent(event model.WorkerEvent) error {
 func (repository *fakeRepository) UpsertResult(record model.ResultRecord, provenance model.ResultCopyProvenance) error {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
-	for _, stored := range repository.results {
+	for index, stored := range repository.results {
 		if stored.Record.SinkTask == record.SinkTask && stored.Record.TupleID == record.TupleID {
-			if stored.Record.Checksum != record.Checksum || stored.Provenance != provenance {
+			if stored.Record.Checksum != record.Checksum {
 				return model.ErrIdentityReuse
+			}
+			if stored.Provenance == provenance {
+				return nil
+			}
+			if !store.ResultProvenanceOrderedBefore(stored.Provenance, provenance) {
+				return model.ErrIdentityReuse
+			}
+			// Copy-provenance rebind of the identical logical record (the
+			// store's Task 24 defect #4 rule).
+			repository.log = append(repository.log, "result-rebind")
+			repository.results[index].Provenance = provenance
+			for workIndex := range repository.work.Results {
+				if repository.work.Results[workIndex].Record.SinkTask == record.SinkTask && repository.work.Results[workIndex].Record.TupleID == record.TupleID {
+					repository.work.Results[workIndex].Provenance = provenance
+				}
 			}
 			return nil
 		}

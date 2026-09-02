@@ -21,6 +21,19 @@ type ownedResult struct {
 	provenance model.ResultCopyProvenance
 	parents    []model.DeliveryID
 	sending    bool
+	// target is the partner-copy provenance of the in-flight replication.
+	target *model.ResultCopyProvenance
+	// retained marks a superseded-envelope copy deliberately left to the
+	// bilateral repair grant that covers it under the current envelope.
+	retained bool
+}
+
+// resultEnvelope identifies the installed assignment envelope a retained
+// result readoption pass was last evaluated against.
+type resultEnvelope struct {
+	revision uint64
+	digest   [32]byte
+	epoch    model.CoordinatorEpoch
 }
 
 type resultJob struct {
@@ -106,10 +119,15 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 			}
 			owned = &ownedResult{record: cloneResultRecord(record), provenance: provenance}
 			engine.results[key] = owned
-		} else if !equalOwnedResult(owned, record, provenance) {
+		} else if !equalOwnedResult(owned, record, provenance) && !(equalResultRecord(owned.record, record) && store.ResultProvenanceOrderedBefore(owned.provenance, provenance)) {
+			// A retained copy under a strictly superseded envelope is the same
+			// logical record; it re-binds on its next durable partner receipt.
 			return model.ErrIdentityReuse
 		}
 		owned.parents = append(owned.parents, id)
+	}
+	if err := engine.readoptRetainedResults(ctx); err != nil {
+		return err
 	}
 
 	type scheduledResult struct {
@@ -133,21 +151,207 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 			continue
 		}
 		assignment, ok := engine.repository.InstalledAssignment(result.record.TupleID.JobID)
-		if !ok || !engine.currentResultProvenance(assignment, result) {
-			// Historical bytes are permanent, but normal replication is
-			// deliberately fail-closed without a bilateral repair grant.
+		if !ok || assignment.SchedulingState != model.Running {
 			continue
 		}
-		target := result.provenance
-		target.DestinationRole = model.SecondaryReplica
-		select {
-		case engine.resultJobs <- resultJob{key: key, record: cloneResultRecord(result.record), provenance: target}:
-			result.sending = true
-		default:
+		local, partner, envelopeOK := engine.currentCopyEnvelope(assignment, result.record.SinkTask)
+		if !envelopeOK || local.DestinationRole != model.PrimaryReplica || result.provenance != local && !store.ResultProvenanceOrderedBefore(result.provenance, local) {
+			// Normal replication stays fail-closed for any copy that is not the
+			// current primary's own — current, or strictly superseded and
+			// re-bound on receipt (Task 24 defect #4 ruling).
+			continue
+		}
+		if !engine.dispatchResult(key, result, partner) {
 			return nil
 		}
 	}
 	return nil
+}
+
+// dispatchResult hands one exact record to the replication workers under the
+// partner provenance and reports whether it was queued.
+func (engine *Engine) dispatchResult(key resultIdentity, result *ownedResult, target model.ResultCopyProvenance) bool {
+	select {
+	case engine.resultJobs <- resultJob{key: key, record: cloneResultRecord(result.record), provenance: target}:
+		result.sending = true
+		sent := target
+		result.target = &sent
+		return true
+	default:
+		return false
+	}
+}
+
+// readoptRetainedResults re-establishes the second copy of every result this
+// worker retains under a superseded copy envelope while it is a member of the
+// CURRENT replica pair (Task 24 defect #4 ruling): the record is
+// re-replicated to the current partner as ordinary two-copy replication under
+// the current assignment envelope (current fence, revision, digest, replica
+// set and worker epochs), and both copies re-bind to the current pair on
+// receipt. It runs on every reconcile, so a partner-changing install and
+// recovery both drive it. Records the durable current-epoch bilateral repair
+// grant covers stay with the grant. Senders that are not current members and
+// copies whose envelope is not strictly superseded never move.
+func (engine *Engine) readoptRetainedResults(ctx context.Context) error {
+	fence := engine.repository.CurrentFence()
+	if err := engine.adoptDurableResults(); err != nil {
+		return err
+	}
+	type jobWork struct {
+		assignment store.InstalledAssignment
+		admitted   bool
+		keys       []resultIdentity
+	}
+	jobs := make(map[model.JobID]*jobWork)
+	for key, result := range engine.results {
+		job := key.tuple.JobID
+		work, seen := jobs[job]
+		if !seen {
+			work = &jobWork{}
+			jobs[job] = work
+			assignment, ok := engine.repository.InstalledAssignment(job)
+			if ok && assignment.CoordinatorEpoch == fence && replicationAdmitted(assignment.SchedulingState) {
+				work.assignment, work.admitted = assignment, true
+				envelope := resultEnvelope{revision: assignment.Assignment.Revision, digest: assignment.Assignment.Digest, epoch: assignment.CoordinatorEpoch}
+				if engine.readoptEnvelopes[job] != envelope {
+					// A new envelope re-evaluates every retained copy of the job.
+					engine.readoptEnvelopes[job] = envelope
+					for other, candidate := range engine.results {
+						if other.tuple.JobID == job {
+							candidate.retained = false
+						}
+					}
+				}
+			}
+		}
+		if !work.admitted || result.sending || result.retained || len(result.parents) > 0 {
+			continue
+		}
+		local, _, ok := engine.currentCopyEnvelope(work.assignment, result.record.SinkTask)
+		if !ok || result.provenance == local || !store.ResultProvenanceOrderedBefore(result.provenance, local) || result.record.SpecificationHash != work.assignment.Topology.Digest() {
+			continue
+		}
+		work.keys = append(work.keys, key)
+	}
+	jobIDs := make([]model.JobID, 0, len(jobs))
+	for job, work := range jobs {
+		if len(work.keys) > 0 {
+			jobIDs = append(jobIDs, job)
+		}
+	}
+	sort.Slice(jobIDs, func(i, j int) bool { return bytes.Compare(jobIDs[i][:], jobIDs[j][:]) < 0 })
+	for _, job := range jobIDs {
+		work := jobs[job]
+		recovered, err := engine.repository.RecoverWork()
+		if err != nil {
+			return engine.ownerError("recover retained results", err)
+		}
+		sort.Slice(work.keys, func(i, j int) bool { return tupleTransferLess(work.keys[i].tuple, work.keys[j].tuple) })
+		for _, key := range work.keys {
+			result := engine.results[key]
+			if grantCoversRetainedResult(recovered.Repairs, fence, result.record, engine.localNode, engine.localEpoch) {
+				tracef("readopt node=%d: seq=%d left to the repair grant", engine.localNode, result.record.TupleID.SourceSequence)
+				result.retained = true
+				continue
+			}
+			_, partner, ok := engine.currentCopyEnvelope(work.assignment, result.record.SinkTask)
+			if !ok {
+				continue
+			}
+			if !engine.dispatchResult(key, result, partner) {
+				return nil
+			}
+			tracef("readopt node=%d: seq=%d re-replicating to node %d (rev=%d state=%d)", engine.localNode, result.record.TupleID.SourceSequence, partner.ReplicaSet.PrimaryNodeID+partner.ReplicaSet.SecondaryNodeID-engine.localNode, work.assignment.Assignment.Revision, work.assignment.SchedulingState)
+		}
+	}
+	return nil
+}
+
+// adoptDurableResults loads, for every job whose installation changed since
+// the last pass, the result copies the durable store retains that this engine
+// does not yet own — a secondary receives its copies through the transfer
+// owner, never through the engine — so a partner-changing install can
+// re-replicate them. Recovery itself already owns every durable copy.
+func (engine *Engine) adoptDurableResults() error {
+	if len(engine.readoptPending) == 0 {
+		return nil
+	}
+	pending := engine.readoptPending
+	engine.readoptPending = make(map[model.JobID]struct{})
+	needed := false
+	for job := range pending {
+		if assignment, ok := engine.repository.InstalledAssignment(job); ok && assignment.CoordinatorEpoch == engine.repository.CurrentFence() && replicationAdmitted(assignment.SchedulingState) {
+			needed = true
+		}
+	}
+	if !needed {
+		return nil
+	}
+	work, err := engine.repository.RecoverWork()
+	if err != nil {
+		return engine.ownerError("recover retained results", err)
+	}
+	for _, stored := range work.Results {
+		if _, wanted := pending[stored.Record.TupleID.JobID]; !wanted {
+			continue
+		}
+		key := resultID(stored.Record)
+		if _, owned := engine.results[key]; owned {
+			continue
+		}
+		engine.results[key] = &ownedResult{record: cloneResultRecord(stored.Record), provenance: stored.Provenance}
+	}
+	return nil
+}
+
+// grantCoversRetainedResult reports whether a durable current-epoch bilateral
+// repair grant naming this worker as an endpoint covers the record; such
+// records are re-established by the grant, never by holder-driven
+// re-replication.
+func grantCoversRetainedResult(repairs []store.ResultRepairRecord, fence model.CoordinatorEpoch, record model.ResultRecord, localNode uint16, localEpoch model.WorkerEpoch) bool {
+	for _, repair := range repairs {
+		instruction := repair.Instruction
+		if instruction.CoordinatorEpoch != fence || instruction.JobID != record.TupleID.JobID || instruction.SinkTask != record.SinkTask || instruction.SpecificationHash != record.SpecificationHash {
+			continue
+		}
+		local := instruction.SourceNodeID == localNode && instruction.SourceWorkerEpoch == localEpoch || instruction.DestinationNodeID == localNode && instruction.DestinationWorkerEpoch == localEpoch
+		if local && repairCoversTuple(instruction, record.TupleID) {
+			return true
+		}
+	}
+	return false
+}
+
+// currentCopyEnvelope returns the provenance this worker's own copy of a sink
+// partition's records carries under the current installed assignment and the
+// provenance of the partner copy it replicates to. It reports false unless the
+// assignment is at the current fence in a replication-admitted state and this
+// exact worker incarnation is one endpoint of a two-distinct-node replica set.
+func (engine *Engine) currentCopyEnvelope(assignment store.InstalledAssignment, sink model.TaskID) (model.ResultCopyProvenance, model.ResultCopyProvenance, bool) {
+	replica, ok := findResultReplica(assignment.Assignment, sink)
+	if !ok || assignment.CoordinatorEpoch != engine.repository.CurrentFence() || !replicationAdmitted(assignment.SchedulingState) || replica.PrimaryNodeID == replica.SecondaryNodeID {
+		return model.ResultCopyProvenance{}, model.ResultCopyProvenance{}, false
+	}
+	envelope := model.ResultCopyProvenance{AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, ReplicaSet: replica, CoordinatorEpoch: assignment.CoordinatorEpoch}
+	local, partner := envelope, envelope
+	switch {
+	case replica.PrimaryNodeID == engine.localNode && replica.PrimaryEpoch == engine.localEpoch:
+		local.DestinationRole, partner.DestinationRole = model.PrimaryReplica, model.SecondaryReplica
+	case replica.SecondaryNodeID == engine.localNode && replica.SecondaryEpoch == engine.localEpoch:
+		local.DestinationRole, partner.DestinationRole = model.SecondaryReplica, model.PrimaryReplica
+	default:
+		return model.ResultCopyProvenance{}, model.ResultCopyProvenance{}, false
+	}
+	return local, partner, true
+}
+
+// replicationAdmitted reports the scheduling states under which result copies
+// move between the current replicas: Running, and Draining — a drained job
+// whose replica pair changed after its records completed still needs its
+// second current copy before it can seal (Task 24 defect #4 ruling). Closed is
+// the re-fence window and stays excluded.
+func replicationAdmitted(state model.SchedulingState) bool {
+	return state == model.Running || state == model.Draining
 }
 
 func (engine *Engine) handleResultResponse(response resultResponse) error {
@@ -156,6 +360,8 @@ func (engine *Engine) handleResultResponse(response resultResponse) error {
 		return errors.New("result replication completed for unknown result")
 	}
 	result.sending = false
+	target := result.target
+	result.target = nil
 	if errors.Is(response.err, context.Canceled) {
 		return nil
 	}
@@ -163,9 +369,14 @@ func (engine *Engine) handleResultResponse(response resultResponse) error {
 		return engine.ownerError("replicate result", response.err)
 	}
 	assignment, ok := engine.repository.InstalledAssignment(result.record.TupleID.JobID)
-	if !ok || !engine.currentResultProvenance(assignment, result) {
+	if !ok {
+		return nil
+	}
+	local, partner, envelopeOK := engine.currentCopyEnvelope(assignment, result.record.SinkTask)
+	tracef("receipt node=%d: seq=%d envelope-ok=%t target-current=%t", engine.localNode, result.record.TupleID.SourceSequence, envelopeOK, target != nil && *target == partner)
+	if !envelopeOK || target == nil || *target != partner {
 		// Assignment/fence closure may race an in-flight durable ACK. Retain the
-		// primary bytes and Processed parent; a later authorized reconcile or
+		// local bytes and Processed parents; a later authorized reconcile or
 		// bilateral repair decides the next action without killing the owner.
 		return nil
 	}
@@ -173,9 +384,20 @@ func (engine *Engine) handleResultResponse(response resultResponse) error {
 	if err != nil {
 		return err
 	}
-	replica := result.provenance.ReplicaSet
-	if response.receipt.DestinationNodeID != replica.SecondaryNodeID || response.receipt.DestinationWorkerEpoch != replica.SecondaryEpoch || response.receipt.StreamChecksum != model.ResultRecordStreamChecksum(result.record) || response.receipt.StreamLength != uint64(len(encoded)) || response.receipt.CoordinatorEpoch != assignment.CoordinatorEpoch {
-		return errors.New("result replication receipt does not bind exact durable secondary copy")
+	destinationNode, destinationEpoch, _, _, _ := endpointsForRole(partner.ReplicaSet, partner.DestinationRole)
+	if response.receipt.DestinationNodeID != destinationNode || response.receipt.DestinationWorkerEpoch != destinationEpoch || response.receipt.StreamChecksum != model.ResultRecordStreamChecksum(result.record) || response.receipt.StreamLength != uint64(len(encoded)) || response.receipt.CoordinatorEpoch != assignment.CoordinatorEpoch {
+		return errors.New("result replication receipt does not bind exact durable partner copy")
+	}
+	if result.provenance != local {
+		// The partner now holds a current-provenance copy: re-bind the local
+		// copy to the current pair (Task 24 defect #4 ruling).
+		if err := engine.repository.UpsertResult(cloneResultRecord(result.record), local); err != nil {
+			return engine.ownerError("rebind retained result", err)
+		}
+		result.provenance = local
+	}
+	if len(result.parents) == 0 || !engine.currentResultProvenance(assignment, result) {
+		return nil
 	}
 	parents := append([]model.DeliveryID(nil), result.parents...)
 	for _, parentID := range parents {
@@ -197,8 +419,24 @@ func (engine *Engine) handleResultResponse(response resultResponse) error {
 	return nil
 }
 
+// currentSinkAuthority reports whether a Processed sink delivery is current
+// custody under the installed assignment. Retained custody published under a
+// superseded envelope that re-adopts byte-exactly under the current assignment
+// (Task 24 defect #5 and #4 rulings) is current custody; a replaced sink task
+// never qualifies.
 func (engine *Engine) currentSinkAuthority(assignment store.InstalledAssignment, delivery store.DeliveryRecord) bool {
-	return assignment.SchedulingState == model.Running && assignment.CoordinatorEpoch == engine.repository.CurrentFence() && delivery.CoordinatorEpoch == assignment.CoordinatorEpoch && delivery.AssignmentRevision == assignment.Assignment.Revision && delivery.AssignmentDigest == assignment.Assignment.Digest && delivery.Destination.WorkerID == engine.localNode && delivery.Destination.WorkerEpoch == engine.localEpoch && containsAssignmentToken(assignment.Assignment, delivery.Destination)
+	fence := engine.repository.CurrentFence()
+	if assignment.SchedulingState != model.Running || assignment.CoordinatorEpoch != fence {
+		return false
+	}
+	if retainedEnvelope(assignment, fence, delivery.AssignmentRevision, delivery.AssignmentDigest, delivery.CoordinatorEpoch) {
+		readopted, ok := engine.readoptRetainedRecord(assignment, fence, delivery)
+		if !ok {
+			return false
+		}
+		delivery = readopted
+	}
+	return delivery.Destination.WorkerID == engine.localNode && delivery.Destination.WorkerEpoch == engine.localEpoch && containsAssignmentToken(assignment.Assignment, delivery.Destination)
 }
 
 func (engine *Engine) currentResultProvenance(assignment store.InstalledAssignment, result *ownedResult) bool {
@@ -221,7 +459,11 @@ func cloneResultRecord(record model.ResultRecord) model.ResultRecord {
 }
 
 func equalOwnedResult(owned *ownedResult, record model.ResultRecord, provenance model.ResultCopyProvenance) bool {
-	return owned != nil && owned.record.TupleID == record.TupleID && owned.record.SinkTask == record.SinkTask && owned.record.SpecificationHash == record.SpecificationHash && owned.record.Checksum == record.Checksum && bytes.Equal(owned.record.Value, record.Value) && owned.provenance == provenance
+	return owned != nil && equalResultRecord(owned.record, record) && owned.provenance == provenance
+}
+
+func equalResultRecord(a, b model.ResultRecord) bool {
+	return a.TupleID == b.TupleID && a.SinkTask == b.SinkTask && a.SpecificationHash == b.SpecificationHash && a.Checksum == b.Checksum && bytes.Equal(a.Value, b.Value)
 }
 
 // SealResultPartition derives the canonical sealed artifact identity and

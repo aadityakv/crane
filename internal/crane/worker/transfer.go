@@ -626,7 +626,7 @@ func (owner *TransferOwner) validateCurrentReplication(peer TransferPeer, chunk 
 	if !ok || assignment.CoordinatorEpoch != owner.repository.CurrentFence() || chunk.Provenance.CoordinatorEpoch != assignment.CoordinatorEpoch {
 		return ErrTransferStaleAuthority
 	}
-	if assignment.SchedulingState != model.Running || chunk.Provenance.AssignmentRevision != assignment.Assignment.Revision || chunk.Provenance.AssignmentDigest != assignment.Assignment.Digest || chunk.Record.SpecificationHash != assignment.Topology.Digest() {
+	if !replicationAdmitted(assignment.SchedulingState) || chunk.Provenance.AssignmentRevision != assignment.Assignment.Revision || chunk.Provenance.AssignmentDigest != assignment.Assignment.Digest || chunk.Record.SpecificationHash != assignment.Topology.Digest() {
 		return ErrTransferUnauthorized
 	}
 	replica, ok := findResultReplica(assignment.Assignment, chunk.Record.SinkTask)

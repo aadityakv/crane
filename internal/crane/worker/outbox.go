@@ -136,7 +136,7 @@ func (engine *Engine) receiveACK(ack protocol.TupleACK) error {
 	if !ok {
 		return errors.New("ACK references unknown durable outbox")
 	}
-	if ack.Destination != outbox.record.Destination || ack.Assignment.JobID != outbox.record.ID.Tuple.JobID || ack.Assignment.Revision != outbox.record.AssignmentRevision || ack.Assignment.Digest != outbox.record.AssignmentDigest || !engine.outboxACKAuthority(outbox.record, ack.Coordinator) {
+	if !engine.outboxACKEnvelope(outbox.record, ack) {
 		return errors.New("ACK envelope does not match durable outbox")
 	}
 	if outbox.record.Completed {
@@ -431,39 +431,42 @@ func findAssignmentToken(set model.AssignmentSet, task model.TaskID) (model.Assi
 // emissionForOutbox builds one durable outbox's outbound message. A retained
 // outbox whose assignment identity still matches the current installation
 // but whose durable branding is strictly ordered before the current fence
-// re-derives its emission under the CURRENT fence (Task 24 defect #5
-// ruling): emissions carry the current coordinator, never the stale one.
+// re-derives its emission under the CURRENT envelope (Task 24 defect #5 and
+// #4 rulings): emissions carry the current coordinator and assignment, never
+// the stale ones.
 func (engine *Engine) emissionForOutbox(record store.OutboxRecord) protocol.TupleDelivery {
 	message := deliveryMessageForOutbox(record)
 	fence := engine.repository.CurrentFence()
-	if record.CoordinatorEpoch == fence || !coordinatorEpochOrderedBefore(record.CoordinatorEpoch, fence) {
-		return message
-	}
 	assignment, ok := engine.repository.InstalledAssignment(record.ID.Tuple.JobID)
 	if !ok || assignment.CoordinatorEpoch != fence || assignment.SchedulingState != model.Running {
 		return message
 	}
-	if record.AssignmentRevision != assignment.Assignment.Revision || record.AssignmentDigest != assignment.Assignment.Digest || !containsAssignmentToken(assignment.Assignment, record.Destination) {
+	if !retainedEnvelope(assignment, fence, record.AssignmentRevision, record.AssignmentDigest, record.CoordinatorEpoch) {
 		return message
 	}
-	message.Coordinator = fence
-	return message
+	// A retained outbox re-derives its emission under the current envelope
+	// (fence, revision, digest, current producer and destination tokens) when
+	// its own producing task incarnation is unchanged and the definition
+	// re-validates byte-exactly (Task 24 defect #5 and #4 rulings).
+	readopted, ok := readoptedDeliveryMessage(assignment, fence, true, record.ID, record.Tuple, record.Producer, record.Destination, record.AssignmentRevision, record.AssignmentDigest, record.CoordinatorEpoch)
+	if !ok {
+		return message
+	}
+	return readopted
 }
 
-// outboxACKAuthority accepts exactly the durable record's own fence and, for
-// a readoptable outbox, the current fence its re-derived emission carries.
-func (engine *Engine) outboxACKAuthority(record store.OutboxRecord, ackEpoch model.CoordinatorEpoch) bool {
-	if ackEpoch == record.CoordinatorEpoch {
-		return true
-	}
-	if ackEpoch != engine.repository.CurrentFence() || !coordinatorEpochOrderedBefore(record.CoordinatorEpoch, ackEpoch) {
+// outboxACKEnvelope reports whether an ACK's envelope binds the durable outbox:
+// either the outbox's own retained envelope or the current-envelope emission
+// it re-derives to.
+func (engine *Engine) outboxACKEnvelope(record store.OutboxRecord, ack protocol.TupleACK) bool {
+	if ack.Assignment.JobID != record.ID.Tuple.JobID {
 		return false
 	}
-	assignment, ok := engine.repository.InstalledAssignment(record.ID.Tuple.JobID)
-	return ok && assignment.CoordinatorEpoch == ackEpoch &&
-		record.AssignmentRevision == assignment.Assignment.Revision &&
-		record.AssignmentDigest == assignment.Assignment.Digest &&
-		containsAssignmentToken(assignment.Assignment, record.Destination)
+	if ack.Destination == record.Destination && ack.Assignment.Revision == record.AssignmentRevision && ack.Assignment.Digest == record.AssignmentDigest && ack.Coordinator == record.CoordinatorEpoch {
+		return true
+	}
+	emission := engine.emissionForOutbox(record)
+	return ack.Destination == emission.Destination && ack.Assignment == emission.Assignment && ack.Coordinator == emission.Coordinator
 }
 
 func deliveryMessageForOutbox(record store.OutboxRecord) protocol.TupleDelivery {

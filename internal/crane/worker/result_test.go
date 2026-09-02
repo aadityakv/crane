@@ -277,7 +277,13 @@ func TestResultRejectsWrongReplicationReceiptBeforeCompletion(t *testing.T) {
 	}
 }
 
-func TestResultRecoveryNeverUsesNormalReplicatorForHistoricalProvenance(t *testing.T) {
+// TestResultRecoveryReReplicatesHistoricalProvenanceAsCurrentMember pins the
+// Task 24 defect #4 ruling over the former fail-closed rule: a copy retained
+// under a superseded assignment revision by a worker that is STILL a current
+// replica member re-enters ordinary replication under the current envelope
+// (and re-binds on receipt); a worker that is no longer a member never does
+// (TestRetainedResultNeverMovesWhenNotCurrentMember).
+func TestResultRecoveryReReplicatesHistoricalProvenanceAsCurrentMember(t *testing.T) {
 	fixture, sink, replica := workerFixtureWithLocalPrimarySink(t)
 	repository := newFakeRepository(fixture)
 	record, provenance := fixture.result(t, sink, replica, 1, model.PrimaryReplica)
@@ -309,13 +315,18 @@ func TestResultRecoveryNeverUsesNormalReplicatorForHistoricalProvenance(t *testi
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runEngine(t, ctx, engine)
 	<-engine.Ready()
-	for i := 0; i < 10_000; i++ {
-		select {
-		case <-replicator.calls:
-			t.Fatal("historical provenance entered normal result replicator")
-		default:
-		}
+	call := <-replicator.calls
+	want := model.ResultCopyProvenance{AssignmentRevision: replacement.Revision, AssignmentDigest: replacement.Digest, ReplicaSet: replica, DestinationRole: model.SecondaryReplica, CoordinatorEpoch: fixture.epoch}
+	if call.provenance != want || call.record.Checksum != record.Checksum {
+		t.Fatalf("re-replication provenance=%+v want=%+v", call.provenance, want)
 	}
+	replicator.ack(call)
+	want.DestinationRole = model.PrimaryReplica
+	waitFor(t, func() bool {
+		repository.mu.Lock()
+		defer repository.mu.Unlock()
+		return len(repository.results) == 1 && repository.results[0].Provenance == want
+	})
 	cancel()
 	<-done
 }

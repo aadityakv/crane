@@ -95,6 +95,8 @@ type Engine struct {
 	eventQueue        []model.WorkerEvent
 	completionReports map[model.TaskID]model.WorkerEvent
 	results           map[resultIdentity]*ownedResult
+	readoptEnvelopes  map[model.JobID]resultEnvelope
+	readoptPending    map[model.JobID]struct{}
 	nextTransactionID uint64
 	localNode         uint16
 	localEpoch        model.WorkerEpoch
@@ -153,6 +155,8 @@ func NewEngine(options EngineOptions) (*Engine, error) {
 		executing: make(map[model.DeliveryID]struct{}), failedTasks: make(map[model.TaskID]struct{}),
 		jobs:              make(map[model.JobID]struct{}),
 		results:           make(map[resultIdentity]*ownedResult),
+		readoptEnvelopes:  make(map[model.JobID]resultEnvelope),
+		readoptPending:    make(map[model.JobID]struct{}),
 		completionReports: make(map[model.TaskID]model.WorkerEvent),
 	}, nil
 }
@@ -441,6 +445,9 @@ func (engine *Engine) handleCommand(ctx context.Context, command any) {
 		} else {
 			delete(engine.jobs, value.job)
 		}
+		// Every install re-evaluates the job's retained result copies against
+		// the (possibly partner-changing) installed envelope.
+		engine.readoptPending[value.job] = struct{}{}
 		value.response <- nil
 	case checkpointCommand:
 		value.response <- engine.applyCheckpoint(value.notice)
