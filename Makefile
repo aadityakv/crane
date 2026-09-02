@@ -1,4 +1,4 @@
-.PHONY: build crane clean-build test race integration vet staticcheck fmt-check verify
+.PHONY: build crane clean-build test race integration sim vet staticcheck fmt-check verify
 
 build: | bin
 	go build -o bin/cs425-node ./cmd/node
@@ -22,6 +22,10 @@ race:
 
 integration:
 	go test -tags=integration ./integration -count=1 -v
+
+sim:
+	go test ./internal/crane/sim -run TestScripted -count=1
+	go test ./internal/crane/sim -run TestRandomized -count=1
 
 vet:
 	go vet ./...
