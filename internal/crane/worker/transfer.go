@@ -590,8 +590,19 @@ func (owner *TransferOwner) receiveRepair(ctx context.Context, peer TransferPeer
 	})
 	if position < len(covered) && covered[position].TupleID == chunk.Record.TupleID {
 		prior, ok := findStoredResult(work.Results, chunk.Record)
-		if !ok || prior.Record.Checksum != chunk.Record.Checksum || !bytes.Equal(prior.Record.Value, chunk.Record.Value) || prior.Provenance != chunk.Provenance {
+		if !ok || prior.Record.Checksum != chunk.Record.Checksum || !bytes.Equal(prior.Record.Value, chunk.Record.Value) {
 			return ErrTransferIdentityReuse
+		}
+		if prior.Provenance != chunk.Provenance {
+			if !store.ResultProvenanceOrderedBefore(prior.Provenance, chunk.Provenance) {
+				return ErrTransferIdentityReuse
+			}
+			// The identical logical record retained under a strictly
+			// superseded envelope re-binds to the grant's current pair; the
+			// store performs and validates the rebind (defect #4 ruling).
+			if err := owner.persistResult(chunk); err != nil {
+				return err
+			}
 		}
 		if uint64(position) < repair.NextRecord {
 			return nil

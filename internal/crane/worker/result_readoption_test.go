@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/aaditya/cs425mp3/internal/crane/admission"
 	"github.com/aaditya/cs425mp3/internal/crane/model"
@@ -409,4 +410,52 @@ func TestReceiveRetainedReReplicationUnderDrainingIsIdempotentAndFailClosed(t *t
 		t.Fatalf("rejected receipts mutated the destination: %+v", work.Results)
 	}
 	_ = protocol.ResultRecordAck{}
+}
+
+// TestRetainedResultSupersededGrantNoLongerCovers pins the superseded-grant
+// ruling's third rule: a grant bound to a revision the installed assignment
+// has advanced past is dead and covers nothing, so the holder-driven
+// re-replication pass resumes for the records it named.
+func TestRetainedResultSupersededGrantNoLongerCovers(t *testing.T) {
+	fixture, sink, replica := workerFixtureWithLocalPrimarySink(t)
+	repository := newFakeRepository(fixture)
+	covered, retained := fixture.result(t, sink, replica, 1, model.PrimaryReplica)
+	above, _ := fixture.result(t, sink, replica, 2, model.PrimaryReplica)
+	repository.results = []store.StoredResult{{Record: covered, Provenance: retained}, {Record: above, Provenance: retained}}
+	repository.work.Results = append([]store.StoredResult(nil), repository.results...)
+	current := partnerChangedAssignment(t, fixture, sink.Task, model.Running)
+	installAssignment(repository, current)
+	currentReplica, _ := findResultReplica(current.Assignment, sink.Task)
+	prior := fixture.assignment.Assignment
+	vector := []model.SourceCheckpoint{{Source: covered.TupleID.SourceTask, Watermark: covered.TupleID.SourceSequence}}
+	instruction := model.RepairResultPartitionDefinition{CoordinatorEpoch: fixture.epoch, JobID: current.Assignment.JobID, AssignmentRevision: prior.Revision, AssignmentDigest: prior.Digest, SourceNodeID: fixture.localNode, SourceWorkerEpoch: fixture.localEpoch, DestinationNodeID: currentReplica.SecondaryNodeID, DestinationWorkerEpoch: currentReplica.SecondaryEpoch, SinkTask: sink.Task, SpecificationHash: fixture.topology.Digest(), Checkpoints: vector, CheckpointDigest: model.CheckpointVectorDigest(vector), ExpectedRecordCount: 1}
+	repository.mu.Lock()
+	repository.work.Repairs = []store.ResultRepairRecord{{Instruction: instruction, Role: store.RepairSource, State: store.RepairStreaming}}
+	repository.mu.Unlock()
+	replicator := &fakeResultReplicator{calls: make(chan resultReplicationCall, 2)}
+	_, cancel, done := startResultEngine(t, repository, fixture.epoch, replicator)
+	defer func() { cancel(); <-done }()
+	seen := make(map[model.TupleID]bool)
+	for len(seen) < 2 {
+		select {
+		case call := <-replicator.calls:
+			seen[call.record.TupleID] = true
+			replicator.ack(call)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("holder pass re-replicated %d records, want both once the grant is superseded", len(seen))
+		}
+	}
+	if !seen[covered.TupleID] || !seen[above.TupleID] {
+		t.Fatalf("re-replicated %v, want both %v and %v", seen, covered.TupleID, above.TupleID)
+	}
+	local := expectedEnvelope(current, sink.Task, model.PrimaryReplica)
+	waitFor(t, func() bool {
+		rebound := 0
+		for _, stored := range storedResults(repository) {
+			if stored.Provenance == local {
+				rebound++
+			}
+		}
+		return rebound == 2
+	})
 }

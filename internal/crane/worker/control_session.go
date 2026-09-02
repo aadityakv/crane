@@ -979,6 +979,23 @@ func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSe
 	if grant.Instruction.CoordinatorEpoch != work.Fence {
 		return nil, ErrControlStaleEpoch
 	}
+	// Exact re-delivery of a durably known grant answers from durable state
+	// before any current-authority admission and performs no mutation: a
+	// superseded (RepairFailed) or completed grant reports its terminal state
+	// without being revived, and a live grant is merely re-scheduled.
+	for _, prior := range work.Repairs {
+		if prior.Instruction.RepairID != grant.Instruction.RepairID {
+			continue
+		}
+		if !equalRepairDefinition(prior.Instruction, protocolRepairDefinition(grant.Instruction)) || prior.InstructionDigest != grant.Instruction.InstructionDigest || prior.Role != grant.Role {
+			return nil, model.ErrIdentityReuse
+		}
+		if prior.State != store.RepairComplete && prior.State != store.RepairFailed {
+			owner.scheduleRepair(prior)
+		}
+		status := repairStatus(prior)
+		return &status, nil
+	}
 	summary, err := owner.controlInventory(work, protocol.ResultInventoryQuery{JobID: grant.Instruction.JobID, SinkTask: grant.Instruction.SinkTask, SpecificationHash: grant.Instruction.SpecificationHash, AssignmentRevision: grant.Instruction.AssignmentRevision, AssignmentDigest: grant.Instruction.AssignmentDigest, Checkpoints: append([]protocol.SourceCheckpoint(nil), grant.Instruction.Checkpoints...), CheckpointDigest: grant.Instruction.CheckpointDigest, QueryDigest: grant.Instruction.InventoryQueryDigest})
 	if err != nil {
 		return nil, err
@@ -998,17 +1015,21 @@ func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSe
 	if !localRole || !controlMemberActive(owner.membership.View(), grant.Instruction.SourceNodeID) || !controlMemberActive(owner.membership.View(), grant.Instruction.DestinationNodeID) {
 		return nil, ErrControlUnauthorized
 	}
+	// One live grant per (epoch, job, sink, role) identity. A prior that is
+	// terminal, or bound to an assignment revision the installed assignment
+	// has advanced past (the reassignment made it dead and the coordinator
+	// now re-repairs the sink under the current revision), never blocks the
+	// replacement; superseded priors are durably marked failed below.
+	var superseded []store.ResultRepairRecord
 	for _, prior := range work.Repairs {
-		if prior.Instruction.RepairID == grant.Instruction.RepairID {
-			definition := protocolRepairDefinition(grant.Instruction)
-			if !equalRepairDefinition(prior.Instruction, definition) || prior.InstructionDigest != grant.Instruction.InstructionDigest || prior.Role != grant.Role {
-				return nil, model.ErrIdentityReuse
-			}
-			owner.scheduleRepair(prior)
-			status := repairStatus(prior)
-			return &status, nil
+		if prior.Instruction.CoordinatorEpoch != grant.Instruction.CoordinatorEpoch || prior.Instruction.JobID != grant.Instruction.JobID || prior.Instruction.SinkTask != grant.Instruction.SinkTask || prior.Role != grant.Role {
+			continue
 		}
-		if prior.Instruction.CoordinatorEpoch == grant.Instruction.CoordinatorEpoch && prior.Instruction.JobID == grant.Instruction.JobID && prior.Instruction.SinkTask == grant.Instruction.SinkTask && prior.Role == grant.Role && (prior.Instruction.RepairID != grant.Instruction.RepairID || prior.InstructionDigest != grant.Instruction.InstructionDigest) {
+		switch {
+		case prior.State == store.RepairComplete || prior.State == store.RepairFailed:
+		case prior.Instruction.AssignmentRevision < assignment.Assignment.Revision:
+			superseded = append(superseded, prior)
+		default:
 			return nil, model.ErrIdentityReuse
 		}
 	}
@@ -1019,6 +1040,13 @@ func (owner *ControlOwner) installRepair(ctx context.Context, session *ControlSe
 	repair := store.ResultRepairRecord{Instruction: definition, InstructionDigest: grant.Instruction.InstructionDigest, Role: grant.Role, State: store.RepairPending, ContentDigest: model.EmptyResultInventoryDigest(grant.Instruction.InstructionDigest)}
 	if err := owner.finalMutation(ctx, session, peer, "repair", grant.Instruction.CoordinatorEpoch, true); err != nil {
 		return nil, err
+	}
+	for _, prior := range superseded {
+		prior.State = store.RepairFailed
+		prior.ErrorCode = protocol.WorkerErrorStaleAssignment
+		if err := owner.repository.UpsertRepair(prior); err != nil {
+			return nil, err
+		}
 	}
 	if err := owner.repository.UpsertRepair(repair); err != nil {
 		return nil, err

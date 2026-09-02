@@ -249,7 +249,7 @@ func (engine *Engine) readoptRetainedResults(ctx context.Context) error {
 		sort.Slice(work.keys, func(i, j int) bool { return tupleTransferLess(work.keys[i].tuple, work.keys[j].tuple) })
 		for _, key := range work.keys {
 			result := engine.results[key]
-			if grantCoversRetainedResult(recovered.Repairs, fence, result.record, engine.localNode, engine.localEpoch) {
+			if grantCoversRetainedResult(recovered.Repairs, fence, work.assignment.Assignment, result.record, engine.localNode, engine.localEpoch) {
 				tracef("readopt node=%d: seq=%d left to the repair grant", engine.localNode, result.record.TupleID.SourceSequence)
 				result.retained = true
 				continue
@@ -304,14 +304,19 @@ func (engine *Engine) adoptDurableResults() error {
 	return nil
 }
 
-// grantCoversRetainedResult reports whether a durable current-epoch bilateral
-// repair grant naming this worker as an endpoint covers the record; such
+// grantCoversRetainedResult reports whether a live durable bilateral repair
+// grant — at the current fence and bound to the exact installed assignment
+// revision/digest — naming this worker as an endpoint covers the record; such
 // records are re-established by the grant, never by holder-driven
-// re-replication.
-func grantCoversRetainedResult(repairs []store.ResultRepairRecord, fence model.CoordinatorEpoch, record model.ResultRecord, localNode uint16, localEpoch model.WorkerEpoch) bool {
+// re-replication. A grant the installed assignment has advanced past, or one
+// durably failed, is dead and covers nothing, so the holder pass resumes.
+func grantCoversRetainedResult(repairs []store.ResultRepairRecord, fence model.CoordinatorEpoch, assignment model.AssignmentSet, record model.ResultRecord, localNode uint16, localEpoch model.WorkerEpoch) bool {
 	for _, repair := range repairs {
 		instruction := repair.Instruction
 		if instruction.CoordinatorEpoch != fence || instruction.JobID != record.TupleID.JobID || instruction.SinkTask != record.SinkTask || instruction.SpecificationHash != record.SpecificationHash {
+			continue
+		}
+		if repair.State == store.RepairFailed || instruction.AssignmentRevision != assignment.Revision || instruction.AssignmentDigest != assignment.Digest {
 			continue
 		}
 		local := instruction.SourceNodeID == localNode && instruction.SourceWorkerEpoch == localEpoch || instruction.DestinationNodeID == localNode && instruction.DestinationWorkerEpoch == localEpoch

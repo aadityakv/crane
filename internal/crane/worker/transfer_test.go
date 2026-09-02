@@ -679,11 +679,26 @@ func (r *transferRepository) UpsertResult(record model.ResultRecord, provenance 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, prior := range r.results {
+	for index, prior := range r.results {
 		if prior.Record.SinkTask == record.SinkTask && prior.Record.TupleID == record.TupleID {
-			if prior.Record.Checksum != record.Checksum || prior.Provenance != provenance {
+			if prior.Record.Checksum != record.Checksum {
 				return model.ErrIdentityReuse
 			}
+			if prior.Provenance == provenance {
+				return nil
+			}
+			// Mirror the store's rebind contract: the identical logical
+			// record re-binds only from a strictly superseded envelope.
+			if !store.ResultProvenanceOrderedBefore(prior.Provenance, provenance) {
+				return model.ErrIdentityReuse
+			}
+			r.results[index].Provenance = provenance
+			for workIndex := range r.work.Results {
+				if r.work.Results[workIndex].Record.SinkTask == record.SinkTask && r.work.Results[workIndex].Record.TupleID == record.TupleID {
+					r.work.Results[workIndex].Provenance = provenance
+				}
+			}
+			r.log = append(r.log, "result")
 			return nil
 		}
 	}
@@ -1221,4 +1236,50 @@ func mustArtifactTransferOwner(t *testing.T, repository TransferRepository, arti
 		t.Fatal(err)
 	}
 	return owner
+}
+
+// TestTransferRepairRebindsHeldSupersededCopy pins the review's M1 fix: a
+// destination that already holds the byte-identical covered record under a
+// strictly superseded provenance re-binds it to the grant's current pair
+// through the store (defect #4 ruling) and advances, instead of failing the
+// repair as identity reuse; a held copy under an envelope that is not
+// ordered before the grant's stays refused.
+func TestTransferRepairRebindsHeldSupersededCopy(t *testing.T) {
+	fixture := newTransferFixture(t)
+	fixture.installRepair(t)
+	held := fixture.provenance()
+	held.AssignmentRevision--
+	fixture.destination.results = []store.StoredResult{{Record: fixture.records[0], Provenance: held}}
+	fixture.destination.work.Results = append([]store.StoredResult(nil), fixture.destination.results...)
+	owner := mustTransferOwner(t, fixture.destination)
+	chunk := fixture.repairChunk(t, fixture.records[0])
+	ack, err := owner.ReceiveResultRecord(context.Background(), fixture.repairSourcePeer(), chunk)
+	if err != nil {
+		t.Fatalf("held superseded copy refused: %v", err)
+	}
+	if err := protocol.ValidateResultRecordAckCorrelation(chunk, ack); err != nil {
+		t.Fatal(err)
+	}
+	if got := fixture.destination.results[0].Provenance; got != chunk.Provenance {
+		t.Fatalf("held copy provenance=%+v want rebound to %+v", got, chunk.Provenance)
+	}
+	if progress := fixture.destination.repairs[0]; progress.State != store.RepairStreaming || progress.NextRecord != 1 {
+		t.Fatalf("durable progress=%+v", progress)
+	}
+	if want := []string{"result", "repair"}; !equalStrings(fixture.destination.log, want) {
+		t.Fatalf("durability order=%v want=%v", fixture.destination.log, want)
+	}
+
+	unordered := newTransferFixture(t)
+	unordered.installRepair(t)
+	foreign := unordered.provenance()
+	foreign.DestinationRole = model.PrimaryReplica
+	unordered.destination.results = []store.StoredResult{{Record: unordered.records[0], Provenance: foreign}}
+	unordered.destination.work.Results = append([]store.StoredResult(nil), unordered.destination.results...)
+	if _, err := mustTransferOwner(t, unordered.destination).ReceiveResultRecord(context.Background(), unordered.repairSourcePeer(), unordered.repairChunk(t, unordered.records[0])); !errors.Is(err, ErrTransferIdentityReuse) {
+		t.Fatalf("held copy under an unordered envelope err=%v want %v", err, ErrTransferIdentityReuse)
+	}
+	if got := unordered.destination.repairs[0]; got.NextRecord != 0 {
+		t.Fatalf("refused chunk advanced the repair: %+v", got)
+	}
 }

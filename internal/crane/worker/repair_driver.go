@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/config"
 	"github.com/aaditya/cs425mp3/internal/crane/admission"
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
@@ -22,6 +20,11 @@ import (
 // ErrRepairSourceUnavailable reports a repair source that could not be
 // reached or answered outside the authenticated +5 protocol.
 var ErrRepairSourceUnavailable = errors.New("crane repair source unavailable")
+
+// ErrRepairSourceRejected reports a repair source that answered one pull with
+// a deterministic typed refusal (authority, epoch, assignment, or validation)
+// rather than a transport failure or a retryable capacity/unavailability code.
+var ErrRepairSourceRejected = errors.New("crane repair source rejected pull")
 
 // RepairDriverRepository is the durable authority the destination-side repair
 // driver reads and the +5 pull client identifies itself from.
@@ -213,7 +216,18 @@ func (driver *RepairDriver) Run(ctx context.Context) error {
 }
 
 // drive streams one grant until the source reports completion, the grant's
-// durable authority disappears, or a deterministic validation fails closed.
+// durable authority disappears or is superseded, the source deterministically
+// refuses it, or a deterministic local validation fails closed.
+//
+// A grant is bound to the exact assignment revision/digest it was issued
+// under: once the installed assignment advances past it the grant is dead
+// (the coordinator replaces it under the current revision) and is retired
+// for this process. A typed source refusal likewise stops the loop — never
+// a bounded-backoff retry that would head-of-line block every other grant —
+// but does not retire the grant: the coordinator installs the destination
+// grant before the source's, so the first pull may legitimately precede the
+// source grant, and the coordinator's next idempotent re-delivery (Schedule)
+// or recovery re-arms exactly one fresh attempt.
 func (driver *RepairDriver) drive(ctx context.Context, scheduled store.ResultRepairRecord) {
 	repairID := scheduled.Instruction.RepairID
 	defer func() {
@@ -226,8 +240,8 @@ func (driver *RepairDriver) drive(ctx context.Context, scheduled store.ResultRep
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		grant, ok := driver.durableGrant(repairID)
-		if !ok || grant.Role != store.RepairDestination || grant.State == store.RepairFailed || grant.Instruction.CoordinatorEpoch != driver.repository.CurrentFence() {
+		work, grant, ok := driver.durableGrant(repairID)
+		if !ok || grant.Role != store.RepairDestination || grant.State == store.RepairFailed || grant.Instruction.CoordinatorEpoch != driver.repository.CurrentFence() || repairGrantSuperseded(work, grant) {
 			driver.markDriven(repairID)
 			return
 		}
@@ -235,6 +249,9 @@ func (driver *RepairDriver) drive(ctx context.Context, scheduled store.ResultRep
 		response, err := driver.client.PullRepair(ctx, grant.Instruction.SourceNodeID, grant.Instruction.SourceWorkerEpoch, status)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if repairSourceRejected(err) {
 				return
 			}
 			if !driver.backoff(ctx, &backoff) {
@@ -292,7 +309,7 @@ func (driver *RepairDriver) install(ctx context.Context, grant store.ResultRepai
 		if source.State != protocol.RepairComplete || source.RecordCount != grant.Instruction.ExpectedRecordCount || source.TotalBytes != grant.Instruction.ExpectedTotalBytes || source.ContentDigest != grant.Instruction.ExpectedContentDigest {
 			return false, ErrTransferIdentityReuse
 		}
-		local, ok := driver.durableGrant(grant.Instruction.RepairID)
+		_, local, ok := driver.durableGrant(grant.Instruction.RepairID)
 		if !ok || local.State != store.RepairComplete {
 			// The source claims a completion the local durable grant does not
 			// reflect: fail closed without mutating anything.
@@ -304,18 +321,27 @@ func (driver *RepairDriver) install(ctx context.Context, grant store.ResultRepai
 	}
 }
 
-// durableGrant rereads one durable grant by repair identity.
-func (driver *RepairDriver) durableGrant(repairID [16]byte) (store.ResultRepairRecord, bool) {
+// durableGrant rereads one durable grant by repair identity together with
+// the durable work it was read from.
+func (driver *RepairDriver) durableGrant(repairID [16]byte) (store.RecoveredWork, store.ResultRepairRecord, bool) {
 	work, err := driver.repository.RecoverWork()
 	if err != nil {
-		return store.ResultRepairRecord{}, false
+		return store.RecoveredWork{}, store.ResultRepairRecord{}, false
 	}
 	for _, repair := range work.Repairs {
 		if repair.Instruction.RepairID == repairID {
-			return repair, true
+			return work, repair, true
 		}
 	}
-	return store.ResultRepairRecord{}, false
+	return store.RecoveredWork{}, store.ResultRepairRecord{}, false
+}
+
+// repairGrantSuperseded reports whether the installed assignment for the
+// grant's job no longer carries the exact revision/digest the grant was
+// issued under (or is gone), which makes the grant dead.
+func repairGrantSuperseded(work store.RecoveredWork, grant store.ResultRepairRecord) bool {
+	assignment, ok := controlAssignment(work, grant.Instruction.JobID)
+	return !ok || assignment.Assignment.Revision != grant.Instruction.AssignmentRevision || assignment.Assignment.Digest != grant.Instruction.AssignmentDigest
 }
 
 func (driver *RepairDriver) markDriven(repairID [16]byte) {
@@ -362,6 +388,13 @@ func repairPullTerminal(err error) bool {
 	return errors.Is(err, ErrTransferUnauthorized) || errors.Is(err, ErrTransferStaleAuthority) || errors.Is(err, ErrTransferIdentityReuse) || errors.Is(err, model.ErrIdentityReuse)
 }
 
+// repairSourceRejected reports a pull the source (or the client's own
+// authentication of it) deterministically refused, as opposed to a transport
+// failure or a retryable capacity/unavailability answer.
+func repairSourceRejected(err error) bool {
+	return errors.Is(err, ErrRepairSourceRejected) || repairPullTerminal(err)
+}
+
 // dialRepairSourceClientOptions fixes the destination's authenticated +5
 // dial identity and dependencies.
 type dialRepairSourceClientOptions struct {
@@ -375,11 +408,14 @@ type dialRepairSourceClientOptions struct {
 }
 
 // dialRepairSourceClient speaks the authenticated +5 worker-control protocol
-// over one TCP connection per pull, mirroring the reviewed worker-side
-// controlResultReplicator session pattern (dial, authorize, handshake,
-// correlated exchange) instead of introducing any new protocol.
+// over one cached session per source incarnation — the reviewed
+// controlResultReplicator session cache (dial, authorize, handshake once;
+// correlated exchanges; drop on failure) — so a grant of N records costs the
+// source's bounded per-peer replay cache one handshake plus one identity per
+// pull rather than two per record.
 type dialRepairSourceClient struct {
-	options dialRepairSourceClientOptions
+	options  dialRepairSourceClientOptions
+	sessions *controlSessionCache
 }
 
 func newDialRepairSourceClient(options dialRepairSourceClientOptions) *dialRepairSourceClient {
@@ -389,52 +425,24 @@ func newDialRepairSourceClient(options dialRepairSourceClientOptions) *dialRepai
 	if options.Timeout <= 0 {
 		options.Timeout = 2 * time.Second
 	}
-	return &dialRepairSourceClient{options: options}
+	sessions := newControlSessionCache(controlSessionCacheOptions{ClusterID: options.ClusterID, Authenticator: options.Authenticator, Clock: options.Clock, Membership: options.Membership, Identity: options.Repository, Timeout: options.Timeout, Dial: options.Dial})
+	return &dialRepairSourceClient{options: options, sessions: sessions}
 }
 
-// PullRepair dials the source's advertised +5 endpoint, handshakes against
-// the exact grant-bound source incarnation, and performs one correlated
-// repair-pull exchange carrying the destination's durable status.
+// Close closes every cached source session; later pulls fail closed.
+func (client *dialRepairSourceClient) Close() {
+	client.sessions.Close()
+}
+
+// PullRepair performs one correlated repair-pull exchange carrying the
+// destination's durable status over the cached authenticated session to the
+// exact grant-bound source incarnation, establishing it on first use.
 func (client *dialRepairSourceClient) PullRepair(ctx context.Context, sourceNode uint16, sourceEpoch model.WorkerEpoch, status protocol.ResultRepairStatus) (protocol.WorkerMessage, error) {
 	if ctx == nil {
 		return nil, errors.New("nil repair pull context")
 	}
-	member, ok := activeControlMember(client.options.Membership.View(), sourceNode)
-	if !ok {
+	if _, ok := activeControlMember(client.options.Membership.View(), sourceNode); !ok {
 		return nil, fmt.Errorf("%w: repair source %d is not an active member", ErrRepairSourceUnavailable, sourceNode)
-	}
-	endpoint, err := memberServiceEndpoint(member.Host, member.BasePort, config.ServiceCraneWorker)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrRepairSourceUnavailable, err)
-	}
-	operationContext, cancel := context.WithTimeout(ctx, client.options.Timeout)
-	defer cancel()
-	connection, err := client.options.Dial(operationContext, "tcp", endpoint.String())
-	if err != nil {
-		return nil, fmt.Errorf("%w: dial repair source: %v", ErrRepairSourceUnavailable, err)
-	}
-	defer connection.Close()
-	if err := client.options.Membership.AuthorizeTCP(sourceNode, connection.RemoteAddr()); err != nil {
-		return nil, ErrTransferUnauthorized
-	}
-	limits := wire.DefaultLimits()
-	limits.MaxFrameSize = int(model.WorkerControlMaxFrameBytesV1)
-	expectedCluster := client.options.ClusterID
-	limits.ExpectedClusterID = &expectedCluster
-	stream := wire.NewTCPFrameStream(connection, client.options.Authenticator, limits, client.options.Timeout)
-
-	localNode, localEpoch := client.options.Repository.LocalIdentity()
-	handshake := protocol.WorkerHandshake{NodeID: localNode, WorkerEpoch: localEpoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-	handshakeResponse, err := client.exchange(operationContext, stream, handshake, sourceNode)
-	if err != nil {
-		return nil, err
-	}
-	handshakeAck, ok := handshakeResponse.(protocol.WorkerHandshakeAck)
-	if !ok || handshakeAck.NodeID != sourceNode || handshakeAck.WorkerEpoch != sourceEpoch || handshakeAck.ConsensusFingerprint != model.ConsensusFingerprint() || handshakeAck.RegistryFingerprint != model.RegistryFingerprint() {
-		return nil, ErrTransferUnauthorized
-	}
-	if !sameActiveControlMember(member, client.options.Membership.View()) {
-		return nil, ErrTransferUnauthorized
 	}
 	transaction, err := client.options.Repository.DurableTransactionID()
 	if err != nil {
@@ -443,45 +451,43 @@ func (client *dialRepairSourceClient) PullRepair(ctx context.Context, sourceNode
 	if transaction == 0 {
 		return nil, fmt.Errorf("%w: repair pull requires a durable store transaction", ErrRepairSourceUnavailable)
 	}
-	request := protocol.WorkerStatus{NodeID: localNode, WorkerEpoch: localEpoch, CoordinatorEpoch: status.Instruction.CoordinatorEpoch, StoreTransactionID: transaction, Repair: &status}
-	response, err := client.exchange(operationContext, stream, request, sourceNode)
+	session, err := client.sessions.session(ctx, sourceNode, sourceEpoch)
 	if err != nil {
-		return nil, err
+		return nil, repairSourceError(err)
 	}
-	if !sameActiveControlMember(member, client.options.Membership.View()) {
+	localNode, localEpoch := client.options.Repository.LocalIdentity()
+	request := protocol.WorkerStatus{NodeID: localNode, WorkerEpoch: localEpoch, CoordinatorEpoch: status.Instruction.CoordinatorEpoch, StoreTransactionID: transaction, Repair: &status}
+	operationContext, cancel := context.WithTimeout(ctx, client.options.Timeout)
+	defer cancel()
+	response, err := client.sessions.exchange(operationContext, session.stream, request, sourceNode)
+	if err != nil {
+		if _, rejected := peerRejection(err); !rejected {
+			// Only a transport or correlation failure invalidates the
+			// session; a typed refusal was a complete healthy exchange.
+			client.sessions.dropSession(sourceNode, sourceEpoch, session)
+		}
+		return nil, repairSourceError(err)
+	}
+	if !sameActiveControlMember(session.member, client.options.Membership.View()) {
+		client.sessions.dropSession(sourceNode, sourceEpoch, session)
 		return nil, ErrTransferUnauthorized
 	}
 	return response, nil
 }
 
-// exchange writes one authenticated frame and validates the correlated reply.
-func (client *dialRepairSourceClient) exchange(ctx context.Context, stream *wire.TCPFrameStream, request protocol.WorkerMessage, destination uint16) (protocol.WorkerMessage, error) {
-	payload, err := protocol.MarshalWorkerMessage(request)
-	if err != nil {
-		return nil, err
+// repairSourceError classifies one session or exchange failure: a typed
+// deterministic refusal is ErrRepairSourceRejected, a retryable refusal or
+// any transport failure is ErrRepairSourceUnavailable, and the client's own
+// authentication failures stay ErrTransferUnauthorized.
+func repairSourceError(err error) error {
+	if rejection, ok := peerRejection(err); ok {
+		if rejection.transient() {
+			return fmt.Errorf("%w: repair pull message %d refused with retryable code %d", ErrRepairSourceUnavailable, rejection.related, rejection.code)
+		}
+		return fmt.Errorf("%w: repair pull message %d refused with code %d", ErrRepairSourceRejected, rejection.related, rejection.code)
 	}
-	var requestID wire.RequestID
-	if _, err := rand.Read(requestID[:]); err != nil {
-		return nil, fmt.Errorf("generate repair pull request ID: %w", err)
+	if errors.Is(err, ErrTransferUnauthorized) {
+		return err
 	}
-	node, _ := client.options.Repository.LocalIdentity()
-	frame := wire.Frame{Header: wire.Header{Version: wire.Version1, Message: request.MessageType(), ClusterID: client.options.ClusterID, SenderID: node, RequestID: requestID, TimestampMillis: client.options.Clock.Now().UnixMilli(), Codec: wire.CodecBinary}, Payload: payload}
-	if err := stream.WriteFrame(ctx, frame); err != nil {
-		return nil, fmt.Errorf("%w: write repair pull frame: %v", ErrRepairSourceUnavailable, err)
-	}
-	response, err := stream.ReadFrame(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("%w: read repair pull frame: %v", ErrRepairSourceUnavailable, err)
-	}
-	if response.Header.SenderID != destination || response.Header.RequestID != requestID {
-		return nil, ErrTransferUnauthorized
-	}
-	message, err := protocol.UnmarshalWorkerMessage(response.Header.Message, response.Payload)
-	if err != nil {
-		return nil, fmt.Errorf("%w: decode repair pull response: %v", ErrRepairSourceUnavailable, err)
-	}
-	if workerError, ok := message.(protocol.WorkerError); ok {
-		return nil, fmt.Errorf("%w: repair pull message %d rejected with code %d", ErrRepairSourceUnavailable, workerError.RelatedMessage, workerError.Code)
-	}
-	return message, nil
+	return fmt.Errorf("%w: %v", ErrRepairSourceUnavailable, err)
 }

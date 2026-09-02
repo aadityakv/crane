@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -174,6 +173,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	}
 	service.transfer = transfer
 	repairClient := newDialRepairSourceClient(dialRepairSourceClientOptions{ClusterID: service.clusterID, Authenticator: service.authenticator, Clock: service.clock, Membership: service.membership, Repository: repository, Timeout: time.Duration(service.configuration.Crane.WorkerControlTimeout), Dial: (&net.Dialer{}).DialContext})
+	defer repairClient.Close()
 	repairDriver, err := NewRepairDriver(RepairDriverOptions{Repository: repository, Transfer: transfer, Client: repairClient, Clock: service.clock, RetryInterval: time.Duration(service.configuration.Crane.TupleRetryInterval), MaxRetryInterval: time.Duration(service.configuration.Crane.TupleCompletionRetryInterval)})
 	if err != nil {
 		return err
@@ -475,25 +475,12 @@ type controlResultReplicator struct {
 	dial          func(context.Context, string, string) (net.Conn, error)
 
 	// sessions caches one authenticated +5 session per destination
-	// incarnation. Every handshake commits a request identity into the
-	// destination's bounded per-peer replay cache, so a session per record
-	// (or per retry) exhausts it and every later handshake is refused
-	// (Task 24 defect #8, the +5 half): a session is dialed once, reused for
-	// every record and retry to that destination, and dropped on any failure.
-	mu       sync.Mutex
-	sessions map[replicaSessionKey]*replicaSession
-	closed   bool
-}
-
-type replicaSessionKey struct {
-	node  uint16
-	epoch model.WorkerEpoch
-}
-
-type replicaSession struct {
-	connection net.Conn
-	stream     *wire.TCPFrameStream
-	member     swim.Member
+	// incarnation (Task 24 defect #8, the +5 half): a session is dialed once,
+	// reused for every record and retry to that destination, and dropped on
+	// any failure. The repair driver's pull client shares the same cache
+	// type so repair pulls honor the same one-identity-per-record budget.
+	once     sync.Once
+	sessions *controlSessionCache
 }
 
 // replicationRetryCap bounds the doubling retry backoff of one record at a
@@ -553,119 +540,36 @@ func (replicator *controlResultReplicator) ReplicateRecord(ctx context.Context, 
 	}
 }
 
-// session returns the cached authenticated session to one destination
-// incarnation, dialing and handshaking once when absent.
-func (replicator *controlResultReplicator) session(ctx context.Context, destination uint16, destinationEpoch model.WorkerEpoch) (*replicaSession, error) {
-	key := replicaSessionKey{node: destination, epoch: destinationEpoch}
-	replicator.mu.Lock()
-	if replicator.closed {
-		replicator.mu.Unlock()
-		return nil, ErrTransferUnauthorized
-	}
-	if cached, ok := replicator.sessions[key]; ok {
-		if sameActiveControlMember(cached.member, replicator.membership.View()) {
-			replicator.mu.Unlock()
-			return cached, nil
-		}
-		delete(replicator.sessions, key)
-		_ = cached.connection.Close()
-	}
-	replicator.mu.Unlock()
-
-	member, ok := activeControlMember(replicator.membership.View(), destination)
-	if !ok {
-		return nil, ErrTransferUnauthorized
-	}
-	endpoint, err := memberServiceEndpoint(member.Host, member.BasePort, config.ServiceCraneWorker)
-	if err != nil {
-		return nil, err
-	}
-	dialContext, cancel := context.WithTimeout(ctx, replicator.timeout)
-	defer cancel()
-	connection, err := replicator.dial(dialContext, "tcp", endpoint.String())
-	if err != nil {
-		return nil, fmt.Errorf("dial result replica: %w", err)
-	}
-	if err := replicator.membership.AuthorizeTCP(destination, connection.RemoteAddr()); err != nil {
-		_ = connection.Close()
-		return nil, ErrTransferUnauthorized
-	}
-	limits := wire.DefaultLimits()
-	limits.MaxFrameSize = int(model.WorkerControlMaxFrameBytesV1)
-	limits.ExpectedClusterID = &replicator.clusterID
-	stream := wire.NewTCPFrameStream(connection, replicator.authenticator, limits, replicator.timeout)
-	node, epoch := replicator.repository.LocalIdentity()
-	handshake := protocol.WorkerHandshake{NodeID: node, WorkerEpoch: epoch, ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint()}
-	handshakeResponse, err := replicator.exchange(dialContext, stream, handshake, destination)
-	if err != nil {
-		_ = connection.Close()
-		return nil, err
-	}
-	handshakeAck, ok := handshakeResponse.(protocol.WorkerHandshakeAck)
-	if !ok || handshakeAck.NodeID != destination || handshakeAck.WorkerEpoch != destinationEpoch || handshakeAck.ConsensusFingerprint != model.ConsensusFingerprint() || handshakeAck.RegistryFingerprint != model.RegistryFingerprint() {
-		_ = connection.Close()
-		return nil, ErrTransferUnauthorized
-	}
-	if !sameActiveControlMember(member, replicator.membership.View()) {
-		_ = connection.Close()
-		return nil, ErrTransferUnauthorized
-	}
-	created := &replicaSession{connection: connection, stream: stream, member: member}
-	replicator.mu.Lock()
-	defer replicator.mu.Unlock()
-	if replicator.closed {
-		_ = connection.Close()
-		return nil, ErrTransferUnauthorized
-	}
-	if existing, ok := replicator.sessions[key]; ok {
-		// A concurrent record already established the session: keep one.
-		_ = connection.Close()
-		return existing, nil
-	}
-	if replicator.sessions == nil {
-		replicator.sessions = make(map[replicaSessionKey]*replicaSession)
-	}
-	replicator.sessions[key] = created
-	return created, nil
-}
-
-// dropSession forgets and closes one failed session.
-func (replicator *controlResultReplicator) dropSession(destination uint16, destinationEpoch model.WorkerEpoch, failed *replicaSession) {
-	key := replicaSessionKey{node: destination, epoch: destinationEpoch}
-	replicator.mu.Lock()
-	if replicator.sessions[key] == failed {
-		delete(replicator.sessions, key)
-	}
-	replicator.mu.Unlock()
-	_ = failed.connection.Close()
+// cache returns the replicator's session cache, built once from its dial
+// identity so literal construction stays valid.
+func (replicator *controlResultReplicator) cache() *controlSessionCache {
+	replicator.once.Do(func() {
+		replicator.sessions = newControlSessionCache(controlSessionCacheOptions{ClusterID: replicator.clusterID, Authenticator: replicator.authenticator, Clock: replicator.clock, Membership: replicator.membership, Identity: replicator.repository, Timeout: replicator.timeout, Dial: replicator.dial})
+	})
+	return replicator.sessions
 }
 
 // Close closes every cached session; later replication attempts fail closed.
 func (replicator *controlResultReplicator) Close() {
-	replicator.mu.Lock()
-	defer replicator.mu.Unlock()
-	replicator.closed = true
-	for key, session := range replicator.sessions {
-		_ = session.connection.Close()
-		delete(replicator.sessions, key)
-	}
+	replicator.cache().Close()
 }
 
 func (replicator *controlResultReplicator) replicateChunk(ctx context.Context, chunk protocol.ResultRecordChunk, destination uint16, destinationEpoch model.WorkerEpoch) (ResultReplicationReceipt, error) {
-	session, err := replicator.session(ctx, destination, destinationEpoch)
+	sessions := replicator.cache()
+	session, err := sessions.session(ctx, destination, destinationEpoch)
 	if err != nil {
 		return ResultReplicationReceipt{}, err
 	}
 	operationContext, cancel := context.WithTimeout(ctx, replicator.timeout)
 	defer cancel()
-	transferResponse, err := replicator.exchange(operationContext, session.stream, chunk, destination)
+	transferResponse, err := sessions.exchange(operationContext, session.stream, chunk, destination)
 	if err != nil {
-		replicator.dropSession(destination, destinationEpoch, session)
+		sessions.dropSession(destination, destinationEpoch, session)
 		return ResultReplicationReceipt{}, err
 	}
 	ack, ok := transferResponse.(protocol.ResultRecordAck)
 	if !ok || protocol.ValidateResultRecordAckCorrelation(chunk, ack) != nil || !sameActiveControlMember(session.member, replicator.membership.View()) {
-		replicator.dropSession(destination, destinationEpoch, session)
+		sessions.dropSession(destination, destinationEpoch, session)
 		return ResultReplicationReceipt{}, ErrTransferUnauthorized
 	}
 	return ResultReplicationReceipt{DestinationNodeID: ack.NodeID, DestinationWorkerEpoch: ack.WorkerEpoch, StreamChecksum: ack.Checksum, StreamLength: ack.TotalLength, CoordinatorEpoch: ack.CoordinatorEpoch}, nil
@@ -692,37 +596,6 @@ func (replicator *controlResultReplicator) currentAuthority(chunk protocol.Resul
 	destinationNode, destinationEpoch, sourceNode, sourceEpoch, ok := endpointsForRole(replica, chunk.Provenance.DestinationRole)
 	localNode, localEpoch := replicator.repository.LocalIdentity()
 	return ok && destinationNode == chunk.DestinationNodeID && destinationEpoch == chunk.DestinationWorkerEpoch && sourceNode == localNode && sourceEpoch == localEpoch, nil
-}
-
-func (replicator *controlResultReplicator) exchange(ctx context.Context, stream *wire.TCPFrameStream, request protocol.WorkerMessage, destination uint16) (protocol.WorkerMessage, error) {
-	payload, err := protocol.MarshalWorkerMessage(request)
-	if err != nil {
-		return nil, err
-	}
-	var requestID wire.RequestID
-	if _, err := rand.Read(requestID[:]); err != nil {
-		return nil, fmt.Errorf("generate Crane control request ID: %w", err)
-	}
-	node, _ := replicator.repository.LocalIdentity()
-	frame := wire.Frame{Header: wire.Header{Version: wire.Version1, Message: request.MessageType(), ClusterID: replicator.clusterID, SenderID: node, RequestID: requestID, TimestampMillis: replicator.clock.Now().UnixMilli(), Codec: wire.CodecBinary}, Payload: payload}
-	if err := stream.WriteFrame(ctx, frame); err != nil {
-		return nil, err
-	}
-	response, err := stream.ReadFrame(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if response.Header.SenderID != destination || response.Header.RequestID != requestID {
-		return nil, ErrTransferUnauthorized
-	}
-	message, err := protocol.UnmarshalWorkerMessage(response.Header.Message, response.Payload)
-	if err != nil {
-		return nil, err
-	}
-	if workerError, ok := message.(protocol.WorkerError); ok {
-		return nil, fmt.Errorf("remote worker rejected %d with code %d", workerError.RelatedMessage, workerError.Code)
-	}
-	return message, nil
 }
 
 func resultReplicationDestination(provenance model.ResultCopyProvenance) (uint16, model.WorkerEpoch, error) {

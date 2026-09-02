@@ -1296,16 +1296,22 @@ func applyRepair(work *RecoveredWork, repair ResultRepairRecord) error {
 		return errors.New("repair coordinator fence mismatch")
 	}
 	assignment, ok := findAssignment(work, repair.Instruction.JobID)
-	if !ok || repair.Instruction.AssignmentRevision != assignment.Assignment.Revision || repair.Instruction.AssignmentDigest != assignment.Assignment.Digest || repair.Instruction.SpecificationHash != assignment.Topology.Digest() {
+	if !ok || repair.Instruction.SpecificationHash != assignment.Topology.Digest() {
 		return errors.New("repair references stale or unknown assignment")
 	}
-	replica, ok := findReplica(assignment.Assignment, repair.Instruction.SinkTask)
-	if !ok {
-		return errors.New("repair sink has no installed replica set")
+	current := repair.Instruction.AssignmentRevision == assignment.Assignment.Revision && repair.Instruction.AssignmentDigest == assignment.Assignment.Digest
+	if !current && !supersededRepairFailure(index, repair, assignment) {
+		return errors.New("repair references stale or unknown assignment")
 	}
 	d := repair.Instruction
-	if !repairDestinationMatchesReplica(d, replica) {
-		return errors.New("repair destination is not a current assigned replica")
+	if current {
+		replica, ok := findReplica(assignment.Assignment, d.SinkTask)
+		if !ok {
+			return errors.New("repair sink has no installed replica set")
+		}
+		if !repairDestinationMatchesReplica(d, replica) {
+			return errors.New("repair destination is not a current assigned replica")
+		}
 	}
 	for index, checkpoint := range d.Checkpoints {
 		if checkpoint.Source.JobID != d.JobID {
@@ -1338,6 +1344,15 @@ func applyRepair(work *RecoveredWork, repair ResultRepairRecord) error {
 	}
 	work.Repairs[index] = cloneRepair(repair)
 	return nil
+}
+
+// supersededRepairFailure admits the one mutation a retained grant bound to a
+// revision the installed assignment has advanced past may still receive: the
+// worker durably marking it RepairFailed. Such a grant can neither progress
+// nor be re-issued (the coordinator replaces it under the current revision),
+// but leaving it non-terminal would block the replacement grant's identity.
+func supersededRepairFailure(index int, repair ResultRepairRecord, assignment InstalledAssignment) bool {
+	return index >= 0 && repair.State == RepairFailed && repair.Instruction.AssignmentRevision < assignment.Assignment.Revision
 }
 
 func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxRecord) error {

@@ -1354,7 +1354,16 @@ func (repository *controlTestRepository) PendingEvents(after uint64, max uint16)
 func (repository *controlTestRepository) UpsertRepair(repair store.ResultRepairRecord) error {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
-	repository.work.Repairs = []store.ResultRepairRecord{repair}
+	replaced := false
+	for index := range repository.work.Repairs {
+		if repository.work.Repairs[index].Instruction.RepairID == repair.Instruction.RepairID {
+			repository.work.Repairs[index] = repair
+			replaced = true
+		}
+	}
+	if !replaced {
+		repository.work.Repairs = append(repository.work.Repairs, repair)
+	}
 	repository.transactionID++
 	repository.log = append(repository.log, "repair")
 	return nil
@@ -1634,4 +1643,186 @@ func zeroSourceVector(assignment store.InstalledAssignment) []protocol.SourceChe
 	}
 	sort.Slice(vector, func(i, j int) bool { return controlTaskLess(vector[i].Source, vector[j].Source) })
 	return vector
+}
+
+// historicalSourceGrantAt installs current on the fixture repository, observes
+// a committed checkpoint and the inventory under it, and returns the
+// coordinator's deterministic source grant for that revision.
+func historicalSourceGrantAt(t *testing.T, fixture *controlFixture, base workerTestFixture, session *ControlSession, current model.AssignmentSet, jobControlRevision uint64, record model.ResultRecord, request *byte) protocol.RepairGrant {
+	t.Helper()
+	fixture.repository.mu.Lock()
+	fixture.repository.work.Assignments = []store.InstalledAssignment{{Assignment: current, SpecificationBytes: base.assignment.Topology.CanonicalBytes(), Topology: base.assignment.Topology, JobControlRevision: jobControlRevision, SchedulingState: model.Closed, CoordinatorEpoch: base.epoch}}
+	fixture.repository.mu.Unlock()
+	var source model.AssignmentToken
+	for _, token := range current.Tasks {
+		stage, _ := controlStage(base.assignment.Topology.Spec(), token.Task.StageID)
+		if stage.Role == model.StageSource {
+			source = token
+			break
+		}
+	}
+	if source == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no current source")
+	}
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: current.JobID, Source: source.Task, Watermark: 1, RaftIndex: 11, Epoch: base.epoch}, JobControlRevision: jobControlRevision, AssignmentRevision: current.Revision, AssignmentDigest: current.Digest}
+	*request++
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, *request, notice)); err != nil {
+		t.Fatalf("checkpoint observation at revision %d rejected: %v", current.Revision, err)
+	}
+	query := protocol.ResultInventoryQuery{JobID: current.JobID, SinkTask: record.SinkTask, SpecificationHash: base.assignment.Topology.Digest(), AssignmentRevision: current.Revision, AssignmentDigest: current.Digest, Checkpoints: []protocol.SourceCheckpoint{{Source: source.Task, Watermark: 1}}}
+	query.CheckpointDigest = protocol.CheckpointVectorDigest(query.Checkpoints)
+	query.QueryDigest = protocol.InventoryQueryDigest(query)
+	*request++
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, *request, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Inventory: &query}))
+	if err != nil {
+		t.Fatalf("inventory at revision %d rejected: %v", current.Revision, err)
+	}
+	summary := response.(protocol.WorkerStatus).Inventory
+	if summary == nil || summary.RecordCount != 1 {
+		t.Fatalf("inventory at revision %d = %#v", current.Revision, summary)
+	}
+	currentReplica, ok := controlReplica(current, record.SinkTask)
+	if !ok {
+		t.Fatal("missing current destination replica")
+	}
+	instruction := protocol.RepairResultPartition{CoordinatorEpoch: base.epoch, JobID: current.JobID, AssignmentRevision: current.Revision, AssignmentDigest: current.Digest, SourceNodeID: base.localNode, SourceWorkerEpoch: base.localEpoch, DestinationNodeID: currentReplica.PrimaryNodeID, DestinationWorkerEpoch: currentReplica.PrimaryEpoch, SinkTask: record.SinkTask, SpecificationHash: base.assignment.Topology.Digest(), Checkpoints: append([]protocol.SourceCheckpoint(nil), query.Checkpoints...), CheckpointDigest: query.CheckpointDigest, InventoryQueryDigest: query.QueryDigest, ExpectedRecordCount: summary.RecordCount, ExpectedTotalBytes: summary.TotalBytes, ExpectedContentDigest: summary.ContentDigest}
+	instruction.RepairID = protocol.DeriveRepairID(instruction)
+	instruction.InstructionDigest = protocol.RepairInstructionDigest(instruction)
+	return protocol.RepairGrant{Instruction: instruction, Role: protocol.RepairSource}
+}
+
+func controlRepairByID(t *testing.T, repository *controlTestRepository, id [16]byte) store.ResultRepairRecord {
+	t.Helper()
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	for _, repair := range repository.work.Repairs {
+		if repair.Instruction.RepairID == id {
+			return repair
+		}
+	}
+	t.Fatalf("repair %x missing from %+v", id[:4], repository.work.Repairs)
+	return store.ResultRepairRecord{}
+}
+
+// historicalHolderRecord returns the fixture's retained sink record held by
+// the local node under the base assignment, together with its provenance.
+func historicalHolderRecord(t *testing.T, base workerTestFixture) (model.ResultRecord, model.ResultCopyProvenance) {
+	t.Helper()
+	var sink model.AssignmentToken
+	var oldReplica model.ResultReplicaSet
+	for _, candidate := range base.assignment.Assignment.ResultReplicas {
+		if candidate.PrimaryNodeID != base.localNode && candidate.SecondaryNodeID != base.localNode {
+			continue
+		}
+		oldReplica = candidate
+		for _, token := range base.assignment.Assignment.Tasks {
+			if token.Task == candidate.SinkTask {
+				sink = token
+				break
+			}
+		}
+		break
+	}
+	if sink == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no historical result")
+	}
+	role := model.PrimaryReplica
+	if oldReplica.PrimaryNodeID != base.localNode {
+		role = model.SecondaryReplica
+	}
+	return base.result(t, sink, oldReplica, 1, role)
+}
+
+func newHistoricalHolderControlFixture(t *testing.T) (*controlFixture, workerTestFixture, model.ResultRecord, *ControlSession) {
+	t.Helper()
+	fixture := newControlFixture(t)
+	base := workerFixture(t)
+	record, provenance := historicalHolderRecord(t, base)
+	fixture.assignment = base.assignment
+	fixture.epoch = base.epoch
+	fixture.repository.work.Fence = base.epoch
+	fixture.repository.work.Results = []store.StoredResult{{Record: record, Provenance: provenance}}
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	return fixture, base, record, session
+}
+
+// TestControlRepairGrantRefusesDifferentIdentityWhileLivePriorIsCurrent pins
+// the unchanged half of the installRepair identity rule: while a prior grant
+// with the same (epoch, job, sink, role) identity is live at the installed
+// assignment revision, a different RepairID is refused as identity reuse
+// without touching durable state.
+func TestControlRepairGrantRefusesDifferentIdentityWhileLivePriorIsCurrent(t *testing.T) {
+	fixture, base, record, session := newHistoricalHolderControlFixture(t)
+	request := byte(1)
+	first := nonTargetAssignmentForControlTest(t, base, base.assignment.Assignment.Revision+1)
+	live := historicalSourceGrantAt(t, fixture, base, session, first, 2, record, &request)
+	request++
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, request, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &live})); err != nil {
+		t.Fatalf("first grant rejected: %v", err)
+	}
+	other := live
+	other.Instruction.Checkpoints = append([]protocol.SourceCheckpoint(nil), live.Instruction.Checkpoints...)
+	other.Instruction.ExpectedRecordCount++
+	other.Instruction.RepairID = protocol.DeriveRepairID(other.Instruction)
+	other.Instruction.InstructionDigest = protocol.RepairInstructionDigest(other.Instruction)
+	request++
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, request, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &other})); !errors.Is(err, model.ErrIdentityReuse) {
+		t.Fatalf("second grant against a live prior at the current revision err=%v want %v", err, model.ErrIdentityReuse)
+	}
+	if got := controlRepairByID(t, fixture.repository, live.Instruction.RepairID); got.State != store.RepairPending || countControlLog(fixture.repository.log, "repair") != 1 {
+		t.Fatalf("refused grant mutated repair state: %+v log=%v", got, fixture.repository.log)
+	}
+}
+
+// TestControlRepairGrantReplacesSupersededPrior pins the superseded-grant
+// ruling's installRepair rule: once the installed assignment revision has
+// advanced past every prior grant with the same (epoch, job, sink, role)
+// identity, the coordinator's replacement grant (a different RepairID under
+// the current revision) is admitted and the superseded priors are durably
+// marked RepairFailed, so the next coordinator pass can re-repair the sink
+// after any reassignment instead of wedging on ErrIdentityReuse until a
+// leadership change; re-delivery of the dead grant reports its terminal
+// state without reviving it.
+func TestControlRepairGrantReplacesSupersededPrior(t *testing.T) {
+	fixture, base, record, session := newHistoricalHolderControlFixture(t)
+	request := byte(1)
+	first := nonTargetAssignmentForControlTest(t, base, base.assignment.Assignment.Revision+1)
+	live := historicalSourceGrantAt(t, fixture, base, session, first, 2, record, &request)
+	request++
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, request, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &live})); err != nil {
+		t.Fatalf("first grant rejected: %v", err)
+	}
+	second := nonTargetAssignmentForControlTest(t, base, base.assignment.Assignment.Revision+2)
+	replacement := historicalSourceGrantAt(t, fixture, base, session, second, 3, record, &request)
+	request++
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, request, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &replacement}))
+	if err != nil {
+		t.Fatalf("replacement grant after reassignment rejected: %v", err)
+	}
+	status := response.(protocol.WorkerStatus).Repair
+	if status == nil || status.RepairID != replacement.Instruction.RepairID || status.State != protocol.RepairPending {
+		t.Fatalf("replacement status=%#v", status)
+	}
+	superseded := controlRepairByID(t, fixture.repository, live.Instruction.RepairID)
+	if superseded.State != store.RepairFailed || superseded.ErrorCode != protocol.WorkerErrorStaleAssignment {
+		t.Fatalf("superseded prior not durably failed: %+v", superseded)
+	}
+	if got := controlRepairByID(t, fixture.repository, replacement.Instruction.RepairID); got.State != store.RepairPending || got.Role != store.RepairSource {
+		t.Fatalf("replacement not installed: %+v", got)
+	}
+	if want := []string{"repair", "repair", "repair"}; countControlLog(fixture.repository.log, "repair") != len(want) {
+		t.Fatalf("expected first install, failed-prior marking, replacement install: %v", fixture.repository.log)
+	}
+	request++
+	response, err = session.Handle(context.Background(), fixture.frame(t, 2, request, protocol.WorkerStatusRequest{CoordinatorEpoch: base.epoch, MaxEvents: 1, Repair: &live}))
+	if err != nil {
+		t.Fatalf("dead grant re-delivery: %v", err)
+	}
+	if status := response.(protocol.WorkerStatus).Repair; status == nil || status.State != protocol.RepairFailed || status.ErrorCode != protocol.WorkerErrorStaleAssignment {
+		t.Fatalf("dead grant status=%#v", status)
+	}
+	if countControlLog(fixture.repository.log, "repair") != 3 {
+		t.Fatalf("dead grant re-delivery mutated repair state: %v", fixture.repository.log)
+	}
 }

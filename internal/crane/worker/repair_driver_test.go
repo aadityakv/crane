@@ -781,3 +781,369 @@ func TestRepairDriverInstallsWhileProcessAdmissionClosed(t *testing.T) {
 		t.Fatalf("installed results=%d want=%d", len(work.Results), len(fixture.records))
 	}
 }
+
+// installSupersedingAssignment installs revision+1 of the fixture assignment
+// with an unchanged placement on the given repositories: the reassignment
+// that supersedes a grant need not touch the repaired sink.
+func installSupersedingAssignment(t *testing.T, fixture *repairDriverFixture, repositories ...*transferRepository) store.InstalledAssignment {
+	t.Helper()
+	prior := fixture.assignment.Assignment
+	tasks := append([]model.AssignmentToken(nil), prior.Tasks...)
+	for index := range tasks {
+		tasks[index].AssignmentRevision = prior.Revision + 1
+	}
+	set, err := model.NewAssignmentSet(prior.JobID, prior.Revision+1, tasks, append([]model.ResultReplicaSet(nil), prior.ResultReplicas...), fixture.assignment.Topology)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed := fixture.assignment
+	installed.Assignment = set
+	installed.JobControlRevision++
+	for _, repository := range repositories {
+		repository.mu.Lock()
+		repository.assignments[set.JobID] = installed
+		repository.work.Assignments = []store.InstalledAssignment{installed}
+		repository.mu.Unlock()
+	}
+	return installed
+}
+
+// supersedingGrant derives the coordinator's replacement grant for the fixture
+// sink under the superseding assignment: same vector, new revision/digest and
+// therefore a new RepairID.
+func supersedingGrant(t *testing.T, fixture *repairDriverFixture, installed store.InstalledAssignment) store.ResultRepairRecord {
+	t.Helper()
+	grant := fixture.repair
+	grant.Instruction.Checkpoints = append([]model.SourceCheckpoint(nil), fixture.repair.Instruction.Checkpoints...)
+	grant.Instruction.AssignmentRevision = installed.Assignment.Revision
+	grant.Instruction.AssignmentDigest = installed.Assignment.Digest
+	rebindTransferRepair(&grant)
+	count, total, digest, err := ResultInventoryAggregate(grant.Instruction.InventoryQueryDigest, fixture.records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant.Instruction.ExpectedRecordCount, grant.Instruction.ExpectedTotalBytes, grant.Instruction.ExpectedContentDigest = count, total, digest
+	rebindTransferRepair(&grant)
+	grant.State = store.RepairPending
+	grant.NextRecord, grant.NextOffset, grant.RecordCount, grant.TotalBytes = 0, 0, 0, 0
+	if grant.Instruction.RepairID == fixture.repair.Instruction.RepairID {
+		t.Fatal("superseding grant derived the same repair identity")
+	}
+	return grant
+}
+
+func (fixture *repairDriverFixture) repairByID(t *testing.T, repository *repairDriverRepository, id [16]byte) store.ResultRepairRecord {
+	t.Helper()
+	work, err := repository.RecoverWork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repair := range work.Repairs {
+		if repair.Instruction.RepairID == id {
+			return repair
+		}
+	}
+	t.Fatalf("repair %x missing", id[:4])
+	return store.ResultRepairRecord{}
+}
+
+// repairState reads one durable grant's state, reporting the zero state when
+// the grant is absent.
+func (fixture *repairDriverFixture) repairState(repository *repairDriverRepository, id [16]byte) store.RepairState {
+	work, err := repository.RecoverWork()
+	if err != nil {
+		return 0
+	}
+	for _, repair := range work.Repairs {
+		if repair.Instruction.RepairID == id {
+			return repair.State
+		}
+	}
+	return 0
+}
+
+func (fixture *repairDriverFixture) pullsFor(id [16]byte) int {
+	count := 0
+	for _, status := range fixture.client.pulled() {
+		if status.RepairID == id {
+			count++
+		}
+	}
+	return count
+}
+
+// TestRepairDriverStopsOnSupersededRevision pins the superseded-grant ruling's
+// first rule: a durable grant bound to an assignment revision the installed
+// assignment has advanced past is dead and is never driven.
+func TestRepairDriverStopsOnSupersededRevision(t *testing.T) {
+	fixture := newRepairDriverFixture(t)
+	fixture.driver.Schedule(fixture.destinationRepair(t))
+	installSupersedingAssignment(t, fixture, fixture.transferFixture.destination)
+	fixture.start(t)
+	if fixture.advanceUntil(func() bool { return len(fixture.client.pulled()) > 0 }) {
+		t.Fatalf("superseded grant was driven: %d pulls", len(fixture.client.pulled()))
+	}
+}
+
+// TestRepairDriverRetiresSupersededGrantAndDrivesReplacementAcrossRestart
+// pins the review's I1 wedge scenario end to end: a grant at revision r1 is
+// mid-stream when a reassignment installs r2 and the coordinator's
+// replacement grant arrives behind it. The dead grant stops (no further
+// pulls, no unbounded retry), the replacement streams to completion, and a
+// restarted driver that recovers both grants still never head-of-line blocks
+// on the dead one.
+func TestRepairDriverRetiresSupersededGrantAndDrivesReplacementAcrossRestart(t *testing.T) {
+	fixture := newRepairDriverFixture(t)
+	dead := fixture.repair.Instruction.RepairID
+	var mu sync.Mutex
+	var replacementID [16]byte
+	replacement := func() [16]byte {
+		mu.Lock()
+		defer mu.Unlock()
+		return replacementID
+	}
+	fixture.client.inject = func(call int, status protocol.ResultRepairStatus) (protocol.WorkerMessage, bool, error) {
+		if status.RepairID != dead {
+			return nil, false, nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if replacementID == ([16]byte{}) {
+			installed := installSupersedingAssignment(t, fixture, fixture.transferFixture.source, fixture.transferFixture.destination)
+			grant := supersedingGrant(t, fixture, installed)
+			sourceGrant := grant
+			sourceGrant.Role = store.RepairSource
+			if err := fixture.transferFixture.source.UpsertRepair(sourceGrant); err != nil {
+				t.Error(err)
+			}
+			if err := fixture.transferFixture.destination.UpsertRepair(grant); err != nil {
+				t.Error(err)
+			}
+			replacementID = grant.Instruction.RepairID
+			fixture.driver.Schedule(grant)
+		}
+		// The source is momentarily unreachable, so the loop re-reads its
+		// durable authority before the next exchange.
+		return nil, true, errors.New("source unreachable")
+	}
+	fixture.driver.Schedule(fixture.destinationRepair(t))
+	fixture.start(t)
+	if !fixture.advanceUntil(func() bool {
+		id := replacement()
+		return id != ([16]byte{}) && fixture.repairState(fixture.destinationRepository, id) == store.RepairComplete
+	}) {
+		t.Fatalf("replacement grant never completed behind the superseded grant: pulls=%d", len(fixture.client.pulled()))
+	}
+	if !fixture.advanceUntil(func() bool {
+		return fixture.repairState(fixture.sourceRepository, replacement()) == store.RepairComplete
+	}) {
+		t.Fatal("source replacement grant never completed")
+	}
+	if got := fixture.pullsFor(dead); got != 1 {
+		t.Fatalf("superseded grant kept being driven: %d pulls", got)
+	}
+	if fixture.repairByID(t, fixture.destinationRepository, dead).State != store.RepairPending {
+		t.Fatalf("driver mutated the superseded grant: %+v", fixture.repairByID(t, fixture.destinationRepository, dead))
+	}
+	work, err := fixture.destinationRepository.RecoverWork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(work.Results) != len(fixture.records) {
+		t.Fatalf("installed results=%d want=%d", len(work.Results), len(fixture.records))
+	}
+
+	// Restart: recovery schedules the dead grant first and the completed
+	// replacement second; the dead grant must not block the loop.
+	fixture.stop()
+	pullsBefore := len(fixture.client.pulled())
+	restarted, err := NewRepairDriver(RepairDriverOptions{Repository: fixture.destinationRepository, Transfer: fixture.destinationOwner, Client: fixture.client, Clock: fixture.clock, RetryInterval: 200 * time.Millisecond, MaxRetryInterval: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.driver = restarted
+	fixture.start(t)
+	if !fixture.advanceUntil(func() bool { return len(fixture.client.pulled()) > pullsBefore }) {
+		t.Fatal("restarted driver blocked behind the superseded grant")
+	}
+	if got := fixture.pullsFor(dead); got != 1 {
+		t.Fatalf("restarted driver re-drove the superseded grant: %d pulls", got)
+	}
+	if fixture.pullsFor(replacement()) <= 3 {
+		t.Fatalf("restarted driver did not reach the replacement grant: pulls=%d", fixture.pullsFor(replacement()))
+	}
+}
+
+// TestRepairDriverStopsOnTypedSourceRejectionUntilRegrant pins the ruling's
+// second rule: a deterministic source rejection (typed, not a transport
+// failure) stops the drive loop instead of retrying forever, so a dead grant
+// never head-of-line blocks the serialized driver; the coordinator's explicit
+// idempotent re-grant re-arms exactly one fresh attempt, which lets the
+// destination-first grant order (destination pulls before the source holds
+// its grant) converge once the source grant lands.
+func TestRepairDriverStopsOnTypedSourceRejectionUntilRegrant(t *testing.T) {
+	fixture := newRepairDriverFixture(t)
+	var mu sync.Mutex
+	reject := true
+	fixture.client.inject = func(call int, status protocol.ResultRepairStatus) (protocol.WorkerMessage, bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if reject {
+			return nil, true, ErrTransferUnauthorized
+		}
+		return nil, false, nil
+	}
+	fixture.driver.Schedule(fixture.destinationRepair(t))
+	fixture.start(t)
+	if !fixture.advanceUntil(func() bool { return len(fixture.client.pulled()) >= 1 }) {
+		t.Fatal("first pull never issued")
+	}
+	if fixture.advanceUntil(func() bool { return len(fixture.client.pulled()) >= 2 }) {
+		t.Fatalf("typed source rejection was retried: %d pulls", len(fixture.client.pulled()))
+	}
+	if fixture.destinationRepair(t).State != store.RepairPending {
+		t.Fatalf("rejected grant mutated: %+v", fixture.destinationRepair(t))
+	}
+	// The coordinator re-delivers the identical grant: one fresh attempt.
+	fixture.driver.Schedule(fixture.destinationRepair(t))
+	if !fixture.advanceUntil(func() bool { return len(fixture.client.pulled()) >= 2 }) {
+		t.Fatal("re-grant did not re-arm the rejected grant")
+	}
+	if fixture.advanceUntil(func() bool { return len(fixture.client.pulled()) >= 3 }) {
+		t.Fatalf("re-armed attempt retried the typed rejection: %d pulls", len(fixture.client.pulled()))
+	}
+	mu.Lock()
+	reject = false
+	mu.Unlock()
+	fixture.driver.Schedule(fixture.destinationRepair(t))
+	if !fixture.advanceUntil(func() bool { return fixture.destinationRepair(t).State == store.RepairComplete }) {
+		t.Fatalf("grant never completed once the source accepted: %+v", fixture.destinationRepair(t))
+	}
+}
+
+// acceptRecorder records every accepted +5 connection so a test can count
+// sessions and sever them.
+type acceptRecorder struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (recorder *acceptRecorder) Accept() (net.Conn, error) {
+	connection, err := recorder.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	recorder.mu.Lock()
+	recorder.conns = append(recorder.conns, connection)
+	recorder.mu.Unlock()
+	return connection, nil
+}
+
+func (recorder *acceptRecorder) count() int {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	return len(recorder.conns)
+}
+
+func (recorder *acceptRecorder) severAll() {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	for _, connection := range recorder.conns {
+		_ = connection.Close()
+	}
+}
+
+// TestRepairSourceClientReusesSessionAcrossPullsAndRedialsAfterFailure pins
+// the repair-session-reuse ruling: every pull of one grant travels over one
+// authenticated +5 session to the source incarnation (one dial, one
+// handshake, one replay identity per record — the defect-#9 budget), a later
+// pull reuses it, and a failed exchange drops the session so the next pull
+// re-establishes exactly one.
+func TestRepairSourceClientReusesSessionAcrossPullsAndRedialsAfterFailure(t *testing.T) {
+	fixture := newRepairDriverFixture(t)
+	specification, ok := config.LookupService(config.ServiceCraneWorker)
+	if !ok {
+		t.Fatal("crane worker service specification missing")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if port <= int(specification.Offset) {
+		t.Fatalf("ephemeral port %d below service offset %d", port, specification.Offset)
+	}
+	accepted := &acceptRecorder{Listener: listener}
+	authenticator := wire.NewHMACAuthenticator([]byte("repair-session-reuse-test-secret"))
+	members := &controlTestMembership{view: membership.View{Revision: 1, Members: []swim.Member{
+		{NodeID: fixture.replica.PrimaryNodeID, Host: "127.0.0.1", BasePort: uint16(port) - specification.Offset, Incarnation: 1, Status: swim.Alive},
+		{NodeID: fixture.replica.SecondaryNodeID, Host: "127.0.0.1", BasePort: 9200, Incarnation: 1, Status: swim.Alive},
+	}}}
+	controlRepository := &repairControlRepository{repository: fixture.transferFixture.source, node: fixture.replica.PrimaryNodeID, epoch: fixture.replica.PrimaryEpoch}
+	sourceOwner, err := NewControlOwner(ControlOptions{Config: config.NodeConfig{NodeID: fixture.replica.PrimaryNodeID, Crane: config.DefaultCraneConfig(), Timing: config.DefaultTimingConfig()}, ClusterID: [16]byte{7}, Repository: controlRepository, Engine: &controlNoopEngine{}, Transfer: fixture.sourceOwner, Gate: admission.NewGate(), Membership: members, Clock: fixture.clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveRepairControlSessions(context.Background(), accepted, sourceOwner, authenticator, [16]byte{7}, fixture.replica.PrimaryNodeID, fixture.replica.PrimaryEpoch, fixture.epoch, fixture.clock)
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-serveDone
+	})
+	var dialMu sync.Mutex
+	dials := 0
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialMu.Lock()
+		dials++
+		dialMu.Unlock()
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	dialed := func() int {
+		dialMu.Lock()
+		defer dialMu.Unlock()
+		return dials
+	}
+	client := newDialRepairSourceClient(dialRepairSourceClientOptions{ClusterID: [16]byte{7}, Authenticator: authenticator, Clock: fixture.clock, Membership: members, Repository: fixture.destinationRepository, Timeout: 2 * time.Second, Dial: dial})
+	t.Cleanup(func() {
+		if closer, ok := any(client).(interface{ Close() }); ok {
+			closer.Close()
+		}
+	})
+	driver, err := NewRepairDriver(RepairDriverOptions{Repository: fixture.destinationRepository, Transfer: fixture.destinationOwner, Client: client, Clock: fixture.clock, RetryInterval: 200 * time.Millisecond, MaxRetryInterval: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.driver = driver
+	fixture.driver.Schedule(fixture.destinationRepair(t))
+	fixture.start(t)
+	if !fixture.advanceUntil(func() bool { return fixture.destinationRepair(t).State == store.RepairComplete }) {
+		t.Fatalf("wire-driven grant never completed: %+v", fixture.destinationRepair(t))
+	}
+	if !fixture.advanceUntil(func() bool { return fixture.sourceRepair(t).State == store.RepairComplete }) {
+		t.Fatalf("wire source grant never completed: %+v", fixture.sourceRepair(t))
+	}
+	if got := dialed(); got != 1 || accepted.count() != 1 {
+		t.Fatalf("three pulls used %d dials and %d sessions, want one authenticated session", got, accepted.count())
+	}
+	source, sourceEpoch := fixture.repair.Instruction.SourceNodeID, fixture.repair.Instruction.SourceWorkerEpoch
+	status := repairStatus(fixture.destinationRepair(t))
+	if _, err := client.PullRepair(context.Background(), source, sourceEpoch, status); err != nil {
+		t.Fatalf("pull over the cached session: %v", err)
+	}
+	if got := dialed(); got != 1 {
+		t.Fatalf("later pull dialed again: %d dials", got)
+	}
+	accepted.severAll()
+	if _, err := client.PullRepair(context.Background(), source, sourceEpoch, status); !errors.Is(err, ErrRepairSourceUnavailable) {
+		t.Fatalf("severed session pull err=%v want %v", err, ErrRepairSourceUnavailable)
+	}
+	if _, err := client.PullRepair(context.Background(), source, sourceEpoch, status); err != nil {
+		t.Fatalf("pull after the dropped session: %v", err)
+	}
+	if got := dialed(); got != 2 || accepted.count() != 2 {
+		t.Fatalf("recovery used %d dials and %d sessions, want exactly one new session", got, accepted.count())
+	}
+}
