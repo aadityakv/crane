@@ -1,4 +1,4 @@
-.PHONY: build crane clean-build test race integration sim vet staticcheck fmt-check verify
+.PHONY: build crane clean-build test race integration crane-integration sim vet staticcheck fmt-check verify
 
 build: | bin
 	go build -o bin/cs425-node ./cmd/node
@@ -23,6 +23,15 @@ race:
 integration:
 	go test -tags=integration ./integration -count=1 -v
 
+# Real four-process Crane failover proof. Only this target compiles the
+# craneintegration seam (durable-boundary events and bounded datagram faults
+# driven over one inherited test-owned descriptor); production binaries
+# never contain it. The explicit timeout keeps go test's default 10m binary
+# budget from panicking mid-scenario (a panic skips t.Cleanup and leaks node
+# processes).
+crane-integration:
+	go test -tags='integration craneintegration' ./integration -run TestCraneLifecycle -count=1 -v -timeout 40m
+
 sim:
 	go test ./internal/crane/sim -run TestScripted -count=1
 	go test ./internal/crane/sim -run TestRandomized -count=1
@@ -36,4 +45,4 @@ staticcheck:
 fmt-check:
 	test -z "$$(gofmt -l cmd internal integration)"
 
-verify: fmt-check test race vet staticcheck integration
+verify: fmt-check test race vet staticcheck integration crane-integration

@@ -22,5 +22,6 @@ jobs:
           cache: true
       - run: make build clean-build
       - run: make fmt-check test race vet integration
+      - run: make crane-integration
       - if: runner.os == 'Linux'
         run: make staticcheck

@@ -439,6 +439,9 @@ func (hook *fdHook) apply(line string) (uint64, string, string) {
 			held := state.held
 			state.held = nil
 			state.released += len(held)
+			// Releasing retires the hold: a rule whose budget was larger than
+			// the frames it captured must not keep swallowing later frames.
+			state.remaining = 0
 			// A released hold is retired: it captures nothing further.
 			state.remaining = 0
 			for _, resend := range held {
