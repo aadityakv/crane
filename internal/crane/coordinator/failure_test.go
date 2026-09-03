@@ -414,3 +414,35 @@ func TestTerminalPropagationInstallsClosedIdempotently(t *testing.T) {
 	h.lead(3)
 	h.waitFor(func() bool { return h.log.count("install:3:closed") > before }, "terminal install after leadership change")
 }
+
+// TestTerminalPropagationRetriesWorkersThatWereUnreachable pins the Task 27
+// real-process finding: a terminal Closed install is not confirmed for a
+// worker that was Dead in membership when the leader's pass ran; once the
+// worker is Alive again the same leadership session installs it, so a
+// sealed-result replica that missed its re-install can serve fetches without
+// waiting for the next leadership change.
+func TestTerminalPropagationRetriesWorkersThatWereUnreachable(t *testing.T) {
+	h, job, _, _ := runningHarness(t)
+	view := h.view()
+	cancel, err := state.NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{0x53}, Sequence: 1}, job, 3, view.CoordinatorEpoch)
+	if err != nil {
+		t.Fatalf("seed cancel: %v", err)
+	}
+	h.raft.applySeed(t, cancel)
+	h.setMemberStatus(3, swim.Dead)
+
+	h.start()
+	h.markReady()
+	h.lead(2)
+	h.waitFor(func() bool { return len(h.workers.installsFor(2, model.Closed)) >= 1 }, "terminal install on the reachable worker")
+	if got := len(h.workers.installsFor(3, model.Closed)); got != 0 {
+		t.Fatalf("unreachable worker 3 received %d terminal installs", got)
+	}
+
+	h.setMemberStatus(3, swim.Alive)
+	h.actor.Wake()
+	h.waitFor(func() bool { return len(h.workers.installsFor(3, model.Closed)) >= 1 }, "terminal install once worker 3 is reachable again")
+	if got := len(h.workers.installsFor(2, model.Closed)); got != 1 {
+		t.Fatalf("confirmed worker 2 received %d terminal installs, want exactly 1", got)
+	}
+}

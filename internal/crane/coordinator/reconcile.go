@@ -329,7 +329,17 @@ func (actor *Actor) propagateTerminal(ctx context.Context, epoch model.Coordinat
 	members := actor.options.Membership.View()
 	complete := true
 	for _, node := range assignmentNodes(*job.Assignment) {
-		if progress.nodes[node] || !memberActive(members, node) {
+		if progress.nodes[node] {
+			continue
+		}
+		if !memberActive(members, node) {
+			// A worker that is not currently reachable has not confirmed
+			// the terminal install; it is retried on a later pass once it
+			// is Alive again instead of being silently dropped for the
+			// rest of the session (a sealed-result replica that missed its
+			// re-install could otherwise never serve fetches until the next
+			// leadership change).
+			complete = false
 			continue
 		}
 		if err := actor.options.Workers.Install(ctx, node, install); err != nil {
