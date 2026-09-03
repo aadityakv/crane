@@ -1,7 +1,6 @@
 .git
 tools
 src/github.com
-ansible
 src/*.sh
 *.pdf
 englishText*
