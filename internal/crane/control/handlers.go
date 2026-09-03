@@ -345,7 +345,11 @@ func (service *Service) resultPageRejection(request protocol.ResultPageRequest, 
 		}
 		return requestBoundError(request, protocol.ControlErrorResultUnavailable, true, "no complete current manifest set matches the request")
 	default:
-		return requestBoundError(request, protocol.ControlErrorResultUnavailable, true, "result stream failed")
+		detail := "result stream failed: " + err.Error()
+		if len(detail) > 120 {
+			detail = detail[:120]
+		}
+		return requestBoundError(request, protocol.ControlErrorResultUnavailable, true, detail)
 	}
 }
 

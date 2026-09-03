@@ -392,7 +392,7 @@ func (cluster *simCluster) startNode(node *simNode) {
 	if err != nil {
 		cluster.fail("compose node %d runtime: %v", nodeID, err)
 	}
-	node.runtime = runtime
+	node.setRuntime(runtime)
 	ctx, cancel := context.WithCancel(context.Background())
 	node.cancel = cancel
 	node.done = make(chan error, 1)
@@ -437,7 +437,7 @@ func (cluster *simCluster) stopNode(node *simNode) {
 		select {
 		case <-node.done:
 			node.setHandle(nil)
-			node.runtime = nil
+			node.setRuntime(nil)
 			node.cancel = nil
 			node.stopped = true
 			cluster.oracle.nodeStopped(node.spec.id)
@@ -515,6 +515,21 @@ func (cluster *simCluster) workerStore(id uint16) *store.Store {
 }
 
 // setHandle publishes (or clears) the node's live store handle under node.mu.
+// setRuntime publishes (or clears) the node's composed runtime under the
+// node mutex so oracle goroutines never observe a torn pointer.
+func (node *simNode) setRuntime(runtime *craneruntime.Runtime) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	node.runtime = runtime
+}
+
+// loadRuntime reads the node's composed runtime under the node mutex.
+func (node *simNode) loadRuntime() *craneruntime.Runtime {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	return node.runtime
+}
+
 func (node *simNode) setHandle(handle *store.Store) {
 	node.mu.Lock()
 	node.handle = handle
@@ -653,7 +668,7 @@ func (cluster *simCluster) checkRunErrors() {
 					cluster.skipReason = fmt.Sprintf("TODO(recorded concern): node %d exhausted its worker store retrying outboxes against an unreachable peer (task-24-report.md, Concerns)", id)
 					node.running = false
 					node.setHandle(nil)
-					node.runtime = nil
+					node.setRuntime(nil)
 					node.cancel = nil
 					node.stopped = true
 					cluster.oracle.nodeStopped(id)

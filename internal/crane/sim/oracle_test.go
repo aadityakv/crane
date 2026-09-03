@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	craneruntime "github.com/aaditya/cs425mp3/internal/crane/runtime"
 	"sort"
 	"sync"
 	"testing"
@@ -385,10 +386,14 @@ func (o *oracle) subscribeLeadership() {
 	o.mu.Unlock()
 	for _, id := range o.cluster.ids {
 		node := o.cluster.nodes[id]
-		if node == nil || node.runtime == nil || node.runtime.Raft == nil {
+		var runtime *craneruntime.Runtime
+		if node != nil {
+			runtime = node.loadRuntime()
+		}
+		if runtime == nil || runtime.Raft == nil {
 			continue
 		}
-		subscription, err := node.runtime.Raft.SubscribeLeadership(ctx, 64)
+		subscription, err := runtime.Raft.SubscribeLeadership(ctx, 64)
 		if err != nil {
 			o.cluster.fail("subscribe leadership on voter %d: %v", id, err)
 		}
@@ -421,7 +426,11 @@ func (o *oracle) subscribeLeadership() {
 func (o *oracle) resubscribeLeadership(id uint16) {
 	o.cluster.t.Helper()
 	node := o.cluster.nodes[id]
-	if node == nil || node.runtime == nil || node.runtime.Raft == nil {
+	var runtime *craneruntime.Runtime
+	if node != nil {
+		runtime = node.loadRuntime()
+	}
+	if runtime == nil || runtime.Raft == nil {
 		return
 	}
 	o.mu.Lock()
@@ -432,7 +441,7 @@ func (o *oracle) resubscribeLeadership(id uint16) {
 	}
 	var subscription *raft.LeadershipSubscription
 	if !o.cluster.awaitOptionally(simDefaultPumpBudget, func() bool {
-		candidate, err := node.runtime.Raft.SubscribeLeadership(ctx, 64)
+		candidate, err := runtime.Raft.SubscribeLeadership(ctx, 64)
 		if err != nil {
 			return false
 		}
@@ -468,10 +477,14 @@ func (o *oracle) observeEvent(node uint16, event raft.LeadershipEvent) {
 		var statuses []string
 		for _, id := range o.cluster.ids {
 			peer := o.cluster.nodes[id]
-			if peer == nil || peer.runtime == nil || peer.runtime.Raft == nil {
+			var runtime *craneruntime.Runtime
+			if peer != nil {
+				runtime = peer.loadRuntime()
+			}
+			if runtime == nil || runtime.Raft == nil {
 				continue
 			}
-			status := peer.runtime.Raft.Status()
+			status := runtime.Raft.Status()
 			statuses = append(statuses, fmt.Sprintf("%d:role=%d/term=%d/lead=%d/commit=%d/last=%d/applied=%d", id, status.Role, status.Term, status.LeaderID, status.CommitIndex, status.LastIndex, status.AppliedIndex))
 		}
 		o.cluster.record("leadership node=%d term=%d role=%d leader=%d voters=%v", node, event.Term, event.Role, event.LeaderID, statuses)

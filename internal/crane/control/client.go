@@ -566,7 +566,7 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 				}
 			}
 			if len(next) == 0 {
-				return nil, fmt.Errorf("%w: every redirected endpoint was already tried", ErrClientRedirectLoop)
+				return nil, fmt.Errorf("%w: every redirected endpoint was already tried (redirect from %s to %v after %d redirects)", ErrClientRedirectLoop, target, redirect.Endpoints, redirects)
 			}
 			targets, index = next, 0
 			continue

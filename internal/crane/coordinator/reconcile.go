@@ -381,7 +381,7 @@ func (actor *Actor) activateJob(ctx context.Context, epoch model.CoordinatorEpoc
 
 // scheduleJob commits every deterministic source EOF and the initial complete
 // assignment set for one committed pending job.
-func (actor *Actor) scheduleJob(ctx context.Context, epoch model.CoordinatorEpoch, view state.View, job state.JobRecord) bool {
+func (actor *Actor) scheduleJob(ctx context.Context, epoch model.CoordinatorEpoch, _ state.View, job state.JobRecord) bool {
 	topology, err := model.DecodeTopology(job.TopologyBytes)
 	if err != nil {
 		return false
@@ -404,7 +404,7 @@ func (actor *Actor) scheduleJob(ctx context.Context, epoch model.CoordinatorEpoc
 			return false
 		}
 	}
-	view = actor.options.Machine.View()
+	view := actor.options.Machine.View()
 	job, ok := findJob(view, job.JobID)
 	if !ok || job.Assignment != nil {
 		return ok
