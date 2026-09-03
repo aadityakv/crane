@@ -84,7 +84,7 @@ service that redirects every request to the voters; they own no Raft storage.
 ./bin/cs425-crane submit  -config examples/config/node-1.json -state ./client.state -topology topology.json
 ./bin/cs425-crane status  -config examples/config/node-1.json -state ./client.state -job <32 hex>
 ./bin/cs425-crane results -config examples/config/node-1.json -state ./client.state -job <32 hex> [-page-bytes N]
-./bin/cs425-crane cancel  -config examples/config/node-1.json -state ./client.state -job <32 hex>
+./bin/cs425-crane cancel  -config examples/config/node-1.json -state ./client.state -job <32 hex> -expected-revision <job-control revision from status>
 ```
 
 `-state` names an owner-only file that holds the durable client identity:
@@ -92,8 +92,10 @@ the client ID, the next request sequence, and any pending mutation. A
 sequence is reserved and persisted before the request is sent, so a crash
 never reuses a sequence; a restarted client resumes the pending request with
 the exact same bytes under a fresh request ID and receives the replicated
-cached result. Submit and cancel responses carry the exact durable revision
-that the command produced. The client follows checked leader redirects to the
+cached result. The client validates every submit and cancel response
+against the exact durable revision the command must have produced (a
+first submit is revision 1; a cancel is the expected revision plus one)
+before reporting success. The client follows checked leader redirects to the
 static voter set only, retries transient errors (`Starting`,
 `CapacityExhausted`, `ResultUnavailable`) within a bounded attempt budget,
 and refuses to continue with a forfeited identity (`StaleRequest`,
@@ -146,13 +148,14 @@ Topology documents are validated against the immutable operator registry:
   per-node identity beyond the configured membership and IP/DNS checks.
 - **Migration.** Replicated snapshots are schema-versioned; an empty legacy
   snapshot upgrades in place, and a nonempty legacy snapshot is rejected
-  rather than reinterpreted. Worker stores read schema v1 and write v2. Two
+  rather than reinterpreted. Legacy schema-v1 worker snapshots remain readable
+  and new worker snapshots are written as schema v2. Two
   binaries with different consensus fingerprints never join the same cluster.
 
 ## Verification
 
 ```sh
-make test              # ordinary suites (-short bounds the slowest proofs)
+make test              # ordinary suites (add -short locally to bound the two slowest proofs)
 make race              # race detector over the tree
 make vet staticcheck   # static analysis
 make sim               # deterministic four-process simulation with oracle

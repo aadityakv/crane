@@ -16,13 +16,30 @@ const (
 
 // CraneConfig contains local operational limits and the compiled consensus contract.
 type CraneConfig struct {
-	WorkerSlots                  uint16   `json:"worker_slots"`
-	WorkerControlTimeout         Duration `json:"worker_control_timeout"`
-	TupleRetryInterval           Duration `json:"tuple_retry_interval"`
+	// WorkerSlots is the number of task slots this worker offers the cluster
+	// (1..MaxWorkerSlots); placement never exceeds the cluster-wide total.
+	WorkerSlots uint16 `json:"worker_slots"`
+	// WorkerControlTimeout bounds every +5 worker-control and +6
+	// public-control request exchange, including dial and handshake.
+	WorkerControlTimeout Duration `json:"worker_control_timeout"`
+	// TupleRetryInterval is the resend interval for +7 tuple deliveries that
+	// have not been acknowledged by the destination.
+	TupleRetryInterval Duration `json:"tuple_retry_interval"`
+	// TupleCompletionRetryInterval is the resend interval for completion
+	// acknowledgments that await durable downstream custody.
 	TupleCompletionRetryInterval Duration `json:"tuple_completion_retry_interval"`
-	FailureGracePeriod           Duration `json:"failure_grace_period"`
-	MaxWorkerStoreBytes          uint64   `json:"max_worker_store_bytes"`
-	ConsensusFingerprint         string   `json:"consensus_fingerprint"`
+	// FailureGracePeriod is how long a worker must remain continuously
+	// Dead/Left and unreachable before its tasks and replicas are reassigned;
+	// Suspect alone never reassigns.
+	FailureGracePeriod Duration `json:"failure_grace_period"`
+	// MaxWorkerStoreBytes is the durable budget for the worker's write-ahead
+	// log plus snapshots; exhaustion fails closed with a retryable capacity
+	// error rather than accepting work that cannot be stored.
+	MaxWorkerStoreBytes uint64 `json:"max_worker_store_bytes"`
+	// ConsensusFingerprint is the hex SHA-256 of the compiled consensus
+	// contract; startup rejects a value that differs from the binary's own,
+	// and peers advertising a different fingerprint fail the handshake.
+	ConsensusFingerprint string `json:"consensus_fingerprint"`
 }
 
 // DefaultCraneConfig returns bounded operational defaults and the compiled v1 fingerprint.

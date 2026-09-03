@@ -143,7 +143,7 @@ The SWIM event loop owns membership state. It runs direct probes, then indirect 
 
 Membership failure does not terminate a process, delete data, alter the configured Raft voter set, or reassign Crane work. Authenticating, replay-checking, and schema validation happen before SWIM state mutation. The real-process integration tests cover local admission, failure detection, restart with a higher incarnation, continued operation after seed loss, and a four-process layout in which only the three fixed voters bind Raft and create durable Raft artifacts.
 
-This milestone implements the runtime foundation, full SWIM membership, fixed-membership Raft replication and persistence, and conditional voter process composition. The portable, structurally validated legacy data schemas under `pkg/topology` remain available for the next Crane migration, but Crane application state, public topology control, worker execution, and plugin operation are not enabled yet.
+The runtime foundation, full SWIM membership, fixed-membership Raft replication and persistence, and the Crane stream-processing system (`internal/crane`, documented below) are implemented and verified together; the removed legacy `pkg/topology` bridge is superseded by the validated topology model in `internal/crane/model`.
 
 ## Crane stream processing
 
