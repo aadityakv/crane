@@ -519,6 +519,11 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 	}
 	targets := client.endpoints
 	visited := make(map[string]bool, len(client.endpoints))
+	// redirected records the endpoints that answered this call with a
+	// LeaderRedirect. Only a hint that names nothing but endpoints which
+	// themselves redirected is a redirect loop; an endpoint that merely
+	// failed a connection or exchange stays eligible for a later hint.
+	redirected := make(map[string]bool, len(client.endpoints))
 	index, redirects := 0, 0
 	var lastErr, lastReachedErr error
 	for attempts := 0; attempts < client.maxAttempts; attempts++ {
@@ -542,8 +547,9 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 				// actionable leader hint (the hinted leader may have died
 				// before its followers learned of a successor): fall back to
 				// the remaining static voters instead of re-dialing it for
-				// every remaining attempt. It stays visited, so a repeated
-				// hint to it is reported as a redirect loop, not retried.
+				// every remaining attempt. A later hint naming it is followed
+				// again (bounded by the attempt and redirect budgets), since a
+				// transient failure is not a redirect.
 				targets, index = client.endpointsExcluding(target), 0
 			}
 			if waitErr := client.waitBackoff(ctx); waitErr != nil {
@@ -552,6 +558,7 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 			continue
 		}
 		if redirect, ok := response.(protocol.LeaderRedirect); ok {
+			redirected[target] = true
 			redirects++
 			if redirects > client.maxRedirects {
 				return nil, fmt.Errorf("%w: %d redirects exceed the bound", ErrClientRedirectLoop, redirects)
@@ -561,12 +568,12 @@ func (client *Client) exchange(ctx context.Context, messageType wire.MessageType
 				if _, trusted := client.endpointSet[endpoint]; !trusted {
 					return nil, fmt.Errorf("%w: %q", ErrClientRedirectUntrusted, endpoint)
 				}
-				if !visited[endpoint] {
+				if !redirected[endpoint] {
 					next = append(next, endpoint)
 				}
 			}
 			if len(next) == 0 {
-				return nil, fmt.Errorf("%w: every redirected endpoint was already tried (redirect from %s to %v after %d redirects)", ErrClientRedirectLoop, target, redirect.Endpoints, redirects)
+				return nil, fmt.Errorf("%w: every redirected endpoint already redirected this call (redirect from %s to %v after %d redirects; last error %v)", ErrClientRedirectLoop, target, redirect.Endpoints, redirects, lastErr)
 			}
 			targets, index = next, 0
 			continue

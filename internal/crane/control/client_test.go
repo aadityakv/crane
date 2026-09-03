@@ -735,3 +735,38 @@ func writeStateFile(t *testing.T, path string, encoded []byte) {
 		t.Fatal(err)
 	}
 }
+
+// TestClientRedirectRetriesTransientlyUnreachableLeader pins the Task 27
+// full-restart finding: a hinted leader whose first connection fails is not a
+// redirect, so when the remaining voters keep hinting it the client follows
+// the hint again instead of reporting a redirect loop.
+func TestClientRedirectRetriesTransientlyUnreachableLeader(t *testing.T) {
+	harness := newClientHarness(t, true)
+	topology := clientTestTopology(t, "redirect-transient-leader")
+	harness.fixture.raft.setLeader(false, 2)
+	failedOnce := false
+	harness.dialErr = func(address string, _ int) error {
+		if address == "127.0.0.2:19206" && !failedOnce {
+			failedOnce = true
+			return &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+		}
+		return nil
+	}
+	harness.dialHook = func(address string, _ int) {
+		if address == "127.0.0.2:19206" && failedOnce {
+			harness.fixture.raft.setLeader(true, 0)
+		}
+	}
+
+	job, err := harness.client().Submit(testContext(t), topology)
+	if err != nil {
+		t.Fatalf("submit past a transiently unreachable hinted leader: %v", err)
+	}
+	if want := expectedSubmitJobID(t, harness.store, 1, topology); job != want {
+		t.Fatalf("job = %x, want %x", job, want)
+	}
+	dialed := harness.dialedAddresses()
+	if len(dialed) < 3 || dialed[len(dialed)-1] != "127.0.0.2:19206" {
+		t.Fatalf("dialed = %v, want the hinted leader retried after its transient failure", dialed)
+	}
+}
