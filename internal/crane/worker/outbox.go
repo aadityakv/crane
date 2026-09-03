@@ -97,6 +97,13 @@ func (engine *Engine) senderWorker(ctx context.Context) {
 func (engine *Engine) handleDispatchStart(start dispatchStart) dispatchResponse {
 	outbox, ok := engine.outboxes[start.id]
 	if !ok {
+		if engine.compactedIdentity(start.id) {
+			// A committed checkpoint compacted this outbox after its sender
+			// job was queued. The checkpoint owns the durable outcome, so
+			// the overtaken dispatch is a benign no-send exactly like a
+			// Completed ACK overtaking a queued handshake (Task 25).
+			return dispatchResponse{disposition: dispatchSkip}
+		}
 		return dispatchResponse{err: errors.New("sender dispatched unknown outbox")}
 	}
 	if outbox.record.Completed {
@@ -121,6 +128,14 @@ func (engine *Engine) handleDispatchStart(start dispatchStart) dispatchResponse 
 	}
 	outbox.record.RetryDeadlineUnixNano = deadline
 	return dispatchResponse{disposition: dispatchSend}
+}
+
+// compactedIdentity reports whether the durable source cursor's committed
+// watermark already covers the delivery identity, i.e. compactCheckpoint
+// retired it from the owner maps.
+func (engine *Engine) compactedIdentity(id model.DeliveryID) bool {
+	cursor, exists := engine.sources[id.Tuple.SourceTask]
+	return exists && id.Tuple.SourceSequence != 0 && id.Tuple.SourceSequence <= cursor.Watermark
 }
 
 func (engine *Engine) handleSendResult(result sendResult) {

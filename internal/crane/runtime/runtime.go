@@ -26,6 +26,7 @@ import (
 	"github.com/aaditya/cs425mp3/internal/crane/admission"
 	"github.com/aaditya/cs425mp3/internal/crane/control"
 	"github.com/aaditya/cs425mp3/internal/crane/coordinator"
+	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
 	"github.com/aaditya/cs425mp3/internal/crane/membership"
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
@@ -69,6 +70,12 @@ type Dependencies struct {
 	// OpenStore optionally overrides the durable worker store opener; nil
 	// uses the production store.Open.
 	OpenStore func(string, store.Identity, store.Options) (*store.Store, error)
+	// Hook optionally observes worker durable boundaries and the real +7
+	// send/receive paths. Nil asks integrationhook.LoadFromInheritedFD for
+	// the process hook: the production no-op in every ordinary build, and
+	// only under the craneintegration tag the seam activated from one
+	// inherited test-owned descriptor.
+	Hook integrationhook.Hook
 }
 
 // Runtime is one completely composed Crane node process. Exactly one
@@ -191,6 +198,10 @@ func New(configuration config.NodeConfig, dependencies Dependencies) (*Runtime, 
 	if openStore == nil {
 		openStore = store.Open
 	}
+	hook := dependencies.Hook
+	if hook == nil {
+		hook = integrationhook.LoadFromInheritedFD()
+	}
 	runtime.workerOptions = worker.ServiceOptions{
 		Config:            owned,
 		Authenticator:     authenticator,
@@ -200,6 +211,7 @@ func New(configuration config.NodeConfig, dependencies Dependencies) (*Runtime, 
 		OpenStore:         openStore,
 		Datagram:          workerDatagram,
 		ArtifactDirectory: filepath.Join(owned.StorageDir, ArtifactDirectoryName),
+		Hook:              hook,
 	}
 	workerService, err := worker.NewService(runtime.workerOptions)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 	"github.com/aaditya/cs425mp3/internal/crane/store"
@@ -153,6 +154,12 @@ func (service *TupleService) process(ctx context.Context, datagram transport.Sou
 		replay.recordInvalid(frame.Header.SenderID, frame.Header.RequestID, timestamp)
 		return nil
 	}
+	// An authenticated inbound datagram may be dropped by the integration
+	// hook exactly as the network could have dropped it: before any replay
+	// accounting or custody.
+	if service.endpoint.hook.DatagramAction(integrationhook.Receive, frame.Header.Message) == integrationhook.Drop {
+		return nil
+	}
 
 	switch frame.Header.Message {
 	case wire.MessageCraneTupleDelivery:
@@ -212,7 +219,7 @@ func (service *TupleService) sendACK(ctx context.Context, datagram transport.Sou
 	if err != nil {
 		return err
 	}
-	return service.endpoint.sendPayload(ctx, datagram, destination, wire.MessageCraneTupleDeliveryAck, payload)
+	return service.endpoint.sendPayload(ctx, datagram, ack.Destination.WorkerID, destination, wire.MessageCraneTupleDeliveryAck, payload)
 }
 
 func (service *TupleService) sendNACK(ctx context.Context, datagram transport.SourceDatagram, destination config.Endpoint, delivery protocol.TupleDelivery, code protocol.TupleNACKCode) error {
@@ -221,7 +228,7 @@ func (service *TupleService) sendNACK(ctx context.Context, datagram transport.So
 	if err != nil {
 		return err
 	}
-	return service.endpoint.sendPayload(ctx, datagram, destination, wire.MessageCraneTupleDeliveryNack, payload)
+	return service.endpoint.sendPayload(ctx, datagram, delivery.Producer.WorkerID, destination, wire.MessageCraneTupleDeliveryNack, payload)
 }
 
 func tupleNACKCode(err error) protocol.TupleNACKCode {

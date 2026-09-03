@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
 	"io"
 	"math"
 	"os"
@@ -59,6 +60,9 @@ func openWithOperations(path string, identity Identity, options Options, operati
 	}
 	if options.MaxBytes == 0 {
 		options.MaxBytes = DefaultMaxBytes
+	}
+	if options.Hook == nil {
+		options.Hook = integrationhook.Noop{}
 	}
 	if options.MaxBytes < uint64(walHeaderBytes+identityPayloadBytes+walChecksumBytes) {
 		return nil, fmt.Errorf("%w: MaxBytes too small", ErrInvalidOptions)
@@ -287,6 +291,14 @@ func (store *Store) release() error {
 		store.directory = nil
 	}
 	return errors.Join(walErr, lockErr, rootErr, dirErr)
+}
+
+// durable publishes one named boundary to the configured hook. It is called
+// only after commitLocked has returned success, i.e. after the transaction's
+// WAL fsync, and before the public mutation returns; callers therefore write
+// any Accepted/Completed/status acknowledgement strictly after it.
+func (store *Store) durable(name string) {
+	store.options.Hook.DurableBoundary(name)
 }
 
 func (store *Store) inject(point FaultPoint) error {

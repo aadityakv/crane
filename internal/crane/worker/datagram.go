@@ -15,6 +15,7 @@ import (
 
 	"github.com/aaditya/cs425mp3/internal/clock"
 	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
 	"github.com/aaditya/cs425mp3/internal/crane/membership"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 	"github.com/aaditya/cs425mp3/internal/swim"
@@ -165,6 +166,9 @@ type TupleEndpointOptions struct {
 	Membership *membership.Authorizer
 	// Datagram optionally supplies one already-created deterministic +7 seam.
 	Datagram transport.SourceDatagram
+	// Hook optionally observes the real send/receive paths; nil selects the
+	// production no-op hook, which never alters a datagram.
+	Hook integrationhook.Hook
 }
 
 // TupleEndpoint is the single socket owner and Engine Sender for one node's
@@ -177,6 +181,7 @@ type TupleEndpoint struct {
 	peers         tuplePeerAuthorizer
 	injected      transport.SourceDatagram
 	bind          config.Endpoint
+	hook          integrationhook.Hook
 
 	mu            sync.RWMutex
 	datagram      transport.SourceDatagram
@@ -209,6 +214,10 @@ func NewTupleEndpoint(options TupleEndpointOptions) (*TupleEndpoint, error) {
 	if _, err = options.Config.AdvertiseEndpoint(config.ServiceCraneTupleACK); err != nil {
 		return nil, fmt.Errorf("%w: derive +7 advertise endpoint: %v", ErrInvalidTupleEndpoint, err)
 	}
+	hook := options.Hook
+	if hook == nil {
+		hook = integrationhook.Noop{}
+	}
 	return &TupleEndpoint{
 		configuration: options.Config,
 		clusterID:     clusterID,
@@ -217,6 +226,7 @@ func NewTupleEndpoint(options TupleEndpointOptions) (*TupleEndpoint, error) {
 		peers:         options.Membership,
 		injected:      options.Datagram,
 		bind:          bind,
+		hook:          hook,
 	}, nil
 }
 
@@ -242,7 +252,7 @@ func (endpoint *TupleEndpoint) Send(ctx context.Context, delivery protocol.Tuple
 	if err != nil {
 		return err
 	}
-	return endpoint.sendPayload(ctx, datagram, destination, wire.MessageCraneTupleDelivery, payload)
+	return endpoint.sendPayload(ctx, datagram, delivery.Destination.WorkerID, destination, wire.MessageCraneTupleDelivery, payload)
 }
 
 func (endpoint *TupleEndpoint) activate() (transport.SourceDatagram, error) {
@@ -284,7 +294,7 @@ func (endpoint *TupleEndpoint) deactivate(datagram transport.SourceDatagram) err
 	return datagram.Close()
 }
 
-func (endpoint *TupleEndpoint) sendPayload(ctx context.Context, datagram transport.SourceDatagram, destination config.Endpoint, message wire.MessageType, payload []byte) error {
+func (endpoint *TupleEndpoint) sendPayload(ctx context.Context, datagram transport.SourceDatagram, destinationNode uint16, destination config.Endpoint, message wire.MessageType, payload []byte) error {
 	if ctx == nil {
 		return errors.New("send Crane tuple datagram: nil context")
 	}
@@ -302,6 +312,24 @@ func (endpoint *TupleEndpoint) sendPayload(ctx context.Context, datagram transpo
 	}
 	if len(frame) > tupleDatagramMaximumBytes {
 		return wire.ErrTooLarge
+	}
+	// The integration hook decides the fate of this exact authenticated
+	// frame; every copy it allows still leaves the node's own bound +7
+	// socket, so the advertised source IP/port stays authentic. A held
+	// frame is re-sent later from this same socket when the hook releases it.
+	if holder, ok := endpoint.hook.(integrationhook.DatagramHolder); ok {
+		held := append([]byte(nil), frame...)
+		if holder.HoldDatagram(message, destinationNode, func() { _ = datagram.SendFrom(context.Background(), endpoint.bind, destination, held) }) {
+			return nil
+		}
+	}
+	switch endpoint.hook.DatagramAction(integrationhook.Send, message) {
+	case integrationhook.Drop:
+		return nil
+	case integrationhook.Duplicate:
+		if err := datagram.SendFrom(ctx, endpoint.bind, destination, frame); err != nil {
+			return err
+		}
 	}
 	return datagram.SendFrom(ctx, endpoint.bind, destination, frame)
 }

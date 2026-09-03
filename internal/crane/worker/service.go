@@ -15,6 +15,7 @@ import (
 	"github.com/aaditya/cs425mp3/internal/clock"
 	"github.com/aaditya/cs425mp3/internal/config"
 	"github.com/aaditya/cs425mp3/internal/crane/admission"
+	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
 	"github.com/aaditya/cs425mp3/internal/crane/membership"
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
@@ -42,6 +43,9 @@ type ServiceOptions struct {
 	// store created during Run. Empty keeps artifact receive and leader fetch
 	// fail-closed unavailable, exactly as before this seam existed.
 	ArtifactDirectory string
+	// Hook optionally observes durable store boundaries and the real +7
+	// send/receive paths; nil selects the production no-op hook.
+	Hook integrationhook.Hook
 }
 
 // Service composes one durable worker owner, one +5 listener, and exactly one
@@ -55,6 +59,7 @@ type Service struct {
 	openStore         func(string, store.Identity, store.Options) (*store.Store, error)
 	datagram          transport.SourceDatagram
 	artifactDirectory string
+	hook              integrationhook.Hook
 	clusterID         [16]byte
 	controlBind       config.Endpoint
 	listen            func(string, string) (net.Listener, error)
@@ -91,10 +96,14 @@ func NewService(options ServiceOptions) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("derive Crane worker control endpoint: %w", err)
 	}
+	hook := options.Hook
+	if hook == nil {
+		hook = integrationhook.Noop{}
+	}
 	return &Service{
 		configuration: configuration, authenticator: options.Authenticator, clock: options.Clock,
 		membership: options.Membership, gate: options.Gate, openStore: options.OpenStore,
-		datagram: options.Datagram, artifactDirectory: options.ArtifactDirectory,
+		datagram: options.Datagram, artifactDirectory: options.ArtifactDirectory, hook: hook,
 		clusterID: clusterID, controlBind: controlBind,
 		listen: net.Listen, ready: make(chan struct{}),
 	}, nil
@@ -123,7 +132,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 	workerStore, err := service.openStore(
 		filepath.Join(service.configuration.StorageDir, WorkerStoreDirectory),
 		store.Identity{ClusterID: service.clusterID, NodeID: service.configuration.NodeID},
-		store.Options{MaxBytes: service.configuration.Crane.MaxWorkerStoreBytes},
+		store.Options{MaxBytes: service.configuration.Crane.MaxWorkerStoreBytes, Hook: service.hook},
 	)
 	if err != nil {
 		return fmt.Errorf("open Crane worker store: %w", err)
@@ -139,7 +148,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 
 	repository := &serviceRepository{Store: workerStore, node: service.configuration.NodeID, fatal: make(chan error, 1)}
 	service.repository = repository
-	endpoint, err := NewTupleEndpoint(TupleEndpointOptions{Config: service.configuration, Authenticator: service.authenticator, Clock: service.clock, Membership: service.membership, Datagram: service.datagram})
+	endpoint, err := NewTupleEndpoint(TupleEndpointOptions{Config: service.configuration, Authenticator: service.authenticator, Clock: service.clock, Membership: service.membership, Datagram: service.datagram, Hook: service.hook})
 	if err != nil {
 		return err
 	}

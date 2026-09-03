@@ -39,6 +39,73 @@ const (
 	recordCheckpointObservation
 )
 
+// Durable boundary names published to the integration hook. Each fires
+// exactly once per successful transaction of the named kind, after the WAL
+// fsync and before the mutation returns.
+const (
+	// BoundaryFence follows a durable coordinator fence install.
+	BoundaryFence = "fence"
+	// BoundaryAssignmentClosed/Running/Draining follow a durable assignment
+	// install that changed state, named by the installed scheduling state.
+	BoundaryAssignmentClosed   = "assignment-closed"
+	BoundaryAssignmentRunning  = "assignment-running"
+	BoundaryAssignmentDraining = "assignment-draining"
+	// BoundaryDeliveryReceived follows new durable Received custody; a
+	// duplicate probe answered from prior custody publishes nothing.
+	BoundaryDeliveryReceived = "delivery-received"
+	// BoundaryDeliveryProcessed follows durable deterministic outputs/outboxes.
+	BoundaryDeliveryProcessed = "delivery-processed"
+	// BoundaryDeliveryCompleted follows durable downstream completion.
+	BoundaryDeliveryCompleted = "delivery-completed"
+	// BoundaryCheckpointApplied follows a durable owned-source watermark.
+	BoundaryCheckpointApplied = "checkpoint-applied"
+	// BoundaryCheckpointObserved follows a durable replica-side observation.
+	BoundaryCheckpointObserved = "checkpoint-observed"
+	// BoundaryResultUpserted follows a durable result copy.
+	BoundaryResultUpserted = "result-upserted"
+	// BoundaryEventPersisted follows a durable worker event.
+	BoundaryEventPersisted = "event-persisted"
+	// BoundaryEventsAcknowledged follows durable event retirement.
+	BoundaryEventsAcknowledged = "events-acknowledged"
+	// BoundaryRepairPending/Streaming/Complete/Failed follow a durable repair
+	// record, named by its state.
+	BoundaryRepairPending   = "repair-pending"
+	BoundaryRepairStreaming = "repair-streaming"
+	BoundaryRepairComplete  = "repair-complete"
+	BoundaryRepairFailed    = "repair-failed"
+	// BoundarySourceAdvanced follows a durable source cursor advance.
+	BoundarySourceAdvanced = "source-advanced"
+	// BoundaryOutboxDispatched/Accepted/Completed follow durable outbox
+	// retry-state transitions.
+	BoundaryOutboxDispatched = "outbox-dispatched"
+	BoundaryOutboxAccepted   = "outbox-accepted"
+	BoundaryOutboxCompleted  = "outbox-completed"
+)
+
+func assignmentBoundary(state model.SchedulingState) string {
+	switch state {
+	case model.SchedulingClosed:
+		return BoundaryAssignmentClosed
+	case model.SchedulingDraining:
+		return BoundaryAssignmentDraining
+	default:
+		return BoundaryAssignmentRunning
+	}
+}
+
+func repairBoundary(state RepairState) string {
+	switch state {
+	case RepairStreaming:
+		return BoundaryRepairStreaming
+	case RepairComplete:
+		return BoundaryRepairComplete
+	case RepairFailed:
+		return BoundaryRepairFailed
+	default:
+		return BoundaryRepairPending
+	}
+}
+
 // DeliveryState is the durable receiver state returned for duplicate custody.
 type DeliveryState uint8
 
@@ -1917,7 +1984,7 @@ func (store *Store) Fence(epoch model.CoordinatorEpoch) error {
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordFence, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordFence, Payload: payload}}}, BoundaryFence)
 }
 
 // InstallAssignment atomically validates, owns, and replaces one complete assignment.
@@ -1934,7 +2001,7 @@ func (store *Store) InstallAssignment(set model.AssignmentSet, specification mod
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordAssignment, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordAssignment, Payload: payload}}}, assignmentBoundary(scheduling))
 }
 
 // Receive durably accepts exact custody or returns the prior duplicate state.
@@ -1965,6 +2032,7 @@ func (store *Store) Receive(record DeliveryRecord) (DeliveryState, error) {
 	if err = store.commitWorkLocked(tx, prospective); err != nil {
 		return 0, err
 	}
+	store.durable(BoundaryDeliveryReceived)
 	return Received, nil
 }
 
@@ -2121,7 +2189,11 @@ func (store *Store) MarkProcessed(id model.DeliveryID, outputs []model.Tuple, ou
 	if err != nil {
 		return err
 	}
-	return store.commitWorkLocked(tx, prospective)
+	if err := store.commitWorkLocked(tx, prospective); err != nil {
+		return err
+	}
+	store.durable(BoundaryDeliveryProcessed)
+	return nil
 }
 
 // MarkCompleted durably closes a processed delivery.
@@ -2130,7 +2202,7 @@ func (store *Store) MarkCompleted(id model.DeliveryID) error {
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordDeliveryCompleted, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordDeliveryCompleted, Payload: payload}}}, BoundaryDeliveryCompleted)
 }
 
 // ApplyCheckpoint persists a monotonic watermark before compacting covered replay state.
@@ -2139,7 +2211,7 @@ func (store *Store) ApplyCheckpoint(notice model.CheckpointNotice) error {
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordCheckpoint, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordCheckpoint, Payload: payload}}}, BoundaryCheckpointApplied)
 }
 
 // ObserveCheckpoint durably records one authenticated committed checkpoint for
@@ -2169,7 +2241,11 @@ func (store *Store) ObserveCheckpoint(notice protocol.CheckpointNotice) error {
 	if err != nil {
 		return err
 	}
-	return store.commitWorkLocked(tx, prospective)
+	if err := store.commitWorkLocked(tx, prospective); err != nil {
+		return err
+	}
+	store.durable(BoundaryCheckpointObserved)
+	return nil
 }
 
 // UpsertResult idempotently persists one logical record and exact current-copy provenance.
@@ -2196,6 +2272,9 @@ func (store *Store) UpsertResult(record model.ResultRecord, provenance model.Res
 	prospective, err := store.reduceWorkLocked(tx)
 	if err == nil {
 		err = store.commitWorkLocked(tx, prospective)
+	}
+	if err == nil {
+		store.durable(BoundaryResultUpserted)
 	}
 	store.mu.Unlock()
 	return err
@@ -2225,6 +2304,9 @@ func (store *Store) PersistEvent(event model.WorkerEvent) error {
 	prospective, err := store.reduceWorkLocked(tx)
 	if err == nil {
 		err = store.commitWorkLocked(tx, prospective)
+	}
+	if err == nil {
+		store.durable(BoundaryEventPersisted)
 	}
 	store.mu.Unlock()
 	return err
@@ -2262,7 +2344,7 @@ func (store *Store) PendingEvents(after uint64, max uint16) ([]model.WorkerEvent
 // AcknowledgeEvents durably removes pending events through a proven response cursor.
 func (store *Store) AcknowledgeEvents(through uint64) error {
 	payload := encodeUint64Payload(through)
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordEventAck, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordEventAck, Payload: payload}}}, BoundaryEventsAcknowledged)
 }
 
 // UpsertRepair persists exact instructions and monotonic resumable progress.
@@ -2290,6 +2372,9 @@ func (store *Store) UpsertRepair(repair ResultRepairRecord) error {
 	if err == nil {
 		err = store.commitWorkLocked(tx, prospective)
 	}
+	if err == nil {
+		store.durable(repairBoundary(repair.State))
+	}
 	store.mu.Unlock()
 	return err
 }
@@ -2300,7 +2385,7 @@ func (store *Store) AdvanceSource(cursor SourceCursor, outboxes []OutboxRecord) 
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordSource, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordSource, Payload: payload}}}, BoundarySourceAdvanced)
 }
 
 // MarkOutboxCompleted durably records one downstream completion.
@@ -2309,7 +2394,7 @@ func (store *Store) MarkOutboxCompleted(id model.DeliveryID) error {
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordOutboxAck, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordOutboxAck, Payload: payload}}}, BoundaryOutboxCompleted)
 }
 
 // MarkOutboxDispatched durably records the retry deadline chosen from the
@@ -2337,7 +2422,11 @@ func (store *Store) MarkOutboxDispatched(id model.DeliveryID, deadlineUnixNano i
 	if err != nil {
 		return err
 	}
-	return store.commitWorkLocked(tx, prospective)
+	if err := store.commitWorkLocked(tx, prospective); err != nil {
+		return err
+	}
+	store.durable(BoundaryOutboxDispatched)
+	return nil
 }
 
 // MarkOutboxAccepted durably enters the completion-wait retry phase.
@@ -2347,7 +2436,7 @@ func (store *Store) MarkOutboxAccepted(id model.DeliveryID, deadlineUnixNano int
 	if err != nil {
 		return err
 	}
-	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordOutboxRetry, Payload: payload}}}, 0)
+	return store.applyWorkTransaction(Transaction{Records: []Record{{Type: recordOutboxRetry, Payload: payload}}}, BoundaryOutboxAccepted)
 }
 
 // RecoverWork returns a complete independently owned validated worker view.
@@ -2363,7 +2452,9 @@ func (store *Store) RecoverWork() (RecoveredWork, error) {
 	return store.work.Clone(), nil
 }
 
-func (store *Store) applyWorkTransaction(tx Transaction, _ uint64) error {
+// applyWorkTransaction commits one registered transaction and, only after its
+// durable commit succeeded, publishes the named boundary.
+func (store *Store) applyWorkTransaction(tx Transaction, boundary string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.closed {
@@ -2376,7 +2467,13 @@ func (store *Store) applyWorkTransaction(tx Transaction, _ uint64) error {
 	if err != nil {
 		return err
 	}
-	return store.commitWorkLocked(tx, prospective)
+	if err := store.commitWorkLocked(tx, prospective); err != nil {
+		return err
+	}
+	if boundary != "" {
+		store.durable(boundary)
+	}
+	return nil
 }
 func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
 	reducer := &workReducer{current: store.work}

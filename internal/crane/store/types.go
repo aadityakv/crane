@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 )
@@ -132,6 +133,10 @@ type Options struct {
 	Faults FaultInjector
 	// NewWorkerEpoch supplies a nonzero epoch only for a truly empty new store.
 	NewWorkerEpoch func() (model.WorkerEpoch, error)
+	// Hook observes named durable boundaries strictly after each
+	// transaction's fsync succeeded and before the mutation returns to its
+	// caller; nil selects the production no-op hook.
+	Hook integrationhook.Hook
 }
 
 // RecordType identifies one Task14+ application record inside a transaction.

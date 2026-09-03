@@ -296,7 +296,7 @@ func integrationConfigsForNodes(t *testing.T, startingBasePort uint16, secretFil
 				IndirectChecks:       2,
 				ReplayWindow:         config.Duration(time.Minute),
 			},
-			Raft: config.DefaultRaftConfig(),
+			Raft:  config.DefaultRaftConfig(),
 			Crane: config.DefaultCraneConfig(),
 		}
 		if err := configuration.Validate(); err != nil {

@@ -9,12 +9,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/config"
-	"github.com/aaditya/cs425mp3/internal/node"
 	"github.com/aaditya/cs425mp3/internal/raft"
 	"github.com/aaditya/cs425mp3/internal/swim"
 )
@@ -104,21 +102,4 @@ func TestFourProcessFixedVoterRaftLifecycle(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(configurations[3].StorageDir, raft.RaftStorageDirectoryName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("nonvoter created Raft storage during its full lifecycle: %v", err)
 	}
-}
-
-func waitForNormalNodeReadiness(t *testing.T, ctx context.Context, harness *processHarness, process *nodeProcess, nodeID uint16) {
-	t.Helper()
-	want := node.ReadySignal(nodeID)
-	waitForCluster(t, ctx, harness, fmt.Sprintf("node %d normal readiness line", nodeID), func() (bool, error) {
-		select {
-		case <-process.done:
-			return false, fmt.Errorf("process exited before readiness: %v", process.result())
-		default:
-		}
-		logs := process.log.String()
-		if strings.Count(logs, want) > 1 {
-			return false, fmt.Errorf("readiness line %q appeared more than once in %q", want, logs)
-		}
-		return strings.Contains(logs, want), nil
-	})
 }
