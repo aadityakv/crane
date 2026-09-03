@@ -95,14 +95,14 @@ func openGrepPortForRPC() {
 		log.Fatal("grep listen error: ", lisErr)
 	}
 	for {
-    conn, err := listener.Accept()
-    if err != nil {
+		conn, err := listener.Accept()
+		if err != nil {
 			log.Fatal("grep listen error: ", lisErr)
 			return
-    }
+		}
 
-    go rpc.ServeConn(conn)
-  }
+		go rpc.ServeConn(conn)
+	}
 }
 
 func Initialize() {
