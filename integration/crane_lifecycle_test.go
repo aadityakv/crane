@@ -885,7 +885,7 @@ func (c *craneCluster) submit(spec model.TopologySpec) craneJob {
 	var lastErr error
 	for attempt := 0; attempt < 8; attempt++ {
 		ctx, cancel := context.WithTimeout(c.ctx, 60*time.Second)
-		job, err := c.client().Submit(ctx, spec)
+		job, _, err := c.client().Submit(ctx, spec)
 		cancel()
 		if err == nil {
 			return craneJob{id: job, spec: spec, reference: referenceValues(c.t, spec)}
@@ -1319,7 +1319,7 @@ func TestCraneLifecycle(t *testing.T) {
 			dialMu.Unlock()
 		})
 		submitCtx, cancelSubmit := context.WithTimeout(ctx, 60*time.Second)
-		jobID, err := recorder.Submit(submitCtx, shape("baseline", 30))
+		jobID, _, err := recorder.Submit(submitCtx, shape("baseline", 30))
 		cancelSubmit()
 		if err != nil {
 			cluster.fatalf("submit baseline: %v", err)
