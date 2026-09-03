@@ -146,7 +146,10 @@ func decodeClusterIDForTest(value string) ([16]byte, error) {
 
 func (c *craneCluster) fatalf(format string, args ...any) {
 	c.t.Helper()
-	c.t.Fatalf(format+"\n%s", append(args, c.harness.logs())...)
+	// Every fatal path captures the cluster diagnostics (leadership probes,
+	// boundary counters, node goroutine dumps) so a failure is attributable
+	// without a rerun.
+	c.t.Fatalf(format+"\n%s\n%s", append(args, c.harness.logs(), c.diagnostics())...)
 }
 
 // launch starts one node incarnation with a fresh activation controller and
