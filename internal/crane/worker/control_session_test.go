@@ -1291,6 +1291,10 @@ type controlTestRepository struct {
 func (repository *controlTestRepository) LocalIdentity() (uint16, model.WorkerEpoch) {
 	return repository.localNode, repository.localEpoch
 }
+func (repository *controlTestRepository) RecoverWorkBounded() (store.RecoveredWork, error) {
+	return repository.RecoverWork()
+}
+
 func (repository *controlTestRepository) RecoverWork() (store.RecoveredWork, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()

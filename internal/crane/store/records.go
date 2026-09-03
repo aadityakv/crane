@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
@@ -2442,6 +2443,32 @@ func (store *Store) MarkOutboxAccepted(id model.DeliveryID, deadlineUnixNano int
 // RecoverWork returns a complete independently owned validated worker view.
 func (store *Store) RecoverWork() (RecoveredWork, error) {
 	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return RecoveredWork{}, ErrClosed
+	}
+	if store.failed {
+		return RecoveredWork{}, ErrUnavailable
+	}
+	return store.work.Clone(), nil
+}
+
+// RecoverWorkWithin behaves like RecoverWork but gives up with ErrBusy when
+// the store lock cannot be taken within wait. The control path uses it so a
+// stalled store (a hung disk, or a durable write held at a boundary) fails
+// control requests fast instead of piling blocked handlers up to the node's
+// connection budget; recovery and execution paths keep the unbounded read.
+func (store *Store) RecoverWorkWithin(wait time.Duration) (RecoveredWork, error) {
+	if wait <= 0 {
+		return store.RecoverWork()
+	}
+	deadline := time.Now().Add(wait)
+	for !store.mu.TryLock() {
+		if time.Now().After(deadline) {
+			return RecoveredWork{}, fmt.Errorf("%w: %s", ErrBusy, wait)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	defer store.mu.Unlock()
 	if store.closed {
 		return RecoveredWork{}, ErrClosed

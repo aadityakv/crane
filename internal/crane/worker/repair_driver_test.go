@@ -732,6 +732,10 @@ type repairControlRepository struct {
 func (repository *repairControlRepository) LocalIdentity() (uint16, model.WorkerEpoch) {
 	return repository.node, repository.epoch
 }
+func (repository *repairControlRepository) RecoverWorkBounded() (store.RecoveredWork, error) {
+	return repository.RecoverWork()
+}
+
 func (repository *repairControlRepository) RecoverWork() (store.RecoveredWork, error) {
 	return repository.repository.RecoverWork()
 }

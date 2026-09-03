@@ -41,6 +41,9 @@ var (
 type controlRepository interface {
 	LocalIdentity() (uint16, model.WorkerEpoch)
 	RecoverWork() (store.RecoveredWork, error)
+	// RecoverWorkBounded is RecoverWork bounded by the control wait: a stalled
+	// store answers store.ErrBusy (retryable) instead of blocking the handler.
+	RecoverWorkBounded() (store.RecoveredWork, error)
 	DurableTransactionID() (uint64, error)
 	Fence(model.CoordinatorEpoch) error
 	InstallAssignment(model.AssignmentSet, model.TopologySpec, uint64, model.SchedulingState, model.CoordinatorEpoch) error
@@ -547,7 +550,7 @@ func (owner *ControlOwner) handleRepairPull(ctx context.Context, session *Contro
 	if !complete {
 		return chunk, nil
 	}
-	work, err := owner.repository.RecoverWork()
+	work, err := owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return nil, err
 	}
@@ -580,7 +583,7 @@ func (owner *ControlOwner) finalCurrentSession(ctx context.Context, session *Con
 	if err := session.revalidate(peer.node); err != nil {
 		return err
 	}
-	work, err := owner.repository.RecoverWork()
+	work, err := owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return err
 	}
@@ -610,7 +613,7 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, false); err != nil {
 		return nil, err
 	}
-	work, err := owner.repository.RecoverWork()
+	work, err := owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +629,7 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 	if err := owner.gate.CloseAndWait(ctx); err != nil {
 		return nil, err
 	}
-	work, err = owner.repository.RecoverWork()
+	work, err = owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return nil, err
 	}
@@ -654,7 +657,7 @@ func (owner *ControlOwner) authorizeCoordinator(peer controlPeer, epoch model.Co
 		return ErrControlUnauthorized
 	}
 	if exact {
-		work, err := owner.repository.RecoverWork()
+		work, err := owner.repository.RecoverWorkBounded()
 		if err != nil {
 			return err
 		}
@@ -712,7 +715,7 @@ func (owner *ControlOwner) handleAssignment(ctx context.Context, session *Contro
 	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
-	work, err := owner.repository.RecoverWork()
+	work, err := owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return nil, err
 	}
@@ -828,7 +831,7 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSes
 			return nil, err
 		}
 	}
-	work, err := owner.repository.RecoverWork()
+	work, err := owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return nil, err
 	}
@@ -838,7 +841,7 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSes
 		if err != nil {
 			return nil, err
 		}
-		work, err = owner.repository.RecoverWork()
+		work, err = owner.repository.RecoverWorkBounded()
 		if err != nil {
 			return nil, err
 		}
@@ -1137,7 +1140,7 @@ func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *Contro
 	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
 		return nil, err
 	}
-	work, err := owner.repository.RecoverWork()
+	work, err := owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return nil, err
 	}

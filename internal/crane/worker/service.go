@@ -146,7 +146,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		runErr = errors.Join(runErr, workerStore.Close())
 	}()
 
-	repository := &serviceRepository{Store: workerStore, node: service.configuration.NodeID, fatal: make(chan error, 1)}
+	repository := &serviceRepository{Store: workerStore, node: service.configuration.NodeID, fatal: make(chan error, 1), controlWait: time.Duration(service.configuration.Crane.WorkerControlTimeout)}
 	service.repository = repository
 	endpoint, err := NewTupleEndpoint(TupleEndpointOptions{Config: service.configuration, Authenticator: service.authenticator, Clock: service.clock, Membership: service.membership, Datagram: service.datagram, Hook: service.hook})
 	if err != nil {
@@ -400,6 +400,8 @@ func (service *Service) controlError(message wire.MessageType, err error) protoc
 		code, retryable, detail = protocol.WorkerErrorCapacity, true, "replay admission budget exhausted"
 	case errors.Is(err, ErrControlCapacity), errors.Is(err, ErrTransferCapacity), errors.Is(err, store.ErrCapacity):
 		code, retryable, detail = protocol.WorkerErrorCapacity, true, "worker capacity exhausted"
+	case errors.Is(err, store.ErrBusy):
+		code, retryable, detail = protocol.WorkerErrorUnavailable, true, "worker store busy"
 	case errors.Is(err, store.ErrUnavailable), errors.Is(err, store.ErrClosed), errors.Is(err, admission.ErrClosed):
 		code, retryable, detail = protocol.WorkerErrorUnavailable, true, "worker store unavailable"
 	case errors.Is(err, ErrResultArtifactUnavailable), errors.Is(err, ErrResultFetchUnavailable):
@@ -429,6 +431,18 @@ type serviceRepository struct {
 	node      uint16
 	fatal     chan error
 	fatalOnce sync.Once
+	// controlWait bounds control-path store reads (RecoverWorkBounded).
+	controlWait time.Duration
+}
+
+// RecoverWorkBounded reads the recovered work with the control wait bound; a
+// store.ErrBusy result is a retryable control rejection, never a poison.
+func (repository *serviceRepository) RecoverWorkBounded() (store.RecoveredWork, error) {
+	work, err := repository.Store.RecoverWorkWithin(repository.controlWait)
+	if err != nil && !errors.Is(err, store.ErrBusy) {
+		repository.signalFatal(err)
+	}
+	return work, err
 }
 
 func (repository *serviceRepository) RecoverWork() (store.RecoveredWork, error) {

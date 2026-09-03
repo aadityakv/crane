@@ -21,6 +21,10 @@ var (
 	ErrClosed = errors.New("worker store closed")
 	// ErrUnavailable reports a Store poisoned by an ambiguous persistence failure.
 	ErrUnavailable = errors.New("worker store unavailable after failed persistence")
+	// ErrBusy classifies a bounded control-path read that could not take the
+	// store lock within its wait; the store itself is healthy and the caller
+	// retries.
+	ErrBusy = errors.New("worker store busy beyond the control wait bound")
 	// ErrHistoricalAuthorityUnavailable reports a checkpoint-compacted delivery
 	// whose old assignment authority was intentionally retired after the causal
 	// safe frontier and therefore cannot be authenticated against a replacement.
