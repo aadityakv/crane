@@ -40,14 +40,28 @@ func TestTupleTrafficGoldenVectorsAndMessageAssociation(t *testing.T) {
 		"1212121212121212121212121212121212121212121212121212121212121212" +
 		"00000000000000130000000000000014001516161616161616161616161616161616"
 
-	ack := TupleACK{
-		DeliveryID: delivery.DeliveryID, Destination: delivery.Destination,
-		Assignment: delivery.Assignment, Coordinator: delivery.Coordinator, Status: TupleAccepted,
-	}
-	nack := TupleNACK{
-		DeliveryID: delivery.DeliveryID, Destination: delivery.Destination,
-		Assignment: delivery.Assignment, Coordinator: delivery.Coordinator, Code: TupleNACKOverloaded,
-	}
+	// The ACK and NACK fixtures and goldens are spelled out independently of
+	// the delivery so a field-order or field-selection drift between the three
+	// layouts cannot hide behind shared slices.
+	ack, nack := testTupleACK(), testTupleNACK()
+	wantACKHex := "0001011901010101010101010101010101010101010101010101010101010101" +
+		"0101010100010002000000000000000304040404040404040404040404040404" +
+		"0404040404040404040404040404040400050101010101010101010101010101" +
+		"0101000600070101010101010101010101010101010100060007000f10101010" +
+		"10101010101010101010101000000000000000110d0d0d0d0d0d0d0d0d0d0d0d" +
+		"0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000000000000e01010101" +
+		"010101010101010101010101000000000000000e121212121212121212121212" +
+		"1212121212121212121212121212121212121212000000000000001300000000" +
+		"0000001400151616161616161616161616161616161601"
+	wantNACKHex := "0001011a01010101010101010101010101010101010101010101010101010101" +
+		"0101010100010002000000000000000304040404040404040404040404040404" +
+		"0404040404040404040404040404040400050101010101010101010101010101" +
+		"0101000600070101010101010101010101010101010100060007000f10101010" +
+		"10101010101010101010101000000000000000110d0d0d0d0d0d0d0d0d0d0d0d" +
+		"0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000000000000e01010101" +
+		"010101010101010101010101000000000000000e121212121212121212121212" +
+		"1212121212121212121212121212121212121212000000000000001300000000" +
+		"000000140015161616161616161616161616161616160007"
 
 	tests := []struct {
 		name     string
@@ -70,7 +84,7 @@ func TestTupleTrafficGoldenVectorsAndMessageAssociation(t *testing.T) {
 			marshal:  func() ([]byte, error) { return MarshalTupleACK(ack) },
 			decode:   func(input []byte) (any, error) { return UnmarshalTupleACK(input) },
 			want:     ack,
-			wantHex:  "00010119" + wantDeliveryHex[8:204] + wantDeliveryHex[404:576] + wantDeliveryHex[576:756] + "01",
+			wantHex:  wantACKHex,
 			wrongOne: func(input []byte) error { _, err := UnmarshalTupleNACK(input); return err },
 		},
 		{
@@ -78,7 +92,7 @@ func TestTupleTrafficGoldenVectorsAndMessageAssociation(t *testing.T) {
 			marshal:  func() ([]byte, error) { return MarshalTupleNACK(nack) },
 			decode:   func(input []byte) (any, error) { return UnmarshalTupleNACK(input) },
 			want:     nack,
-			wantHex:  "0001011a" + wantDeliveryHex[8:204] + wantDeliveryHex[404:576] + wantDeliveryHex[576:756] + "0007",
+			wantHex:  wantNACKHex,
 			wrongOne: func(input []byte) error { _, err := UnmarshalTupleDelivery(input); return err },
 		},
 	}
@@ -563,27 +577,64 @@ func TestTupleTrafficRandomMalformedInputsDoNotPanic(t *testing.T) {
 }
 
 func FuzzUnmarshalTupleDelivery(f *testing.F) {
-	f.Add([]byte{})
-	f.Add(mustMarshalDelivery(f, testTupleDelivery()))
+	valid := mustMarshalDelivery(f, testTupleDelivery())
+	// Byte 102 starts the embedded tuple: length, field count, name length,
+	// name "raw", value type at byte 112, value length at bytes 113-114.
+	for _, seed := range tupleFuzzSeeds(valid, wire.MessageCraneTupleDeliveryAck, map[int]byte{112: 0xff}) {
+		f.Add(seed)
+	}
+	f.Add(mutatedBytes(valid, map[int]byte{102: 0xff, 103: 0xff})) // impossible tuple length
+	f.Add(mutatedBytes(valid, map[int]byte{104: 0xff, 105: 0xff})) // impossible field count
+	f.Add(mutatedBytes(valid, map[int]byte{113: 0xff, 114: 0xff})) // impossible value length
 	f.Fuzz(func(t *testing.T, input []byte) {
 		_, _ = UnmarshalTupleDelivery(input)
 	})
 }
 
 func FuzzUnmarshalTupleACK(f *testing.F) {
-	f.Add([]byte{})
-	f.Add(mustMarshalACK(f, testTupleACK()))
+	valid := mustMarshalACK(f, testTupleACK())
+	// Byte 278 is the trailing TupleACKStatus enum.
+	for _, seed := range tupleFuzzSeeds(valid, wire.MessageCraneTupleDeliveryNack, map[int]byte{278: 0xff}) {
+		f.Add(seed)
+	}
 	f.Fuzz(func(t *testing.T, input []byte) {
 		_, _ = UnmarshalTupleACK(input)
 	})
 }
 
 func FuzzUnmarshalTupleNACK(f *testing.F) {
-	f.Add([]byte{})
-	f.Add(mustMarshalNACK(f, testTupleNACK()))
+	valid := mustMarshalNACK(f, testTupleNACK())
+	// Bytes 278-279 are the trailing big-endian TupleNACKCode enum.
+	for _, seed := range tupleFuzzSeeds(valid, wire.MessageCraneTupleDelivery, map[int]byte{278: 0xff, 279: 0xff}) {
+		f.Add(seed)
+	}
 	f.Fuzz(func(t *testing.T, input []byte) {
 		_, _ = UnmarshalTupleNACK(input)
 	})
+}
+
+// tupleFuzzSeeds derives the shared malformed-specimen corpus from one valid
+// encoding: empty, valid, one byte short, one trailing byte, an unsupported
+// schema version, another message type, and an out-of-domain enum value.
+func tupleFuzzSeeds(valid []byte, wrongType wire.MessageType, invalidEnum map[int]byte) [][]byte {
+	return [][]byte{
+		{},
+		valid,
+		valid[:len(valid)-1],
+		append(append([]byte(nil), valid...), 0x00),
+		mutatedBytes(valid, map[int]byte{0: 0x00, 1: 0x02}),
+		mutatedBytes(valid, map[int]byte{2: byte(wrongType >> 8), 3: byte(wrongType)}),
+		mutatedBytes(valid, invalidEnum),
+	}
+}
+
+// mutatedBytes copies input and overwrites the listed byte offsets.
+func mutatedBytes(input []byte, overrides map[int]byte) []byte {
+	result := append([]byte(nil), input...)
+	for offset, value := range overrides {
+		result[offset] = value
+	}
+	return result
 }
 
 func testTupleDelivery() TupleDelivery {
@@ -610,14 +661,52 @@ func testTupleDelivery() TupleDelivery {
 	}
 }
 
+// testTupleACK spells out the ACK fixture independently of testTupleDelivery
+// so the ACK golden does not inherit the delivery layout by construction.
 func testTupleACK() TupleACK {
-	delivery := testTupleDelivery()
-	return TupleACK{DeliveryID: delivery.DeliveryID, Destination: delivery.Destination, Assignment: delivery.Assignment, Coordinator: delivery.Coordinator, Status: TupleAccepted}
+	job := model.JobID{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	specification := [32]byte{13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13}
+	return TupleACK{
+		DeliveryID: model.DeliveryID{
+			Tuple: model.TupleID{
+				JobID: job, SourceTask: model.TaskID{JobID: job, StageID: 1, Partition: 2}, SourceSequence: 3,
+				PathDigest: [32]byte{4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4},
+			},
+			EdgeID: 5, DestinationTask: model.TaskID{JobID: job, StageID: 6, Partition: 7},
+		},
+		Destination: model.AssignmentToken{
+			Task: model.TaskID{JobID: job, StageID: 6, Partition: 7}, WorkerID: 15,
+			WorkerEpoch: model.WorkerEpoch{16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16},
+			Attempt:     17, SpecificationHash: specification, AssignmentRevision: 14,
+		},
+		Assignment:  AssignmentSetIdentity{JobID: job, Revision: 14, Digest: [32]byte{18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18}},
+		Coordinator: model.CoordinatorEpoch{Term: 19, BeginIndex: 20, Coordinator: 21, Nonce: [16]byte{22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22}},
+		Status:      TupleAccepted,
+	}
 }
 
+// testTupleNACK spells out the NACK fixture independently of testTupleDelivery
+// and testTupleACK for the same reason.
 func testTupleNACK() TupleNACK {
-	delivery := testTupleDelivery()
-	return TupleNACK{DeliveryID: delivery.DeliveryID, Destination: delivery.Destination, Assignment: delivery.Assignment, Coordinator: delivery.Coordinator, Code: TupleNACKOverloaded}
+	job := model.JobID{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	specification := [32]byte{13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13}
+	return TupleNACK{
+		DeliveryID: model.DeliveryID{
+			Tuple: model.TupleID{
+				JobID: job, SourceTask: model.TaskID{JobID: job, StageID: 1, Partition: 2}, SourceSequence: 3,
+				PathDigest: [32]byte{4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4},
+			},
+			EdgeID: 5, DestinationTask: model.TaskID{JobID: job, StageID: 6, Partition: 7},
+		},
+		Destination: model.AssignmentToken{
+			Task: model.TaskID{JobID: job, StageID: 6, Partition: 7}, WorkerID: 15,
+			WorkerEpoch: model.WorkerEpoch{16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16},
+			Attempt:     17, SpecificationHash: specification, AssignmentRevision: 14,
+		},
+		Assignment:  AssignmentSetIdentity{JobID: job, Revision: 14, Digest: [32]byte{18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18}},
+		Coordinator: model.CoordinatorEpoch{Term: 19, BeginIndex: 20, Coordinator: 21, Nonce: [16]byte{22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22}},
+		Code:        TupleNACKOverloaded,
+	}
 }
 
 type testingFataler interface {
