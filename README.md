@@ -59,8 +59,8 @@ Ports come only from the typed registry, never hostname parsing or node-ID arith
 | +0 | `swim-ping` | UDP | 8000 |
 | +1 | `swim-ack` | UDP | 8001 |
 | +2 | `swim-snapshot` | TCP | 8002 |
-| +3 | `file-rpc` | TCP | 8003 |
-| +4 | `grep-rpc` | TCP | 8004 |
+| +3 | `file-rpc` | TCP (legacy, reference-only) | 8003 |
+| +4 | `grep-rpc` | TCP (legacy, reference-only) | 8004 |
 | +5 | `crane-worker` | TCP | 8005 |
 | +6 | `topology-control` | TCP | 8006 |
 | +7 | `crane-tuple-ack` | UDP | 8007 |
@@ -144,3 +144,19 @@ The SWIM event loop owns membership state. It runs direct probes, then indirect 
 Membership failure does not terminate a process, delete data, alter the configured Raft voter set, or reassign Crane work. Authenticating, replay-checking, and schema validation happen before SWIM state mutation. The real-process integration tests cover local admission, failure detection, restart with a higher incarnation, continued operation after seed loss, and a four-process layout in which only the three fixed voters bind Raft and create durable Raft artifacts.
 
 This milestone implements the runtime foundation, full SWIM membership, fixed-membership Raft replication and persistence, and conditional voter process composition. The portable, structurally validated legacy data schemas under `pkg/topology` remain available for the next Crane migration, but Crane application state, public topology control, worker execution, and plugin operation are not enabled yet.
+
+## Crane stream processing
+
+Crane is the supported stream-processing runtime and runs inside every node
+process alongside SWIM and Raft: voters host the replicated coordinator state
+and the leader's coordinator, every node hosts the worker services on +5/+7,
+and the public client API is served on +6 with checked leader redirects. The
+`crane` configuration section, the client CLI (`make crane` builds
+`bin/cs425-crane`), the operator registry, the recovery guarantees, and the
+verification gates are documented in [`docs/crane-operations.md`](docs/crane-operations.md).
+
+The `src/` directory (file system and grep exercises) is reference-only
+legacy code: it is not built into the node, not covered by the Crane
+verification gates, and the removed legacy Crane runtime (`src/crane`,
+`src/topology`, `src/treejob`, `pkg/topology`) is superseded entirely by
+`internal/crane`.
