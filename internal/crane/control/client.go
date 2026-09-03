@@ -29,20 +29,20 @@ const (
 var (
 	// ErrClientAttemptsExhausted reports a request whose bounded attempt
 	// budget ran out; a durable reservation stays pending for resumption.
-	ErrClientAttemptsExhausted = errors.New("Crane client attempts exhausted")
+	ErrClientAttemptsExhausted = errors.New("crane client attempts exhausted")
 	// ErrClientRedirectLoop reports redirects that only name endpoints this
 	// request already tried.
-	ErrClientRedirectLoop = errors.New("Crane client redirect loop")
+	ErrClientRedirectLoop = errors.New("crane client redirect loop")
 	// ErrClientRedirectUntrusted reports a redirect naming an endpoint outside
 	// the configured static voter control set.
-	ErrClientRedirectUntrusted = errors.New("Crane client redirect names an unconfigured endpoint")
+	ErrClientRedirectUntrusted = errors.New("crane client redirect names an unconfigured endpoint")
 	// ErrClientIdentityForfeited reports that the durable client state no
 	// longer matches the cluster's replicated dedup history, so the prior
 	// dedup identity is forfeit; the local state is preserved for inspection.
-	ErrClientIdentityForfeited = errors.New("Crane client dedup identity forfeited by lost or rolled-back state")
+	ErrClientIdentityForfeited = errors.New("crane client dedup identity forfeited by lost or rolled-back state")
 	// ErrClientStoreRequired reports a mutation attempted without a durable
 	// client identity store.
-	ErrClientStoreRequired = errors.New("Crane client mutations require a durable identity store")
+	ErrClientStoreRequired = errors.New("crane client mutations require a durable identity store")
 )
 
 // errClientRetryExchange marks one unusable attempt inside the bounded loop.
@@ -118,10 +118,10 @@ type Client struct {
 // network resource.
 func NewClient(options ClientOptions) (*Client, error) {
 	if options.Authenticator == nil || options.Clock == nil {
-		return nil, errors.New("Crane client requires authenticator and clock")
+		return nil, errors.New("crane client requires authenticator and clock")
 	}
 	if options.MaxAttempts < 0 || options.MaxRedirects < 0 || options.RetryBackoff < 0 || options.RequestTimeout < 0 {
-		return nil, errors.New("Crane client bounds must not be negative")
+		return nil, errors.New("crane client bounds must not be negative")
 	}
 	configuration := cloneControlNodeConfig(options.Config)
 	if err := configuration.Validate(); err != nil {
@@ -133,7 +133,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	if options.Store != nil {
 		if bound := options.Store.State().ClusterID; bound != clusterID {
-			return nil, fmt.Errorf("Crane client store binds cluster %x, configuration names %x", bound, clusterID)
+			return nil, fmt.Errorf("crane client store binds cluster %x, configuration names %x", bound, clusterID)
 		}
 	}
 	endpoints, err := deriveVoterControlEndpoints(configuration.RaftVoters)
@@ -515,7 +515,7 @@ func rejectionError(controlError protocol.ControlError) *RequestRejectedError {
 // Every attempt uses a fresh RequestID with the exact same payload bytes.
 func (client *Client) exchange(ctx context.Context, messageType wire.MessageType, payload []byte, accept func(protocol.ControlMessage) error) (protocol.ControlMessage, error) {
 	if ctx == nil {
-		return nil, errors.New("Crane client exchange requires a context")
+		return nil, errors.New("crane client exchange requires a context")
 	}
 	targets := client.endpoints
 	visited := make(map[string]bool, len(client.endpoints))
@@ -642,7 +642,7 @@ func (client *Client) exchangeOnce(ctx context.Context, target string, messageTy
 		return nil, fmt.Errorf("receive Crane control response: %w", err)
 	}
 	if response.Header.RequestID != requestID {
-		return nil, errors.New("Crane control response does not echo the request identity")
+		return nil, errors.New("crane control response does not echo the request identity")
 	}
 	message, err := protocol.UnmarshalControlMessage(response.Header.Message, response.Payload)
 	if err != nil {

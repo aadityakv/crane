@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"sync"
 	"testing"
 
 	"github.com/aaditya/cs425mp3/internal/crane/admission"
@@ -555,7 +554,6 @@ type resultReplicationResponse struct {
 }
 
 type fakeResultReplicator struct {
-	mu            sync.Mutex
 	calls         chan resultReplicationCall
 	mutateReceipt func(*ResultReplicationReceipt)
 }

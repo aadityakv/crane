@@ -549,7 +549,8 @@ func TestFailJobReplayCreatesNoSecondTransition(t *testing.T) {
 		}
 	}
 	report := model.JobFailureReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Task: token, Epoch: machine.coordinatorEpoch, TransactionID: 21, Code: model.FailureOperator, DetailDigest: [32]byte{0xC1}}
-	if failureEventDigest(report) != failureEventDigest(report) {
+	firstDigest, secondDigest := failureEventDigest(report), failureEventDigest(report)
+	if firstDigest != secondDigest {
 		t.Fatal("failure digest is not deterministic")
 	}
 	fail, err := NewFailJob(InternalCommandID{0xC2}, report.JobControlRevision, report, machine.coordinatorEpoch)

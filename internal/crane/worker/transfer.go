@@ -219,8 +219,7 @@ func (owner *TransferOwner) NextRepairRecord(ctx context.Context, peer TransferP
 		return protocol.ResultRecordChunk{}, false, err
 	}
 	defer release()
-	work, repair, err := owner.currentRepair(repairID, store.RepairSource)
-	if err != nil {
+	if _, _, err := owner.currentRepair(repairID, store.RepairSource); err != nil {
 		return protocol.ResultRecordChunk{}, false, err
 	}
 	releaseRepair, err := owner.acquireRepair(ctx, repairID)
@@ -228,7 +227,7 @@ func (owner *TransferOwner) NextRepairRecord(ctx context.Context, peer TransferP
 		return protocol.ResultRecordChunk{}, false, err
 	}
 	defer releaseRepair()
-	work, repair, err = owner.currentRepair(repairID, store.RepairSource)
+	work, repair, err := owner.currentRepair(repairID, store.RepairSource)
 	if err != nil {
 		return protocol.ResultRecordChunk{}, false, err
 	}

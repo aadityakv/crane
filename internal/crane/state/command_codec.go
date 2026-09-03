@@ -472,10 +472,6 @@ func appendMarkerTraced(encoded []byte, marker NeedsReassignment, trace *[]strin
 	return encoded
 }
 
-func completionReportBytes(report model.CompletionReport) []byte {
-	return appendCompletionReportTraced(nil, report, nil)
-}
-
 func appendCompletionReportTraced(encoded []byte, report model.CompletionReport, trace *[]string) []byte {
 	appendCodecField(&encoded, trace, "JobID:JobID", func(out []byte) []byte { return append(out, report.JobID[:]...) })
 	appendCodecField(&encoded, trace, "JobControlRevision:u64(nonzero)", func(out []byte) []byte { return appendU64(out, report.JobControlRevision) })

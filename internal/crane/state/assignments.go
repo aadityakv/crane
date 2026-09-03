@@ -327,10 +327,6 @@ func signedSizeDelta(next, current uint64) int64 {
 	return -int64(current - next)
 }
 
-func (machine *Machine) eligiblePlacements() []model.WorkerPlacement {
-	return machine.residualEligiblePlacements(model.JobID{})
-}
-
 // residualEligiblePlacements returns task-execution capacity after subtracting
 // every token in every other nonterminal job. Result replicas consume durable
 // storage capacity, not logical worker execution slots, and are not subtracted.

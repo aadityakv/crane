@@ -320,13 +320,6 @@ func (m *fakeMembership) setMember(member swim.Member) {
 	m.mu.Unlock()
 }
 
-func (m *fakeMembership) removeMember(node uint16) {
-	m.mu.Lock()
-	m.revision++
-	delete(m.members, node)
-	m.mu.Unlock()
-}
-
 func (m *fakeMembership) emit(event membership.Event) {
 	m.mu.Lock()
 	subs := append([]*fakeMemberSubscription(nil), m.subs...)

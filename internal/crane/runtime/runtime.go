@@ -127,10 +127,10 @@ type Runtime struct {
 // never read from ClusterSecretFile here.
 func New(configuration config.NodeConfig, dependencies Dependencies) (*Runtime, error) {
 	if dependencies.Clock == nil || dependencies.Random == nil {
-		return nil, errors.New("Crane runtime requires clock and random dependencies")
+		return nil, errors.New("crane runtime requires clock and random dependencies")
 	}
 	if len(dependencies.Secret) < config.MinClusterSecretBytes {
-		return nil, fmt.Errorf("Crane runtime requires a cluster secret of at least %d bytes", config.MinClusterSecretBytes)
+		return nil, fmt.Errorf("crane runtime requires a cluster secret of at least %d bytes", config.MinClusterSecretBytes)
 	}
 	owned := configuration
 	owned.RaftVoters = append([]config.RaftVoter(nil), configuration.RaftVoters...)
@@ -310,7 +310,7 @@ func (runtime *Runtime) Run(ctx context.Context) error {
 		return errors.New("run Crane runtime: nil context")
 	}
 	if !runtime.started.CompareAndSwap(false, true) {
-		return errors.New("Crane runtime Run called more than once")
+		return errors.New("crane runtime Run called more than once")
 	}
 	return superviseWithGate(ctx, runtime.Gate, runtime.Services, runtime.closeTimeout, func() {
 		runtime.readyOnce.Do(func() { close(runtime.ready) })

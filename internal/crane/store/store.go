@@ -308,10 +308,6 @@ func (store *Store) inject(point FaultPoint) error {
 	return store.options.Faults.Inject(point)
 }
 
-func writeFull(file *os.File, data []byte) error {
-	return writeFullWith(file, data, func(file *os.File, data []byte) (int, error) { return file.Write(data) })
-}
-
 func writeFullWith(file *os.File, data []byte, write func(*os.File, []byte) (int, error)) error {
 	for len(data) > 0 {
 		written, err := write(file, data)

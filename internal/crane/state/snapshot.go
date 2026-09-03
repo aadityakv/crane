@@ -1099,10 +1099,6 @@ func (decoder *snapshotDecoder) workerEvents(machine *Machine, count uint64) err
 	return nil
 }
 
-func workerEventLess(left, right workerEventKey) bool {
-	return compareSnapshotWorkerEvent(left, right) < 0
-}
-
 func validateSnapshotState(machine *Machine) error {
 	if uint64(len(machine.clients)) > model.StateCommandMaxClientSessionsV1 || uint64(len(machine.subjects)) > model.StateCommandMaxSubjectHistoriesV1 || uint64(len(machine.workers)) > model.LimitsV1().MaxRegisteredWorkers || uint64(len(machine.jobs)) > model.LimitsV1().MaxRetainedJobs || uint64(len(machine.workerEvents)) > model.LimitsV1().MaxRegisteredWorkers {
 		return errors.New("snapshot collection count exceeds bound")

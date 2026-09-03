@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"runtime"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1009,13 +1008,4 @@ func (sender *fakeSender) sendTimes() []time.Time {
 
 func deliveryMessage(record store.DeliveryRecord) protocol.TupleDelivery {
 	return protocol.TupleDelivery{DeliveryID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: record.ID.Tuple.JobID, Revision: record.AssignmentRevision, Digest: record.AssignmentDigest}, Coordinator: record.CoordinatorEpoch}
-}
-
-func sortedOutboxes(records map[model.DeliveryID]store.OutboxRecord) []store.OutboxRecord {
-	result := make([]store.OutboxRecord, 0, len(records))
-	for _, record := range records {
-		result = append(result, record)
-	}
-	sort.Slice(result, func(i, j int) bool { return deliveryIDLess(result[i].ID, result[j].ID) })
-	return result
 }

@@ -351,13 +351,3 @@ func (cluster *simCluster) tupleTrafficActive(job model.JobID) bool {
 	}
 	return false
 }
-
-// lastCut returns the most recent dial cut.
-func (d *faultDialer) lastCut() *dialRule {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(d.rules) == 0 {
-		return nil
-	}
-	return d.rules[len(d.rules)-1]
-}

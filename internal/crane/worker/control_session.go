@@ -30,12 +30,12 @@ const (
 )
 
 var (
-	ErrControlHandshakeRequired = errors.New("Crane worker control handshake required")
-	ErrControlUnauthorized      = errors.New("Crane worker control unauthorized")
-	ErrControlStaleEpoch        = errors.New("Crane worker control stale epoch")
-	ErrControlStaleAssignment   = errors.New("Crane worker control stale assignment")
-	ErrControlCapacity          = errors.New("Crane worker control capacity exhausted")
-	ErrControlClosed            = errors.New("Crane worker control session closed")
+	ErrControlHandshakeRequired = errors.New("crane worker control handshake required")
+	ErrControlUnauthorized      = errors.New("crane worker control unauthorized")
+	ErrControlStaleEpoch        = errors.New("crane worker control stale epoch")
+	ErrControlStaleAssignment   = errors.New("crane worker control stale assignment")
+	ErrControlCapacity          = errors.New("crane worker control capacity exhausted")
+	ErrControlClosed            = errors.New("crane worker control session closed")
 )
 
 type controlRepository interface {

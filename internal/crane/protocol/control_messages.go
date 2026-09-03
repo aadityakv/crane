@@ -44,7 +44,7 @@ var (
 	// ErrInvalidControlMessage classifies a well-formed payload violating its schema.
 	ErrInvalidControlMessage = errors.New("invalid Crane public-control message")
 	// ErrControlMessageTooLarge classifies payloads above the complete-frame budget.
-	ErrControlMessageTooLarge = errors.New("Crane public-control message too large")
+	ErrControlMessageTooLarge = errors.New("crane public-control message too large")
 )
 
 // ControlMessage is one concrete payload owned by message IDs 240 through 249.

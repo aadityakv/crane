@@ -161,7 +161,6 @@ func rewriteSnapshotSourceAsLegacyForTest(t *testing.T, path string, identity Id
 		updated = append(updated, frame...)
 		updated = append(updated, data[end:]...)
 		data = updated
-		bodyEnd = len(data) - snapshotFooterBytes
 		replaced = true
 		break
 	}

@@ -12,14 +12,15 @@ import (
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 )
 
+const walSchemaVersion uint16 = 1
+
 const (
-	walSchemaVersion           uint16 = 1
-	walHeaderBytes                    = 20
-	walChecksumBytes                  = 4
-	identityPayloadBytes              = 34
-	boundaryPayloadBytes              = 44
-	dataPrefixBytes                   = 6
-	snapshotAnchorPayloadBytes        = 92
+	walHeaderBytes             = 20
+	walChecksumBytes           = 4
+	identityPayloadBytes       = 34
+	boundaryPayloadBytes       = 44
+	dataPrefixBytes            = 6
+	snapshotAnchorPayloadBytes = 92
 )
 
 var walMagic = [4]byte{'C', 'W', 'W', 'L'}

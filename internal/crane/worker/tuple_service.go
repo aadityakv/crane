@@ -42,10 +42,10 @@ type TupleService struct {
 // socket or starting receive work.
 func NewTupleService(options TupleServiceOptions) (*TupleService, error) {
 	if options.Endpoint == nil || options.Engine == nil {
-		return nil, errors.New("Crane tuple service requires endpoint and engine")
+		return nil, errors.New("crane tuple service requires endpoint and engine")
 	}
 	if options.Engine.sender != options.Endpoint {
-		return nil, errors.New("Crane tuple service endpoint is not the Engine sender")
+		return nil, errors.New("crane tuple service endpoint is not the Engine sender")
 	}
 	if !options.Endpoint.claimed.CompareAndSwap(false, true) {
 		return nil, ErrTupleEndpointInUse
@@ -63,7 +63,7 @@ func (service *TupleService) Run(ctx context.Context) (runErr error) {
 		return errors.New("run Crane tuple service: nil context")
 	}
 	if !service.started.CompareAndSwap(false, true) {
-		return errors.New("Crane tuple service Run called more than once")
+		return errors.New("crane tuple service Run called more than once")
 	}
 	datagram, err := service.endpoint.activate()
 	if err != nil {

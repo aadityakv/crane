@@ -118,10 +118,10 @@ type Service struct {
 // binding a listener, reading state, or starting any goroutine.
 func NewService(options ServiceOptions) (*Service, error) {
 	if options.Authenticator == nil || options.Clock == nil || options.Membership == nil || options.Machine == nil || options.Gate == nil || options.Results == nil || options.WakeCoordinator == nil {
-		return nil, errors.New("Crane control service requires authenticator, clock, membership, machine, gate, results, and coordinator wake")
+		return nil, errors.New("crane control service requires authenticator, clock, membership, machine, gate, results, and coordinator wake")
 	}
 	if options.Results.Machine != options.Machine {
-		return nil, errors.New("Crane control results engine must share the exact service state machine")
+		return nil, errors.New("crane control results engine must share the exact service state machine")
 	}
 	configuration := cloneControlNodeConfig(options.Config)
 	if err := configuration.Validate(); err != nil {
@@ -137,7 +137,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 	}
 	_, voter := configuration.RaftVoterByID(configuration.NodeID)
 	if voter && options.Raft == nil {
-		return nil, errors.New("Crane control service on a configured voter requires raft")
+		return nil, errors.New("crane control service on a configured voter requires raft")
 	}
 	voterEndpoints, err := deriveVoterControlEndpoints(configuration.RaftVoters)
 	if err != nil {
@@ -176,7 +176,7 @@ func (service *Service) Run(ctx context.Context) error {
 		return errors.New("run Crane control service: nil context")
 	}
 	if !service.started.CompareAndSwap(false, true) {
-		return errors.New("Crane control service Run called more than once")
+		return errors.New("crane control service Run called more than once")
 	}
 	if err := ctx.Err(); err != nil {
 		return err

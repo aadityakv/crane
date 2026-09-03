@@ -11,7 +11,7 @@ import (
 
 var (
 	// ErrClosed reports that the shared process gate is not admitting new work.
-	ErrClosed = errors.New("Crane admission gate is closed")
+	ErrClosed = errors.New("crane admission gate is closed")
 	// ErrStaleEpoch reports an attempt to reopen a leadership generation that
 	// has already been closed or that collides at the same Raft order.
 	ErrStaleEpoch = errors.New("stale Crane admission epoch")

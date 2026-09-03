@@ -322,21 +322,6 @@ func (cluster *simCluster) awaitFaultConsumed(name string) {
 // Harness fault helpers.
 // ---------------------------------------------------------------------------
 
-// advertiseEndpointsOf returns one node's advertised SWIM and +7 endpoints.
-func (cluster *simCluster) advertiseEndpointsOf(id uint16) []config.Endpoint {
-	cluster.t.Helper()
-	node := cluster.nodes[id]
-	var endpoints []config.Endpoint
-	for _, service := range []config.Service{config.ServiceSWIMPing, config.ServiceSWIMACK, config.ServiceCraneTupleACK} {
-		endpoint, err := node.config.AdvertiseEndpoint(service)
-		if err != nil {
-			cluster.t.Fatal(err)
-		}
-		endpoints = append(endpoints, endpoint)
-	}
-	return endpoints
-}
-
 // tupleEndpointOf returns one node's advertised +7 datagram endpoint.
 func (cluster *simCluster) tupleEndpointOf(id uint16) config.Endpoint {
 	cluster.t.Helper()
@@ -387,19 +372,6 @@ func (cluster *simCluster) trackRules(name string, rules ...*datagramRule) {
 func (cluster *simCluster) dropTupleDatagrams(id uint16, name string, destinations ...config.Endpoint) {
 	cluster.t.Helper()
 	cluster.trackRules(name, cluster.nodes[id].tupleD.addRule(dgramFaultDrop, destinations...))
-}
-
-// duplicateTupleDatagrams duplicates one node's +7 sends.
-func (cluster *simCluster) duplicateTupleDatagrams(id uint16, name string, destinations ...config.Endpoint) {
-	cluster.t.Helper()
-	cluster.trackRules(name, cluster.nodes[id].tupleD.addRule(dgramFaultDuplicate, destinations...))
-}
-
-// holdTupleDatagrams holds one node's +7 sends for a later pump step,
-// deterministically reordering them behind later traffic.
-func (cluster *simCluster) holdTupleDatagrams(id uint16, name string, destinations ...config.Endpoint) {
-	cluster.t.Helper()
-	cluster.trackRules(name, cluster.nodes[id].tupleD.addRule(dgramFaultHold, destinations...))
 }
 
 // dropSwimDatagrams drops one node's SWIM datagram sends toward optional

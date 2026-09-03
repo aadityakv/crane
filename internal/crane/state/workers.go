@@ -273,12 +273,6 @@ func cloneAffected(input []AffectedAssignment) []AffectedAssignment {
 	return append([]AffectedAssignment(nil), input...)
 }
 
-func canonicalAffected(input []AffectedAssignment) []AffectedAssignment {
-	result := cloneAffected(input)
-	sort.Slice(result, func(i, j int) bool { return bytes.Compare(result[i].JobID[:], result[j].JobID[:]) < 0 })
-	return result
-}
-
 func (machine *Machine) applyRegisterWorkerLocked(command RegisterWorker) ([]byte, error) {
 	target := registerWorkerTarget(command)
 	return machine.applyInternalLocked(command.Envelope, target, func(nextRevision uint64) (mutationPlan, error) {

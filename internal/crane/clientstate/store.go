@@ -38,21 +38,21 @@ const (
 var (
 	// ErrClientStateUnprotected reports a state file or parent directory whose
 	// permissions grant group or other access.
-	ErrClientStateUnprotected = errors.New("Crane client state must be owner-only")
+	ErrClientStateUnprotected = errors.New("crane client state must be owner-only")
 	// ErrClientStateCorrupt reports a state file whose bytes fail the
 	// checksum, layout, or semantic validation and is never silently replaced.
-	ErrClientStateCorrupt = errors.New("Crane client state is corrupt")
+	ErrClientStateCorrupt = errors.New("crane client state is corrupt")
 	// ErrClientStateForeignCluster reports a state file bound to another cluster.
-	ErrClientStateForeignCluster = errors.New("Crane client state belongs to another cluster")
+	ErrClientStateForeignCluster = errors.New("crane client state belongs to another cluster")
 	// ErrClientStatePending reports a reservation attempted while an
 	// unresolved request is still pending.
-	ErrClientStatePending = errors.New("Crane client state has an unresolved pending request")
+	ErrClientStatePending = errors.New("crane client state has an unresolved pending request")
 	// ErrClientStateNoPending reports a resolution without a pending request.
-	ErrClientStateNoPending = errors.New("Crane client state has no pending request")
+	ErrClientStateNoPending = errors.New("crane client state has no pending request")
 	// ErrClientStateBounds reports an empty or over-bound payload.
-	ErrClientStateBounds = errors.New("Crane client payload is outside bounds")
+	ErrClientStateBounds = errors.New("crane client payload is outside bounds")
 	// ErrClientStateExhausted reports a client sequence with no valid successor.
-	ErrClientStateExhausted = errors.New("Crane client sequence is exhausted")
+	ErrClientStateExhausted = errors.New("crane client sequence is exhausted")
 )
 
 // persistBoundaries names the injected crash points of one atomic persist, in

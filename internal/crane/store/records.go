@@ -927,7 +927,7 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 	if index >= 0 {
 		prior = work.Sources[index]
 	}
-	if notice.Watermark == 0 || notice.Watermark >= math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences || prior.CheckpointRevision == math.MaxUint64 {
+	if notice.Watermark == 0 || notice.Watermark == math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences || prior.CheckpointRevision == math.MaxUint64 {
 		return errors.New("checkpoint watermark or revision outside v1 bounds")
 	}
 	// Committed-watermark adoption (Task 24 defect #2 ruling): the notice
@@ -1067,7 +1067,7 @@ func applyLegacyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) e
 		prior.Watermark, prior.RaftIndex = notice.Watermark, notice.RaftIndex
 		work.Sources[index] = prior
 	} else {
-		if notice.Watermark >= math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences {
+		if notice.Watermark == math.MaxUint64 || notice.Watermark > model.LimitsV1().MaxSourceSequences {
 			return errors.New("checkpoint watermark outside v1 bounds")
 		}
 		work.Sources = append(work.Sources, SourceCursor{Source: notice.Source, NextSequence: notice.Watermark + 1, EOF: eof, Watermark: notice.Watermark, RaftIndex: notice.RaftIndex})

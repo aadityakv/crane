@@ -69,8 +69,6 @@ const (
 	simClientCallRetryPumps = 2000
 	// simShutdownPumps bounds one process join during shutdown in pump steps.
 	simShutdownPumps = 30000
-	// simShutdownTimeout bounds process joins during shutdown.
-	simShutdownTimeout = 40 * time.Second
 	// simManualEpoch is the fixed start of the shared simulated clock.
 	simManualEpoch = int64(1_700_000_000)
 )

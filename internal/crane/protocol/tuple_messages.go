@@ -28,7 +28,7 @@ var (
 	// ErrInvalidTupleMessage classifies a structurally complete payload with invalid semantics.
 	ErrInvalidTupleMessage = errors.New("invalid Crane tuple message")
 	// ErrTupleMessageTooLarge classifies a payload that cannot fit the compiled datagram bound.
-	ErrTupleMessageTooLarge = errors.New("Crane tuple message too large")
+	ErrTupleMessageTooLarge = errors.New("crane tuple message too large")
 )
 
 // AssignmentSetIdentity binds tuple traffic to one exact complete committed set.

@@ -17,10 +17,10 @@ import (
 var (
 	// ErrNotReady reports an engine whose one-time durable recovery has not
 	// completed or whose owner loop has already stopped.
-	ErrNotReady = errors.New("Crane worker engine is not ready")
+	ErrNotReady = errors.New("crane worker engine is not ready")
 	// ErrNotRunning reports admission under a missing, closed, or stale durable
 	// job installation.
-	ErrNotRunning = errors.New("Crane job is not durably Running at the current fence")
+	ErrNotRunning = errors.New("crane job is not durably Running at the current fence")
 )
 
 // OperatorExecutor performs one deterministic built-in operator invocation.

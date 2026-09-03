@@ -17,7 +17,7 @@ import (
 
 // ErrControlRequestUnauthorized classifies +6 frames that fail cluster,
 // membership, source-IP, or replay admission and are dropped without response.
-var ErrControlRequestUnauthorized = errors.New("Crane control request unauthorized")
+var ErrControlRequestUnauthorized = errors.New("crane control request unauthorized")
 
 // handleConnection serves exactly one bounded request and one correlated
 // response, then returns so the caller closes the connection.

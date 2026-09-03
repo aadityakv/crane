@@ -138,7 +138,7 @@ func (matcher *Matcher) resolve(ctx context.Context, host string) ([]netip.Addr,
 		return []netip.Addr{address.Unmap()}, nil
 	}
 	key := canonicalHost(host)
-	cachedAddresses, cachedError, ok, generation := matcher.cached(key)
+	cachedAddresses, ok, generation, cachedError := matcher.cached(key)
 	if ok {
 		return cachedAddresses, cachedError
 	}
@@ -176,20 +176,20 @@ func (matcher *Matcher) resolve(ctx context.Context, host string) ([]netip.Addr,
 	return append([]netip.Addr(nil), canonical...), nil
 }
 
-func (matcher *Matcher) cached(key string) ([]netip.Addr, error, bool, uint64) {
+func (matcher *Matcher) cached(key string) ([]netip.Addr, bool, uint64, error) {
 	matcher.mu.Lock()
 	defer matcher.mu.Unlock()
 	generation := matcher.generation
 	entry := matcher.cache[key]
 	if entry == nil {
-		return nil, nil, false, generation
+		return nil, false, generation, nil
 	}
 	if !matcher.clock.Now().Before(entry.expires) {
 		matcher.removeLocked(key, entry)
-		return nil, nil, false, generation
+		return nil, false, generation, nil
 	}
 	matcher.order.MoveToBack(entry.element)
-	return append([]netip.Addr(nil), entry.addresses...), entry.err, true, generation
+	return append([]netip.Addr(nil), entry.addresses...), true, generation, entry.err
 }
 
 func (matcher *Matcher) store(key string, addresses []netip.Addr, err error, ttl time.Duration, generation uint64) {

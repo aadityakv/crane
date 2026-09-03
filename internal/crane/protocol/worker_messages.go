@@ -25,7 +25,7 @@ var (
 	ErrUnsupportedWorkerSchema = errors.New("unsupported Crane worker-control schema")
 	ErrUnexpectedWorkerMessage = errors.New("unexpected Crane worker-control message type")
 	ErrInvalidWorkerMessage    = errors.New("invalid Crane worker-control message")
-	ErrWorkerMessageTooLarge   = errors.New("Crane worker-control message too large")
+	ErrWorkerMessageTooLarge   = errors.New("crane worker-control message too large")
 )
 
 type WorkerMessage interface{ MessageType() wire.MessageType }

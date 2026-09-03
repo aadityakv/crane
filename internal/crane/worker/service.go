@@ -27,7 +27,7 @@ import (
 
 const WorkerStoreDirectory = "crane-worker"
 
-var ErrServiceNotReady = errors.New("Crane worker service is not ready")
+var ErrServiceNotReady = errors.New("crane worker service is not ready")
 
 // ServiceOptions fixes every caller-owned dependency of one worker service.
 // NewService retains these exact values but does not open any resource.
@@ -82,7 +82,7 @@ type Service struct {
 // opening a store, binding a listener, activating a datagram, or starting work.
 func NewService(options ServiceOptions) (*Service, error) {
 	if options.Authenticator == nil || options.Clock == nil || options.Membership == nil || options.Gate == nil || options.OpenStore == nil || options.Datagram == nil {
-		return nil, errors.New("Crane worker service requires authenticator, clock, membership, gate, store opener, and datagram")
+		return nil, errors.New("crane worker service requires authenticator, clock, membership, gate, store opener, and datagram")
 	}
 	configuration := cloneWorkerNodeConfig(options.Config)
 	if err := configuration.Validate(); err != nil {
@@ -120,7 +120,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		return errors.New("run Crane worker service: nil context")
 	}
 	if !service.started.CompareAndSwap(false, true) {
-		return errors.New("Crane worker service Run called more than once")
+		return errors.New("crane worker service Run called more than once")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -235,7 +235,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		case <-ctx.Done():
 			runErr = ctx.Err()
 		case fatalErr := <-repository.fatal:
-			runErr = fmt.Errorf("Crane worker durable authority: %w", fatalErr)
+			runErr = fmt.Errorf("crane worker durable authority: %w", fatalErr)
 		}
 		if engineIsReady && tupleIsReady && !dispatchEnabled {
 			close(controlDispatch)
@@ -252,7 +252,7 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		case <-ctx.Done():
 			runErr = ctx.Err()
 		case fatalErr := <-repository.fatal:
-			runErr = fmt.Errorf("Crane worker durable authority: %w", fatalErr)
+			runErr = fmt.Errorf("crane worker durable authority: %w", fatalErr)
 		}
 	}
 

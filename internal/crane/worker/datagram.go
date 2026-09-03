@@ -26,15 +26,15 @@ import (
 var (
 	// ErrTupleEndpointNotReady reports a +7 send attempted before its owning
 	// TupleService has activated the endpoint or after that service stopped.
-	ErrTupleEndpointNotReady = errors.New("Crane tuple endpoint is not ready")
+	ErrTupleEndpointNotReady = errors.New("crane tuple endpoint is not ready")
 	// ErrInvalidTupleEndpoint reports missing, mismatched, or unsafe +7 endpoint
 	// construction and ownership dependencies.
 	ErrInvalidTupleEndpoint = errors.New("invalid Crane tuple endpoint")
 	// ErrTuplePeerUnavailable reports an outbound destination that is not an
 	// active member with a derivable +7 endpoint.
-	ErrTuplePeerUnavailable = errors.New("Crane tuple peer unavailable")
+	ErrTuplePeerUnavailable = errors.New("crane tuple peer unavailable")
 	// ErrTupleEndpointInUse reports an endpoint already claimed by one service.
-	ErrTupleEndpointInUse = errors.New("Crane tuple endpoint already in use")
+	ErrTupleEndpointInUse = errors.New("crane tuple endpoint already in use")
 )
 
 const tupleDatagramMaximumBytes = wire.MaxCraneDatagramBytesV1
@@ -342,7 +342,7 @@ func (endpoint *TupleEndpoint) nextRequestID(datagram transport.SourceDatagram) 
 	}
 	endpoint.requestCount++
 	if endpoint.requestCount == 0 {
-		return wire.RequestID{}, errors.New("Crane tuple request identity exhausted")
+		return wire.RequestID{}, errors.New("crane tuple request identity exhausted")
 	}
 	var requestID wire.RequestID
 	binary.BigEndian.PutUint64(requestID[:8], endpoint.requestPrefix)
