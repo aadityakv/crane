@@ -318,7 +318,28 @@ func (actor *Actor) propagateTerminal(ctx context.Context, epoch model.Coordinat
 	if session.reconciled[job.JobID] == fence {
 		return
 	}
-	if actor.installAssignment(ctx, epoch, job, model.Closed, false, 0) {
+	install, ok := actor.buildInstall(job, model.Closed, epoch)
+	if !ok {
+		return
+	}
+	progress := session.terminal[job.JobID]
+	if progress.fence != fence || progress.nodes == nil {
+		progress = terminalProgress{fence: fence, nodes: make(map[uint16]bool)}
+	}
+	members := actor.options.Membership.View()
+	complete := true
+	for _, node := range assignmentNodes(*job.Assignment) {
+		if progress.nodes[node] || !memberActive(members, node) {
+			continue
+		}
+		if err := actor.options.Workers.Install(ctx, node, install); err != nil {
+			complete = false
+			continue
+		}
+		progress.nodes[node] = true
+	}
+	session.terminal[job.JobID] = progress
+	if complete {
 		session.reconciled[job.JobID] = fence
 	}
 }

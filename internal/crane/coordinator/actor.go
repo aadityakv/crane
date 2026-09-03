@@ -278,6 +278,11 @@ type sessionState struct {
 	observations  map[uint16]time.Time
 	controlFailed map[uint16]bool
 	reconciled    map[model.JobID]jobFence
+	// terminal retains, per job, the exact fence and the set of workers whose
+	// durable terminal Closed install this session has already confirmed, so
+	// one unreachable or rejecting worker never forces the converged workers
+	// to re-commit the identical terminal install on every pass.
+	terminal map[model.JobID]terminalProgress
 	// admission retains each worker's last observed process admission epoch
 	// from the durable status exchange. A missing or non-current entry means
 	// the worker's gate was not observed open under this leadership epoch —
@@ -290,8 +295,16 @@ func newSessionState() *sessionState {
 	return &sessionState{
 		observations: make(map[uint16]time.Time),
 		reconciled:   make(map[model.JobID]jobFence),
+		terminal:     make(map[model.JobID]terminalProgress),
 		admission:    make(map[uint16]model.CoordinatorEpoch),
 	}
+}
+
+// terminalProgress records which workers durably confirmed one job's terminal
+// Closed install at one exact fence within the current leadership session.
+type terminalProgress struct {
+	fence jobFence
+	nodes map[uint16]bool
 }
 
 // runLeader owns one leadership epoch: barrier, stable-nonce epoch creation,

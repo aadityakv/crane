@@ -382,6 +382,12 @@ func TestTerminalPropagationInstallsClosedIdempotently(t *testing.T) {
 	h.waitFor(func() bool { return h.log.count("install:2:closed") >= 1 }, "first terminal install attempt")
 	h.actor.Wake()
 	h.waitFor(func() bool { return len(h.workers.installsFor(2, model.Closed)) >= 1 }, "lost acknowledgment retried")
+	// The retry re-drives only the worker whose acknowledgment was lost; the
+	// worker that already confirmed the identical terminal install is not
+	// asked to commit it again within the same leadership session.
+	if got := len(h.workers.installsFor(3, model.Closed)); got != 1 {
+		t.Fatalf("converged worker 3 received %d terminal installs during the retry, want 1", got)
+	}
 
 	record, _ := h.job(job)
 	if record.Lifecycle != state.JobCanceled {
