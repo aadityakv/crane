@@ -62,7 +62,7 @@ func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 		bundle = append(bundle, encoded...)
 	}
 	digest := sha256.Sum256(bundle)
-	const want = "8a8cb9300f29689bd9b2ed9eb581c73c882cdfeec404e798ccad725c8a82c3b3"
+	const want = "a513b104fe289bba378d90b08313dc297d981d1dfeef6f23d59199e1b4250ca9"
 	if got := hex.EncodeToString(digest[:]); got != want {
 		t.Fatalf("Task 10 canonical command bundle SHA-256 = %s, want %s", got, want)
 	}

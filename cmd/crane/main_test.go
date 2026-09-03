@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aaditya/cs425mp3/internal/crane/clientstate"
+	"github.com/aaditya/cs425mp3/internal/crane/control"
 	"github.com/aaditya/cs425mp3/internal/crane/model"
 	"github.com/aaditya/cs425mp3/internal/crane/protocol"
 	"github.com/aaditya/cs425mp3/internal/wire"
@@ -548,5 +550,43 @@ func TestCLIContextCancellationStopsPromptly(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("cancellation took %s, want prompt shutdown", elapsed)
+	}
+}
+
+// TestCLISubmitResolvesResultTooLargeAsTerminalRejection pins that a consumed
+// ResultTooLarge rejection ends the submit with a typed error and durably
+// resolves the reservation: the sequence advances and nothing stays pending,
+// so a later invocation is a fresh command rather than an endless resume.
+func TestCLISubmitResolvesResultTooLargeAsTerminalRejection(t *testing.T) {
+	server := startCLIControlServer(t)
+	server.setHandler(func(message protocol.ControlMessage) protocol.ControlMessage {
+		request, ok := message.(protocol.SubmitRequest)
+		if !ok {
+			return nil
+		}
+		return protocol.ControlError{
+			RelatedMessage: wire.MessageCraneSubmitRequest, Code: protocol.ControlErrorResultTooLarge,
+			HasClientRequest: true, ClientRequest: request.Request, ClientDigest: request.Digest,
+			Detail: []byte("durable command result exceeds the replicated cache bound"),
+		}
+	})
+	configPath := writeCLIConfig(t, server.port())
+	statePath := cliStatePath(t)
+	topologyPath, _ := writeExampleTopologyFile(t)
+
+	stdout, _, err := runCLI(t, context.Background(), "submit", "-config", configPath, "-state", statePath, "-topology", topologyPath, "-backoff", "1ms")
+	var rejection *control.RequestRejectedError
+	if !errors.As(err, &rejection) || rejection.Code != protocol.ControlErrorResultTooLarge || rejection.Retryable {
+		t.Fatalf("submit error = %v, want a terminal ResultTooLarge RequestRejectedError", err)
+	}
+	if stdout != "" {
+		t.Fatalf("rejected submit wrote stdout %q", stdout)
+	}
+	store, err := clientstate.OpenClientState(statePath, cliTestClusterID)
+	if err != nil {
+		t.Fatalf("open CLI state store: %v", err)
+	}
+	if state := store.State(); state.NextSequence != 2 || len(state.Pending) != 0 {
+		t.Fatalf("state after consumed rejection = sequence %d pending %d bytes, want sequence 2 and nothing pending", state.NextSequence, len(state.Pending))
 	}
 }

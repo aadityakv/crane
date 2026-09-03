@@ -193,41 +193,44 @@ func (client *Client) Submit(ctx context.Context, topology model.TopologySpec) (
 	if err != nil {
 		return model.JobID{}, 0, err
 	}
-	if resumed != nil {
-		response, ok := resumed.(protocol.SubmitResponse)
-		if !ok {
-			return model.JobID{}, 0, fmt.Errorf("pending submit resolved to unexpected %T", resumed)
+	if resumed == nil {
+		resumed, err = client.sendSubmit(ctx, topology)
+		if err != nil {
+			return model.JobID{}, 0, err
 		}
+	}
+	switch response := resumed.(type) {
+	case protocol.SubmitResponse:
 		return response.JobID, response.JobControlRevision, nil
+	case protocol.ControlError:
+		return model.JobID{}, 0, rejectionError(response)
+	default:
+		return model.JobID{}, 0, fmt.Errorf("submit resolved to unexpected %T", resumed)
 	}
+}
 
+// sendSubmit reserves, sends, and durably resolves one fresh submit request.
+func (client *Client) sendSubmit(ctx context.Context, topology model.TopologySpec) (protocol.ControlMessage, error) {
 	request := protocol.SubmitRequest{Request: client.store.NextRequestID(), Topology: topology}
-	request.Digest, err = protocol.SubmitCommandDigest(request.Request, topology)
+	digest, err := protocol.SubmitCommandDigest(request.Request, topology)
 	if err != nil {
-		return model.JobID{}, 0, fmt.Errorf("derive submit digest: %w", err)
+		return nil, fmt.Errorf("derive submit digest: %w", err)
 	}
+	request.Digest = digest
 	payload, err := protocol.MarshalControlMessage(request)
 	if err != nil {
-		return model.JobID{}, 0, fmt.Errorf("marshal submit request: %w", err)
+		return nil, fmt.Errorf("marshal submit request: %w", err)
 	}
 	if _, _, err := client.store.Begin(payload); err != nil {
-		return model.JobID{}, 0, fmt.Errorf("reserve submit request: %w", err)
+		return nil, fmt.Errorf("reserve submit request: %w", err)
 	}
-	resolution, err := client.resolveMutation(ctx, payload)
-	if err != nil {
-		return model.JobID{}, 0, err
-	}
-	response, ok := resolution.(protocol.SubmitResponse)
-	if !ok {
-		return model.JobID{}, 0, fmt.Errorf("submit resolved to unexpected %T", resolution)
-	}
-	return response.JobID, response.JobControlRevision, nil
+	return client.resolveMutation(ctx, payload)
 }
 
 // Cancel durably reserves, sends, and resolves one exact-revision cancel,
 // resuming any pending request first. Deterministically consumed rejections
-// (NotFound, RevisionMismatch) advance the durable sequence and surface as a
-// typed RequestRejectedError.
+// (NotFound, RevisionMismatch, ResultTooLarge) advance the durable sequence
+// and surface as a typed RequestRejectedError.
 func (client *Client) Cancel(ctx context.Context, job model.JobID, expectedRevision uint64) (uint64, error) {
 	if client.store == nil {
 		return 0, ErrClientStoreRequired
@@ -378,10 +381,12 @@ func decodePendingRequest(pending []byte) (protocol.ControlMessage, error) {
 	return request, nil
 }
 
-// submitAccept classifies one response to an exact submit request. Submit has
-// no deterministically consumed rejection, so only the validated correlated
-// response completes the exchange.
+// submitAccept classifies one response to an exact submit request. The only
+// deterministically consumed submit rejection is ResultTooLarge (the machine
+// spent the sequence without a cacheable outcome); it completes the exchange
+// for durable resolution exactly like a validated correlated response.
 func (client *Client) submitAccept(request protocol.SubmitRequest) func(protocol.ControlMessage) error {
+	consumed := map[protocol.ControlErrorCode]bool{protocol.ControlErrorResultTooLarge: true}
 	return func(response protocol.ControlMessage) error {
 		switch typed := response.(type) {
 		case protocol.SubmitResponse:
@@ -393,20 +398,22 @@ func (client *Client) submitAccept(request protocol.SubmitRequest) func(protocol
 			if protocol.ValidateSubmitErrorCorrelation(request, typed) != nil {
 				return classifyUncorrelatedError(typed)
 			}
-			return classifyMutationError(typed, nil)
+			return classifyMutationError(typed, consumed)
 		default:
 			return fmt.Errorf("%w: unexpected %T", errClientRetryExchange, response)
 		}
 	}
 }
 
-// cancelAccept classifies one response to an exact cancel request. NotFound
-// and RevisionMismatch are deterministically consumed by the replicated dedup
-// history, so they complete the exchange and must be durably resolved.
+// cancelAccept classifies one response to an exact cancel request. NotFound,
+// RevisionMismatch, and ResultTooLarge are deterministically consumed by the
+// replicated dedup history, so they complete the exchange and must be durably
+// resolved.
 func (client *Client) cancelAccept(request protocol.CancelRequest) func(protocol.ControlMessage) error {
 	consumed := map[protocol.ControlErrorCode]bool{
 		protocol.ControlErrorNotFound:         true,
 		protocol.ControlErrorRevisionMismatch: true,
+		protocol.ControlErrorResultTooLarge:   true,
 	}
 	return func(response protocol.ControlMessage) error {
 		switch typed := response.(type) {

@@ -101,14 +101,14 @@ func TestControlErrorRequestCodeCompatibilityMatrix(t *testing.T) {
 		base    ControlError
 		allowed map[ControlErrorCode]bool
 	}{
-		{"submit", ControlError{RelatedMessage: wire.MessageCraneSubmitRequest, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.submitDigest}, codeSet(ControlErrorStarting, ControlErrorNotLeader, ControlErrorStaleRequest, ControlErrorSkippedRequest, ControlErrorIdentityReuse, ControlErrorCapacityExhausted)},
-		{"cancel", ControlError{RelatedMessage: wire.MessageCraneCancelRequest, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.cancelDigest}, codeSet(ControlErrorStarting, ControlErrorNotLeader, ControlErrorStaleRequest, ControlErrorSkippedRequest, ControlErrorIdentityReuse, ControlErrorNotFound, ControlErrorRevisionMismatch)},
+		{"submit", ControlError{RelatedMessage: wire.MessageCraneSubmitRequest, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.submitDigest}, codeSet(ControlErrorStarting, ControlErrorNotLeader, ControlErrorStaleRequest, ControlErrorSkippedRequest, ControlErrorIdentityReuse, ControlErrorCapacityExhausted, ControlErrorResultTooLarge)},
+		{"cancel", ControlError{RelatedMessage: wire.MessageCraneCancelRequest, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.cancelDigest}, codeSet(ControlErrorStarting, ControlErrorNotLeader, ControlErrorStaleRequest, ControlErrorSkippedRequest, ControlErrorIdentityReuse, ControlErrorNotFound, ControlErrorRevisionMismatch, ControlErrorResultTooLarge)},
 		{"status", ControlError{RelatedMessage: wire.MessageCraneStatusRequest, HasStatusRequest: true, StatusJobID: fixture.job}, codeSet(ControlErrorStarting, ControlErrorNotLeader, ControlErrorNotFound)},
 		{"page", ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, HasResultPage: true, ResultPage: fixture.pageRequest}, codeSet(ControlErrorStarting, ControlErrorNotLeader, ControlErrorNotFound, ControlErrorPageLimitTooSmall, ControlErrorResultUnavailable, ControlErrorCorruptResult)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			for code := ControlErrorMalformed; code <= ControlErrorCorruptResult; code++ {
+			for code := ControlErrorMalformed; code <= ControlErrorResultTooLarge; code++ {
 				value := test.base
 				value.Code = code
 				if code == ControlErrorPageLimitTooSmall {
@@ -123,7 +123,7 @@ func TestControlErrorRequestCodeCompatibilityMatrix(t *testing.T) {
 		})
 	}
 	for _, message := range []wire.MessageType{wire.MessageCraneSubmitRequest, wire.MessageCraneCancelRequest, wire.MessageCraneStatusRequest, wire.MessageCraneResultPageRequest} {
-		for code := ControlErrorMalformed; code <= ControlErrorCorruptResult; code++ {
+		for code := ControlErrorMalformed; code <= ControlErrorResultTooLarge; code++ {
 			_, err := MarshalControlError(ControlError{RelatedMessage: message, Code: code})
 			want := code == ControlErrorMalformed || code == ControlErrorUnsupportedSchema || code == ControlErrorInvalidRequest
 			if (err == nil) != want {

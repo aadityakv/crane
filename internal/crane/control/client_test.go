@@ -773,3 +773,28 @@ func TestClientRedirectRetriesTransientlyUnreachableLeader(t *testing.T) {
 		t.Fatalf("dialed = %v, want the hinted leader retried after its transient failure", dialed)
 	}
 }
+
+// TestClientTreatsResultTooLargeAsConsumedRejection pins that a request-bound
+// ResultTooLarge completes the submit and cancel exchanges (so the reservation
+// is durably resolved and surfaces as a typed rejection) while a retryable
+// CapacityExhausted still retries the exact bytes.
+func TestClientTreatsResultTooLargeAsConsumedRejection(t *testing.T) {
+	harness := newClientHarness(t, true)
+	client := harness.client()
+
+	submit := submitRequestFor(t, 0x72, 1, queryTopology(1))
+	tooLarge := requestBoundError(submit, protocol.ControlErrorResultTooLarge, false, "durable command result exceeds the replicated cache bound")
+	if err := client.submitAccept(submit)(tooLarge); err != nil {
+		t.Fatalf("submit ResultTooLarge classified as %v, want a completed exchange", err)
+	}
+	capacity := requestBoundError(submit, protocol.ControlErrorCapacityExhausted, true, "replicated capacity exhausted")
+	if err := client.submitAccept(submit)(capacity); !errors.Is(err, errClientRetryExchange) {
+		t.Fatalf("submit CapacityExhausted classified as %v, want retry", err)
+	}
+
+	cancel := cancelRequestFor(t, 0x72, 2, model.JobID{0x72}, 1)
+	tooLarge = requestBoundError(cancel, protocol.ControlErrorResultTooLarge, false, "durable command result exceeds the replicated cache bound")
+	if err := client.cancelAccept(cancel)(tooLarge); err != nil {
+		t.Fatalf("cancel ResultTooLarge classified as %v, want a completed exchange", err)
+	}
+}

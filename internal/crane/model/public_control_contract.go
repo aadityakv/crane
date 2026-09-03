@@ -149,7 +149,7 @@ var publicControlNestedLayoutsV1 = []PublicControlNestedDescriptor{
 
 var publicControlEnumDomainsV1 = []PublicControlEnumDescriptor{
 	{Name: "JobState", Values: []string{"Pending=1", "Deploying=2", "Running=3", "Draining=4", "Succeeded=5", "Failed=6", "Canceled=7"}},
-	{Name: "ControlErrorCode", Values: []string{"Malformed=1", "UnsupportedSchema=2", "InvalidRequest=3", "Starting=4", "NotLeader=5", "StaleRequest=6", "SkippedRequest=7", "IdentityReuse=8", "NotFound=9", "RevisionMismatch=10", "CapacityExhausted=11", "PageLimitTooSmall=12", "ResultUnavailable=13", "CorruptResult=14"}},
+	{Name: "ControlErrorCode", Values: []string{"Malformed=1", "UnsupportedSchema=2", "InvalidRequest=3", "Starting=4", "NotLeader=5", "StaleRequest=6", "SkippedRequest=7", "IdentityReuse=8", "NotFound=9", "RevisionMismatch=10", "CapacityExhausted=11", "PageLimitTooSmall=12", "ResultUnavailable=13", "CorruptResult=14", "ResultTooLarge=15"}},
 	{Name: "FailureCode", Values: []string{"Operator=1", "TupleInvalid=2", "Storage=3"}},
 }
 
@@ -160,8 +160,8 @@ var publicControlIdentityDomainsV1 = []string{
 
 var publicControlErrorCodeMatrixV1 = []string{
 	"Unbound=Malformed,UnsupportedSchema,InvalidRequest",
-	"SubmitRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,CapacityExhausted",
-	"CancelRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,NotFound,RevisionMismatch",
+	"SubmitRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,CapacityExhausted,ResultTooLarge",
+	"CancelRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,NotFound,RevisionMismatch,ResultTooLarge",
 	"StatusRequest=Starting,NotLeader,NotFound",
 	"ResultPageRequest=Starting,NotLeader,NotFound,PageLimitTooSmall,ResultUnavailable,CorruptResult",
 }

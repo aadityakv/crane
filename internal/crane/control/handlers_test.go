@@ -493,3 +493,33 @@ func TestResultReadsAbortOnGateLossInsteadOfServingStale(t *testing.T) {
 		t.Fatal("gate-loss abort must be retryable")
 	}
 }
+
+// TestClientRejectionMapsResultTooLargeToTypedTerminalError pins the mapping
+// of the consumed ResultResultTooLarge machine outcome: both mutations answer
+// a request-bound, non-retryable ControlErrorResultTooLarge instead of the
+// former nil (a silent drop the client resumed forever).
+func TestClientRejectionMapsResultTooLargeToTypedTerminalError(t *testing.T) {
+	fixture := newServiceFixture(t, state.NewMachine())
+	result := state.CommandResult{Code: state.ResultResultTooLarge}
+
+	submit := submitRequestFor(t, 0x71, 1, queryTopology(1))
+	controlError := requireControlError(t, fixture.service.clientRejection(submit, result), protocol.ControlErrorResultTooLarge)
+	if controlError.Retryable {
+		t.Fatal("ResultTooLarge submit rejection must be terminal")
+	}
+	if err := protocol.ValidateSubmitErrorCorrelation(submit, controlError); err != nil {
+		t.Fatalf("submit correlation: %v", err)
+	}
+
+	cancel := cancelRequestFor(t, 0x71, 2, model.JobID{0x71}, 1)
+	controlError = requireControlError(t, fixture.service.clientRejection(cancel, result), protocol.ControlErrorResultTooLarge)
+	if controlError.Retryable {
+		t.Fatal("ResultTooLarge cancel rejection must be terminal")
+	}
+	if err := protocol.ValidateCancelErrorCorrelation(cancel, controlError); err != nil {
+		t.Fatalf("cancel correlation: %v", err)
+	}
+	if _, err := protocol.MarshalControlMessage(controlError); err != nil {
+		t.Fatalf("ResultTooLarge is not encodable on the public matrix: %v", err)
+	}
+}

@@ -102,6 +102,10 @@ const (
 	ControlErrorResultUnavailable
 	// ControlErrorCorruptResult reports an inconsistent committed manifest or artifact.
 	ControlErrorCorruptResult
+	// ControlErrorResultTooLarge reports a deterministically consumed client
+	// mutation whose durable result exceeded the replicated cache bound, so
+	// the sequence is spent but no cached outcome can ever be served.
+	ControlErrorResultTooLarge
 )
 
 // SubmitRequest submits one canonical topology under a sequenced client identity.
@@ -640,7 +644,7 @@ func validateControlEndpoint(endpoint string) error {
 }
 
 func validateControlError(value ControlError) error {
-	if value.Code < ControlErrorMalformed || value.Code > ControlErrorCorruptResult || len(value.Detail) > MaxControlErrorDetailBytes || !utf8.Valid(value.Detail) || bytes.IndexByte(value.Detail, 0) >= 0 {
+	if value.Code < ControlErrorMalformed || value.Code > ControlErrorResultTooLarge || len(value.Detail) > MaxControlErrorDetailBytes || !utf8.Valid(value.Detail) || bytes.IndexByte(value.Detail, 0) >= 0 {
 		return errors.New("invalid control error code or detail")
 	}
 	selectors := 0
@@ -708,9 +712,9 @@ func controlErrorCodeCompatible(message wire.MessageType, code ControlErrorCode)
 	}
 	switch message {
 	case wire.MessageCraneSubmitRequest:
-		return code == ControlErrorStaleRequest || code == ControlErrorSkippedRequest || code == ControlErrorIdentityReuse || code == ControlErrorCapacityExhausted
+		return code == ControlErrorStaleRequest || code == ControlErrorSkippedRequest || code == ControlErrorIdentityReuse || code == ControlErrorCapacityExhausted || code == ControlErrorResultTooLarge
 	case wire.MessageCraneCancelRequest:
-		return code == ControlErrorStaleRequest || code == ControlErrorSkippedRequest || code == ControlErrorIdentityReuse || code == ControlErrorNotFound || code == ControlErrorRevisionMismatch
+		return code == ControlErrorStaleRequest || code == ControlErrorSkippedRequest || code == ControlErrorIdentityReuse || code == ControlErrorNotFound || code == ControlErrorRevisionMismatch || code == ControlErrorResultTooLarge
 	case wire.MessageCraneStatusRequest:
 		return code == ControlErrorNotFound
 	case wire.MessageCraneResultPageRequest:

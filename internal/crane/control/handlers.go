@@ -281,6 +281,10 @@ func (service *Service) clientRejection(request protocol.ControlMessage, result 
 		return requestBoundError(request, protocol.ControlErrorSkippedRequest, false, "client sequence skips the durable history")
 	case state.ResultCapacityExhausted:
 		return requestBoundError(request, protocol.ControlErrorCapacityExhausted, true, "replicated capacity exhausted")
+	case state.ResultResultTooLarge:
+		// The machine consumed the sequence but could not cache the outcome;
+		// the client must resolve the reservation instead of resuming forever.
+		return requestBoundError(request, protocol.ControlErrorResultTooLarge, false, "durable command result exceeds the replicated cache bound")
 	case state.ResultStaleEpoch:
 		// The stamped committed fence lost to a newer epoch mid-request; the
 		// unchanged retry observes the newer fence.
