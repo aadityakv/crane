@@ -25,8 +25,8 @@ const (
 	DefaultMaxControlSessions             = 128
 	DefaultMaxControlSessionsPerPeer      = 4
 	DefaultMaxQueuedControlWork           = 256
-	DefaultMaxControlReplayEntries        = 8192
-	DefaultMaxControlReplayEntriesPerPeer = 512
+	DefaultMaxControlReplayEntries        = 65536
+	DefaultMaxControlReplayEntriesPerPeer = 8192
 )
 
 var (

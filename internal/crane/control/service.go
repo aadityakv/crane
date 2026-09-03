@@ -28,9 +28,9 @@ const (
 	// consume the shared global connection budget.
 	DefaultMaxControlConnectionsPerPeer = 4
 	// DefaultMaxControlReplayEntries bounds retained request-replay identities.
-	DefaultMaxControlReplayEntries = 8192
+	DefaultMaxControlReplayEntries = 65536
 	// DefaultMaxControlReplayEntriesPerPeer bounds per-sender replay identities.
-	DefaultMaxControlReplayEntriesPerPeer = 512
+	DefaultMaxControlReplayEntriesPerPeer = 8192
 )
 
 // RaftAPI is the bounded consensus surface the public control service
