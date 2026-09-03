@@ -8,7 +8,9 @@ import (
 )
 
 const (
-	// DefaultMaxBytes is the default complete worker WAL ceiling.
+	// DefaultMaxBytes is the default worker store byte budget: the complete
+	// WAL including framing plus every snapshot file and outstanding custody
+	// reservation charged against the same ceiling.
 	DefaultMaxBytes uint64 = 1 << 30
 	// MaxRecordPayloadBytes bounds one future domain record before allocation.
 	MaxRecordPayloadBytes = 1 << 20
@@ -127,7 +129,9 @@ func allFaultPoints() []FaultPoint {
 
 // Options fixes store bounds and new-store epoch creation for one lifetime.
 type Options struct {
-	// MaxBytes bounds the complete WAL including framing; zero selects DefaultMaxBytes.
+	// MaxBytes bounds the complete WAL including framing together with the
+	// snapshot files and custody reservations charged against the same
+	// budget; zero selects DefaultMaxBytes.
 	MaxBytes uint64
 	// Faults optionally injects deterministic durable-boundary failures.
 	Faults FaultInjector

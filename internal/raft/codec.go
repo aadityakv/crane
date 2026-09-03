@@ -40,7 +40,9 @@ func DefaultCodecLimits() CodecLimits {
 	}
 }
 
-// EncodeRPC validates rpc and returns its stable wire type plus canonical big-endian v1 payload.
+// EncodeRPC validates rpc and returns its stable wire type plus canonical
+// big-endian payload. Consensus RPCs carry the v1 schema; Handshake messages
+// carry HandshakeSchemaVersion.
 func EncodeRPC(rpc RPC, limits CodecLimits) (wire.MessageType, []byte, error) {
 	resolved, err := resolveCodecLimits(limits)
 	if err != nil {
