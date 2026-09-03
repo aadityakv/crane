@@ -42,6 +42,11 @@ const (
 	commandIdentityDomain = "cs425/crane/coordinator/command-id/v1\x00"
 )
 
+// errLeaderSessionAborted reports a leader loop that ended while leadership
+// was still held: the nonce source failed or the coordinator epoch could not
+// be established within establishAttemptLimit paced attempts.
+var errLeaderSessionAborted = errors.New("coordinator leader session aborted")
+
 // LeadershipSubscription is the leadership stream contract the actor consumes.
 // *raft.LeadershipSubscription satisfies it directly.
 type LeadershipSubscription interface {
@@ -196,6 +201,12 @@ func (actor *Actor) Run(ctx context.Context) error {
 	close(actor.ready)
 
 	var session *leaderSession
+	sessionDone := func() <-chan struct{} {
+		if session == nil {
+			return nil
+		}
+		return session.done
+	}
 	stopSession := func() {
 		if session == nil {
 			return
@@ -224,6 +235,18 @@ func (actor *Actor) Run(ctx context.Context) error {
 	handle(subscription.Snapshot())
 	for {
 		select {
+		case <-sessionDone():
+			// The leader loop ended on its own while leadership is still held.
+			// A leading node must never stay idle and silent, so the session
+			// is joined, its failure is surfaced by the loop's return value,
+			// and a fresh session (new nonce) restarts for the same term after
+			// one pause; leadership events keep taking precedence.
+			term, failure := session.term, session.err
+			stopSession()
+			if failure == nil || !actor.pause(ctx) {
+				continue
+			}
+			session = actor.startLeaderSession(ctx, term)
 		case event, open := <-subscription.Events():
 			if !open {
 				stopSession()
@@ -249,10 +272,12 @@ func (actor *Actor) Run(ctx context.Context) error {
 }
 
 // leaderSession owns the cancellation and join handle of one leader loop.
+// err is written once by the loop goroutine before done closes.
 type leaderSession struct {
 	term   uint64
 	cancel context.CancelFunc
 	done   chan struct{}
+	err    error
 }
 
 func (actor *Actor) startLeaderSession(parent context.Context, term uint64) *leaderSession {
@@ -260,7 +285,7 @@ func (actor *Actor) startLeaderSession(parent context.Context, term uint64) *lea
 	session := &leaderSession{term: term, cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(session.done)
-		actor.runLeader(sessionContext)
+		session.err = actor.runLeader(sessionContext)
 	}()
 	return session
 }
@@ -300,6 +325,27 @@ func newSessionState() *sessionState {
 	}
 }
 
+// pruneJobs drops the per-job reconciliation and terminal-install memory of
+// jobs the replicated view no longer retains. Entries for retained jobs are
+// untouched, so no decision changes; the maps merely stop carrying evicted
+// identities for the rest of the leadership session.
+func (session *sessionState) pruneJobs(view state.View) {
+	retained := make(map[model.JobID]bool, len(view.Jobs))
+	for _, job := range view.Jobs {
+		retained[job.JobID] = true
+	}
+	for jobID := range session.reconciled {
+		if !retained[jobID] {
+			delete(session.reconciled, jobID)
+		}
+	}
+	for jobID := range session.terminal {
+		if !retained[jobID] {
+			delete(session.terminal, jobID)
+		}
+	}
+}
+
 // terminalProgress records which workers durably confirmed one job's terminal
 // Closed install at one exact fence within the current leadership session.
 type terminalProgress struct {
@@ -309,10 +355,15 @@ type terminalProgress struct {
 
 // runLeader owns one leadership epoch: barrier, stable-nonce epoch creation,
 // then repeated full reconciliation passes until the session context ends.
-func (actor *Actor) runLeader(ctx context.Context) {
+// It returns nil when the session context ended and errLeaderSessionAborted
+// when the loop gave up while leadership was still held.
+func (actor *Actor) runLeader(ctx context.Context) error {
 	nonce, err := actor.options.Nonces.Nonce()
-	if err != nil || nonce == ([16]byte{}) {
-		return
+	if err != nil {
+		return fmt.Errorf("%w: nonce: %w", errLeaderSessionAborted, err)
+	}
+	if nonce == ([16]byte{}) {
+		return fmt.Errorf("%w: zero nonce", errLeaderSessionAborted)
 	}
 	session := newSessionState()
 	// A new leadership session performs a complete repoll of every worker's
@@ -323,7 +374,10 @@ func (actor *Actor) runLeader(ctx context.Context) {
 	}
 	epoch, ok := actor.establishEpoch(ctx, nonce)
 	if !ok {
-		return
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("%w: coordinator epoch not established within %d attempts", errLeaderSessionAborted, establishAttemptLimit)
 	}
 	for {
 		if actor.reconcile(ctx, epoch, session) {
@@ -331,7 +385,7 @@ func (actor *Actor) runLeader(ctx context.Context) {
 		}
 		actor.driveTerminalResults(ctx, epoch)
 		if !actor.awaitTrigger(ctx, session) {
-			return
+			return nil
 		}
 	}
 }

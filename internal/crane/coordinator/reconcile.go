@@ -33,6 +33,7 @@ func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch,
 	for _, jobID := range jobs {
 		actor.reconcileJob(ctx, epoch, jobID, session, &converged)
 	}
+	session.pruneJobs(view)
 	return converged && ctx.Err() == nil
 }
 

@@ -1321,3 +1321,68 @@ func TestActorRetriesAmbiguousWorkerInstallIdempotently(t *testing.T) {
 		t.Fatal("worker 2 never accepted the running install")
 	}
 }
+
+// TestReconcilePrunesSessionStateForEvictedJobs pins that per-job session
+// memory (reconciled fences and terminal-install progress) is dropped at the
+// end of a pass for jobs the replicated view no longer retains, while a
+// retained job's entries survive.
+func TestReconcilePrunesSessionStateForEvictedJobs(t *testing.T) {
+	h := newHarness(t)
+	epoch := h.seedEpoch()
+	h.seedWorker(2, model.WorkerEpoch{2}, 4)
+	h.seedWorker(3, model.WorkerEpoch{3}, 4)
+	retained, _, _ := h.seedRunningJob(1)
+
+	session := newSessionState()
+	evicted := model.JobID{0x99, 0x99}
+	fence := jobFence{jobControlRevision: 1, assignmentRevision: 1}
+	session.reconciled[evicted] = fence
+	session.terminal[evicted] = terminalProgress{fence: fence, nodes: map[uint16]bool{2: true}}
+	session.terminal[retained] = terminalProgress{fence: fence, nodes: map[uint16]bool{2: true}}
+
+	h.actor.reconcile(context.Background(), epoch, session)
+
+	if _, ok := session.reconciled[evicted]; ok {
+		t.Fatal("reconciled fence for an evicted job survived the pass")
+	}
+	if _, ok := session.terminal[evicted]; ok {
+		t.Fatal("terminal progress for an evicted job survived the pass")
+	}
+	if progress, ok := session.terminal[retained]; !ok || !progress.nodes[2] {
+		t.Fatalf("terminal progress for the retained job was pruned: %#v", progress)
+	}
+}
+
+// TestLeaderSessionRestartsAfterPersistentBarrierFailure pins that a leader
+// loop which gives up establishing its epoch (every Barrier failing) does
+// not leave the still-leading node idle for the rest of the term: the
+// session's failure is surfaced and a fresh session restarts under the same
+// term, opening the gate once Raft recovers.
+func TestLeaderSessionRestartsAfterPersistentBarrierFailure(t *testing.T) {
+	h := newHarness(t)
+	h.raft.mu.Lock()
+	h.raft.barrierErr = errors.New("injected: no quorum")
+	h.raft.mu.Unlock()
+	h.start()
+	h.markReady()
+	h.lead(1)
+
+	h.waitFor(func() bool {
+		h.clk.Advance(retryPause)
+		return h.log.count("barrier") >= establishAttemptLimit
+	}, "first leader session to exhaust its establish attempts")
+	if h.gateOpen() {
+		t.Fatal("gate opened while every barrier failed")
+	}
+
+	h.raft.mu.Lock()
+	h.raft.barrierErr = nil
+	h.raft.mu.Unlock()
+	h.waitFor(func() bool {
+		h.clk.Advance(retryPause)
+		return h.gateOpen()
+	}, "gate open after the leader session restarted under the same term")
+	if view := h.view(); view.CoordinatorEpoch.Term != 1 {
+		t.Fatalf("restarted session established epoch under term %d, want the unchanged term 1", view.CoordinatorEpoch.Term)
+	}
+}
