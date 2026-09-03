@@ -39,6 +39,12 @@ import (
 	"github.com/aaditya/cs425mp3/internal/wire"
 )
 
+// simPaceSlice is the wall time granted to the node goroutines per virtual
+// step. It is a variable so a race-detector build (see pace_race_test.go) can
+// widen it: under -race the runtimes fall behind the virtual clock and
+// membership convergence after a relaunch needs more real time per step.
+var simPaceSlice = 1000 * time.Microsecond
+
 const (
 	simClusterIDText = "6ba7b810-9dad-41d1-80b4-00c04fd43124"
 	simVoterCount    = 3
@@ -53,7 +59,6 @@ const (
 	// that a real durability burst never expires a simulated raft or SWIM
 	// deadline unfairly. This is scheduler pacing, not synchronization: no
 	// condition ever waits on wall-clock time.
-	simPaceSlice = 1000 * time.Microsecond
 	// simDefaultPumpBudget bounds one await condition in pump steps.
 	simDefaultPumpBudget = 30000
 	// simClientCallAttempts bounds whole-call retries of one public client
@@ -807,6 +812,25 @@ func (cluster *simCluster) awaitSteady() {
 		return true
 	})
 	cluster.oracle.subscribeLeadership()
+	// Membership convergence after a (re)launch is bounded by real SWIM work
+	// (join, snapshot, dissemination) that runs behind the virtual clock under
+	// load, so it gets twice the default virtual budget.
+	if !cluster.awaitOptionally(2*simDefaultPumpBudget, func() bool {
+		for _, id := range cluster.ids {
+			members := cluster.membershipOf(id)
+			if len(members) != len(cluster.ids) {
+				return false
+			}
+			for _, member := range members {
+				if member.Status != swim.Alive {
+					return false
+				}
+			}
+		}
+		return true
+	}) {
+		cluster.record("membership did not converge within the extended budget")
+	}
 	cluster.await("membership converged to all four alive members", func() bool {
 		converged := true
 		for _, id := range cluster.ids {
