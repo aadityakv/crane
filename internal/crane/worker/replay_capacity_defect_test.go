@@ -137,3 +137,25 @@ func TestPerPeerReplayBudgetSurvivesConnectionPerCommandPacing(t *testing.T) {
 		t.Fatalf("replay-capacity handshake rejection = %#v, want retryable WorkerErrorCapacity", rejection)
 	}
 }
+
+// TestTimestampWindowRejectionCarriesItsOwnDetail pins that a sender whose
+// frame timestamp falls outside the replay window is told so: the rejection
+// stays retryable capacity (a fresh transmission carries a fresh timestamp)
+// but must not be misdescribed as replay-budget exhaustion.
+func TestTimestampWindowRejectionCarriesItsOwnDetail(t *testing.T) {
+	service := newReplayDefectService(t)
+	budget, ok := service.controlError(wire.MessageCraneWorkerHandshake, wire.ErrReplayCacheFull).(protocol.WorkerError)
+	if !ok {
+		t.Fatalf("replay-budget rejection rendered as %T, want protocol.WorkerError", budget)
+	}
+	skew, ok := service.controlError(wire.MessageCraneWorkerHandshake, wire.ErrTimestamp).(protocol.WorkerError)
+	if !ok {
+		t.Fatalf("timestamp rejection rendered as %T, want protocol.WorkerError", skew)
+	}
+	if skew.Code != protocol.WorkerErrorCapacity || !skew.Retryable {
+		t.Fatalf("timestamp rejection = code %d retryable %v, want WorkerErrorCapacity retryable", skew.Code, skew.Retryable)
+	}
+	if string(skew.Detail) != "request timestamp outside the replay window" || string(skew.Detail) == string(budget.Detail) {
+		t.Fatalf("timestamp rejection detail = %q (budget detail %q), want a distinct timestamp-window detail", skew.Detail, budget.Detail)
+	}
+}

@@ -911,3 +911,35 @@ func TestControlServiceCancellationClosesSlowClientsAndJoins(t *testing.T) {
 		_ = connection.Close()
 	}
 }
+
+// TestControlServicePerPeerReplayBudgetAdmitsConfiguredCountThenDropsWithoutResponse
+// pins the +6 half of the replay-budget change: one peer is admitted exactly
+// its per-peer budget of request identities inside the replay window, the
+// next frame from that peer is dropped without any response (the client's
+// ambiguous-drop retry path handles it), other peers keep their own budget,
+// and the budget frees once the window has elapsed.
+func TestControlServicePerPeerReplayBudgetAdmitsConfiguredCountThenDropsWithoutResponse(t *testing.T) {
+	fixture := newServiceFixture(t, state.NewMachine())
+	production := fixture.service.replay
+	const perPeer = 2
+	fixture.service.replay = newServiceReplay(fixture.clock, production.window, production.future, DefaultMaxControlReplayEntries, perPeer)
+	fixture.start()
+	request := statusRequest(model.JobID{0x44})
+
+	for index := 0; index < perPeer; index++ {
+		if _, err := fixture.exchangeFrame(2, testRequestID(t), request); err != nil {
+			t.Fatalf("request %d within the per-peer budget: %v", index+1, err)
+		}
+	}
+	if _, err := fixture.exchangeFrame(2, testRequestID(t), request); err == nil {
+		t.Fatal("frame beyond the per-peer replay budget received a response, want a silent drop")
+	}
+	if _, err := fixture.exchangeFrame(1, testRequestID(t), request); err != nil {
+		t.Fatalf("another peer lost admission to the first peer's exhausted budget: %v", err)
+	}
+
+	fixture.clock.Advance(production.window + time.Second)
+	if _, err := fixture.exchangeFrame(2, testRequestID(t), request); err != nil {
+		t.Fatalf("peer budget did not free after the replay window elapsed: %v", err)
+	}
+}

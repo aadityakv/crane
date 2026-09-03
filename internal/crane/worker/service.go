@@ -393,11 +393,16 @@ func (service *Service) controlError(message wire.MessageType, err error) protoc
 		code, detail = protocol.WorkerErrorStaleEpoch, "stale coordinator epoch"
 	case errors.Is(err, ErrControlStaleAssignment), errors.Is(err, ErrTransferIdentityReuse), errors.Is(err, model.ErrIdentityReuse):
 		code, detail = protocol.WorkerErrorStaleAssignment, "stale assignment"
-	case errors.Is(err, wire.ErrReplayCacheFull), errors.Is(err, wire.ErrTimestamp):
-		// Replay-budget exhaustion and timestamp-window rejection are transient
-		// admission capacity, never deterministic malformation: the sender
-		// retries rather than terminating grants or wedging activation.
+	case errors.Is(err, wire.ErrReplayCacheFull):
+		// Replay-budget exhaustion is transient admission capacity, never
+		// deterministic malformation: the sender retries rather than
+		// terminating grants or wedging activation.
 		code, retryable, detail = protocol.WorkerErrorCapacity, true, "replay admission budget exhausted"
+	case errors.Is(err, wire.ErrTimestamp):
+		// A frame timestamp outside the replay window is likewise transient
+		// (a fresh transmission carries a fresh timestamp) but names its own
+		// cause so a skewed sender is not told the budget is exhausted.
+		code, retryable, detail = protocol.WorkerErrorCapacity, true, "request timestamp outside the replay window"
 	case errors.Is(err, ErrControlCapacity), errors.Is(err, ErrTransferCapacity), errors.Is(err, store.ErrCapacity):
 		code, retryable, detail = protocol.WorkerErrorCapacity, true, "worker capacity exhausted"
 	case errors.Is(err, store.ErrBusy):
