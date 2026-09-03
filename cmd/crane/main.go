@@ -35,7 +35,13 @@ const maxTopologyDocumentBytes = 1 << 20
 // defaultResultPageBytes is the default complete-record page budget.
 const defaultResultPageBytes = 64 << 10
 
-const craneUsage = "usage: crane <submit|cancel|status|results|example-topology> [flags]"
+const craneUsage = "usage: crane <submit|cancel|status|results|example-topology> [flags]\n" +
+	"  submit  -config FILE -state FILE -topology FILE\n" +
+	"  cancel  -config FILE -state FILE -job HEX32 -expected-revision N\n" +
+	"  status  -config FILE -job HEX32\n" +
+	"  results -config FILE -job HEX32 [-page-bytes N]\n" +
+	"  example-topology\n" +
+	"network subcommands also accept -attempts N (1..1024), -backoff DURATION, and -timeout DURATION"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -188,14 +194,14 @@ func executeSubmit(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	job, err := client.Submit(ctx, topology)
+	job, revision, err := client.Submit(ctx, topology)
 	if err != nil {
 		return err
 	}
 	return writeJSONLine(stdout, map[string]any{
 		"command":              "submit",
 		"job_id":               hex.EncodeToString(job[:]),
-		"job_control_revision": 1,
+		"job_control_revision": revision,
 		"state":                "pending",
 	})
 }

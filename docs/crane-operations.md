@@ -87,6 +87,13 @@ service that redirects every request to the voters; they own no Raft storage.
 ./bin/cs425-crane cancel  -config examples/config/node-1.json -state ./client.state -job <32 hex> -expected-revision <job-control revision from status>
 ```
 
+Every network subcommand also accepts `-attempts N` (complete request
+attempts, 1 through 1024, default 8), `-backoff DURATION` (pause between
+attempts, default 200ms), and `-timeout DURATION` (per-exchange timeout
+override; zero keeps the configured `worker_control_timeout`). The submit
+and cancel outputs carry the durable job-control revision the client
+validated in the response.
+
 `-state` names an owner-only file that holds the durable client identity:
 the client ID, the next request sequence, and any pending mutation. A
 sequence is reserved and persisted before the request is sent, so a crash

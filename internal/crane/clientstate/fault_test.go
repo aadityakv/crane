@@ -232,3 +232,36 @@ func TestClientStateReopenAfterResolveCrashBoundaries(t *testing.T) {
 		})
 	}
 }
+
+// TestClientStateOpenRemovesOrphanedTemporary pins that a crash between the
+// temporary write and the rename never leaves <path>.tmp behind: opening the
+// state removes the orphan whether or not the durable file exists.
+func TestClientStateOpenRemovesOrphanedTemporary(t *testing.T) {
+	t.Run("ExistingState", func(t *testing.T) {
+		path := protectedStatePath(t)
+		identity := openTestStore(t, path, testClusterA).State().ClientID
+		if err := os.WriteFile(path+".tmp", []byte("torn temporary"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		reopened := openTestStore(t, path, testClusterA)
+		if reopened.State().ClientID != identity {
+			t.Fatal("orphaned temporary changed the durable identity")
+		}
+		if _, err := os.Lstat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("orphaned temporary survived open: %v", err)
+		}
+	})
+	t.Run("MissingState", func(t *testing.T) {
+		path := protectedStatePath(t)
+		if err := os.WriteFile(path+".tmp", []byte("torn temporary"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store := openTestStore(t, path, testClusterA)
+		if store.State().NextSequence != 1 {
+			t.Fatalf("fresh state sequence = %d, want 1", store.State().NextSequence)
+		}
+		if _, err := os.Lstat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("orphaned temporary survived creation: %v", err)
+		}
+	})
+}

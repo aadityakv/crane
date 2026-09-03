@@ -112,6 +112,10 @@ func openClientStateAt(path string, clusterID [16]byte, crash func(string) error
 	if err := requireProtectedDirectory(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
+	// A crash between the temporary write and the rename leaves the durable
+	// state intact but orphans <path>.tmp; the next persist would overwrite
+	// it anyway, so remove it best-effort rather than let it outlive the run.
+	_ = os.Remove(path + ".tmp")
 	store := &ClientStore{path: path, crash: crash}
 	info, err := os.Lstat(path)
 	switch {

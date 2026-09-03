@@ -242,9 +242,12 @@ func TestClientSubmitReservesPendingBeforeSendAndResolvesDurably(t *testing.T) {
 	}
 
 	client := harness.client()
-	job, err := client.Submit(testContext(t), topology)
+	job, revision, err := client.Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
+	}
+	if revision != 1 {
+		t.Fatalf("submit revision = %d, want the validated first durable revision 1", revision)
 	}
 	if len(observedPending) == 0 || observedSequence != 1 {
 		t.Fatalf("first send observed pending=%d bytes sequence=%d, want durable reservation", len(observedPending), observedSequence)
@@ -281,7 +284,7 @@ func TestClientSubmitRetryReplaysExactBytesAfterAmbiguousDrop(t *testing.T) {
 	}
 
 	client := harness.client()
-	job, err := client.Submit(testContext(t), topology)
+	job, _, err := client.Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("submit after ambiguous drop: %v", err)
 	}
@@ -308,7 +311,7 @@ func TestClientSubmitRetryStopsAtBoundedAttempts(t *testing.T) {
 	harness.connWrap = func(conn net.Conn, _ int) net.Conn { return ambiguousDropConn{Conn: conn} }
 
 	client := harness.client()
-	_, err := client.Submit(testContext(t), topology)
+	_, _, err := client.Submit(testContext(t), topology)
 	if !errors.Is(err, ErrClientAttemptsExhausted) {
 		t.Fatalf("submit with every response dropped = %v, want ErrClientAttemptsExhausted", err)
 	}
@@ -322,7 +325,7 @@ func TestClientSubmitRetryStopsAtBoundedAttempts(t *testing.T) {
 
 	// Recovery resolves the exact same reservation without a new sequence.
 	harness.connWrap = nil
-	job, err := harness.client().Submit(testContext(t), topology)
+	job, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("resume submit: %v", err)
 	}
@@ -340,7 +343,7 @@ func TestClientSubmitCrashResumeAcrossRestartRetriesSameIdentity(t *testing.T) {
 	harness.dialErr = func(string, int) error { return errors.New("injected dial failure") }
 
 	// Crash after the pending persist: the reservation exists, no server saw it.
-	_, err := harness.client().Submit(testContext(t), topology)
+	_, _, err := harness.client().Submit(testContext(t), topology)
 	if !errors.Is(err, ErrClientAttemptsExhausted) {
 		t.Fatalf("unsendable submit = %v, want ErrClientAttemptsExhausted", err)
 	}
@@ -351,7 +354,7 @@ func TestClientSubmitCrashResumeAcrossRestartRetriesSameIdentity(t *testing.T) {
 	// Restart: a reopened store and fresh client resume the exact identity.
 	harness.dialErr = nil
 	harness.store = harness.openStore()
-	job, err := harness.client().Submit(testContext(t), topology)
+	job, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("post-restart submit: %v", err)
 	}
@@ -363,7 +366,7 @@ func TestClientSubmitCrashResumeAcrossRestartRetriesSameIdentity(t *testing.T) {
 	}
 
 	// A repeated submit after resolution is a new command with a new identity.
-	second, err := harness.client().Submit(testContext(t), topology)
+	second, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("second submit: %v", err)
 	}
@@ -376,7 +379,7 @@ func TestClientResumePendingResolvesReservationOnce(t *testing.T) {
 	harness := newClientHarness(t, true)
 	topology := clientTestTopology(t, "resume-pending-api")
 	harness.dialErr = func(string, int) error { return errors.New("injected dial failure") }
-	if _, err := harness.client().Submit(testContext(t), topology); !errors.Is(err, ErrClientAttemptsExhausted) {
+	if _, _, err := harness.client().Submit(testContext(t), topology); !errors.Is(err, ErrClientAttemptsExhausted) {
 		t.Fatalf("unsendable submit = %v, want ErrClientAttemptsExhausted", err)
 	}
 
@@ -399,7 +402,7 @@ func TestClientCancelRetryResolvesConsumedRejectionsExactly(t *testing.T) {
 	topology := clientTestTopology(t, "cancel-matrix")
 	client := harness.client()
 	ctx := testContext(t)
-	job, err := client.Submit(ctx, topology)
+	job, _, err := client.Submit(ctx, topology)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +450,7 @@ func TestClientRedirectFollowsCheckedLeaderHint(t *testing.T) {
 		}
 	}
 
-	job, err := harness.client().Submit(testContext(t), topology)
+	job, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("submit through redirect: %v", err)
 	}
@@ -482,7 +485,7 @@ func TestClientRedirectToUnreachableLeaderFallsBackToVoters(t *testing.T) {
 		}
 	}
 
-	job, err := harness.client().Submit(testContext(t), topology)
+	job, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("submit past a dead hinted leader: %v", err)
 	}
@@ -523,7 +526,7 @@ func TestClientRedirectRejectsLoopsAndPreservesReservation(t *testing.T) {
 	topology := clientTestTopology(t, "redirect-loop")
 	harness.fixture.raft.setLeader(false, 2)
 
-	_, err := harness.client().Submit(testContext(t), topology)
+	_, _, err := harness.client().Submit(testContext(t), topology)
 	if !errors.Is(err, ErrClientRedirectLoop) {
 		t.Fatalf("looping redirects = %v, want ErrClientRedirectLoop", err)
 	}
@@ -533,7 +536,7 @@ func TestClientRedirectRejectsLoopsAndPreservesReservation(t *testing.T) {
 
 	// Leadership recovery resumes the same reservation to success.
 	harness.fixture.raft.setLeader(true, 0)
-	job, err := harness.client().Submit(testContext(t), topology)
+	job, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("post-loop resume: %v", err)
 	}
@@ -555,7 +558,7 @@ func TestClientRedirectRejectsUntrustedEndpoints(t *testing.T) {
 		return dialer.DialContext(ctx, "tcp", address)
 	}
 
-	_, err := harness.clientFrom(options).Submit(testContext(t), topology)
+	_, _, err := harness.clientFrom(options).Submit(testContext(t), topology)
 	if !errors.Is(err, ErrClientRedirectUntrusted) {
 		t.Fatalf("foreign redirect = %v, want ErrClientRedirectUntrusted", err)
 	}
@@ -583,7 +586,7 @@ func TestClientRetryRejectsWrongClusterResponses(t *testing.T) {
 		return dialer.DialContext(ctx, "tcp", address)
 	}
 
-	_, err := harness.clientFrom(options).Submit(testContext(t), topology)
+	_, _, err := harness.clientFrom(options).Submit(testContext(t), topology)
 	if !errors.Is(err, ErrClientAttemptsExhausted) {
 		t.Fatalf("wrong-cluster responses = %v, want bounded ErrClientAttemptsExhausted", err)
 	}
@@ -595,11 +598,11 @@ func TestClientRetryRejectsWrongClusterResponses(t *testing.T) {
 func TestClientReportsForfeitedDedupIdentityAfterStateRollback(t *testing.T) {
 	harness := newClientHarness(t, true)
 	ctx := testContext(t)
-	if _, err := harness.client().Submit(ctx, clientTestTopology(t, "rollback-one")); err != nil {
+	if _, _, err := harness.client().Submit(ctx, clientTestTopology(t, "rollback-one")); err != nil {
 		t.Fatal(err)
 	}
 	backup := readStateFile(t, harness.statePath)
-	if _, err := harness.client().Submit(ctx, clientTestTopology(t, "rollback-two")); err != nil {
+	if _, _, err := harness.client().Submit(ctx, clientTestTopology(t, "rollback-two")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -607,7 +610,7 @@ func TestClientReportsForfeitedDedupIdentityAfterStateRollback(t *testing.T) {
 	// lost-state restart that would reuse sequence 2 with different bytes.
 	writeStateFile(t, harness.statePath, backup)
 	harness.store = harness.openStore()
-	_, err := harness.client().Submit(ctx, clientTestTopology(t, "rollback-three"))
+	_, _, err := harness.client().Submit(ctx, clientTestTopology(t, "rollback-three"))
 	if !errors.Is(err, ErrClientIdentityForfeited) {
 		t.Fatalf("rolled-back identity submit = %v, want ErrClientIdentityForfeited", err)
 	}
@@ -625,7 +628,7 @@ func TestClientRetryWaitsThroughRetryableStarting(t *testing.T) {
 		}
 	}
 
-	job, err := harness.client().Submit(testContext(t), topology)
+	job, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("submit through Starting retries: %v", err)
 	}
@@ -641,7 +644,7 @@ func TestClientStatusReadsWithoutDurableStore(t *testing.T) {
 	harness := newClientHarness(t, true)
 	ctx := testContext(t)
 	topology := clientTestTopology(t, "status-read")
-	job, err := harness.client().Submit(ctx, topology)
+	job, _, err := harness.client().Submit(ctx, topology)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +665,7 @@ func TestClientStatusReadsWithoutDurableStore(t *testing.T) {
 		t.Fatalf("unknown status = %v, want NotFound rejection", err)
 	}
 
-	if _, err := reader.Submit(ctx, topology); !errors.Is(err, ErrClientStoreRequired) {
+	if _, _, err := reader.Submit(ctx, topology); !errors.Is(err, ErrClientStoreRequired) {
 		t.Fatalf("submit without store = %v, want ErrClientStoreRequired", err)
 	}
 	if _, err := reader.Cancel(ctx, job, 1); !errors.Is(err, ErrClientStoreRequired) {
@@ -758,7 +761,7 @@ func TestClientRedirectRetriesTransientlyUnreachableLeader(t *testing.T) {
 		}
 	}
 
-	job, err := harness.client().Submit(testContext(t), topology)
+	job, _, err := harness.client().Submit(testContext(t), topology)
 	if err != nil {
 		t.Fatalf("submit past a transiently unreachable hinted leader: %v", err)
 	}

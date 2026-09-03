@@ -1025,7 +1025,7 @@ func (cluster *simCluster) submit(client *simClient, plan *simJobPlan) model.Job
 	cluster.t.Helper()
 	var job model.JobID
 	err := cluster.callPumped("submit job", func(ctx context.Context) error {
-		submitted, submitErr := client.client.Submit(ctx, plan.spec)
+		submitted, _, submitErr := client.client.Submit(ctx, plan.spec)
 		job = submitted
 		return submitErr
 	})

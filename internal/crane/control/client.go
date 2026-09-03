@@ -172,13 +172,15 @@ func NewClient(options ClientOptions) (*Client, error) {
 // Submit durably reserves, sends, and resolves one topology submission,
 // resuming any pending request first. Re-running the exact unresolved
 // submission resumes its reserved sequence instead of creating a second job.
-func (client *Client) Submit(ctx context.Context, topology model.TopologySpec) (model.JobID, error) {
+// It returns the job identity and the durable job-control revision the
+// validated response carried.
+func (client *Client) Submit(ctx context.Context, topology model.TopologySpec) (model.JobID, uint64, error) {
 	if client.store == nil {
-		return model.JobID{}, ErrClientStoreRequired
+		return model.JobID{}, 0, ErrClientStoreRequired
 	}
 	validated, err := model.ValidateTopology(topology)
 	if err != nil {
-		return model.JobID{}, fmt.Errorf("validate submit topology: %w", err)
+		return model.JobID{}, 0, fmt.Errorf("validate submit topology: %w", err)
 	}
 	resumed, err := client.resumePendingMatch(ctx, func(pending protocol.ControlMessage) bool {
 		request, ok := pending.(protocol.SubmitRequest)
@@ -189,37 +191,37 @@ func (client *Client) Submit(ctx context.Context, topology model.TopologySpec) (
 		return validateErr == nil && pendingValidated.Digest() == validated.Digest()
 	})
 	if err != nil {
-		return model.JobID{}, err
+		return model.JobID{}, 0, err
 	}
 	if resumed != nil {
 		response, ok := resumed.(protocol.SubmitResponse)
 		if !ok {
-			return model.JobID{}, fmt.Errorf("pending submit resolved to unexpected %T", resumed)
+			return model.JobID{}, 0, fmt.Errorf("pending submit resolved to unexpected %T", resumed)
 		}
-		return response.JobID, nil
+		return response.JobID, response.JobControlRevision, nil
 	}
 
 	request := protocol.SubmitRequest{Request: client.store.NextRequestID(), Topology: topology}
 	request.Digest, err = protocol.SubmitCommandDigest(request.Request, topology)
 	if err != nil {
-		return model.JobID{}, fmt.Errorf("derive submit digest: %w", err)
+		return model.JobID{}, 0, fmt.Errorf("derive submit digest: %w", err)
 	}
 	payload, err := protocol.MarshalControlMessage(request)
 	if err != nil {
-		return model.JobID{}, fmt.Errorf("marshal submit request: %w", err)
+		return model.JobID{}, 0, fmt.Errorf("marshal submit request: %w", err)
 	}
 	if _, _, err := client.store.Begin(payload); err != nil {
-		return model.JobID{}, fmt.Errorf("reserve submit request: %w", err)
+		return model.JobID{}, 0, fmt.Errorf("reserve submit request: %w", err)
 	}
 	resolution, err := client.resolveMutation(ctx, payload)
 	if err != nil {
-		return model.JobID{}, err
+		return model.JobID{}, 0, err
 	}
 	response, ok := resolution.(protocol.SubmitResponse)
 	if !ok {
-		return model.JobID{}, fmt.Errorf("submit resolved to unexpected %T", resolution)
+		return model.JobID{}, 0, fmt.Errorf("submit resolved to unexpected %T", resolution)
 	}
-	return response.JobID, nil
+	return response.JobID, response.JobControlRevision, nil
 }
 
 // Cancel durably reserves, sends, and resolves one exact-revision cancel,

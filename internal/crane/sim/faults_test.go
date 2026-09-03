@@ -1376,7 +1376,7 @@ func TestScriptedFailureScenarios(t *testing.T) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_, err := client.client.Submit(ctx, plan.spec)
+			_, _, err := client.client.Submit(ctx, plan.spec)
 			submitted <- err
 		}()
 		cluster.await("server applied the pending submit", func() bool {
