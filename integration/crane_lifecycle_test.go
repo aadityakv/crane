@@ -519,6 +519,17 @@ func (c *craneCluster) diagnostics() string {
 		// The tail of each live process's captured stderr explains what the
 		// boundary counters cannot (leadership terms, rejected commands).
 		if node := c.nodes[id]; node.process != nil {
+			// A failing phase is terminal for the run, so ask every live node
+			// for a goroutine dump (SIGQUIT) and keep the complete captured
+			// output in a file for offline analysis of stalls.
+			if node.process.command != nil && node.process.command.Process != nil {
+				_ = node.process.command.Process.Signal(syscall.SIGQUIT)
+				time.Sleep(750 * time.Millisecond)
+				dumpPath := filepath.Join(os.TempDir(), fmt.Sprintf("crane-node-%d-%d.dump", id, node.incarnation))
+				if writeErr := os.WriteFile(dumpPath, []byte(node.process.log.String()), 0o600); writeErr == nil {
+					lines = append(lines, fmt.Sprintf("node %d[%d] full log + goroutine dump: %s", id, node.incarnation, dumpPath))
+				}
+			}
 			logLines := strings.Split(strings.TrimSpace(node.process.log.String()), "\n")
 			if len(logLines) > 12 {
 				logLines = logLines[len(logLines)-12:]
@@ -655,6 +666,12 @@ func (c *craneCluster) probeLeadership(id uint16) (isLeader bool, err error) {
 		}
 		return false, nil
 	case protocol.ControlError:
+		if decoded.Code == protocol.ControlErrorStarting && strings.Contains(string(decoded.Detail), "admission gate is closed") {
+			// Only the voter whose Barrier succeeded reaches the gate check:
+			// a leader whose coordinator is still reconciling answers this
+			// way, while followers redirect instead.
+			return true, nil
+		}
 		if decoded.Code == protocol.ControlErrorStarting || decoded.Code == protocol.ControlErrorNotLeader {
 			return false, fmt.Errorf("voter %d has no leader: code %d", id, decoded.Code)
 		}
