@@ -100,6 +100,9 @@ type simNode struct {
 
 	swimD  *faultDatagram
 	tupleD *faultDatagram
+	// mu guards handle and epochN: both are written on the node's worker
+	// goroutine inside the store-open hook and read on the test goroutine.
+	mu     sync.Mutex
 	handle *store.Store
 	epochN uint8
 	// starts counts process incarnations: every restart derives fresh
@@ -364,12 +367,14 @@ func (cluster *simCluster) startNode(node *simNode) {
 	incarnation := node.starts
 	openStore := func(path string, identity store.Identity, options store.Options) (*store.Store, error) {
 		options.NewWorkerEpoch = func() (model.WorkerEpoch, error) {
+			node.mu.Lock()
+			defer node.mu.Unlock()
 			node.epochN++
 			return simWorkerEpoch(seed, nodeID, node.epochN), nil
 		}
 		opened, openErr := store.Open(path, identity, options)
 		if openErr == nil {
-			node.handle = opened
+			node.setHandle(opened)
 		}
 		return opened, openErr
 	}
@@ -431,7 +436,7 @@ func (cluster *simCluster) stopNode(node *simNode) {
 	for i := 0; i < simShutdownPumps; i++ {
 		select {
 		case <-node.done:
-			node.handle = nil
+			node.setHandle(nil)
 			node.runtime = nil
 			node.cancel = nil
 			node.stopped = true
@@ -503,9 +508,23 @@ func (cluster *simCluster) reseedIntroducer(node *simNode) {
 // workerStore returns the live durable store handle of one running node.
 func (cluster *simCluster) workerStore(id uint16) *store.Store {
 	node := cluster.nodes[id]
-	if node == nil || node.runtime == nil || node.handle == nil {
+	if node == nil || node.runtime == nil {
 		return nil
 	}
+	return node.loadHandle()
+}
+
+// setHandle publishes (or clears) the node's live store handle under node.mu.
+func (node *simNode) setHandle(handle *store.Store) {
+	node.mu.Lock()
+	node.handle = handle
+	node.mu.Unlock()
+}
+
+// loadHandle reads the node's live store handle under node.mu.
+func (node *simNode) loadHandle() *store.Store {
+	node.mu.Lock()
+	defer node.mu.Unlock()
 	return node.handle
 }
 
@@ -633,7 +652,7 @@ func (cluster *simCluster) checkRunErrors() {
 					cluster.record("node %d runtime exited on the recorded outbox-retry capacity concern", id)
 					cluster.skipReason = fmt.Sprintf("TODO(recorded concern): node %d exhausted its worker store retrying outboxes against an unreachable peer (task-24-report.md, Concerns)", id)
 					node.running = false
-					node.handle = nil
+					node.setHandle(nil)
 					node.runtime = nil
 					node.cancel = nil
 					node.stopped = true

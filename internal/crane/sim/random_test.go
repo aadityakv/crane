@@ -253,7 +253,7 @@ func applyRandomFaultAction(cluster *simCluster, schedule *randomScheduleState, 
 		cluster.record("arm fault %s", name)
 		schedule.mu.Lock()
 		schedule.dialCuts = append(schedule.dialCuts, rule)
-		schedule.pendingWindows = append(schedule.pendingWindows, pendingFaultWindow{name: name, consumed: func() bool { return rule.blocked > 0 }})
+		schedule.pendingWindows = append(schedule.pendingWindows, pendingFaultWindow{name: name, consumed: func() bool { return rule.blocked.Load() > 0 }})
 		schedule.mu.Unlock()
 	case action < 7 && crashedCount == 0:
 		// Crash one node; the leader is preferred half the time.
@@ -310,7 +310,7 @@ func (cluster *simCluster) expireRandomWindows(schedule *randomScheduleState) {
 		rule.deactivate()
 	}
 	for _, rule := range dialCuts {
-		rule.active = false
+		rule.active.Store(false)
 	}
 	for _, window := range pending {
 		if window.consumed() {
@@ -323,7 +323,7 @@ func (cluster *simCluster) expireRandomWindows(schedule *randomScheduleState) {
 func anyRuleConsumed(rules []*datagramRule) func() bool {
 	return func() bool {
 		for _, rule := range rules {
-			if rule.consumed > 0 {
+			if rule.consumed.Load() > 0 {
 				return true
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,12 +39,15 @@ const (
 type datagramRule struct {
 	kind         dgramFaultKind
 	destinations map[config.Endpoint]struct{}
-	active       bool
-	consumed     int
+	// active and consumed are atomic: the network goroutines read them under
+	// the owning faultDatagram.mu while the test goroutine deactivates and
+	// polls rules without that lock.
+	active   atomic.Bool
+	consumed atomic.Int64
 }
 
 func (rule *datagramRule) matches(destination config.Endpoint) bool {
-	if !rule.active {
+	if !rule.active.Load() {
 		return false
 	}
 	if len(rule.destinations) == 0 {
@@ -53,7 +57,7 @@ func (rule *datagramRule) matches(destination config.Endpoint) bool {
 	return exists
 }
 
-func (rule *datagramRule) deactivate() { rule.active = false }
+func (rule *datagramRule) deactivate() { rule.active.Store(false) }
 
 type heldDatagram struct {
 	source      config.Endpoint
@@ -116,16 +120,16 @@ func (d *faultDatagram) SendFrom(ctx context.Context, source, destination config
 	}
 	switch {
 	case drop != nil:
-		drop.consumed++
+		drop.consumed.Add(1)
 		d.dropped++
 		d.mu.Unlock()
 		return nil
 	case hold != nil:
-		hold.consumed++
+		hold.consumed.Add(1)
 		d.heldTotal++
 		copies := 1
 		if duplicate != nil {
-			duplicate.consumed++
+			duplicate.consumed.Add(1)
 			d.duplicated++
 			copies = 2
 		}
@@ -135,7 +139,7 @@ func (d *faultDatagram) SendFrom(ctx context.Context, source, destination config
 		d.mu.Unlock()
 		return nil
 	case duplicate != nil:
-		duplicate.consumed++
+		duplicate.consumed.Add(1)
 		d.duplicated++
 		d.mu.Unlock()
 		if err := d.inner.SendFrom(ctx, source, destination, payload); err != nil {
@@ -179,7 +183,8 @@ func (d *faultDatagram) releaseHeld() {
 func (d *faultDatagram) addRule(kind dgramFaultKind, destinations ...config.Endpoint) *datagramRule {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rule := &datagramRule{kind: kind, active: true}
+	rule := &datagramRule{kind: kind}
+	rule.active.Store(true)
 	if len(destinations) > 0 {
 		rule.destinations = make(map[config.Endpoint]struct{}, len(destinations))
 		for _, destination := range destinations {
@@ -212,8 +217,8 @@ func (d *faultDatagram) stats() (sent, dropped, duplicated, held int) {
 // dialRule is one active injected TCP dial cut on one exact address.
 type dialRule struct {
 	address string
-	active  bool
-	blocked int
+	active  atomic.Bool
+	blocked atomic.Int64
 }
 
 // faultDialer wraps the production dialer used by the coordinator's +5
@@ -232,13 +237,13 @@ func (d *faultDialer) Dial(ctx context.Context, network, address string) (net.Co
 	d.mu.Lock()
 	var matched *dialRule
 	for _, rule := range d.rules {
-		if rule.active && rule.address == address {
+		if rule.active.Load() && rule.address == address {
 			matched = rule
 			break
 		}
 	}
 	if matched != nil {
-		matched.blocked++
+		matched.blocked.Add(1)
 		d.mu.Unlock()
 		return nil, fmt.Errorf("sim dial cut to %s", address)
 	}
@@ -249,7 +254,8 @@ func (d *faultDialer) Dial(ctx context.Context, network, address string) (net.Co
 func (d *faultDialer) cut(address string) *dialRule {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	rule := &dialRule{address: address, active: true}
+	rule := &dialRule{address: address}
+	rule.active.Store(true)
 	d.rules = append(d.rules, rule)
 	return rule
 }
@@ -369,7 +375,7 @@ func (cluster *simCluster) controlAddressOf(id uint16) string {
 func (cluster *simCluster) trackRules(name string, rules ...*datagramRule) {
 	cluster.trackFault(name, func() bool {
 		for _, rule := range rules {
-			if rule.consumed > 0 {
+			if rule.consumed.Load() > 0 {
 				return true
 			}
 		}
@@ -447,7 +453,7 @@ func (cluster *simCluster) tupleDatagramFaultEverywhere(kind dgramFaultKind, nam
 func (cluster *simCluster) cutControl(id uint16, name string) {
 	cluster.t.Helper()
 	rule := cluster.dialer.cut(cluster.controlAddressOf(id))
-	cluster.trackFault(name, func() bool { return rule.blocked > 0 })
+	cluster.trackFault(name, func() bool { return rule.blocked.Load() > 0 })
 }
 
 // healDatagrams deactivates every datagram fault rule in the cluster.
