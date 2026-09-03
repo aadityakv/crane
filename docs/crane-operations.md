@@ -172,5 +172,5 @@ make verify            # all of the above
 ```
 
 The deterministic simulation and the real-process proof are the reference for
-the failure scenarios above; `docs/superpowers/verification/` holds the
-recorded evidence for each release.
+the failure scenarios above; the recorded verification evidence for each
+release is kept outside the repository.
