@@ -329,11 +329,11 @@ func wipeIncompatibleDataRoot(dataRoot string) error {
 	return writeConsensusStamp(dataRoot)
 }
 
-// resetDataRoot removes every child of the data root, refusing paths that
+// resetDataRoot removes and recreates the data root, refusing paths that
 // would erase the working directory or a filesystem root.
 func resetDataRoot(dataRoot string) error {
 	cleaned := filepath.Clean(dataRoot)
-	if cleaned == "." || cleaned == string(filepath.Separator) || filepath.Dir(cleaned) == cleaned {
+	if cleaned == "." || cleaned == ".." || cleaned == string(filepath.Separator) || filepath.Dir(cleaned) == cleaned {
 		return fmt.Errorf("refusing to reset unsafe data root %q", dataRoot)
 	}
 	if err := os.RemoveAll(dataRoot); err != nil {

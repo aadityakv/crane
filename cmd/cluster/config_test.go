@@ -438,7 +438,7 @@ func TestReconcileDataRootResumesResetsAndRefuses(t *testing.T) {
 		wantStamp         bool
 		wantNotice        string
 	}{
-		{name: "matching stamp resumes", stamp: model.ConsensusFingerprintHex(), wantStamp: true},
+		{name: "matching stamp resumes", stamp: model.ConsensusFingerprintHex(), nodeStorage: true, wantStamp: true},
 		{name: "fresh root stamps", wantStamp: true},
 		{name: "mismatch without flag refuses up front", stamp: other, wantErr: "-reset-incompatible"},
 		{name: "mismatch with flag resets and restamps", stamp: other, resetIncompatible: true, wantReset: true, wantStamp: true, wantNotice: "was written under consensus fingerprint"},
@@ -480,6 +480,10 @@ func TestReconcileDataRootResumesResetsAndRefuses(t *testing.T) {
 				if _, statErr := os.Stat(filepath.Join(root, "node-1")); !os.IsNotExist(statErr) {
 					t.Fatalf("node storage survived the reset (stat err = %v)", statErr)
 				}
+			} else if test.nodeStorage {
+				if _, statErr := os.Stat(filepath.Join(root, "node-1")); statErr != nil {
+					t.Fatalf("node storage vanished without a reset (stat err = %v)", statErr)
+				}
 			}
 			stamped, readErr := os.ReadFile(filepath.Join(root, consensusStampFilename))
 			if test.wantStamp {
@@ -505,9 +509,27 @@ func TestReconcileDataRootResumesResetsAndRefuses(t *testing.T) {
 // TestResetDataRootRefusesUnsafeRoots pins the wipe guard: a mistyped data
 // root must error out before anything is removed.
 func TestResetDataRootRefusesUnsafeRoots(t *testing.T) {
-	for _, unsafe := range []string{"", ".", string(filepath.Separator)} {
+	for _, unsafe := range []string{"", ".", "..", string(filepath.Separator)} {
 		if err := resetDataRoot(unsafe); err == nil {
 			t.Fatalf("resetDataRoot(%q) accepted an unsafe root", unsafe)
 		}
+	}
+}
+
+// TestReconcileDataRootSurfacesStampReadFailure covers the read-error branch
+// of the reconcile matrix: a stamp path that cannot be read as a file must
+// surface as an error instead of silently proceeding.
+func TestReconcileDataRootSurfacesStampReadFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, consensusStampFilename), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	err := reconcileDataRoot(root, false, &output)
+	if err == nil || !strings.Contains(err.Error(), "read consensus fingerprint stamp") {
+		t.Fatalf("reconcileDataRoot error = %v, want it to mention %q", err, "read consensus fingerprint stamp")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("unexpected notice %q", output.String())
 	}
 }
