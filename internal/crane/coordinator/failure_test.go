@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -222,7 +223,11 @@ func TestSecondaryOnlyFailureReplacesReplicaWithoutTouchingAttempts(t *testing.T
 	h.start()
 	h.markReady()
 	h.lead(2)
-	h.waitFor(func() bool { return h.log.count("install:2:closed") >= 1 }, "first pass past the failure tracker")
+	survivor := uint16(2)
+	if secondary == survivor {
+		survivor = 3
+	}
+	h.waitFor(func() bool { return h.log.count(fmt.Sprintf("install:%d:closed", survivor)) >= 1 }, "first pass past the failure tracker")
 	h.clk.Advance(150 * time.Millisecond)
 	h.actor.Wake()
 	h.waitFor(func() bool {

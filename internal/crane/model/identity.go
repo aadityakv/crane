@@ -12,9 +12,9 @@ import (
 var ErrIdentityReuse = errors.New("identity reuse with different defining bytes")
 
 const (
-	jobIDDomain         = "cs425/crane/job/v1\x00"
-	sourceTupleIDDomain = "cs425/crane/source-tuple/v1\x00"
-	childTupleIDDomain  = "cs425/crane/derived-tuple/v1\x00"
+	jobIDDomain         = "crane/job/v1\x00"
+	sourceTupleIDDomain = "crane/source-tuple/v1\x00"
+	childTupleIDDomain  = "crane/derived-tuple/v1\x00"
 )
 
 // ClientID identifies a submitter independently of an individual request.

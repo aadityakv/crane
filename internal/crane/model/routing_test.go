@@ -12,7 +12,7 @@ func TestRouteGoldensAndDeterminism(t *testing.T) {
 	tupleID := DeriveSourceTupleID(job, TaskID{JobID: job, StageID: 1}, 1)
 	tuple := intTuple(42)
 	shuffle, err := Route(v, v.Spec().Edges[0], tupleID, tuple)
-	if err != nil || !reflect.DeepEqual(shuffle, []uint16{1}) {
+	if err != nil || !reflect.DeepEqual(shuffle, []uint16{0}) {
 		t.Fatalf("shuffle = %v,%v", shuffle, err)
 	}
 	field, err := Route(v, v.Spec().Edges[1], tupleID, tuple)

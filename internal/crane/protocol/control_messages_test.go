@@ -835,7 +835,7 @@ func independentSubmitDigest(t *testing.T, request model.ClientRequestID, topolo
 }
 
 func independentSubmitDigestValue(request model.ClientRequestID, topology []byte) [32]byte {
-	encoded := []byte("cs425/crane/submit-control-command/v1\x00")
+	encoded := []byte("crane/submit-control-command/v1\x00")
 	encoded = append(encoded, request.ClientID[:]...)
 	encoded = appendU64Golden(encoded, request.Sequence)
 	encoded = append(encoded, topology...)
@@ -843,7 +843,7 @@ func independentSubmitDigestValue(request model.ClientRequestID, topology []byte
 }
 
 func independentCancelDigest(request model.ClientRequestID, job model.JobID, revision uint64) [32]byte {
-	encoded := []byte("cs425/crane/cancel-control-command/v1\x00")
+	encoded := []byte("crane/cancel-control-command/v1\x00")
 	encoded = append(encoded, request.ClientID[:]...)
 	encoded = appendU64Golden(encoded, request.Sequence)
 	encoded = append(encoded, job[:]...)

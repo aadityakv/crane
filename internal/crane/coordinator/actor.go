@@ -39,7 +39,7 @@ const (
 	establishAttemptLimit          = 64
 	retryPause                     = 10 * time.Millisecond
 
-	commandIdentityDomain = "cs425/crane/coordinator/command-id/v1\x00"
+	commandIdentityDomain = "crane/coordinator/command-id/v1\x00"
 )
 
 // errLeaderSessionAborted reports a leader loop that ended while leadership

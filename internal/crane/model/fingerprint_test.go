@@ -69,14 +69,14 @@ func TestRegistryV1ReturnsSortedOwnedExactBuiltins(t *testing.T) {
 
 func TestV1FingerprintsMatchIndependentGoldens(t *testing.T) {
 	registry := RegistryFingerprint()
-	if got := hex.EncodeToString(registry[:]); got != "56b222c3476fa78b244396eb8c12a74b1d6f4cfa1ab0b8cf7655d76cfb81d6d0" {
+	if got := hex.EncodeToString(registry[:]); got != "4ce85942faf3332c39007e36a119ace453c4b8ed3ba1a7d92de43a0466bd1df7" {
 		t.Fatalf("RegistryFingerprint() = %s", got)
 	}
-	if got := ConsensusFingerprintHex(); got != "0bf8cc21803ad28017a9826481dcf1df1b475f0e8cfd1d9dbb434a2f6602c129" {
+	if got := ConsensusFingerprintHex(); got != "7732f1f226ca753e085cb5f963f79c7de666dfc7882a733353f08522aca1028b" {
 		t.Fatalf("ConsensusFingerprintHex() = %s", got)
 	}
 	consensus := ConsensusFingerprint()
-	if got := hex.EncodeToString(consensus[:]); got != "0bf8cc21803ad28017a9826481dcf1df1b475f0e8cfd1d9dbb434a2f6602c129" {
+	if got := hex.EncodeToString(consensus[:]); got != "7732f1f226ca753e085cb5f963f79c7de666dfc7882a733353f08522aca1028b" {
 		t.Fatalf("ConsensusFingerprint() = %s", got)
 	}
 }

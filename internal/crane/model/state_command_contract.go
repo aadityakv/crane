@@ -1,6 +1,6 @@
 package model
 
-const stateCommandContractFingerprintDomain = "cs425/crane/state-command-contract/v1\x00"
+const stateCommandContractFingerprintDomain = "crane/state-command-contract/v1\x00"
 
 const (
 	stateSnapshotMagicBytesV2          = 4
@@ -449,7 +449,7 @@ func StateCommandContractV1() StateCommandContract {
 		SnapshotEstimatorConstants: append([]StateCommandConstantDescriptor(nil), stateSnapshotEstimatorConstantsV2...),
 		EnumDomains:                cloneStateCommandEnums(stateCommandEnumsV1),
 		ResultMatrix:               append([]StateCommandResultRule(nil), stateCommandResultMatrixV1...),
-		DigestDomains:              []string{"cs425/crane/internal-command/v1", "cs425/crane/needs-reassignment/v1", "cs425/crane/completion-report/v1", "cs425/crane/job-failure-event/v1", AssignmentSetDigestDomainV1},
+		DigestDomains:              []string{"crane/internal-command/v1", "crane/needs-reassignment/v1", "crane/completion-report/v1", "crane/job-failure-event/v1", AssignmentSetDigestDomainV1},
 		MaxClientSessions:          StateCommandMaxClientSessionsV1,
 		MaxSubjectHistories:        StateCommandMaxSubjectHistoriesV1,
 		MaxCachedResultBytes:       StateCommandMaxCachedResultBytesV1,

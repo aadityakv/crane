@@ -35,7 +35,7 @@ func TestVoterSetCanonicalOrderingMajorityAndFingerprint(t *testing.T) {
 	if voters.Majority() != 2 {
 		t.Fatalf("Majority() = %d, want 2", voters.Majority())
 	}
-	wantFingerprint, err := hex.DecodeString("6f2671a478c32bac4c5b2a24b429150ce9ac0dc4dd3d9980ad2a8d0e63d96e07")
+	wantFingerprint, err := hex.DecodeString("d76855ab738c652262a13b46a62736fa9a69f1c9419b04b5add2ee97a554272a")
 	if err != nil {
 		t.Fatal(err)
 	}

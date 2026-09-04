@@ -26,7 +26,7 @@ const (
 var walMagic = [4]byte{'C', 'W', 'W', 'L'}
 var walCRC = crc32.MakeTable(crc32.Castagnoli)
 
-const transactionDigestDomain = "cs425/crane/worker-wal-transaction/v1\x00"
+const transactionDigestDomain = "crane/worker-wal-transaction/v1\x00"
 
 type walRecordType uint16
 

@@ -41,17 +41,17 @@ func TestIdentityDerivationUsesExactDomainsBigEndianAndTruncation(t *testing.T) 
 	topology := digestFixture(0)
 	request := ClientRequestID{ClientID: client, Sequence: 0x0102030405060708}
 	job := DeriveJobID(request, topology)
-	if got := hex.EncodeToString(job[:]); got != "012654e89324a1834bdb4e9af0287a4d" {
+	if got := hex.EncodeToString(job[:]); got != "57a26950630001ae65b2e1401f73a63b" {
 		t.Fatalf("DeriveJobID() = %s", got)
 	}
-	if !bytes.Equal(job[:], []byte{0x01, 0x26, 0x54, 0xe8, 0x93, 0x24, 0xa1, 0x83, 0x4b, 0xdb, 0x4e, 0x9a, 0xf0, 0x28, 0x7a, 0x4d}) {
+	if !bytes.Equal(job[:], []byte{0x57, 0xa2, 0x69, 0x50, 0x63, 0x00, 0x01, 0xae, 0x65, 0xb2, 0xe1, 0x40, 0x1f, 0x73, 0xa6, 0x3b}) {
 		t.Fatal("JobID was not the leading SHA-256 bytes")
 	}
 
 	sourceJob := JobID{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f}
 	sourceTask := TaskID{JobID: sourceJob, StageID: 0x1122, Partition: 0x3344}
 	source := DeriveSourceTupleID(sourceJob, sourceTask, 0x0102030405060708)
-	if got := hex.EncodeToString(source.PathDigest[:]); got != "03995ef357370299d49340e0f02f4070be9f34b70b57c248899efc3e50340d01" {
+	if got := hex.EncodeToString(source.PathDigest[:]); got != "516e1ed5eb26f3d5e52b0ff664979a1c75cd817af6cb3d750e459025f4347cfa" {
 		t.Fatalf("source path digest = %s", got)
 	}
 	if source.JobID != sourceJob || source.SourceTask != sourceTask || source.SourceSequence != 0x0102030405060708 {
@@ -60,10 +60,10 @@ func TestIdentityDerivationUsesExactDomainsBigEndianAndTruncation(t *testing.T) 
 
 	child0 := DeriveChildTupleID(source, TaskID{JobID: sourceJob, StageID: 0x5566, Partition: 0x7788}, 0x99aa, 0)
 	child1 := DeriveChildTupleID(source, TaskID{JobID: sourceJob, StageID: 0x5566, Partition: 0x7788}, 0x99aa, 1)
-	if got := hex.EncodeToString(child0.PathDigest[:]); got != "8e38b711fb047f8513365a63ce18747d650f9236384358f8ec537f3d93d22825" {
+	if got := hex.EncodeToString(child0.PathDigest[:]); got != "aa308072fb6c8a28fe379dcd99b349f509f7bd25bac8a1224ab92ded5f330550" {
 		t.Fatalf("child ordinal zero path digest = %s", got)
 	}
-	if got := hex.EncodeToString(child1.PathDigest[:]); got != "d00b1dcb579c3b557f6c34ec6d6620ac74685dc16aaa25a56eb778d7a9967099" {
+	if got := hex.EncodeToString(child1.PathDigest[:]); got != "67b76ebab52d8df56853e4ce1db88a5527cd8d92e9dd74424307b410e08493ae" {
 		t.Fatalf("child ordinal one path digest = %s", got)
 	}
 	if child0 == child1 {

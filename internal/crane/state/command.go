@@ -19,7 +19,7 @@ const (
 	commandResultBytes        = model.StateCommandCommandResultBytesV1
 )
 
-const internalCommandDigestDomain = "cs425/crane/internal-command/v1\x00"
+const internalCommandDigestDomain = "crane/internal-command/v1\x00"
 
 // CommandKind selects one concrete, non-opaque replicated transition.
 type CommandKind uint16

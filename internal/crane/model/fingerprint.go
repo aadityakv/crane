@@ -7,19 +7,19 @@ import (
 )
 
 const (
-	registryFingerprintDomain     = "cs425/crane/operator-registry/v1\x00"
-	consensusFingerprintDomain    = "cs425/crane/consensus/v1\x00"
-	wireContractFingerprintDomain = "cs425/crane/wire-contract/v1\x00"
+	registryFingerprintDomain     = "crane/operator-registry/v1\x00"
+	consensusFingerprintDomain    = "crane/consensus/v1\x00"
+	wireContractFingerprintDomain = "crane/wire-contract/v1\x00"
 )
 
 var identityDomainsV1 = []string{
-	"cs425/crane/job/v1",
-	"cs425/crane/source-tuple/v1",
-	"cs425/crane/derived-tuple/v1",
-	"cs425/crane/route/v1",
-	"cs425/crane/rendezvous/v1",
-	"cs425/crane/internal-command/v1",
-	"cs425/crane/completion-report/v1",
+	"crane/job/v1",
+	"crane/source-tuple/v1",
+	"crane/derived-tuple/v1",
+	"crane/route/v1",
+	"crane/rendezvous/v1",
+	"crane/internal-command/v1",
+	"crane/completion-report/v1",
 }
 
 // RegistryFingerprint returns the SHA-256 compatibility fingerprint for v1 operators.

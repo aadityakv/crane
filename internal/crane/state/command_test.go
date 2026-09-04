@@ -19,7 +19,7 @@ func TestCommandBeginCoordinatorEpochCanonicalGoldenAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBeginCoordinatorEpoch: %v", err)
 	}
-	const wantHex = "00010bf8cc21803ad28017a9826481dcf1df1b475f0e8cfd1d9dbb434a2f6602c1290001000000000000000000000000000000000000000000000000000000000000000000000211000000000000000000000000000000000000000000000000000000000000005b6c5cc348f25214eaf73cdb527c0b24efdcc73eeb48e0a765fd5c271a7888520100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
+	const wantHex = "00017732f1f226ca753e085cb5f963f79c7de666dfc7882a733353f08522aca1028b000100000000000000000000000000000000000000000000000000000000000000000000021100000000000000000000000000000000000000000000000000000000000000ed12770cb35aee522db1acba8fba6c76fcc01bca1a55dd8b878088ec0a0fce0c0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("golden = %s, want %s", got, wantHex)
 	}
@@ -526,7 +526,7 @@ func validBeginCommandNoTB(expected uint64, coordinator uint16, nonceByte byte) 
 }
 
 func independentInternalDigest(envelope Envelope, target []byte) [32]byte {
-	encoded := append([]byte("cs425/crane/internal-command/v1\x00"), byte(envelope.SchemaVersion>>8), byte(envelope.SchemaVersion))
+	encoded := append([]byte("crane/internal-command/v1\x00"), byte(envelope.SchemaVersion>>8), byte(envelope.SchemaVersion))
 	encoded = append(encoded, envelope.ConsensusFingerprint[:]...)
 	var fixed [8]byte
 	binary.BigEndian.PutUint16(fixed[:2], uint16(envelope.Kind))

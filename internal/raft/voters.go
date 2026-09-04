@@ -9,7 +9,7 @@ import (
 	"github.com/aadityakv/crane/internal/config"
 )
 
-const voterFingerprintDomain = "cs425/raft/voter-set/v1\x00"
+const voterFingerprintDomain = "raft/voter-set/v1\x00"
 
 // StorageFormatVersion identifies an incompatible durable Raft storage layout.
 type StorageFormatVersion uint16

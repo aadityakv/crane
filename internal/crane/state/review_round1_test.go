@@ -156,7 +156,7 @@ func TestReplaceWorkerEpochRequiresExactCurrentOperatorState(t *testing.T) {
 func TestStateCommandContractBindsAssignmentDigestDomain(t *testing.T) {
 	contract := model.StateCommandContractV1()
 	for _, domain := range contract.DigestDomains {
-		if domain == "cs425/crane/assignment-set/v1" {
+		if domain == "crane/assignment-set/v1" {
 			return
 		}
 	}

@@ -1,6 +1,6 @@
 package model
 
-const workerStoreContractFingerprintDomain = "cs425/crane/worker-store-contract/v1\x00"
+const workerStoreContractFingerprintDomain = "crane/worker-store-contract/v1\x00"
 
 // WorkerStoreRecordDescriptor pins one Store registry entry and payload schema.
 type WorkerStoreRecordDescriptor struct {

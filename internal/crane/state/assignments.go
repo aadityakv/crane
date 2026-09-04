@@ -11,7 +11,7 @@ import (
 	"github.com/aadityakv/crane/internal/crane/model"
 )
 
-const needsReassignmentDigestDomain = "cs425/crane/needs-reassignment/v1\x00"
+const needsReassignmentDigestDomain = "crane/needs-reassignment/v1\x00"
 
 // ReassignmentTargetKind selects a task token or one result-replica role.
 type ReassignmentTargetKind uint8

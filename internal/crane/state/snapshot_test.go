@@ -78,7 +78,7 @@ func TestEmptySnapshotCanonicalGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded, _ := capture.MarshalBinary()
-	const wantPrefix = "4352534e00020bf8cc21803ad28017a9826481dcf1df1b475f0e8cfd1d9dbb434a2f6602c129"
+	const wantPrefix = "4352534e00027732f1f226ca753e085cb5f963f79c7de666dfc7882a733353f08522aca1028b"
 	wantHex := wantPrefix + strings.Repeat("00", 90)
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("empty snapshot golden=%s", got)
@@ -126,7 +126,7 @@ func TestSnapshotRoundTripIsCompleteDeterministicOwnedAndEstimatorExact(t *testi
 
 	// The capture and restore own their bytes independently of callers and live state.
 	leftBytes[0] ^= 0xff
-	left.clients[model.ClientID{0x71}] = clientHistory{sequence: 999, digest: [32]byte{9}, result: []byte("mutated")}
+	left.clients[model.ClientID{0xdb}] = clientHistory{sequence: 999, digest: [32]byte{9}, result: []byte("mutated")}
 	again, err := leftCapture.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)

@@ -99,8 +99,8 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 			{Name: "FailureCode", Values: []string{"Operator=1", "TupleInvalid=2", "Storage=3"}},
 		},
 		IdentityDomains: []string{
-			"cs425/crane/submit-control-command/v1",
-			"cs425/crane/cancel-control-command/v1",
+			"crane/submit-control-command/v1",
+			"crane/cancel-control-command/v1",
 		},
 		ErrorCodeMatrix: []string{
 			"Unbound=Malformed,UnsupportedSchema,InvalidRequest",
@@ -149,7 +149,7 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 	got.ErrorCodeMatrix[0] = "mutated"
 	got.Rules[0] = "mutated"
 	again := PublicControlContractV1()
-	if again.Messages[0].Name != "SubmitRequest" || again.Messages[0].Fields[0].Name != "Request" || again.NestedLayouts[0].Fields[0].Encoding != "bytes16(nonzero)" || again.EnumDomains[0].Values[0] != "Pending=1" || again.IdentityDomains[0] != "cs425/crane/submit-control-command/v1" || again.ErrorCodeMatrix[0] != "Unbound=Malformed,UnsupportedSchema,InvalidRequest" || again.Rules[0] != "payload-prefix-is-schema-version-then-message-type" {
+	if again.Messages[0].Name != "SubmitRequest" || again.Messages[0].Fields[0].Name != "Request" || again.NestedLayouts[0].Fields[0].Encoding != "bytes16(nonzero)" || again.EnumDomains[0].Values[0] != "Pending=1" || again.IdentityDomains[0] != "crane/submit-control-command/v1" || again.ErrorCodeMatrix[0] != "Unbound=Malformed,UnsupportedSchema,InvalidRequest" || again.Rules[0] != "payload-prefix-is-schema-version-then-message-type" {
 		t.Fatalf("PublicControlContractV1 shares mutable storage: %#v", again)
 	}
 }

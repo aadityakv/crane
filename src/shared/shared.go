@@ -55,13 +55,13 @@ func Hash(s string) uint32 {
 	return h.Sum32()
 }
 
-// Given the servNum, returns address in form of fa18-cs425-g27-{SERVNUM}.cs.illinois.edu
+// Given the servNum, returns address in form of crane-node-{SERVNUM}.local
 func GetServerAddressFromNumber(servNum int) (serverAddress string) {
-	serverAddress = "fa18-cs425-g27-"
+	serverAddress = "crane-node-"
 	if servNum != 10 {
-		serverAddress += fmt.Sprintf("0%d%s", servNum, ".cs.illinois.edu")
+		serverAddress += fmt.Sprintf("0%d%s", servNum, ".local")
 	} else {
-		serverAddress += fmt.Sprintf("%d%s", servNum, ".cs.illinois.edu")
+		serverAddress += fmt.Sprintf("%d%s", servNum, ".local")
 	}
 	return
 }
@@ -84,11 +84,11 @@ func GetOwnServerNumber() (servNum int) {
 }
 
 func GetServerNumberFromString(serverAddress string) (servNum int) {
-	server := strings.Split(serverAddress, "fa18-cs425-g37-")
+	server := strings.Split(serverAddress, "crane-node-")
 	if len(server) != 2 {
 		panic("This is not one of the VMs, exiting execution.\n")
 	}
-	serverAddress = strings.Split(server[1], ".cs.illinois.edu")[0]
+	serverAddress = strings.Split(server[1], ".local")[0]
 	if serverAddress[0] == '0' {
 		servNum, _ = strconv.Atoi(string(serverAddress[1]))
 	} else {

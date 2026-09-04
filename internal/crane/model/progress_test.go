@@ -12,7 +12,7 @@ func TestProgressSchemasRejectCrossJobAndIncompleteEvents(t *testing.T) {
 	epoch := CoordinatorEpoch{Term: 1, BeginIndex: 2, Coordinator: 3, Nonce: [16]byte{4}}
 	report := CompletionReport{JobID: job, JobControlRevision: 1, AssignmentRevision: 4, Source: task, Token: token, Epoch: epoch, ExpectedCheckpointRevision: 0, Prior: 5, New: 7, EOF: 9, WorkerTransactionID: 1}
 	report.Digest = CompletionReportDigest(report)
-	if got := hex.EncodeToString(report.Digest[:]); got != "2e7bcaea7016bc9a34074b80dadc01ed33b477d6b0f8dedcaf162b6c135e12a2" {
+	if got := hex.EncodeToString(report.Digest[:]); got != "c28aa2c2ac9538fd2551988ab7a5a4764431b7210620faa287c1772d4794f9e1" {
 		t.Fatalf("completion digest = %s", got)
 	}
 	if err := report.Validate(); err != nil {

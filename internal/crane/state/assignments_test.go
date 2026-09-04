@@ -201,7 +201,7 @@ func task10AssignedJob(t *testing.T, workerCount int) (*Machine, model.JobID, mo
 	if err != nil {
 		t.Fatal(err)
 	}
-	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0x71}, Sequence: 1}, topology.Spec(), machine.coordinatorEpoch)
+	submit, _ := NewSubmitJob(model.ClientRequestID{ClientID: model.ClientID{0xdb}, Sequence: 1}, topology.Spec(), machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, 10, submit); got.Code != ResultSuccess {
 		t.Fatalf("submit = %#v", got)
 	}

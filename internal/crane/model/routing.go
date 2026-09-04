@@ -7,7 +7,7 @@ import (
 	"errors"
 )
 
-const routeDomain = "cs425/crane/route/v1\x00"
+const routeDomain = "crane/route/v1\x00"
 
 // Route returns canonical destination partitions for one validated edge.
 func Route(topology ValidatedTopology, edge EdgeSpec, tupleID TupleID, tuple Tuple) ([]uint16, error) {

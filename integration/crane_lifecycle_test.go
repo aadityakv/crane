@@ -38,7 +38,7 @@ import (
 
 const (
 	craneIntegrationSecret = "crane-integration-secret-32bytes!!"
-	craneVariantDomain     = "cs425/crane/integration-variant\x00"
+	craneVariantDomain     = "crane/integration-variant\x00"
 )
 
 // ---------------------------------------------------------------------------

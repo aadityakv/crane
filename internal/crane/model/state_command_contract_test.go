@@ -109,7 +109,7 @@ func TestStateCommandContractV1PinsCompleteReplicatedDedupContract(t *testing.T)
 			{Code: 8, Subject: 5, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
 			{Code: 8, Subject: 6, Revision: StateCommandRevisionAny, Identity: StateCommandIdentityJob, Epoch: StateCommandEpochZero},
 		},
-		DigestDomains:     []string{"cs425/crane/internal-command/v1", "cs425/crane/needs-reassignment/v1", "cs425/crane/completion-report/v1", "cs425/crane/job-failure-event/v1", AssignmentSetDigestDomainV1},
+		DigestDomains:     []string{"crane/internal-command/v1", "crane/needs-reassignment/v1", "crane/completion-report/v1", "crane/job-failure-event/v1", AssignmentSetDigestDomainV1},
 		MaxClientSessions: 1024, MaxSubjectHistories: 197889,
 		MaxCachedResultBytes: 65536, MaxSnapshotBytes: 8388608,
 		MaxWorkers: 1024, MaxActiveJobs: 64, MaxRetainedJobs: 256,
@@ -354,8 +354,8 @@ func TestStateCommandContractPinsEveryTask10CommandAndNestedRecord(t *testing.T)
 		}
 	}
 	wantDomains := []string{
-		"cs425/crane/internal-command/v1", "cs425/crane/needs-reassignment/v1",
-		"cs425/crane/completion-report/v1", "cs425/crane/job-failure-event/v1", AssignmentSetDigestDomainV1,
+		"crane/internal-command/v1", "crane/needs-reassignment/v1",
+		"crane/completion-report/v1", "crane/job-failure-event/v1", AssignmentSetDigestDomainV1,
 	}
 	if !reflect.DeepEqual(contract.DigestDomains, wantDomains) {
 		t.Fatalf("Task 10 digest domains = %#v, want %#v", contract.DigestDomains, wantDomains)

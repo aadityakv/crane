@@ -2,7 +2,7 @@ package model
 
 import "crypto/sha256"
 
-const workerControlContractFingerprintDomain = "cs425/crane/worker-control-contract/v1\x00"
+const workerControlContractFingerprintDomain = "crane/worker-control-contract/v1\x00"
 
 const (
 	WorkerControlSchemaVersionV1    uint16 = 1
@@ -51,12 +51,12 @@ type WorkerControlContract struct {
 }
 
 var workerControlIdentityDomainsV1 = []string{
-	"cs425/crane/checkpoint-vector/v1",
-	"cs425/crane/result-inventory-query/v1",
-	"cs425/crane/empty-result-inventory/v1",
-	"cs425/crane/repair-id/v1",
-	"cs425/crane/repair-instruction/v1",
-	"cs425/crane/result-record-stream/v1",
+	"crane/checkpoint-vector/v1",
+	"crane/result-inventory-query/v1",
+	"crane/empty-result-inventory/v1",
+	"crane/repair-id/v1",
+	"crane/repair-instruction/v1",
+	"crane/result-record-stream/v1",
 	ResultInventoryChainDomainV1,
 }
 

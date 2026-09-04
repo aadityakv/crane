@@ -5,7 +5,7 @@ import (
 	"errors"
 )
 
-const completionReportDigestDomain = "cs425/crane/completion-report/v1\x00"
+const completionReportDigestDomain = "crane/completion-report/v1\x00"
 
 // SchedulingState is the committed admission state for a job.
 type SchedulingState uint8

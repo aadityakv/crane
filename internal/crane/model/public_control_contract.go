@@ -5,7 +5,7 @@ import (
 	"errors"
 )
 
-const publicControlContractFingerprintDomain = "cs425/crane/public-control-contract/v1\x00"
+const publicControlContractFingerprintDomain = "crane/public-control-contract/v1\x00"
 
 var errPublicControlResultEntrySize = errors.New("public control result entry size outside tuple bounds")
 
@@ -154,8 +154,8 @@ var publicControlEnumDomainsV1 = []PublicControlEnumDescriptor{
 }
 
 var publicControlIdentityDomainsV1 = []string{
-	"cs425/crane/submit-control-command/v1",
-	"cs425/crane/cancel-control-command/v1",
+	"crane/submit-control-command/v1",
+	"crane/cancel-control-command/v1",
 }
 
 var publicControlErrorCodeMatrixV1 = []string{

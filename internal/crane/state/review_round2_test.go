@@ -27,7 +27,7 @@ func TestAuthoritativeRevisionDriftNeverReplaysObsoleteAppliedTarget(t *testing.
 	if got := mustResult(t, firstBytes); got.Code != ResultSuccess || got.Revision != 3 {
 		t.Fatalf("running = %#v", got)
 	}
-	cancel, _ := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{0x71}, Sequence: 2}, job, 3, machine.coordinatorEpoch)
+	cancel, _ := NewCancelJob(model.ClientRequestID{ClientID: model.ClientID{0xdb}, Sequence: 2}, job, 3, machine.coordinatorEpoch)
 	if got := applyTask10(t, machine, 22, cancel); got.Code != ResultSuccess || got.Revision != 4 {
 		t.Fatalf("cancel = %#v", got)
 	}

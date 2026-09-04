@@ -7,14 +7,14 @@ import (
 	"sort"
 )
 
-const rendezvousDomain = "cs425/crane/rendezvous/v1\x00"
+const rendezvousDomain = "crane/rendezvous/v1\x00"
 
 // AssignmentSetDigestDomainV1 is the immutable domain separator for complete
 // assignment-set identity.
-const AssignmentSetDigestDomainV1 = "cs425/crane/assignment-set/v1"
+const AssignmentSetDigestDomainV1 = "crane/assignment-set/v1"
 
 var assignmentSetDigestLayoutV1 = []string{
-	"Domain:cs425/crane/assignment-set/v1+zero",
+	"Domain:crane/assignment-set/v1+zero",
 	"JobID:bytes16(nonzero)",
 	"Revision:u64(nonzero)",
 	"Tasks:u16-count+list(TaskID,WorkerID,WorkerEpoch,Attempt,SpecificationHash,AssignmentRevision)",

@@ -30,9 +30,9 @@ func TestWorkerControlContractV1IsOwnedAndPinsEveryConsensusRule(t *testing.T) {
 		AllowZeroCheckpointWatermark: true, AllowEmptyResultArtifact: true,
 		ResultRecordStreamSchemaVersion: 1,
 		IdentityDomains: []string{
-			"cs425/crane/checkpoint-vector/v1", "cs425/crane/result-inventory-query/v1",
-			"cs425/crane/empty-result-inventory/v1", "cs425/crane/repair-id/v1",
-			"cs425/crane/repair-instruction/v1", "cs425/crane/result-record-stream/v1",
+			"crane/checkpoint-vector/v1", "crane/result-inventory-query/v1",
+			"crane/empty-result-inventory/v1", "crane/repair-id/v1",
+			"crane/repair-instruction/v1", "crane/result-record-stream/v1",
 			"crane-result-inventory-chain-v1",
 		},
 		Rules: []string{"status-events-strictly-increasing-after-cursor", "status-page-last-transaction-and-has-more-consistent", "checkpoint-vectors-sorted-unique", "aggregate-count-zero-iff-bytes-zero", "empty-aggregate-digest-binds-query-or-instruction", "repair-grant-epoch-equals-current-epoch", "completed-repair-equals-instruction-summary", "result-record-chunks-are-exact-canonical-stream-slices", "result-record-ack-binds-nonzero-stream-total-and-checksum", "transfer-offset-final-and-checksum-correlated"},
@@ -63,7 +63,7 @@ func TestWorkerControlCanonicalHelpersHaveIndependentGoldens(t *testing.T) {
 		}
 	}
 	// Literal is updated only when the independently reviewed contract intentionally changes.
-	if got := hex.EncodeToString(emptyDigest[:]); got != "c9758f02facf9ebde95a534e04a65e4e63f8ed749f29cc59a9ceef405ba45d2c" {
+	if got := hex.EncodeToString(emptyDigest[:]); got != "4491123f76e0aec375d462fcda34e2b27b174c15c5eb9bbdb8be1bc46ffaab09" {
 		t.Fatalf("empty inventory digest = %s", got)
 	}
 }
@@ -85,7 +85,7 @@ func TestResultInventoryDigestChainHasIndependentGolden(t *testing.T) {
 	if entryBytes != 170 {
 		t.Fatalf("inventory entry bytes = %d, want 170", entryBytes)
 	}
-	if got := hex.EncodeToString(digest[:]); got != "2955579d4d817129212554a51fd1c7780002a560d8335e0b2b3c530df0b6658f" {
+	if got := hex.EncodeToString(digest[:]); got != "67ada0928cfbd8bf2315802541d29d7ba1cb366329658ae55048b405f6b16053" {
 		t.Fatalf("inventory chain digest = %s", got)
 	}
 }
@@ -133,7 +133,7 @@ func TestCanonicalResultRecordStreamRoundTripGoldenAndNonzeroEmptyTupleValue(t *
 		t.Fatalf("round trip = %#v, %v", decoded, err)
 	}
 	streamDigest := sha256.Sum256(encoded)
-	if got := hex.EncodeToString(streamDigest[:]); got != "559e89f0a89601d811048defb7d0e4c581eddfbacad95c1a4583d08690a7580b" {
+	if got := hex.EncodeToString(streamDigest[:]); got != "3a65f20914e9712b4b025d234efc67b20b325fdc0581ea8813c8e2b90dda8cdf" {
 		t.Fatalf("result stream golden = %s", got)
 	}
 	for cut := range encoded {

@@ -9,7 +9,7 @@ import (
 	"github.com/aadityakv/crane/internal/crane/model"
 )
 
-const failureEventDigestDomain = "cs425/crane/job-failure-event/v1\x00"
+const failureEventDigestDomain = "crane/job-failure-event/v1\x00"
 
 // SourceEOFRecord retains one immutable source bound and its subject revision.
 type SourceEOFRecord struct {
