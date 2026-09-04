@@ -718,13 +718,13 @@ func awaitClosed(t *testing.T, channel <-chan struct{}) {
 }
 
 func readFrameOrError(stream *wire.TCPFrameStream) (wire.Frame, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(time.Second))
 	defer cancel()
 	return stream.ReadFrame(ctx)
 }
 
 func writeFrameForTest(stream *wire.TCPFrameStream, frame wire.Frame) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(time.Second))
 	defer cancel()
 	return stream.WriteFrame(ctx, frame)
 }

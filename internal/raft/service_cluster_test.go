@@ -145,7 +145,7 @@ func TestRealTCPClusterFailoverRestartAndSnapshotCatchUp(t *testing.T) {
 		leader = proposeTask10Command(t, nodes, command)
 		expected[command.Key] = command.Value
 	}
-	barrierContext, cancelBarrier := context.WithTimeout(context.Background(), 2*time.Second)
+	barrierContext, cancelBarrier := context.WithTimeout(context.Background(), testutil.Scale(2*time.Second))
 	if _, err := leader.service.Barrier(barrierContext); err != nil {
 		cancelBarrier()
 		t.Fatalf("initial Barrier: %v; statuses=%s", err, task10Statuses(nodes))
@@ -489,7 +489,7 @@ func proposeTask10CommandWithResult(t *testing.T, nodes []*task10ClusterNode, co
 		if leader == nil {
 			return false
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(500*time.Millisecond))
 		result, err := leader.service.Propose(ctx, encoded)
 		cancel()
 		leader.machine.tracker.recordProposalAttempt(task10ProposalAttempt{

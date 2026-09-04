@@ -538,7 +538,7 @@ func TestSimulationCancellationClosesListenersTimersAndGoroutines(t *testing.T) 
 			t.Fatalf("UDP aliases remained registered after shutdown: %v", err)
 		}
 		_ = reused.Close()
-		dialContext, cancelDial := context.WithTimeout(context.Background(), time.Second)
+		dialContext, cancelDial := context.WithTimeout(context.Background(), testutil.Scale(time.Second))
 		connection, err := (&net.Dialer{}).DialContext(dialContext, "tcp", snapshotEndpoint.String())
 		cancelDial()
 		if err == nil {
@@ -653,7 +653,7 @@ func TestSimulationCancellationInterruptsNormalSendAndLeaveAtClockDeadline(t *te
 	if call := receiveBlockingSendCall(t, datagram.started); call != 1 {
 		t.Fatalf("first blocked send call = %d, want 1", call)
 	}
-	snapshotContext, cancelSnapshot := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	snapshotContext, cancelSnapshot := context.WithTimeout(context.Background(), testutil.Scale(250*time.Millisecond))
 	if _, err := service.Snapshot(snapshotContext); err != nil {
 		cancelSnapshot()
 		t.Fatalf("owner loop blocked behind outbound datagram I/O: %v", err)
@@ -1004,7 +1004,7 @@ func (c *simulationCluster) settle(rounds int) {
 			if !node.active || node.running == nil {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(time.Second))
 			_, _ = node.running.service.Snapshot(ctx)
 			cancel()
 		}
@@ -1018,7 +1018,7 @@ func (c *simulationCluster) advance(duration time.Duration) {
 
 func (c *simulationCluster) waitSnapshot(nodeID uint16, condition func([]Member) bool) []Member {
 	c.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(5*time.Second))
 	defer cancel()
 	var last []Member
 	var lastError error
@@ -1262,7 +1262,7 @@ func settleMemoryServices(network *transport.MemoryNetwork, services ...*Service
 	for range 50 {
 		network.Advance()
 		for _, service := range services {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(time.Second))
 			_, _ = service.Snapshot(ctx)
 			cancel()
 		}

@@ -2801,7 +2801,7 @@ func assertConnectionClosedPromptly(t *testing.T, connection net.Conn, label str
 
 func waitForSnapshot(t *testing.T, service *Service, condition func([]Member) bool) []Member {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(5*time.Second))
 	defer cancel()
 	for ctx.Err() == nil {
 		snapshot, err := service.Snapshot(ctx)
@@ -2836,7 +2836,7 @@ func TestEventsChangeActiveMembershipTreatsMissingPreviousAsInactive(t *testing.
 
 func testContext(t *testing.T) context.Context {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(time.Second))
 	t.Cleanup(cancel)
 	return ctx
 }
