@@ -31,7 +31,12 @@ func TestReconcileExactOrder(t *testing.T) {
 	h.start()
 	h.markReady()
 	h.lead(2)
-	h.waitGateOpen()
+	// gate decoupling: the gate now opens before per-job convergence, so the
+	// pass order is pinned by waiting for its final artifact — the Running
+	// install on every assignment node.
+	h.waitFor(func() bool {
+		return len(h.workers.installsFor(2, model.Running)) > 0 && len(h.workers.installsFor(3, model.Running)) > 0
+	}, "running installs on both workers")
 
 	entries := h.log.snapshot()
 	assertSubsequence(t, entries,
@@ -46,9 +51,7 @@ func TestReconcileExactOrder(t *testing.T) {
 		fmt.Sprintf("inventory:%d", replica.SecondaryNodeID),
 		"install:2:running", "install:3:running",
 	)
-	// The gate must have stayed closed through the entire recorded pass: every
-	// running install carries the reconciled fence, and gate admission begins
-	// only after the last one.
+	// Every running install carries the reconciled fence.
 	record, ok := h.job(job)
 	if !ok || record.Lifecycle != state.JobRunning {
 		t.Fatalf("job record = %#v", record)
@@ -333,7 +336,10 @@ func TestReconcileRepairsDivergentReplica(t *testing.T) {
 	h.start()
 	h.markReady()
 	h.lead(2)
-	h.waitGateOpen()
+	// gate decoupling: wait for the pass's final artifact instead of the gate.
+	h.waitFor(func() bool {
+		return len(h.workers.installsFor(2, model.Running)) > 0 && len(h.workers.installsFor(3, model.Running)) > 0
+	}, "running installs after repair")
 
 	assertSubsequence(t, h.log.snapshot(),
 		fmt.Sprintf("inventory:%d", primary),
@@ -369,7 +375,7 @@ func TestReconcileRepairsDivergentReplica(t *testing.T) {
 	}
 }
 
-func TestReconcileDisagreeingSurvivorsLeaveAdmissionClosed(t *testing.T) {
+func TestReconcileDisagreeingSurvivorsNeverRepairWhileGateStaysOpen(t *testing.T) {
 	h, _, _, assignment := runningHarness(t)
 	replica := assignment.ResultReplicas[0]
 	primaryScript := h.workers.script(replica.PrimaryNodeID)
@@ -390,8 +396,11 @@ func TestReconcileDisagreeingSurvivorsLeaveAdmissionClosed(t *testing.T) {
 		return h.log.count(fmt.Sprintf("inventory:%d", replica.SecondaryNodeID)) >= 1
 	}, "both replicas queried")
 	time.Sleep(20 * time.Millisecond)
-	if h.gateOpen() {
-		t.Fatal("gate opened with disagreeing survivors")
+	// gate decoupling: admission opens after the cluster phase, so a job whose
+	// replicas disagree keeps the gate open; the pinned safety property is
+	// that no repair is ever issued between disagreeing survivors.
+	if !h.gateOpen() {
+		t.Fatal("gate closed while only per-job convergence was stuck")
 	}
 	for _, entry := range h.log.snapshot() {
 		if len(entry) >= 6 && entry[:6] == "repair" {
@@ -437,7 +446,11 @@ func TestReconcileScansRegisteredWorkersForRetainedInventory(t *testing.T) {
 	h.start()
 	h.markReady()
 	h.lead(2)
-	h.waitGateOpen()
+	// gate decoupling: wait for the pass's final artifact instead of the gate.
+	h.waitFor(func() bool {
+		return h.log.count(fmt.Sprintf("repair:%d:destination", replica.SecondaryNodeID)) >= 1 &&
+			len(h.workers.installsFor(2, model.Running)) > 0 && len(h.workers.installsFor(3, model.Running)) > 0
+	}, "holder repair completed and job activated")
 
 	assertSubsequence(t, h.log.snapshot(),
 		fmt.Sprintf("inventory:%d", replica.PrimaryNodeID),

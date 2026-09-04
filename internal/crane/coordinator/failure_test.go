@@ -282,7 +282,15 @@ func TestNextLeaderCompletesReplacementAfterReplaceWorkerEpochCrash(t *testing.T
 	h.start()
 	h.markReady()
 	h.lead(2)
-	h.waitGateOpen()
+	// gate decoupling: the gate opens before the replacement converges, so
+	// wait for the pass's final artifact — the completed replacement and the
+	// Running installs that follow it.
+	h.waitFor(func() bool {
+		record, ok := h.job(job)
+		return ok && len(record.NeedsReassignment) == 0 && record.Assignment != nil &&
+			record.Assignment.Revision == assignment.Revision+1 &&
+			len(h.workers.installsFor(2, model.Running)) > 0 && len(h.workers.installsFor(3, model.Running)) > 0
+	}, "markers cleared by conditional replacement")
 	record, _ := h.job(job)
 	if len(record.NeedsReassignment) != 0 || record.Assignment.Revision != assignment.Revision+1 {
 		t.Fatalf("markers not cleared by conditional replacement: %#v", record)

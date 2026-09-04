@@ -1,8 +1,9 @@
 // Package coordinator implements Crane's fenced leader actor. The actor is an
 // idle follower until Raft leadership arrives, then owns exactly one
 // epoch-scoped reconciliation loop that registers workers, fences the +3
-// control plane, converges replicated assignments, repairs result replicas,
-// and only then opens the caller-owned admission gate.
+// control plane, opens the caller-owned admission gate once the cluster phase
+// has run, and then converges replicated assignments and repairs result
+// replicas with the gate held open for the rest of the epoch.
 package coordinator
 
 import (
@@ -379,10 +380,21 @@ func (actor *Actor) runLeader(ctx context.Context) error {
 		}
 		return fmt.Errorf("%w: coordinator epoch not established within %d attempts", errLeaderSessionAborted, establishAttemptLimit)
 	}
+	// The admission gate opens exactly once per epoch, unconditionally after
+	// the first cluster phase completes: a failing worker-control exchange in
+	// any later phase must never lock the control plane out of admission.
+	// A session context that died mid-pass never opens the gate, because the
+	// owning loop is ending and the fencing close may already have happened.
+	// The cluster phase itself keeps running every pass so registration,
+	// event draining, and failure resolution stay live for the whole epoch.
+	gateOpened := false
 	for {
-		if actor.reconcile(ctx, epoch, session) {
+		actor.reconcileCluster(ctx, epoch, session)
+		if !gateOpened && ctx.Err() == nil {
 			_ = actor.options.Gate.Open(epoch)
+			gateOpened = true
 		}
+		actor.reconcileJobs(ctx, epoch, session)
 		actor.driveTerminalResults(ctx, epoch)
 		if !actor.awaitTrigger(ctx, session) {
 			return nil

@@ -12,11 +12,20 @@ import (
 )
 
 // reconcile performs one complete full-view pass in the exact required order:
-// worker registration, worker fences, status draining, failure resolution,
-// then per-job convergence (reassignment, distribution, checkpoint notices,
-// result repair, replay activation). It reports whether the pass converged
-// completely, which is the only state that may open the admission gate.
+// the cluster phase (worker registration, worker fences, status draining,
+// failure resolution) followed by per-job convergence (reassignment,
+// distribution, checkpoint notices, result repair, replay activation). The
+// cluster phase gates admission-opening; job convergence does not.
 func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
+	clusterConverged := actor.reconcileCluster(ctx, epoch, session)
+	jobsConverged := actor.reconcileJobs(ctx, epoch, session)
+	return clusterConverged && jobsConverged
+}
+
+// reconcileCluster performs the cluster phase: worker registration, worker
+// fences, status draining, and failure resolution. It reports whether the
+// phase converged.
+func (actor *Actor) reconcileCluster(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
 	converged := true
 	session.controlFailed = make(map[uint16]bool)
 	actor.registerWorkers(ctx, epoch, &converged)
@@ -24,8 +33,13 @@ func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch,
 	reachable := actor.fenceWorkers(ctx, epoch, view, session, &converged)
 	actor.drainWorkerEvents(ctx, reachable, session, &converged)
 	actor.resolveWorkerFailures(ctx, epoch, session, &converged)
+	return converged && ctx.Err() == nil
+}
 
-	view = actor.options.Machine.View()
+// reconcileJobs performs every per-job convergence pass and session pruning.
+func (actor *Actor) reconcileJobs(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
+	converged := true
+	view := actor.options.Machine.View()
 	jobs := make([]model.JobID, 0, len(view.Jobs))
 	for _, job := range view.Jobs {
 		jobs = append(jobs, job.JobID)
