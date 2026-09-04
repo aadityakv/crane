@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"unicode/utf8"
 )
 
 // StageRole identifies a stage's semantic topology role.
@@ -557,6 +558,9 @@ func validateOperatorSpec(spec OperatorSpec) (OperatorDescriptor, error) {
 				if err != nil || strconv.FormatInt(parsed, 10) != setting.Value {
 					return OperatorDescriptor{}, errors.New("operator setting is not canonical int64")
 				}
+			}
+			if descriptor.Settings[index].Type == SettingTypeString && (setting.Value == "" || !utf8.ValidString(setting.Value)) {
+				return OperatorDescriptor{}, errors.New("operator setting is not a nonempty UTF-8 string")
 			}
 		}
 		return descriptor, nil

@@ -38,7 +38,7 @@
     "tuple_completion_retry_interval": "1s",
     "failure_grace_period": "5s",
     "max_worker_store_bytes": 1073741824,
-    "consensus_fingerprint": "2b98e62384afd912506b032e751aba4504e905fe5d6cec53754a6675e9b93435"
+    "consensus_fingerprint": "80586b11b13c86be8ec0578a802c6d0f31b5126083e2fd4bcedbc3b8a8776950"
   },
   "timing": {
     "probe_interval": "1s",

@@ -25,6 +25,9 @@ func SourceTuple(topology ValidatedTopology, task TaskID, sequence uint64) (Tupl
 	if sequence > eof {
 		return Tuple{}, false, nil
 	}
+	if stage.Operator.Name == "lines" {
+		return linesTuple(stage.Operator, stage.Parallelism, task.Partition, sequence)
+	}
 	start, _, err := rangeSettings(stage.Operator)
 	if err != nil {
 		return Tuple{}, false, err
@@ -68,8 +71,13 @@ func ExecuteOperator(operator OperatorSpec, input Tuple) ([]Tuple, error) {
 	if err := input.Validate(); err != nil {
 		return nil, err
 	}
-	if operator.Name == "collect" {
+	switch operator.Name {
+	case "collect":
 		return []Tuple{cloneTuple(input)}, nil
+	case "split_words":
+		return splitWords(input)
+	case "min_length":
+		return minLength(operator, input)
 	}
 	value, err := exactIntValue(input)
 	if err != nil {
@@ -118,14 +126,23 @@ func rangeEOFs(operator OperatorSpec, parallelism uint16) ([]uint64, error) {
 }
 
 func sourceEOF(operator OperatorSpec, parallelism, partition uint16) (uint64, error) {
-	start, end, err := rangeSettings(operator)
-	if err != nil {
-		return 0, err
-	}
 	if parallelism == 0 || partition >= parallelism {
 		return 0, errors.New("invalid source partition")
 	}
-	length := uint64(end) - uint64(start)
+	var length uint64
+	if operator.Name == "lines" {
+		chunks, err := linesSettings(operator)
+		if err != nil {
+			return 0, err
+		}
+		length = uint64(len(chunks))
+	} else {
+		start, end, err := rangeSettings(operator)
+		if err != nil {
+			return 0, err
+		}
+		length = uint64(end) - uint64(start)
+	}
 	if length <= uint64(partition) {
 		return 0, nil
 	}

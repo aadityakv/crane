@@ -14,12 +14,15 @@ const (
 	OperatorRoleSink
 )
 
-// SettingType identifies the only setting value type accepted by v1 built-ins.
+// SettingType identifies the setting value types accepted by v1 built-ins.
 type SettingType uint8
 
 const (
 	// SettingTypeInt64 is a signed 64-bit integer setting.
 	SettingTypeInt64 SettingType = iota + 1
+	// SettingTypeString is a nonempty UTF-8 string setting bounded by
+	// MaxSettingValueBytes.
+	SettingTypeString
 )
 
 // SettingDescriptor describes one exact named operator setting.
@@ -49,8 +52,11 @@ var registryV1 = Registry{Operators: []OperatorDescriptor{
 	{Name: "collect", Version: 1, Role: OperatorRoleSink, MinInputs: 1, MaxInputs: 1, ImplementationFingerprint: fingerprintLiteral("a5b0b7f51389a3ff7680d1f01315d0310d6fcd2e94ca7287c71631d21113aefb")},
 	{Name: "even", Version: 1, Role: OperatorRoleTransform, MinInputs: 1, MaxInputs: 1, MaxOutputs: 1, ImplementationFingerprint: fingerprintLiteral("1a50bbd7e4997bd656979b54fe6bdf548867e962d778413671c6c41632ca0b1d")},
 	{Name: "less_than", Version: 1, Role: OperatorRoleTransform, Settings: []SettingDescriptor{{Name: "threshold", Type: SettingTypeInt64, Required: true}}, MinInputs: 1, MaxInputs: 1, MaxOutputs: 1, ImplementationFingerprint: fingerprintLiteral("71f922b0a90501450c91bb24fc3c774ae0de4ef61b6aa665048cebb5d9c06d8d")},
+	{Name: "lines", Version: 1, Role: OperatorRoleSource, Settings: []SettingDescriptor{{Name: "corpus", Type: SettingTypeString, Required: true}}, MinOutputs: 1, MaxOutputs: 1, ImplementationFingerprint: fingerprintLiteral("5a04d07b54b4c6ae858baa93e355fa58b762a13bf2c903766de51d3e95d74c74")},
+	{Name: "min_length", Version: 1, Role: OperatorRoleTransform, Settings: []SettingDescriptor{{Name: "length", Type: SettingTypeInt64, Required: true}}, MinInputs: 1, MaxInputs: 1, MaxOutputs: 1, ImplementationFingerprint: fingerprintLiteral("70973e22c4b53c39593e9fa1d4892952b027ecc342c9806cbe172db8fd2d926f")},
 	{Name: "multiply", Version: 1, Role: OperatorRoleTransform, Settings: []SettingDescriptor{{Name: "factor", Type: SettingTypeInt64, Required: true}}, MinInputs: 1, MaxInputs: 1, MinOutputs: 1, MaxOutputs: 1, ImplementationFingerprint: fingerprintLiteral("84c086f1eaa2f2bb39659cf49c7fbfaec42def79abd21376917d401884f09fc2")},
 	{Name: "range", Version: 1, Role: OperatorRoleSource, Settings: []SettingDescriptor{{Name: "end_exclusive", Type: SettingTypeInt64, Required: true}, {Name: "start", Type: SettingTypeInt64, Required: true}}, MinOutputs: 1, MaxOutputs: 1, ImplementationFingerprint: fingerprintLiteral("ec92810e95284f19de73d1002a6035fcc2e48e515d7460dc2ff7654036075a5e")},
+	{Name: "split_words", Version: 1, Role: OperatorRoleTransform, MinInputs: 1, MaxInputs: 1, MaxOutputs: 16, ImplementationFingerprint: fingerprintLiteral("51da21999c2b6c5af3e0bc9bf39fd8693596568033a5fc79d50da251cb758ab6")},
 }}
 
 // RegistryV1 returns an owned copy of the sorted v1 operator registry.
