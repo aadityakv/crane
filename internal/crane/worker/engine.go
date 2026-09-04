@@ -582,8 +582,10 @@ func (engine *Engine) refreshInstalledFence() {
 
 // refreshInstalledAssignment republishes one job's assignment after a
 // durable install or replacement has already reached the serialized owner.
-// On a repository read failure the prior view is retained and the command
-// still ACKs nil; the stale window is bounded by the repository's fatal
+// A failed per-job read evicts the job's entry from the published view —
+// fail-closed, like the old per-lookup semantics — while a failed fence
+// refresh retains the prior fence view; either way the command still ACKs
+// nil, and the stale or closed window is bounded by the repository's fatal
 // signalling tearing the service down.
 func (engine *Engine) refreshInstalledAssignment(job model.JobID) {
 	engine.refreshInstalledFence()

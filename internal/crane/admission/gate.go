@@ -140,8 +140,8 @@ func compareEpoch(left, right model.CoordinatorEpoch) int {
 
 // AdmissionEpoch reports the coordinator epoch the process gate is currently
 // open under. It reports the zero epoch and false exactly while the gate is
-// closed, so a durable status exchange can distinguish a fresh process (closed
-// gate, no accepted generation) from an admitted one.
+// closed; worker status reporting and the coordinator's session bookkeeping
+// observe it to place each process against the epoch that admitted it.
 func (gate *Gate) AdmissionEpoch() (model.CoordinatorEpoch, bool) {
 	if gate == nil {
 		return model.CoordinatorEpoch{}, false
