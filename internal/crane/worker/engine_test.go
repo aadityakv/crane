@@ -602,6 +602,7 @@ type fakeRepository struct {
 	receiveErr            error
 	processedErr          error
 	advanceSourceErr      error
+	recoverErr            error
 	advanceSourceBefore   func()
 	outboxCompleteStarted chan struct{}
 	outboxCompleteRelease chan struct{}
@@ -623,8 +624,12 @@ func (repository *fakeRepository) RecoverWork() (store.RecoveredWork, error) {
 	repository.mu.Lock()
 	repository.recoverCalls++
 	started, release := repository.recoverStarted, repository.recoverRelease
+	injected := repository.recoverErr
 	work := repository.work.Clone()
 	repository.mu.Unlock()
+	if injected != nil {
+		return store.RecoveredWork{}, injected
+	}
 	if started != nil {
 		select {
 		case <-started:
@@ -1059,6 +1064,30 @@ func TestEngineAssignmentCacheEliminatesPerLookupStoreRecovery(t *testing.T) {
 		t.Fatalf("reconcile re-read durable state per lookup: recover %d->%d installed %d->%d fence %d->%d", recoverBefore, recoverAfter, installedBefore, installedAfter, fenceBefore, fenceAfter)
 	}
 
+	// Non-owner paths answer from the published immutable snapshot: one
+	// sender-path emission derivation and one delivery probe also perform
+	// zero repository recoveries.
+	sourceTuple, tupleOK, tupleErr := model.SourceTuple(fixture.topology, fixture.source.Task, 1)
+	if tupleErr != nil || !tupleOK {
+		t.Fatalf("SourceTuple = %t,%v", tupleOK, tupleErr)
+	}
+	derived, deriveErr := deriveSourceOutboxes(fixture.assignment, fixture.source, 1, sourceTuple)
+	if deriveErr != nil || len(derived) == 0 {
+		t.Fatalf("deriveSourceOutboxes = %+v,%v", derived, deriveErr)
+	}
+	if emission := engine.emissionForOutbox(derived[0]); emission.Coordinator != fixture.epoch {
+		t.Fatalf("emission derived from snapshot = %+v", emission)
+	}
+	if _, probed, probeErr := engine.probeDelivery(fixture.message(t, 1)); probed || probeErr != nil {
+		t.Fatalf("probe = %t,%v", probed, probeErr)
+	}
+	repository.mu.Lock()
+	nonOwnerAfterRecover, nonOwnerAfterInstalled, nonOwnerAfterFence := repository.recoverCalls, repository.installedCalls, repository.fenceCalls
+	repository.mu.Unlock()
+	if nonOwnerAfterRecover != recoverAfter || nonOwnerAfterInstalled != installedAfter || nonOwnerAfterFence != fenceAfter {
+		t.Fatalf("non-owner path re-read durable state: recover %d->%d installed %d->%d fence %d->%d", recoverAfter, nonOwnerAfterRecover, installedAfter, nonOwnerAfterInstalled, fenceAfter, nonOwnerAfterFence)
+	}
+
 	// A replacement install that reached the engine as an assignment command
 	// overwrites the cached entry with the new revision.
 	runningRepository := newFakeRepository(fixture)
@@ -1095,6 +1124,13 @@ func TestEngineAssignmentCacheEliminatesPerLookupStoreRecovery(t *testing.T) {
 	cached, ok := runningEngine.installedAssignment(job)
 	if !ok || cached.Assignment.Revision != 2 || cached.Assignment.Digest != replacement.Digest {
 		t.Fatalf("serialized replaced assignment = %+v, %t", cached, ok)
+	}
+	snapshotAssignments, snapshotFence := runningEngine.currentSnapshot()
+	if snapshotFence != fixture.epoch {
+		t.Fatalf("published snapshot fence = %+v", snapshotFence)
+	}
+	if published, publishedOK := snapshotAssignments[job]; !publishedOK || published.Assignment.Revision != 2 || published.Assignment.Digest != replacement.Digest {
+		t.Fatalf("published snapshot does not reflect the drained replacement: %+v, %t", published, publishedOK)
 	}
 
 	// A begin-epoch rebind (identical content under a strictly newer fence)
@@ -1176,4 +1212,50 @@ func TestEngineObserveFenceRepublishesSerializedView(t *testing.T) {
 	if assignment, current := engine.currentRunning(job); current {
 		t.Fatalf("old-epoch assignment remained current after the fence change: %+v", assignment)
 	}
+}
+
+// TestEngineRefreshKeepsPriorViewOnReadFailureAndCorrectsLater pins the
+// refresh-on-error contract: one repository read failure retains the prior
+// serialized view while the command still acknowledges, and the next
+// successful refresh republishes the corrected view.
+func TestEngineRefreshKeepsPriorViewOnReadFailureAndCorrectsLater(t *testing.T) {
+	fixture := workerFixture(t)
+	job := fixture.assignment.Assignment.JobID
+	repository := newFakeRepository(fixture)
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	newer := fixture.epoch
+	newer.Term++
+	newer.BeginIndex++
+	newer.Nonce[0]++
+	repository.mu.Lock()
+	repository.recoverErr = errors.New("injected recovery failure")
+	repository.work.Fence = newer
+	repository.mu.Unlock()
+	if err = engine.ObserveFence(ctx); err != nil {
+		t.Fatalf("fence observation failed on read failure: %v", err)
+	}
+	if assignments, fence := engine.currentSnapshot(); fence != fixture.epoch || assignments[job].CoordinatorEpoch != fixture.epoch {
+		t.Fatalf("read failure replaced the serialized view: fence=%+v assignment=%+v", fence, assignments[job])
+	}
+	repository.mu.Lock()
+	repository.recoverErr = nil
+	repository.mu.Unlock()
+	if err = engine.ObserveFence(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, fence := engine.currentSnapshot(); fence != newer {
+		t.Fatalf("successful refresh did not correct the serialized fence: %+v", fence)
+	}
+	cancel()
+	<-done
 }

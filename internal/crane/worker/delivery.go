@@ -112,7 +112,12 @@ func (engine *Engine) probeDelivery(message protocol.TupleDelivery) (protocol.Tu
 	if message.Destination.WorkerID != engine.localNode || message.Destination.WorkerEpoch != engine.localEpoch {
 		return protocol.TupleACK{}, true, errors.New("delivery destination is not the durable local worker")
 	}
-	assignment, ok := engine.repository.InstalledAssignment(message.DeliveryID.Tuple.JobID)
+	// The probe is a best-effort admission bypass on the session goroutine:
+	// it reads the published immutable snapshot and stays fail-closed — a
+	// missing or unpublished view defers to the serialized owner's enqueue
+	// revalidation, exactly as a repository miss did.
+	assignments, _ := engine.currentSnapshot()
+	assignment, ok := assignments[message.DeliveryID.Tuple.JobID]
 	if !ok {
 		return protocol.TupleACK{}, false, nil
 	}

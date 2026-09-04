@@ -635,6 +635,9 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 			return nil, ErrControlStaleEpoch
 		}
 		if comparison == 0 {
+			// Idempotent redelivery of the already-durable fence skips
+			// ObserveFence safely: the original request observed this exact
+			// transition, or this process recovered the fence at startup.
 			return owner.fenceResponse(work.Fence), nil
 		}
 	}
@@ -649,6 +652,7 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 		comparison := compareControlEpoch(request.CoordinatorEpoch, work.Fence)
 		if comparison <= 0 {
 			if comparison == 0 && request.CoordinatorEpoch == work.Fence {
+				// Same-fence retry after the gate drain: already observed above.
 				return owner.fenceResponse(work.Fence), nil
 			}
 			return nil, ErrControlStaleEpoch
