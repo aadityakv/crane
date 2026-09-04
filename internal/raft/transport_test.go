@@ -2,17 +2,17 @@ package raft
 
 import (
 	"context"
+	"crane/internal/testutil"
 	"errors"
-	"github.com/aadityakv/crane/internal/testutil"
 	"net"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/clock"
+	"crane/internal/config"
+	"crane/internal/wire"
 )
 
 func TestTransportQueueOwnsMessagesAndPinsBoundary(t *testing.T) {

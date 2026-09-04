@@ -7,9 +7,9 @@ import (
 	"errors"
 	"math"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
-	"github.com/aadityakv/crane/internal/crane/store"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
+	"crane/internal/crane/store"
 )
 
 type deliveryCommand struct {

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/wire"
 )
 
 // newHookPair activates one hook over a socketpair exactly as an inherited

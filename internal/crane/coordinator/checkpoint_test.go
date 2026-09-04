@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/state"
+	"crane/internal/crane/model"
+	"crane/internal/crane/state"
 )
 
 // failureWorkerEvent builds one valid failure event for the job's current

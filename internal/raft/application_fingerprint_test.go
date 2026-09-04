@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/clock"
+	"crane/internal/wire"
 )
 
 var task5ApplicationFingerprint = [32]byte{

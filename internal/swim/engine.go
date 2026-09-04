@@ -6,8 +6,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/aadityakv/crane/internal/random"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/random"
+	"crane/internal/wire"
 )
 
 var (

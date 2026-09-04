@@ -8,8 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/swim"
+	"crane/internal/config"
+	"crane/internal/swim"
 )
 
 const localNodePortStride = 100

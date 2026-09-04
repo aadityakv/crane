@@ -1,10 +1,10 @@
 package store
 
 import (
+	"crane/internal/crane/integrationhook"
 	"fmt"
-	"github.com/aadityakv/crane/internal/crane/integrationhook"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 const (

@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 // TestCheckpointAdoptsCommittedWatermarkWithoutPendingReport pins the Task 24

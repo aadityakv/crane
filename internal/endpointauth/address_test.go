@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/config"
+	"crane/internal/clock"
+	"crane/internal/config"
 )
 
 func TestAddressMatcherCanonicalAliasesMultipleAnswersAndTransportPorts(t *testing.T) {

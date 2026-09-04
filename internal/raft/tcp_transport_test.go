@@ -2,9 +2,9 @@ package raft
 
 import (
 	"context"
+	"crane/internal/testutil"
 	"encoding/binary"
 	"errors"
-	"github.com/aadityakv/crane/internal/testutil"
 	"io"
 	"net"
 	"reflect"
@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/clock"
+	"crane/internal/wire"
 )
 
 func TestTCPHandshakeBindsConfiguredHeaderAndPayloadSender(t *testing.T) {

@@ -1,6 +1,6 @@
 package state
 
-import "github.com/aadityakv/crane/internal/crane/model"
+import "crane/internal/crane/model"
 
 const (
 	workerRecordEstimatedBytes        int64  = int64(model.StateCommandWorkerRecordBytesV1)

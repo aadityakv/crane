@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 func TestWorkerStoreContractMatchesConcreteRegistries(t *testing.T) {

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	internalnode "github.com/aadityakv/crane/internal/node"
-	"github.com/aadityakv/crane/internal/testutil"
+	internalnode "crane/internal/node"
+	"crane/internal/testutil"
 )
 
 func TestParseClusterFlagsUsesSpecifiedLocalLayout(t *testing.T) {

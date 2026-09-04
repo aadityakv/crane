@@ -5,9 +5,9 @@ import (
 	"context"
 	"sort"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/state"
-	"github.com/aadityakv/crane/internal/swim"
+	"crane/internal/crane/model"
+	"crane/internal/crane/state"
+	"crane/internal/swim"
 )
 
 // resolveWorkerFailures tracks continuous Dead/Left membership combined with

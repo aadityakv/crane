@@ -13,8 +13,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
 )
 
 func TestTransactionFenceAssignmentDeliveryAndRecovery(t *testing.T) {

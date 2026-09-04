@@ -2,13 +2,13 @@ package swim
 
 import (
 	"context"
-	"github.com/aadityakv/crane/internal/testutil"
+	"crane/internal/testutil"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/config"
+	"crane/internal/config"
 )
 
 func TestSnapshotResyncUsesBoundedWorkerPool(t *testing.T) {

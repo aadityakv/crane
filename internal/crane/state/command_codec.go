@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 const (

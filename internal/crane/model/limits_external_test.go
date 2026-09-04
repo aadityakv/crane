@@ -5,9 +5,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/config"
+	"crane/internal/crane/model"
+	"crane/internal/wire"
 )
 
 func TestConsensusLimitsMatchExistingIndependentTransportBounds(t *testing.T) {

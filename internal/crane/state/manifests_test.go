@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {

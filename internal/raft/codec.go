@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/config"
+	"crane/internal/wire"
 )
 
 const (

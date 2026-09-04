@@ -6,10 +6,10 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
-	"github.com/aadityakv/crane/internal/crane/state"
-	"github.com/aadityakv/crane/internal/crane/worker"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
+	"crane/internal/crane/state"
+	"crane/internal/crane/worker"
 )
 
 var _ ResultTransferClient = (*fakeWorkers)(nil)

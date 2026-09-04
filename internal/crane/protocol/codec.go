@@ -7,8 +7,8 @@ import (
 	"math"
 	"strings"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/crane/model"
+	"crane/internal/wire"
 )
 
 // MarshalWorkerMessage validates and emits the sole canonical payload for IDs 200-218.

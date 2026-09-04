@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/aadityakv/crane/internal/config"
+	"crane/internal/config"
 )
 
 const (

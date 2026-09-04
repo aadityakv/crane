@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 // movedSourceSet derives revision+1 of prior in which the source task moves

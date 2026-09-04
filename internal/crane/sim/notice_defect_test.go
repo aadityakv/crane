@@ -3,7 +3,7 @@ package sim
 import (
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/state"
+	"crane/internal/crane/state"
 )
 
 // The acceptance pin for the second cross-system production defect found by

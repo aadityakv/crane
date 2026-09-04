@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/config"
+	"crane/internal/config"
 )
 
 func TestDatagramDNSResolutionHonorsSendCancellation(t *testing.T) {

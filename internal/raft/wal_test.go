@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/config"
+	"crane/internal/config"
 )
 
 func TestWALRecordExactCanonicalBytes(t *testing.T) {

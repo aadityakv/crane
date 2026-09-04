@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 func TestJobCommandsCanonicalRoundTripAndSubmitSizeAgreement(t *testing.T) {

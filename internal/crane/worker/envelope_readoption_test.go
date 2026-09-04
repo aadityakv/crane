@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/admission"
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
-	"github.com/aadityakv/crane/internal/crane/store"
+	"crane/internal/crane/admission"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
+	"crane/internal/crane/store"
 )
 
 // movedTaskAssignment derives revision+1 of the fixture's installed assignment

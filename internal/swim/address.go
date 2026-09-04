@@ -5,9 +5,9 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/endpointauth"
+	"crane/internal/clock"
+	"crane/internal/config"
+	"crane/internal/endpointauth"
 )
 
 // AddressResolver is the bounded DNS seam used to authenticate advertised

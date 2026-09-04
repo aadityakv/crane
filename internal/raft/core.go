@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/aadityakv/crane/internal/config"
-	boundedrandom "github.com/aadityakv/crane/internal/random"
+	"crane/internal/config"
+	boundedrandom "crane/internal/random"
 )
 
 // CoreOptions contains already-validated, side-effect-free inputs for one core.

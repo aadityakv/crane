@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 func TestCoordinatorEpochApplyUsesActualPositionAndStableRetry(t *testing.T) {

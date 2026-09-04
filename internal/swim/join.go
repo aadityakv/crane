@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/aadityakv/crane/internal/config"
+	"crane/internal/config"
 )
 
 var (

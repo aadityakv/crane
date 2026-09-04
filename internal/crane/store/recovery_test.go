@@ -12,7 +12,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 func TestStoreInitializesIdentityBound0700Directory0600FilesAndPersistsEpoch(t *testing.T) {

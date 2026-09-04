@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
+	"crane/internal/clock"
 )
 
 func TestReplayGuardRejectsDuplicateAndFutureMessages(t *testing.T) {

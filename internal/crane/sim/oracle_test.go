@@ -3,17 +3,17 @@ package sim
 import (
 	"bytes"
 	"context"
+	craneruntime "crane/internal/crane/runtime"
 	"fmt"
-	craneruntime "github.com/aadityakv/crane/internal/crane/runtime"
 	"sort"
 	"sync"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
-	"github.com/aadityakv/crane/internal/crane/state"
-	"github.com/aadityakv/crane/internal/crane/store"
-	"github.com/aadityakv/crane/internal/raft"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
+	"crane/internal/crane/state"
+	"crane/internal/crane/store"
+	"crane/internal/raft"
 )
 
 // simJobPlan is the pure reference evaluation of one submitted job: the exact

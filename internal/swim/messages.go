@@ -3,7 +3,7 @@ package swim
 import (
 	"time"
 
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/wire"
 )
 
 // PingMessage is the concrete authenticated payload for a direct probe.

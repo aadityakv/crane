@@ -15,13 +15,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/crane/admission"
-	"github.com/aadityakv/crane/internal/crane/membership"
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/state"
-	"github.com/aadityakv/crane/internal/raft"
-	"github.com/aadityakv/crane/internal/swim"
+	"crane/internal/clock"
+	"crane/internal/crane/admission"
+	"crane/internal/crane/membership"
+	"crane/internal/crane/model"
+	"crane/internal/crane/state"
+	"crane/internal/raft"
+	"crane/internal/swim"
 )
 
 const (

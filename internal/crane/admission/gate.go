@@ -6,7 +6,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 var (

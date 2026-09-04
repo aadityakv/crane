@@ -19,12 +19,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/config"
-	internalrandom "github.com/aadityakv/crane/internal/random"
-	"github.com/aadityakv/crane/internal/swim"
-	"github.com/aadityakv/crane/internal/testutil"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/clock"
+	"crane/internal/config"
+	internalrandom "crane/internal/random"
+	"crane/internal/swim"
+	"crane/internal/testutil"
+	"crane/internal/wire"
 )
 
 const (

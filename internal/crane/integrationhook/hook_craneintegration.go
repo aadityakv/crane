@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/wire"
 )
 
 // Enabled reports that this binary can activate the seam from an inherited

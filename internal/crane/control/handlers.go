@@ -6,13 +6,13 @@ import (
 	"net"
 	"time"
 
-	"github.com/aadityakv/crane/internal/crane/membership"
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
-	"github.com/aadityakv/crane/internal/crane/state"
-	"github.com/aadityakv/crane/internal/raft"
-	"github.com/aadityakv/crane/internal/swim"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/crane/membership"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
+	"crane/internal/crane/state"
+	"crane/internal/raft"
+	"crane/internal/swim"
+	"crane/internal/wire"
 )
 
 // ErrControlRequestUnauthorized classifies +6 frames that fail cluster,

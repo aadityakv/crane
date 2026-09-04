@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/crane/membership"
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
-	"github.com/aadityakv/crane/internal/swim"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/clock"
+	"crane/internal/crane/membership"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
+	"crane/internal/swim"
+	"crane/internal/wire"
 )
 
 var testClusterID = [16]byte{0xC1}

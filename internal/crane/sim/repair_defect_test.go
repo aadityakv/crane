@@ -3,8 +3,8 @@ package sim
 import (
 	"testing"
 
-	"github.com/aadityakv/crane/internal/crane/state"
-	"github.com/aadityakv/crane/internal/crane/store"
+	"crane/internal/crane/state"
+	"crane/internal/crane/store"
 )
 
 // The third cross-system production defect found by the Task 24 harness —

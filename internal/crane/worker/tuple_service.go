@@ -9,13 +9,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/crane/integrationhook"
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/protocol"
-	"github.com/aadityakv/crane/internal/crane/store"
-	"github.com/aadityakv/crane/internal/transport"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/config"
+	"crane/internal/crane/integrationhook"
+	"crane/internal/crane/model"
+	"crane/internal/crane/protocol"
+	"crane/internal/crane/store"
+	"crane/internal/transport"
+	"crane/internal/wire"
 )
 
 const tupleIngressQueueSize = 4096

@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"sort"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 // WorkerState is the replicated assignment-eligibility state.

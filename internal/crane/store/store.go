@@ -1,17 +1,17 @@
 package store
 
 import (
+	"crane/internal/crane/integrationhook"
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"github.com/aadityakv/crane/internal/crane/integrationhook"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 // Store is the exclusive process-lifetime owner of one worker WAL.

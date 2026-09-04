@@ -2,9 +2,9 @@ package swim
 
 import (
 	"context"
+	"crane/internal/testutil"
 	"errors"
 	"fmt"
-	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"net/netip"
@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/random"
-	"github.com/aadityakv/crane/internal/transport"
-	"github.com/aadityakv/crane/internal/wire"
+	"crane/internal/clock"
+	"crane/internal/config"
+	"crane/internal/random"
+	"crane/internal/transport"
+	"crane/internal/wire"
 )
 
 func TestProtocolClientDialUsesConfiguredIOTimeout(t *testing.T) {

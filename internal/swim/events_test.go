@@ -1,7 +1,7 @@
 package swim
 
 import (
-	"github.com/aadityakv/crane/internal/testutil"
+	"crane/internal/testutil"
 	"sync"
 	"testing"
 	"time"

@@ -2,10 +2,10 @@ package raft
 
 import (
 	"context"
+	"crane/internal/testutil"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"os"
@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/clock"
-	"github.com/aadityakv/crane/internal/config"
-	internalrandom "github.com/aadityakv/crane/internal/random"
+	"crane/internal/clock"
+	"crane/internal/config"
+	internalrandom "crane/internal/random"
 )
 
 func TestTask10StateMachineCachesDistinctIndexRetryWithoutSecondMutation(t *testing.T) {

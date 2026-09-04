@@ -1,3 +1,3 @@
-module github.com/aadityakv/crane
+module crane
 
 go 1.26

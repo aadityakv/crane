@@ -3,7 +3,7 @@ package state
 import (
 	"sort"
 
-	"github.com/aadityakv/crane/internal/crane/model"
+	"crane/internal/crane/model"
 )
 
 // ClientHistoryView is one owned public-command retry record.

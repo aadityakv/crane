@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/config"
+	"crane/internal/config"
 )
 
 func TestMemoryNetworkDeliversOnlyWhenAdvancedAndOwnsPayloads(t *testing.T) {

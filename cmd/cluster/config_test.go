@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aadityakv/crane/internal/config"
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/swim"
+	"crane/internal/config"
+	"crane/internal/crane/model"
+	"crane/internal/swim"
 )
 
 // TestGeneratedConfigsCarryCompiledCraneContract pins that every generated

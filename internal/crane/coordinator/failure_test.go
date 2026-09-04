@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aadityakv/crane/internal/crane/model"
-	"github.com/aadityakv/crane/internal/crane/state"
-	"github.com/aadityakv/crane/internal/swim"
+	"crane/internal/crane/model"
+	"crane/internal/crane/state"
+	"crane/internal/swim"
 )
 
 // failWorker scripts one node as continuously unreachable over worker control.
