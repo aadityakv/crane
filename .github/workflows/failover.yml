@@ -1,0 +1,23 @@
+name: failover
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  crane-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - run: make build
+      - run: go test ./internal/crane/sim -count=1 -timeout 30m
+      - run: make crane-integration

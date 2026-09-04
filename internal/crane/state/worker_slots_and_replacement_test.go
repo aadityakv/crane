@@ -210,7 +210,7 @@ func TestResultManifestRejectsImpossibleRecordCountAndByteCombinations(t *testin
 	}
 }
 
-func TestTask10CodecLayoutsAreTracedFromActualEncoder(t *testing.T) {
+func TestStateCodecLayoutsAreTracedFromActualEncoder(t *testing.T) {
 	if got, want := StateCommandEncodingLayouts(), model.StateCommandContractV1().EnvelopeLayouts; !reflect.DeepEqual(got, want) {
 		t.Fatalf("actual state codec layouts\n got: %#v\nwant: %#v", got, want)
 	}

@@ -1,162 +1,194 @@
 # Crane
 
-This repository contains the modern Go runtime foundation and its SWIM membership service. It runs authenticated nodes locally or on separately addressed machines. The legacy implementation under [`src/`](src/) is a quarantined nested Go module: it is retained for reference only and is not built, imported, or operated by the root module.
+Crane is a small, exactly-once stream-processing system written in Go with no
+external dependencies. A job is a DAG of operators (`range` sources,
+`even`/`less_than`/`multiply` transforms, a `collect` sink) partitioned across a
+fixed cluster of nodes. Every node runs three cooperating layers in one
+process:
 
-## Prerequisites and verification
+- **SWIM membership** — authenticated failure detection with incarnation
+  numbers and tombstones; it decides who is alive, never what the cluster does.
+- **Fixed-membership Raft** — three or five configured voters replicate the
+  job state machine: jobs, worker registrations, assignments, checkpoints, and
+  result manifests. Nonvoters run workers only.
+- **Crane** — a leader-elected coordinator (fences workers by epoch, reconciles
+  assignments, repairs result replicas) and per-node workers with a
+  crash-atomic write-ahead store that delivers tuples over authenticated UDP,
+  keeps two current copies of every result, and answers duplicates from
+  durable state.
 
-Install Go 1.26.x for the full pinned verification gate and CI, then confirm that the selected toolchain is available:
+Everything speaks over nine fixed ports derived from one `base_port` (see
+[Ports](#ports)); all traffic is HMAC-authenticated with a cluster secret and
+replay-guarded.
 
-```sh
-go version
-go env GOMOD
-```
-
-The second command must point to this repository's `go.mod`. The module's Go version floor remains 1.26. A newer Go release may build and test the project, but the pinned Staticcheck v0.7.0 analyzer is verified only with Go 1.26.x; use that toolchain for `make verify`.
-
-Run the full local gate, including a build from a clean copied tree, before
-changing or operating the runtime:
-
-```sh
-make clean-build verify
-```
-
-The gate checks clean-tree build isolation, formatting, unit tests, race safety, `go vet`, Staticcheck, and the real-process integration test. `make build` produces `bin/crane-node` and `bin/crane-cluster`; the other individual targets are `clean-build`, `test`, `race`, `integration`, `vet`, `staticcheck`, and `fmt-check`. CI runs the supported checks on current macOS and Linux runners.
-
-## Cluster secret
-
-Every node in one cluster must use the same secret file containing at least 32 raw bytes (a 256-bit HMAC key). Validation reads the opened regular file, rejects group- or world-readable permissions, and rejects empty or shorter key material. Create it once with owner-only permissions before starting a node:
+## Run it locally
 
 ```sh
-umask 077
-test ! -e local.secret || { echo "refusing to overwrite local.secret" >&2; exit 1; }
-head -c 32 /dev/urandom > local.secret
-chmod 600 local.secret
+make build                                    # bin/crane-node, bin/crane-cluster, bin/crane
+umask 077 && head -c 32 /dev/urandom > local.secret && chmod 600 local.secret
+./bin/crane-cluster -nodes 3 -base-port 8000 -data-root ./data/local \
+  -secret-file ./local.secret -node-binary ./bin/crane-node
 ```
 
-Do not commit or place the secret in JSON configuration. The example configuration names `./local.secret` but contains no secret value. Copy the same protected file to each remote host through an approved secure channel.
+Then, from another shell, submit a job through the client CLI and page its
+results:
+
+```sh
+./bin/crane example-topology > topology.json
+./bin/crane submit  -config data/local/configs/node-1.json -state ./client.state -topology topology.json
+./bin/crane status  -config data/local/configs/node-1.json -state ./client.state -job <job id>
+./bin/crane results -config data/local/configs/node-1.json -state ./client.state -job <job id>
+```
+
+The client keeps a durable identity file (`-state`): request sequences are
+reserved before they are sent, so a crashed client resumes the same request
+and receives the replicated cached answer rather than submitting twice.
+
+The full operations guide — every configuration field, the port table,
+multi-host deployment, the client contract, operator settings, recovery
+guarantees, capacity bounds, and migration rules — is in
+[`docs/crane-operations.md`](docs/crane-operations.md).
+
+## Guarantees, briefly
+
+- **Exactly-once results.** Tuple deliveries carry canonical identities;
+  workers hold durable custody (`Received` → `Processed` → `Completed`) in an
+  identity-bound, checksummed WAL and answer duplicates from it. A checkpoint
+  can cover a result only once two current replicas hold it; a job seals only
+  when both replicas' inventories agree.
+- **Leader loss.** All authority lives in Raft. A new leader barriers, fences
+  every worker to a fresh coordinator epoch, re-reads worker status,
+  re-installs the exact committed assignment state, repairs result copies, and
+  only then reopens admission. A superseded coordinator cannot mutate
+  anything.
+- **Worker crash, with or without its store.** With the store intact, a worker
+  recovers its WAL before reporting ready and re-adopts custody; with the
+  store lost, it rejoins under a new worker epoch, its old attempts are fenced
+  (stale deliveries are refused without custody), and its replica duties are
+  re-established through authenticated bilateral repair.
+- **Bounded everything.** 1,200-byte tuple frames, 1 MiB control frames, 64
+  active / 256 retained jobs, 256 manifests and 64 MiB of results per job, a
+  configured worker-store budget; exhaustion is a typed retryable error, never
+  silently accepted work.
+
+The one deliberate limitation: authentication is a single shared cluster
+secret. Any holder of the secret is a fully trusted member.
+
+## How it is tested
+
+```sh
+make test                # unit suites for every package (-short bounds two long proofs)
+make race                # the same under the race detector
+make sim                 # deterministic in-process four-node simulation with a safety oracle
+make integration         # real-process SWIM and Raft suites
+make crane-integration   # real four-process Crane failover proof (build-tagged seam)
+make verify              # all of the above plus vet, staticcheck, formatting
+```
+
+Three layers of evidence, each stronger than the last:
+
+1. **Unit tests** pin codecs (golden byte vectors, fuzz seeds, allocation
+   bounds), the replicated state machine (command dedup, snapshot validation),
+   the worker store (crash-atomic WAL, a 21-phase injected fault matrix), and
+   the coordinator's reconciliation order.
+2. **Deterministic simulation** (`internal/crane/sim`) runs four real node
+   runtimes over a simulated network and virtual clock through scripted
+   failures (leader loss, packet loss and duplication, exact crash points,
+   false suspicion, partition and heal, store loss, sink replica loss and
+   repair, full cluster restart) plus seeded randomized schedules, with an
+   oracle checking safety invariants after every step.
+3. **Real-process integration** (`integration/`) launches four `crane-node`
+   processes and drives the same failures with exact durable-boundary crash
+   points through a build-tagged hook that production binaries do not contain.
 
 ## Configuration and endpoints
 
-`internal/config.NodeConfig` is the single source of a node's logical identity and all runtime endpoints. A configuration file has these fields:
+`internal/config.NodeConfig` is the single source of a node's identity and
+endpoints. A configuration file has these fields:
 
 - `node_id`: stable, nonzero cluster identity.
 - `cluster_id`: UUID that separates clusters.
-- `bind_host`: local address on which listeners bind; wildcard addresses are allowed here.
-- `advertise_host`: routable IP address or DNS name advertised to peers; wildcard addresses are rejected.
-- `base_port`: nonzero base used with the typed service registry below.
-- `introducer`: a seed node's SWIM snapshot endpoint, used only for initial admission.
-- `storage_dir`: non-root directory for persisted SWIM incarnation and fixed-voter Raft state, with space for later Crane/SDFS state.
+- `bind_host`: local address on which listeners bind; wildcards allowed.
+- `advertise_host`: routable IP or DNS name advertised to peers.
+- `base_port`: nonzero base for the typed service registry below.
+- `introducer`: a seed node's SWIM snapshot endpoint, used only for admission.
+- `storage_dir`: owner-only directory for SWIM incarnation, Raft, and worker
+  state.
 - `cluster_secret_file`: path to the owner-only HMAC key file.
-- `raft_voters`: the same static three- or five-member ID/endpoint map in every node configuration.
-- `timing`: positive SWIM and replay durations; direct plus indirect probe timeouts may not exceed the probe interval.
+- `raft_voters`: the same three- or five-member ID/endpoint map on every node.
+- `timing`: SWIM probe, suspicion, and replay-window durations.
+- `crane`: worker slots, control and retry timeouts, failure grace period,
+  worker-store budget, and the consensus fingerprint the binary must match.
 
-Unknown JSON fields, trailing JSON, invalid hosts, unsafe secret permissions, duplicate voters, invalid voter endpoints, and port overflow fail validation before listeners are opened. [`examples/config/node-1.json`](examples/config/node-1.json) is a one-node configuration example; it is part of a three-voter local layout and expects a sibling `local.secret`.
+Unknown fields, trailing JSON, invalid hosts, unsafe secret permissions,
+duplicate voters, and port overflow fail validation before anything binds.
+`examples/config/node-1.json` is a complete working example.
 
-Ports come only from the typed registry, never hostname parsing or node-ID arithmetic. The modeled registry in [`internal/config/service.go`](internal/config/service.go) is authoritative for service identity, offset, and transport; tests and local-cluster port reservation derive their maximum offset from it. For a `base_port` of `8000`, the complete layout is:
+### Ports
 
-| Offset | Service | Transport | Example port |
-| ---: | --- | --- | ---: |
-| +0 | `swim-ping` | UDP | 8000 |
-| +1 | `swim-ack` | UDP | 8001 |
-| +2 | `swim-snapshot` | TCP | 8002 |
-| +3 | `file-rpc` | TCP (legacy, reference-only) | 8003 |
-| +4 | `grep-rpc` | TCP (legacy, reference-only) | 8004 |
-| +5 | `crane-worker` | TCP | 8005 |
-| +6 | `topology-control` | TCP | 8006 |
-| +7 | `crane-tuple-ack` | UDP | 8007 |
-| +8 | `raft-rpc` | TCP | 8008 |
+| Offset | Service | Transport | Purpose |
+| ---: | --- | --- | --- |
+| +0 | `swim-ping` | UDP | membership probes |
+| +1 | `swim-ack` | UDP | membership acknowledgments |
+| +2 | `swim-snapshot` | TCP | membership join and snapshots |
+| +3 | `file-rpc` | TCP | reserved, unused |
+| +4 | `grep-rpc` | TCP | reserved, unused |
+| +5 | `crane-worker` | TCP | coordinator→worker control, worker→worker result transfer |
+| +6 | `topology-control` | TCP | public client API; non-leaders answer with a checked redirect |
+| +7 | `crane-tuple-ack` | UDP | tuple deliveries and ACK/NACK |
+| +8 | `raft-rpc` | TCP | Raft among the configured voters |
 
-## Running a node
+## Cluster secret
 
-Build the executables, provision the example node's identity state exactly once, and launch it:
+Every node in a cluster uses the same secret file containing at least 32 raw
+bytes. Validation rejects group- or world-readable files and short keys.
+Create it once with owner-only permissions (`umask 077; head -c 32
+/dev/urandom > local.secret; chmod 600 local.secret`) and copy it to each host
+over a secure channel. Never place the secret in JSON configuration.
 
-```sh
-make build
-umask 077
-state_dir=./data/node-1
-mkdir -p "$state_dir"
-chmod 700 "$state_dir"
-test ! -e "$state_dir/swim.incarnation" || { echo "refusing to overwrite existing SWIM identity state" >&2; exit 1; }
-printf '1\n' > "$state_dir/swim.incarnation"
-chmod 600 "$state_dir/swim.incarnation"
-./bin/crane-node -config examples/config/node-1.json
-```
+## Membership and consensus behavior
 
-The secret-creation command in the preceding section must also have created `./local.secret`, the path used by the example config. Writing `swim.incarnation` is an explicit first-run trust/bootstrap ceremony: it establishes the initial nonzero identity generation before any network admission. It deliberately refuses overwriting state. On every later restart, preserve this file; SWIM atomically increments it when required. A corrupted state is rejected. A missing prior state is never silently reset to zero: recovery requires authenticated seed knowledge of the identity, otherwise admission is refused and the operator must restore state or allocate a new node ID.
+**SWIM.** Direct probes, then indirect `PING-REQ` probes on timeout; a missing
+authenticated ACK creates `Suspect`, and the suspicion timer produces `Dead`.
+A node refutes suspicion with a higher-incarnation `Alive`; `Dead` and `Left`
+are retained as tombstones so a stale incarnation can never resurrect. On
+restart a node persists an incarnation higher than both its prior state and
+the seed's retained value. Membership failure never deletes data, changes the
+Raft voter set, or by itself reassigns Crane work; Crane reassigns only after
+a worker has been continuously `Dead`/`Left` and unreachable for the
+configured grace period.
 
-`-config` is required. For generated local clusters only, the node command accepts `-node-id`, `-bind-host`, `-advertise-host`, `-base-port`, and `-storage-dir` overrides. Cluster identity, seed, voters, timing, and secret location remain file-controlled so a command-line typo cannot create another security or consensus domain.
-
-Startup creates a missing storage directory as `0700`. If the final path already exists, it must be a real directory owned by the current user with exactly `0700` permissions; startup rejects an unsafe path without silently applying `chmod`. The incarnation path must be a non-symlink regular file owned by the current user, grant no group or other permissions, and fit the bounded decimal-state representation; FIFOs, directories, links, oversized files, and permissive files are rejected before reading. After loading identity, every node binds SWIM's UDP and snapshot TCP listeners. A configured Raft voter also recovers its durable Raft state and binds its `raft-rpc` TCP listener at `+8`; a nonvoter does neither. The process prints one readiness signal only after every service constructed for that node is ready. Raft readiness does not wait for a leader or quorum. The supervisor cancels and joins all services if a required listener or startup invariant fails. Send `SIGINT` or `SIGTERM` for graceful shutdown: the node persists a newer SWIM incarnation, announces `Left` for a bounded dissemination interval, then closes listeners and waits for every service goroutine. Configuration, authentication-key, storage, listener, and invariant failures exit nonzero; requested graceful shutdown exits zero.
-
-## Local three-node cluster
-
-The launcher generates strict `0600` configuration files under its data root, creates per-node storage directories and initial nonzero incarnation state, and never writes the secret into those files. Its default local bases are 8000, 8100, and 8200 (a stride of 100); node 1 is the initial seed, not a permanent authority.
-
-```sh
-make build
-umask 077
-test ! -e local.secret || { echo "refusing to overwrite local.secret" >&2; exit 1; }
-head -c 32 /dev/urandom > local.secret
-chmod 600 local.secret
-./bin/crane-cluster \
-  -nodes 3 \
-  -base-port 8000 \
-  -data-root ./data/local \
-  -secret-file ./local.secret \
-  -node-binary ./bin/crane-node
-```
-
-`cmd/cluster` starts the seed first, waits for its readiness signal, then launches the remaining nodes with node-ID-prefixed logs. Missing per-node and configuration directories are created as `0700`; unsafe existing final directories are rejected without permission repair. It forwards the first `SIGINT`/`SIGTERM` to the children for graceful leave and waits for them; a second signal escalates shutdown. A child operational failure remains a launcher error even after the user requested shutdown. Five or more local nodes use a five-voter static map; three or four nodes use a three-voter map.
-
-## Fixed-membership Raft behavior
-
-Every node configuration carries the same fixed `raft_voters` map containing exactly three or five stable node IDs and their advertised `raft-rpc` (`+8`) endpoints. A process starts Raft only when its exact local `node_id` appears in that map. SWIM admission, suspicion, failure, recovery, and membership size never add, remove, promote, or replace a Raft voter. In a four-node generated cluster, nodes 1-3 are voters and node 4 is a SWIM-only nonvoter; node 4 does not bind `+8`, open Raft storage, vote, or become a voter when it joins SWIM.
-
-Each voter stores identity-bound consensus state under `<storage_dir>/raft`. The `identity` file binds the store to the configured cluster ID, local node ID, storage format, and complete voter set; `wal` contains committed persistence transactions, `lock` prevents concurrent use, and `snapshot` appears after application snapshotting. Preserve this entire directory and the SWIM incarnation file for a same-identity restart. A voter safely recovers only when its configured identity and fixed voter map still match the durable identity; do not copy another voter's store, delete selected artifacts, or reuse a lost node ID with freshly initialized state.
-
-Raft requires a majority of the configured voters: two of three or three of five. When a majority cannot communicate, the remaining minority cannot elect a usable leader or commit new work. Durable committed state is retained and normal progress resumes after enough same-identity voters return and reconcile. SWIM may report those processes Alive, Suspect, Dead, or Left, but those observations do not change the quorum definition. Changing the voter set requires a future explicitly designed consensus membership protocol; editing live configurations independently is unsafe and unsupported.
-
-The current Raft application is an explicit bootstrap state machine. It restores and snapshots only a versioned empty state and rejects application commands, so no public proposal or debug endpoint is exposed yet. Crane's schema-validated replicated job state, public topology/client control protocol, worker assignment, tuple acknowledgments, deduplication, and failover recovery are the next milestone.
+**Raft.** Every configuration carries the same fixed `raft_voters` map. A
+process runs Raft only if its own `node_id` is in that map; a majority (two of
+three, three of five) is required to elect and commit. Each voter keeps
+identity-bound state under `<storage_dir>/raft` (`identity`, `wal`, `lock`,
+`snapshot`); preserve that directory and the SWIM incarnation file across
+restarts. Peers whose compiled consensus fingerprint differs are refused at
+the handshake, before any RPC.
 
 ## Remote hosts
 
-Use one config per machine, with a unique `node_id`, separate writable `storage_dir`, the shared protected secret path, and an identical `cluster_id`, timing block, and `raft_voters` map on every node. Set `bind_host` to the interface the local process can bind and `advertise_host` to the routable DNS name or IP peers can contact. The `introducer` must be the configured seed's advertised `swim-snapshot` endpoint (base port `+2`), not its bind-only or wildcard address. Open the registry's UDP and TCP ports as needed by the enabled runtime services.
-
-Before the first remote start, securely create or copy the shared 32-byte-or-longer secret to the exact `cluster_secret_file` path on each host, then provision the configured storage directory once on that host (substitute its exact configured path). This is the same explicit identity-trust ceremony as the standalone example; do not repeat it for restarts:
+One configuration per machine with a unique `node_id`, its own `storage_dir`,
+the shared secret path, and identical `cluster_id`, `timing`, `raft_voters`,
+and `crane` sections. Set `advertise_host` to the routable address, start the
+introducer first, then the remaining nodes:
 
 ```sh
 umask 077
 storage_dir=/var/lib/crane/node-1
-mkdir -p "$storage_dir"
-chmod 700 "$storage_dir"
+mkdir -p "$storage_dir" && chmod 700 "$storage_dir"
 test ! -e "$storage_dir/swim.incarnation" || { echo "refusing to overwrite existing SWIM identity state" >&2; exit 1; }
-printf '1\n' > "$storage_dir/swim.incarnation"
-chmod 600 "$storage_dir/swim.incarnation"
+printf '1\n' > "$storage_dir/swim.incarnation" && chmod 600 "$storage_dir/swim.incarnation"
 ./bin/crane-node -config /etc/crane/node-1.json
 ```
 
-The introducer admits a joining node and supplies its snapshot; after admission it has no special authority. If the original seed stops, existing members continue probing and disseminating. A new node still needs a configured reachable seed to join. On restart, a node chooses and atomically persists an incarnation higher than both its prior state and the seed's retained value. If its state directory is lost, do not recreate `swim.incarnation` with `1`: recovery requires a seed-retained identity; without it, admission is refused and the operator must restore the state or assign a new node ID rather than reusing incarnation zero.
+The introducer only admits and supplies a snapshot; after admission it has no
+special role.
 
-## SWIM behavior and current scope
+## Toolchain
 
-The SWIM event loop owns membership state. It runs direct probes, then indirect `PING-REQ` probes on timeout; lack of a matching authenticated ACK creates `Suspect`, and the suspicion timer eventually produces `Dead`. A node refutes suspicion by publishing a higher-incarnation `Alive`; `Dead` and `Left` are retained as tombstones to prevent stale resurrection. If a join acceptance is lost after admission, the client performs one exact idempotent retry without advancing durable incarnation state again. Membership events and snapshots are copied, bounded views: slow subscribers receive a resynchronization marker instead of blocking SWIM. Recovery is scoped to the returned subscription handle: call `Subscription.Snapshot` after its marker; a general `Service.Snapshot` does not resume any subscriber. If membership advances between capture and the owner-confined recovery acknowledgment, `Subscription.Snapshot` returns `swim.ErrSnapshotSuperseded`, leaves that subscription paused, and the caller should retry. If the subscription context removes the handle before acknowledgment, it returns `swim.ErrSubscriptionClosed`. `Service.Stats` exposes only fixed-label, saturating counts for rejected UDP datagrams and transient send failures; it does not retain endpoints, request IDs, payloads, or secrets.
-
-Membership failure does not terminate a process, delete data, alter the configured Raft voter set, or reassign Crane work. Authenticating, replay-checking, and schema validation happen before SWIM state mutation. The real-process integration tests cover local admission, failure detection, restart with a higher incarnation, continued operation after seed loss, and a four-process layout in which only the three fixed voters bind Raft and create durable Raft artifacts.
-
-The runtime foundation, full SWIM membership, fixed-membership Raft replication and persistence, and the Crane stream-processing system (`internal/crane`, documented below) are implemented and verified together; the removed legacy `pkg/topology` bridge is superseded by the validated topology model in `internal/crane/model`.
-
-## Crane stream processing
-
-Crane is the supported stream-processing runtime and runs inside every node
-process alongside SWIM and Raft: voters host the replicated coordinator state
-and the leader's coordinator, every node hosts the worker services on +5/+7,
-and the public client API is served on +6 with checked leader redirects. The
-`crane` configuration section, the client CLI (`make crane` builds
-`bin/crane`), the operator registry, the recovery guarantees, and the
-verification gates are documented in [`docs/crane-operations.md`](docs/crane-operations.md).
-
-The `src/` directory (file system and grep exercises) is reference-only
-legacy code: it is not built into the node, not covered by the Crane
-verification gates, and the removed legacy Crane runtime (`src/crane`,
-`src/topology`, `src/treejob`, `pkg/topology`) is superseded entirely by
-`internal/crane`.
+The module targets Go 1.26 and has no external dependencies. `make verify`
+runs formatting, unit, race, vet, staticcheck, and the real-process suites.
+CI runs the fast gates on every push (Linux and macOS) and the race detector
+on Linux; the four-process failover proof runs nightly and on demand, since it
+is timing-sensitive on shared runners.

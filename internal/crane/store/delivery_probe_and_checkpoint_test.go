@@ -9,7 +9,7 @@ import (
 	"github.com/aadityakv/crane/internal/crane/protocol"
 )
 
-func TestTask15ProbeDeliveryReturnsExactDurableStateAfterFenceAdvance(t *testing.T) {
+func TestDeliveryProbeDeliveryReturnsExactDurableStateAfterFenceAdvance(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		state DeliveryState
@@ -80,7 +80,7 @@ func TestTask15ProbeDeliveryReturnsExactDurableStateAfterFenceAdvance(t *testing
 	}
 }
 
-func TestTask15CompactedProbeFailsClosedAfterAssignmentReplacement(t *testing.T) {
+func TestDeliveryCompactedProbeFailsClosedAfterAssignmentReplacement(t *testing.T) {
 	store, identity, _ := openDomainStore(t, 16<<20)
 	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
 	if err := store.Fence(epoch); err != nil {
@@ -144,7 +144,7 @@ func TestTask15CompactedProbeFailsClosedAfterAssignmentReplacement(t *testing.T)
 	}
 }
 
-func TestTask15ProcessedReplayRejectsMutableOutboxPhase(t *testing.T) {
+func TestDeliveryProcessedReplayRejectsMutableOutboxPhase(t *testing.T) {
 	mutations := []struct {
 		name   string
 		mutate func(*OutboxRecord)
@@ -221,7 +221,7 @@ func TestTask15ProcessedReplayRejectsMutableOutboxPhase(t *testing.T) {
 	}
 }
 
-func TestTask15MarkProcessedCompletedIsIdempotentAndExact(t *testing.T) {
+func TestDeliveryMarkProcessedCompletedIsIdempotentAndExact(t *testing.T) {
 	store, identity, _ := openDomainStore(t, 16<<20)
 	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
 	if err := store.Fence(epoch); err != nil {
@@ -279,7 +279,7 @@ func TestTask15MarkProcessedCompletedIsIdempotentAndExact(t *testing.T) {
 	}
 }
 
-func TestTask15CheckpointRequiresDurableCompletionAndAdvancesRevisionOnce(t *testing.T) {
+func TestDeliveryCheckpointRequiresDurableCompletionAndAdvancesRevisionOnce(t *testing.T) {
 	newCompleted := func(t *testing.T) (*Store, model.AssignmentSet, model.CoordinatorEpoch, DeliveryRecord, model.AssignmentToken) {
 		t.Helper()
 		store, identity, _ := openDomainStore(t, 16<<20)
@@ -473,7 +473,7 @@ func TestTask15CheckpointRequiresDurableCompletionAndAdvancesRevisionOnce(t *tes
 	})
 }
 
-func TestTask15LegacySourceSchemaDefaultsCheckpointProofFailClosed(t *testing.T) {
+func TestDeliveryLegacySourceSchemaDefaultsCheckpointProofFailClosed(t *testing.T) {
 	w := newRecordWriter()
 	w.u16(domainRecordSchema)
 	source := model.TaskID{JobID: model.JobID{1}, StageID: 1}
@@ -503,7 +503,7 @@ func cloneZeroPhaseOutboxes(outboxes []OutboxRecord) []OutboxRecord {
 	return cloned
 }
 
-func TestTask15OutboxRetryPhaseAndDeadlineSurviveSnapshotReopen(t *testing.T) {
+func TestDeliveryOutboxRetryPhaseAndDeadlineSurviveSnapshotReopen(t *testing.T) {
 	path := t.TempDir() + "/worker"
 	identity := Identity{ClusterID: [16]byte{1}, NodeID: 1}
 	options := Options{MaxBytes: 16 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return model.WorkerEpoch{7}, nil }}
@@ -562,7 +562,7 @@ func TestTask15OutboxRetryPhaseAndDeadlineSurviveSnapshotReopen(t *testing.T) {
 	}
 }
 
-func TestTask15OutboxCodecReadsV1AndRejectsUnsetAcceptedV2(t *testing.T) {
+func TestDeliveryOutboxCodecReadsV1AndRejectsUnsetAcceptedV2(t *testing.T) {
 	store, identity, _ := openDomainStore(t, 16<<20)
 	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)
 	var source model.AssignmentToken

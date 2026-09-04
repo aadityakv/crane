@@ -1,6 +1,2 @@
 .git
 tools
-src/github.com
-src/*.sh
-*.pdf
-englishText*

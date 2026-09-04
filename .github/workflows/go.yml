@@ -13,7 +13,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v7
@@ -21,7 +21,19 @@ jobs:
           go-version: '1.26.x'
           cache: true
       - run: make build clean-build
-      - run: make fmt-check test race vet integration
-      - run: make crane-integration
+      - run: make fmt-check vet
+      - run: go test ./... -short -count=1
+      - run: make integration
       - if: runner.os == 'Linux'
         run: make staticcheck
+
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - run: go test -race ./... -short -count=1

@@ -3,9 +3,7 @@
 This document describes how to install, configure, run, drive, and verify the
 supported Crane stream-processing runtime. Crane runs inside the same node
 process as SWIM membership and fixed-membership Raft; there is no separate
-Crane daemon, no dynamic port allocation, and no plugin loading. The legacy
-`src/` tree (file system and grep exercises) is reference-only and is not part
-of the supported runtime.
+Crane daemon, no dynamic port allocation, and no plugin loading.
 
 ## Installation and toolchain
 
@@ -48,8 +46,8 @@ is parsed from hostnames or node IDs.
 | +0 | `swim-ping` | UDP | membership probes |
 | +1 | `swim-ack` | UDP | membership acknowledgments |
 | +2 | `swim-snapshot` | TCP | membership join/snapshot |
-| +3 | `file-rpc` | TCP | legacy, reference-only |
-| +4 | `grep-rpc` | TCP | legacy, reference-only |
+| +3 | `file-rpc` | TCP | reserved, unused |
+| +4 | `grep-rpc` | TCP | reserved, unused |
 | +5 | `crane-worker` | TCP | authenticated coordinator→worker control sessions, worker→worker result transfer and repair |
 | +6 | `topology-control` | TCP | public client API: submit, cancel, status, result paging; non-leaders answer with a checked redirect |
 | +7 | `crane-tuple-ack` | UDP | bounded 1,200-byte authenticated tuple deliveries and ACK/NACK |
