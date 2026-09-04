@@ -1,3 +1,10 @@
+// Command node runs one Crane cluster member. It loads and validates the
+// strict node configuration, composes the complete runtime (SWIM membership,
+// the admission gate and replicated state machine, the worker services, Raft
+// and the coordinator on configured voters, and the control service), and
+// runs it under a supervisor that reports readiness on stdout. The process
+// exits non-zero whenever any owned service fails, so a node is either fully
+// serving or not running at all.
 package main
 
 import (

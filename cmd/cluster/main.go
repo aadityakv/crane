@@ -1,3 +1,11 @@
+// Command cluster launches and supervises a local multi-node Crane cluster
+// for development. It derives one configuration per node from ClusterOptions
+// (GenerateConfigs), writes them under the data root with a shared secret and
+// a persisted cluster ID, spawns one node process each, and multiplexes their
+// output with per-node prefixes; it can also serve a read-only job dashboard
+// against the running cluster. The launcher owns every child it starts: a
+// signal or a failed child tears the whole cluster down within the shutdown
+// grace period, so a partially running cluster is never left behind.
 package main
 
 import (
