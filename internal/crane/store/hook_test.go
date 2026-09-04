@@ -7,9 +7,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/crane/integrationhook"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 // orderLog records every WAL fsync and every durable boundary in the exact

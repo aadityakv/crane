@@ -3,7 +3,7 @@ package raft
 import (
 	"fmt"
 
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 // RPCSchemaVersion is the initial canonical binary schema for non-handshake Raft payloads.

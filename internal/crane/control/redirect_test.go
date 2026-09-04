@@ -4,10 +4,10 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/protocol"
-	"github.com/aaditya/cs425mp3/internal/crane/state"
-	"github.com/aaditya/cs425mp3/internal/raft"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/raft"
 )
 
 // redirectProbes returns one instance of every +6 request type.

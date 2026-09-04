@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const voterFingerprintDomain = "cs425/raft/voter-set/v1\x00"

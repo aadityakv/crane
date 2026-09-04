@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const (

@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	internalnode "github.com/aaditya/cs425mp3/internal/node"
+	internalnode "github.com/aadityakv/crane/internal/node"
 )
 
 const (
@@ -60,7 +60,7 @@ func parseClusterFlags(args []string) (ClusterOptions, string, error) {
 	basePort := flags.Uint64("base-port", 8000, "first node base port")
 	dataRoot := flags.String("data-root", "./data/local", "local cluster data root")
 	secretFile := flags.String("secret-file", "./local.secret", "permission-restricted cluster secret file")
-	nodeBinary := flags.String("node-binary", "./bin/cs425-node", "node executable")
+	nodeBinary := flags.String("node-binary", "./bin/crane-node", "node executable")
 	if err := flags.Parse(args); err != nil {
 		return ClusterOptions{}, "", fmt.Errorf("parse cluster flags: %w", err)
 	}

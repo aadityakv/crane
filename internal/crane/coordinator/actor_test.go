@@ -10,15 +10,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/crane/admission"
-	"github.com/aaditya/cs425mp3/internal/crane/membership"
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/protocol"
-	"github.com/aaditya/cs425mp3/internal/crane/state"
-	"github.com/aaditya/cs425mp3/internal/crane/worker"
-	"github.com/aaditya/cs425mp3/internal/raft"
-	"github.com/aaditya/cs425mp3/internal/swim"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/crane/admission"
+	"github.com/aadityakv/crane/internal/crane/membership"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/worker"
+	"github.com/aadityakv/crane/internal/raft"
+	"github.com/aadityakv/crane/internal/swim"
 )
 
 const testWaitBudget = 5 * time.Second

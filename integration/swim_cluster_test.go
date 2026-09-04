@@ -19,12 +19,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/config"
-	internalrandom "github.com/aaditya/cs425mp3/internal/random"
-	"github.com/aaditya/cs425mp3/internal/swim"
-	"github.com/aaditya/cs425mp3/internal/testutil"
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	internalrandom "github.com/aadityakv/crane/internal/random"
+	"github.com/aadityakv/crane/internal/swim"
+	"github.com/aadityakv/crane/internal/testutil"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const (
@@ -93,7 +93,7 @@ func TestLocalClusterLauncher(t *testing.T) {
 		}
 		return true, nil
 	})
-	readyLine := "[node-1] CS425_NODE_READY node_id=1"
+	readyLine := "[node-1] CRANE_NODE_READY node_id=1"
 	if logs := launcher.log.String(); !strings.Contains(logs, readyLine) {
 		t.Fatalf("launcher logs do not contain seed readiness %q:\n%s", readyLine, harness.logs())
 	}
@@ -203,11 +203,11 @@ func TestLocalSWIMCluster(t *testing.T) {
 }
 
 func buildNodeBinary(t *testing.T, repositoryRoot string) string {
-	return buildGoBinary(t, repositoryRoot, "cs425-node", "./cmd/node")
+	return buildGoBinary(t, repositoryRoot, "crane-node", "./cmd/node")
 }
 
 func buildClusterBinary(t *testing.T, repositoryRoot string) string {
-	return buildGoBinary(t, repositoryRoot, "cs425-cluster", "./cmd/cluster")
+	return buildGoBinary(t, repositoryRoot, "crane-cluster", "./cmd/cluster")
 }
 
 func buildGoBinary(t *testing.T, repositoryRoot, name, packagePath string) string {

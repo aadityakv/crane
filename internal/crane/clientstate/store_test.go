@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 var (

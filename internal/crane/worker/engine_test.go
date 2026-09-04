@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/crane/admission"
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/protocol"
-	"github.com/aaditya/cs425mp3/internal/crane/store"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/crane/admission"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 func TestEngineRequiresAndPreservesCallerGate(t *testing.T) {

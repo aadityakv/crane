@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	internalnode "github.com/aaditya/cs425mp3/internal/node"
-	"github.com/aaditya/cs425mp3/internal/testutil"
+	internalnode "github.com/aadityakv/crane/internal/node"
+	"github.com/aadityakv/crane/internal/testutil"
 )
 
 func TestParseClusterFlagsUsesSpecifiedLocalLayout(t *testing.T) {
@@ -24,7 +24,7 @@ func TestParseClusterFlagsUsesSpecifiedLocalLayout(t *testing.T) {
 		"-base-port", "12000",
 		"-data-root", "/tmp/local-data",
 		"-secret-file", "/tmp/local.secret",
-		"-node-binary", "/tmp/cs425-node",
+		"-node-binary", "/tmp/crane-node",
 	})
 	if err != nil {
 		t.Fatalf("parseClusterFlags: %v", err)
@@ -32,7 +32,7 @@ func TestParseClusterFlagsUsesSpecifiedLocalLayout(t *testing.T) {
 	if options.Nodes != 5 || options.Voters != 5 || options.Host != "127.0.0.1" || options.StartingBasePort != 12000 {
 		t.Fatalf("cluster options = %#v", options)
 	}
-	if options.DataRoot != "/tmp/local-data" || options.SecretFile != "/tmp/local.secret" || nodeBinary != "/tmp/cs425-node" {
+	if options.DataRoot != "/tmp/local-data" || options.SecretFile != "/tmp/local.secret" || nodeBinary != "/tmp/crane-node" {
 		t.Fatalf("paths = %#v, binary %q", options, nodeBinary)
 	}
 }
@@ -404,7 +404,7 @@ func TestDrainChildrenReapsChildAfterGraceExpires(t *testing.T) {
 }
 
 func TestClusterChildHelper(t *testing.T) {
-	if os.Getenv("CS425_CLUSTER_HELPER") != "1" {
+	if os.Getenv("CRANE_CLUSTER_HELPER") != "1" {
 		return
 	}
 	args := flag.Args()
@@ -493,7 +493,7 @@ func writeClusterHelperWrapper(t *testing.T) string {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "cluster-child")
-	content := fmt.Sprintf("#!/bin/sh\nCS425_CLUSTER_HELPER=1 exec %q -test.run=TestClusterChildHelper -- \"$@\"\n", testBinary)
+	content := fmt.Sprintf("#!/bin/sh\nCRANE_CLUSTER_HELPER=1 exec %q -test.run=TestClusterChildHelper -- \"$@\"\n", testBinary)
 	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
 		t.Fatal(err)
 	}

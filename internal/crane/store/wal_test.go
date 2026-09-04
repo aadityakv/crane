@@ -15,7 +15,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func TestWALPinsMagicSchemaTypesBigEndianLengthSequenceAndCRC32C(t *testing.T) {

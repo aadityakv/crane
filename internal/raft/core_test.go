@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 type coreScriptedRandom struct {

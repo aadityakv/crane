@@ -2,9 +2,9 @@ package store
 
 import (
 	"fmt"
-	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
+	"github.com/aadityakv/crane/internal/crane/integrationhook"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 const (

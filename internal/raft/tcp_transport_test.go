@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 func TestTCPHandshakeBindsConfiguredHeaderAndPayloadSender(t *testing.T) {

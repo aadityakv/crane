@@ -11,8 +11,8 @@ of the supported runtime.
 
 - Go 1.26 exactly (`go.mod` pins the language version; the verification gate
   records `go version`).
-- `make build` produces `bin/cs425-node` (the node), `bin/cs425-cluster`
-  (local cluster launcher), and `bin/cs425-crane` (the client CLI).
+- `make build` produces `bin/crane-node` (the node), `bin/crane-cluster`
+  (local cluster launcher), and `bin/crane` (the client CLI).
 - Optional static analysis: `go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...`.
 
 ## Configuration
@@ -63,14 +63,14 @@ Local cluster, exactly as in the README:
 make build
 umask 077
 head -c 32 /dev/urandom > local.secret && chmod 600 local.secret
-./bin/cs425-cluster -nodes 3 -base-port 8000 -data-root ./data/local \
-  -secret-file ./local.secret -node-binary ./bin/cs425-node
+./bin/crane-cluster -nodes 3 -base-port 8000 -data-root ./data/local \
+  -secret-file ./local.secret -node-binary ./bin/crane-node
 ```
 
 Multi-host: generate one configuration per host with the same `cluster_id`,
 `cluster_secret_file` contents, `raft_voters` map, and `crane` section; set
 `advertise_host` to the routable address; start the introducer first, then the
-remaining nodes with `./bin/cs425-node -config <file>`. `tools/rsync_exclude.txt`
+remaining nodes with `./bin/crane-node -config <file>`. `tools/rsync_exclude.txt`
 excludes local state when syncing the tree to hosts.
 
 Voters run Raft, the coordinator (when leading), the worker services, and the
@@ -80,11 +80,11 @@ service that redirects every request to the voters; they own no Raft storage.
 ## Client CLI
 
 ```sh
-./bin/cs425-crane example-topology > topology.json
-./bin/cs425-crane submit  -config examples/config/node-1.json -state ./client.state -topology topology.json
-./bin/cs425-crane status  -config examples/config/node-1.json -state ./client.state -job <32 hex>
-./bin/cs425-crane results -config examples/config/node-1.json -state ./client.state -job <32 hex> [-page-bytes N]
-./bin/cs425-crane cancel  -config examples/config/node-1.json -state ./client.state -job <32 hex> -expected-revision <job-control revision from status>
+./bin/crane example-topology > topology.json
+./bin/crane submit  -config examples/config/node-1.json -state ./client.state -topology topology.json
+./bin/crane status  -config examples/config/node-1.json -state ./client.state -job <32 hex>
+./bin/crane results -config examples/config/node-1.json -state ./client.state -job <32 hex> [-page-bytes N]
+./bin/crane cancel  -config examples/config/node-1.json -state ./client.state -job <32 hex> -expected-revision <job-control revision from status>
 ```
 
 Every network subcommand also accepts `-attempts N` (complete request

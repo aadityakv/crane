@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/random"
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/random"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 func TestNewEngineRejectsInvalidOwnerDependenciesAndTiming(t *testing.T) {

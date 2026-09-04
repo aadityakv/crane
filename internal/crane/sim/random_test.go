@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/state"
 )
 
 // randomStressEnvironment optionally widens the randomized seed set.

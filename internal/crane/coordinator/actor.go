@@ -15,13 +15,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/crane/admission"
-	"github.com/aaditya/cs425mp3/internal/crane/membership"
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/state"
-	"github.com/aaditya/cs425mp3/internal/raft"
-	"github.com/aaditya/cs425mp3/internal/swim"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/crane/admission"
+	"github.com/aadityakv/crane/internal/crane/membership"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/raft"
+	"github.com/aadityakv/crane/internal/swim"
 )
 
 const (

@@ -1,3 +1,3 @@
-module github.com/aaditya/cs425mp3/legacy
+module github.com/aadityakv/crane/legacy
 
 go 1.26

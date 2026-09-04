@@ -1,4 +1,4 @@
-# CS 425 MP3 runtime foundation
+# Crane
 
 This repository contains the modern Go runtime foundation and its SWIM membership service. It runs authenticated nodes locally or on separately addressed machines. The legacy implementation under [`src/`](src/) is a quarantined nested Go module: it is retained for reference only and is not built, imported, or operated by the root module.
 
@@ -20,7 +20,7 @@ changing or operating the runtime:
 make clean-build verify
 ```
 
-The gate checks clean-tree build isolation, formatting, unit tests, race safety, `go vet`, Staticcheck, and the real-process integration test. `make build` produces `bin/cs425-node` and `bin/cs425-cluster`; the other individual targets are `clean-build`, `test`, `race`, `integration`, `vet`, `staticcheck`, and `fmt-check`. CI runs the supported checks on current macOS and Linux runners.
+The gate checks clean-tree build isolation, formatting, unit tests, race safety, `go vet`, Staticcheck, and the real-process integration test. `make build` produces `bin/crane-node` and `bin/crane-cluster`; the other individual targets are `clean-build`, `test`, `race`, `integration`, `vet`, `staticcheck`, and `fmt-check`. CI runs the supported checks on current macOS and Linux runners.
 
 ## Cluster secret
 
@@ -79,7 +79,7 @@ chmod 700 "$state_dir"
 test ! -e "$state_dir/swim.incarnation" || { echo "refusing to overwrite existing SWIM identity state" >&2; exit 1; }
 printf '1\n' > "$state_dir/swim.incarnation"
 chmod 600 "$state_dir/swim.incarnation"
-./bin/cs425-node -config examples/config/node-1.json
+./bin/crane-node -config examples/config/node-1.json
 ```
 
 The secret-creation command in the preceding section must also have created `./local.secret`, the path used by the example config. Writing `swim.incarnation` is an explicit first-run trust/bootstrap ceremony: it establishes the initial nonzero identity generation before any network admission. It deliberately refuses overwriting state. On every later restart, preserve this file; SWIM atomically increments it when required. A corrupted state is rejected. A missing prior state is never silently reset to zero: recovery requires authenticated seed knowledge of the identity, otherwise admission is refused and the operator must restore state or allocate a new node ID.
@@ -98,12 +98,12 @@ umask 077
 test ! -e local.secret || { echo "refusing to overwrite local.secret" >&2; exit 1; }
 head -c 32 /dev/urandom > local.secret
 chmod 600 local.secret
-./bin/cs425-cluster \
+./bin/crane-cluster \
   -nodes 3 \
   -base-port 8000 \
   -data-root ./data/local \
   -secret-file ./local.secret \
-  -node-binary ./bin/cs425-node
+  -node-binary ./bin/crane-node
 ```
 
 `cmd/cluster` starts the seed first, waits for its readiness signal, then launches the remaining nodes with node-ID-prefixed logs. Missing per-node and configuration directories are created as `0700`; unsafe existing final directories are rejected without permission repair. It forwards the first `SIGINT`/`SIGTERM` to the children for graceful leave and waits for them; a second signal escalates shutdown. A child operational failure remains a launcher error even after the user requested shutdown. Five or more local nodes use a five-voter static map; three or four nodes use a three-voter map.
@@ -126,13 +126,13 @@ Before the first remote start, securely create or copy the shared 32-byte-or-lon
 
 ```sh
 umask 077
-storage_dir=/var/lib/cs425/node-1
+storage_dir=/var/lib/crane/node-1
 mkdir -p "$storage_dir"
 chmod 700 "$storage_dir"
 test ! -e "$storage_dir/swim.incarnation" || { echo "refusing to overwrite existing SWIM identity state" >&2; exit 1; }
 printf '1\n' > "$storage_dir/swim.incarnation"
 chmod 600 "$storage_dir/swim.incarnation"
-./bin/cs425-node -config /etc/cs425/node-1.json
+./bin/crane-node -config /etc/crane/node-1.json
 ```
 
 The introducer admits a joining node and supplies its snapshot; after admission it has no special authority. If the original seed stops, existing members continue probing and disseminating. A new node still needs a configured reachable seed to join. On restart, a node chooses and atomically persists an incarnation higher than both its prior state and the seed's retained value. If its state directory is lost, do not recreate `swim.incarnation` with `1`: recovery requires a seed-retained identity; without it, admission is refused and the operator must restore the state or assign a new node ID rather than reusing incarnation zero.
@@ -152,7 +152,7 @@ process alongside SWIM and Raft: voters host the replicated coordinator state
 and the leader's coordinator, every node hosts the worker services on +5/+7,
 and the public client API is served on +6 with checked leader redirects. The
 `crane` configuration section, the client CLI (`make crane` builds
-`bin/cs425-crane`), the operator registry, the recovery guarantees, and the
+`bin/crane`), the operator registry, the recovery guarantees, and the
 verification gates are documented in [`docs/crane-operations.md`](docs/crane-operations.md).
 
 The `src/` directory (file system and grep exercises) is reference-only

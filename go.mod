@@ -1,3 +1,3 @@
-module github.com/aaditya/cs425mp3
+module github.com/aadityakv/crane
 
 go 1.26

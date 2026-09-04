@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/aaditya/cs425mp3/internal/config"
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const (

@@ -4,16 +4,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	craneruntime "github.com/aaditya/cs425mp3/internal/crane/runtime"
+	craneruntime "github.com/aadityakv/crane/internal/crane/runtime"
 	"sort"
 	"sync"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/protocol"
-	"github.com/aaditya/cs425mp3/internal/crane/state"
-	"github.com/aaditya/cs425mp3/internal/crane/store"
-	"github.com/aaditya/cs425mp3/internal/raft"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/raft"
 )
 
 // simJobPlan is the pure reference evaluation of one submitted job: the exact

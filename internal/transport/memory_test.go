@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 func TestMemoryNetworkDeliversOnlyWhenAdvancedAndOwnsPayloads(t *testing.T) {

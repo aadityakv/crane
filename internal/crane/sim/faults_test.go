@@ -11,13 +11,13 @@ import (
 
 	goruntime "runtime"
 
-	"github.com/aaditya/cs425mp3/internal/config"
-	"github.com/aaditya/cs425mp3/internal/crane/control"
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/state"
-	"github.com/aaditya/cs425mp3/internal/crane/store"
-	"github.com/aaditya/cs425mp3/internal/swim"
-	"github.com/aaditya/cs425mp3/internal/transport"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/crane/control"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/swim"
+	"github.com/aadityakv/crane/internal/transport"
 )
 
 func gosched() { goruntime.Gosched() }

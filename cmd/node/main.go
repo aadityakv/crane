@@ -13,13 +13,13 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/config"
-	craneruntime "github.com/aaditya/cs425mp3/internal/crane/runtime"
-	"github.com/aaditya/cs425mp3/internal/node"
-	internalrandom "github.com/aaditya/cs425mp3/internal/random"
-	"github.com/aaditya/cs425mp3/internal/swim"
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	craneruntime "github.com/aadityakv/crane/internal/crane/runtime"
+	"github.com/aadityakv/crane/internal/node"
+	internalrandom "github.com/aadityakv/crane/internal/random"
+	"github.com/aadityakv/crane/internal/swim"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const incarnationStateFilename = swim.IncarnationStateFilename

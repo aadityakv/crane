@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/aaditya/cs425mp3/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const (

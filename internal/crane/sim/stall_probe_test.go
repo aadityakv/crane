@@ -38,8 +38,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/state"
-	"github.com/aaditya/cs425mp3/internal/crane/store"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 // probeDump records one node's raft role/term, admission gate, and replicated

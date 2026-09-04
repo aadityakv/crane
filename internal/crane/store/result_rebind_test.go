@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 // rebindFixture opens a store whose node 1 holds one result under revision 1

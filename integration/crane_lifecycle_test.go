@@ -23,17 +23,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/config"
-	"github.com/aaditya/cs425mp3/internal/crane/clientstate"
-	"github.com/aaditya/cs425mp3/internal/crane/control"
-	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/protocol"
-	"github.com/aaditya/cs425mp3/internal/crane/store"
-	"github.com/aaditya/cs425mp3/internal/crane/worker"
-	"github.com/aaditya/cs425mp3/internal/swim"
-	"github.com/aaditya/cs425mp3/internal/wire"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/crane/clientstate"
+	"github.com/aadityakv/crane/internal/crane/control"
+	"github.com/aadityakv/crane/internal/crane/integrationhook"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/crane/worker"
+	"github.com/aadityakv/crane/internal/swim"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const (
@@ -1032,7 +1032,7 @@ func (c *craneCluster) verifyResults(job craneJob) []model.ResultRecord {
 	return records
 }
 
-// cliResults runs the real cs425-crane binary and returns the decoded values
+// cliResults runs the real crane binary and returns the decoded values
 // in emitted order plus the summary record count.
 func (c *craneCluster) cliResults(job craneJob) ([]int64, int) {
 	c.t.Helper()
@@ -1091,8 +1091,8 @@ func (c *craneCluster) phase(name string, body func()) {
 func buildCraneBinaries(t *testing.T) (nodeBinary, craneBinary string) {
 	t.Helper()
 	root := repositoryRootForTest(t)
-	return buildGoBinaryWithTags(t, root, "cs425-node-craneintegration", "./cmd/node", []string{"craneintegration"}),
-		buildGoBinaryWithTags(t, root, "cs425-crane", "./cmd/crane", nil)
+	return buildGoBinaryWithTags(t, root, "crane-node-craneintegration", "./cmd/node", []string{"craneintegration"}),
+		buildGoBinaryWithTags(t, root, "crane", "./cmd/crane", nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,7 +1767,7 @@ func TestCraneLifecycle(t *testing.T) {
 		}
 		values, total := cluster.cliResults(jobs["sink-loss"])
 		if total != len(finalRecords["sink-loss"]) || !equalInt64s(values, recordValues(cluster.t, finalRecords["sink-loss"])) {
-			cluster.fatalf("cs425-crane results = %d records %v, want %d identical ordered values", total, values, len(finalRecords["sink-loss"]))
+			cluster.fatalf("crane results = %d records %v, want %d identical ordered values", total, values, len(finalRecords["sink-loss"]))
 		}
 		cluster.t.Logf("all %d jobs report identical ordered results after a full restart; the CLI matches", len(finalRecords))
 	})
@@ -2055,7 +2055,7 @@ func buildVariantNodeBinary(t *testing.T) (string, [32]byte) {
 	if err := os.WriteFile(overlayPath, overlay, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	binary := buildGoBinaryWithTags(t, root, "cs425-node-variant", "./cmd/node", []string{"craneintegration"}, "-overlay", overlayPath)
+	binary := buildGoBinaryWithTags(t, root, "crane-node-variant", "./cmd/node", []string{"craneintegration"}, "-overlay", overlayPath)
 	production := model.ConsensusFingerprint()
 	return binary, sha256Sum(append([]byte(craneVariantDomain), production[:]...))
 }
@@ -2087,7 +2087,7 @@ func (c *craneCluster) startExpectingExit(id uint16, configPath string, timeout 
 	if err := process.waitExit(ctx); err != nil {
 		c.fatalf("node %d did not exit: %v", id, err)
 	}
-	if strings.Contains(process.log.String(), "CS425_NODE_READY") {
+	if strings.Contains(process.log.String(), "CRANE_NODE_READY") {
 		c.fatalf("node %d reported readiness before exiting", id)
 	}
 	return process.result()
@@ -2280,7 +2280,7 @@ func TestCraneLifecycleProductionBinaryIgnoresInheritedActivation(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	root := repositoryRootForTest(t)
-	production := buildGoBinaryWithTags(t, root, "cs425-node-production", "./cmd/node", nil)
+	production := buildGoBinaryWithTags(t, root, "crane-node-production", "./cmd/node", nil)
 	names, err := exec.CommandContext(ctx, "go", "tool", "nm", production).Output()
 	if err != nil {
 		t.Fatal(err)

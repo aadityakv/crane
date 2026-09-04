@@ -4,8 +4,8 @@ GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
 GOGET=$(GOCMD) get
 
-MAIN_BINARY=ece428
-GREP_BINARY=ece428_grep
+MAIN_BINARY=crane_legacy
+GREP_BINARY=crane_legacy_grep
 
 all: build build_grep
 build:

@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const readySignalPrefix = "CS425_NODE_READY node_id="
+const readySignalPrefix = "CRANE_NODE_READY node_id="
 
 // ReadySignal returns the exact machine-readable line emitted after all node services are ready.
 func ReadySignal(nodeID uint16) string {

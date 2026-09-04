@@ -3,7 +3,7 @@ package state
 import (
 	"fmt"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func stateLayout(name string, fields ...string) model.StateCommandLayoutDescriptor {

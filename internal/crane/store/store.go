@@ -4,14 +4,14 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"github.com/aaditya/cs425mp3/internal/crane/integrationhook"
+	"github.com/aadityakv/crane/internal/crane/integrationhook"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 // Store is the exclusive process-lifetime owner of one worker WAL.

@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/clock"
-	"github.com/aaditya/cs425mp3/internal/config"
-	internalrandom "github.com/aaditya/cs425mp3/internal/random"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	internalrandom "github.com/aadityakv/crane/internal/random"
 )
 
 func TestTask10StateMachineCachesDistinctIndexRetryWithoutSecondMutation(t *testing.T) {

@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aaditya/cs425mp3/internal/config"
-	"github.com/aaditya/cs425mp3/internal/node"
-	"github.com/aaditya/cs425mp3/internal/swim"
-	"github.com/aaditya/cs425mp3/internal/testutil"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/node"
+	"github.com/aadityakv/crane/internal/swim"
+	"github.com/aadityakv/crane/internal/testutil"
 )
 
 // buildGoBinaryWithTags builds one package into a test-owned path with the

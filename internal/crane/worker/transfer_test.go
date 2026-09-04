@@ -9,9 +9,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aaditya/cs425mp3/internal/crane/model"
-	"github.com/aaditya/cs425mp3/internal/crane/protocol"
-	"github.com/aaditya/cs425mp3/internal/crane/store"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 func TestTransferNormalReplicationPersistsBeforeExactAck(t *testing.T) {
