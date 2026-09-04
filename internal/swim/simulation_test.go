@@ -1027,22 +1027,9 @@ func (c *simulationCluster) settle(rounds int) {
 	}
 }
 
-// advance moves the injected clock by duration in small quanta, settling the
-// memory network between steps so every service arms its next timer before
-// the clock passes it; one big jump lets a slowly scheduled service arm a
-// timer relative to the post-jump time and end one tick short of the state
-// the test waits for (observed on shared CI runners).
 func (c *simulationCluster) advance(duration time.Duration) {
-	const quantum = 25 * time.Millisecond
-	for remaining := duration; remaining > 0; remaining -= quantum {
-		step := quantum
-		if remaining < quantum {
-			step = remaining
-		}
-		c.clock.Advance(step)
-		c.settle(3)
-	}
-	c.settle(20)
+	c.clock.Advance(duration)
+	c.settle(100)
 }
 
 func (c *simulationCluster) waitSnapshot(nodeID uint16, condition func([]Member) bool) []Member {
