@@ -195,10 +195,21 @@ func TestSimulationGracefulLeaveSendsOneRetransmitBudget(t *testing.T) {
 	waitForSnapshot(t, seed.service, func(members []Member) bool { return len(members) == 3 })
 	// The leaver announces Left only to peers its own view holds Alive or
 	// Suspect, so the premise needs the third node's view converged too, not
-	// just the seed's (a slow runner can stop it before the join snapshot
-	// is applied, in which case it legitimately sends nothing).
-	waitForSnapshot(t, third.service, func(members []Member) bool { return len(members) == 3 })
-	settleMemoryServices(network, seed.service, second.service, third.service)
+	// just the seed's. Convergence needs the memory network pumped (the
+	// services run on an injected clock), so settle repeatedly until the
+	// third node's snapshot holds every member.
+	for round := 0; ; round++ {
+		settleMemoryServices(network, seed.service, second.service, third.service)
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.Scale(time.Second))
+		snapshot, err := third.service.Snapshot(ctx)
+		cancel()
+		if err == nil && len(snapshot) == 3 {
+			break
+		}
+		if round == 20 {
+			t.Fatalf("third node never converged before leaving: members=%d err=%v", len(snapshot), err)
+		}
+	}
 	recording.clear()
 	third.stop(t)
 

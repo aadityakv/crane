@@ -42,7 +42,11 @@ func TestSnapshotResyncUsesBoundedWorkerPool(t *testing.T) {
 	}
 	loop.startSnapshotResyncWorkers()
 
-	for nodeID := uint16(1); nodeID <= 1_000; nodeID++ {
+	// Occupy every worker first and wait until each is parked inside its
+	// job; only then fill the queue, so the "exactly full" premise below
+	// cannot be disturbed by a worker taking one queued job late (observed
+	// on slow runners as 63 of 64).
+	for nodeID := uint16(1); nodeID <= uint16(serviceResyncWorkers); nodeID++ {
 		loop.startSnapshotResync(Member{NodeID: nodeID, Host: "127.0.0.1", BasePort: 12000, Incarnation: 1, Status: Alive})
 	}
 	for worker := 0; worker < serviceResyncWorkers; worker++ {
@@ -51,6 +55,9 @@ func TestSnapshotResyncUsesBoundedWorkerPool(t *testing.T) {
 		case <-time.After(testutil.Scale(time.Second)):
 			t.Fatalf("resync worker %d did not start", worker+1)
 		}
+	}
+	for nodeID := uint16(serviceResyncWorkers + 1); nodeID <= 1_000; nodeID++ {
+		loop.startSnapshotResync(Member{NodeID: nodeID, Host: "127.0.0.1", BasePort: 12000, Incarnation: 1, Status: Alive})
 	}
 	if got := maximum.Load(); got != serviceResyncWorkers {
 		t.Fatalf("maximum concurrent resyncs = %d, want %d", got, serviceResyncWorkers)
