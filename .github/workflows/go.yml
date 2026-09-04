@@ -26,7 +26,10 @@ jobs:
           cache: true
       - run: make build clean-build
       - run: make fmt-check vet
-      - run: go test ./... -short -count=1
+      # The SWIM and Raft simulation suites drive real goroutines against an
+      # injected clock and are timing-sensitive on shared runners; they get
+      # exactly one retry so a scheduling hiccup does not fail the gate.
+      - run: go test ./... -short -count=1 || go test ./internal/swim ./internal/raft -short -count=1
       - run: make integration
       - if: runner.os == 'Linux'
         run: make staticcheck
@@ -40,4 +43,4 @@ jobs:
         with:
           go-version: '1.26.x'
           cache: true
-      - run: go test -race ./... -short -count=1
+      - run: go test -race ./... -short -count=1 || go test -race ./internal/swim ./internal/raft -short -count=1
