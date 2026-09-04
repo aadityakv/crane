@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Crane dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; background: #f5f5f7; color: #1d1d1f; }
+  @media (prefers-color-scheme: dark) { body { background: #1d1d1f; color: #f5f5f7; } }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+  .badges span { margin-left: 0.5rem; padding: 0.1rem 0.6rem; border-radius: 99px; background: rgba(125,125,135,.2); font-size: .8rem; }
+  #banner { display: none; padding: .5rem .75rem; border-radius: 8px; background: rgba(255,159,10,.2); margin-bottom: 1rem; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th { text-align: left; font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; opacity: .6; padding: .5rem .75rem; }
+  td { padding: .5rem .75rem; border-top: 1px solid rgba(125,125,135,.3); }
+  tr.job { cursor: pointer; }
+  tr.job:hover { background: rgba(125,125,135,.12); }
+  tr.detail td { background: rgba(125,125,135,.08); font-family: ui-monospace, Menlo, monospace; font-size: .75rem; white-space: pre-wrap; }
+  .job-id { font-family: ui-monospace, Menlo, monospace; }
+  .succeeded { color: #34c759; font-weight: 600; }
+  .running { color: #0a84ff; font-weight: 600; }
+  .failed { color: #ff3b30; font-weight: 600; }
+  .canceled { color: #ff9f0a; font-weight: 600; }
+  .bar { display: inline-block; vertical-align: middle; width: 9rem; height: 6px; border-radius: 99px; background: rgba(125,125,135,.3); margin-right: .5rem; }
+  .bar > div { height: 6px; border-radius: 99px; background: #0a84ff; }
+  .empty { opacity: .6; padding: 2rem; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Crane &middot; local cluster</h1>
+  <div class="badges"><span id="cluster"></span><span id="leader"></span><span id="updated"></span></div>
+</header>
+<div id="banner">connecting&hellip;</div>
+<table>
+  <thead><tr><th>job</th><th>state</th><th>source tasks</th><th>manifests</th><th>rev</th></tr></thead>
+  <tbody id="jobs"></tbody>
+</table>
+<div class="empty" id="empty" hidden>no jobs yet &mdash; submit one with <code>crane submit</code></div>
+<script>
+const stateClasses = ["pending","deploying","running","draining","succeeded","failed","canceled"];
+const stateNames = ["pending","deploying","running","draining","succeeded","failed","canceled"];
+let expanded = null;
+
+function shortJob(id) { return id.slice(0, 8) + "\u2026" + id.slice(-4); }
+
+function detailRow(status) {
+  const fields = [
+    ["job_id", status.job_id], ["state", status.state],
+    ["topology_digest", status.topology_digest],
+    ["job_control_revision", status.job_control_revision],
+    ["assignment_revision", status.assignment_revision],
+    ["source_tasks", status.completed_source_tasks + "/" + status.source_task_count],
+    ["manifests", status.manifest_count + "/" + status.result_partition_count],
+    ["manifest_set_digest", status.manifest_set_digest || "-"],
+    ["failure_code", status.has_failure ? String(status.failure_code) : "-"],
+  ];
+  const row = document.createElement("tr");
+  row.className = "detail";
+  const cell = document.createElement("td");
+  cell.colSpan = 5;
+  cell.textContent = fields.map(([name, value]) => name.padEnd(22) + value).join("\n");
+  row.appendChild(cell);
+  return row;
+}
+
+function renderJobs(listing) {
+  const body = document.getElementById("jobs");
+  body.replaceChildren();
+  document.getElementById("empty").hidden = listing.jobs.length > 0;
+  document.getElementById("leader").textContent = "leader node-" + listing.leader_node_id;
+  if (listing.cluster_id) {
+    document.getElementById("cluster").textContent = "cluster " + listing.cluster_id.slice(0, 8);
+  }
+  for (const status of listing.jobs) {
+    const row = document.createElement("tr");
+    row.className = "job";
+    const id = document.createElement("td");
+    id.className = "job-id";
+    id.textContent = shortJob(status.job_id);
+    const state = document.createElement("td");
+    state.textContent = status.state;
+    state.className = stateClasses[status.state_number - 1] || "";
+    const progress = document.createElement("td");
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    const fill = document.createElement("div");
+    const total = Math.max(1, status.source_task_count);
+    fill.style.width = Math.round(100 * status.completed_source_tasks / total) + "%";
+    if (status.state === "succeeded") fill.style.background = "#34c759";
+    bar.appendChild(fill);
+    progress.appendChild(bar);
+    progress.appendChild(document.createTextNode(status.completed_source_tasks + "/" + status.source_task_count));
+    const manifests = document.createElement("td");
+    manifests.textContent = status.manifest_count + "/" + status.result_partition_count;
+    const revision = document.createElement("td");
+    revision.textContent = status.job_control_revision;
+    row.append(id, state, progress, manifests, revision);
+    row.addEventListener("click", () => {
+      expanded = expanded === status.job_id ? null : status.job_id;
+      renderJobs(lastListing);
+    });
+    body.appendChild(row);
+    if (expanded === status.job_id) body.appendChild(detailRow(status));
+  }
+}
+
+let lastListing = {jobs: [], leader_node_id: 0};
+
+async function poll() {
+  try {
+    const response = await fetch("/api/jobs");
+    if (!response.ok) throw new Error("status " + response.status);
+    lastListing = await response.json();
+    renderJobs(lastListing);
+    document.getElementById("banner").style.display = "none";
+    document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (err) {
+    document.getElementById("banner").style.display = "block";
+  }
+}
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

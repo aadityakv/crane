@@ -58,6 +58,18 @@ func executeCluster(ctx context.Context, args []string, signals <-chan os.Signal
 	if err != nil {
 		return err
 	}
+	if options.Dashboard != "" {
+		fetcher, err := newDashboardFetcher(configurations[0], options.SecretFile)
+		if err != nil {
+			return err
+		}
+		url, stopDashboard, err := startDashboard(ctx, options.ClusterID, options.Dashboard, fetcher, stderr)
+		if err != nil {
+			return err
+		}
+		defer stopDashboard()
+		fmt.Fprintf(stdout, "dashboard: %s\n", url)
+	}
 	return runClusterProcesses(ctx, nodeBinary, configPaths, signals, stdout, stderr)
 }
 
@@ -69,6 +81,7 @@ func parseClusterFlags(args []string) (ClusterOptions, string, error) {
 	dataRoot := flags.String("data-root", "./data/local", "local cluster data root")
 	secretFile := flags.String("secret-file", "./local.secret", "permission-restricted cluster secret file")
 	nodeBinary := flags.String("node-binary", "./bin/crane-node", "node executable")
+	dashboard := flags.String("dashboard", "", "read-only loopback job dashboard address")
 	if err := flags.Parse(args); err != nil {
 		return ClusterOptions{}, "", fmt.Errorf("parse cluster flags: %w", err)
 	}
@@ -82,7 +95,13 @@ func parseClusterFlags(args []string) (ClusterOptions, string, error) {
 	if *nodes >= 5 {
 		voters = 5
 	}
+	if *dashboard != "" {
+		if err := validateDashboardAddress(*dashboard); err != nil {
+			return ClusterOptions{}, "", fmt.Errorf("parse cluster flags: %w", err)
+		}
+	}
 	return ClusterOptions{
+		Dashboard:        *dashboard,
 		Nodes:            *nodes,
 		Voters:           voters,
 		Host:             "127.0.0.1",

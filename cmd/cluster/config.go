@@ -26,6 +26,9 @@ type ClusterOptions struct {
 	// ClusterID, when set, is the persisted cluster UUID to reuse instead of
 	// minting a fresh one (see resolveClusterID).
 	ClusterID string
+	// Dashboard is the optional loopback host:port of the read-only job
+	// dashboard; empty disables it.
+	Dashboard string
 }
 
 func GenerateConfigs(options ClusterOptions) ([]config.NodeConfig, error) {
