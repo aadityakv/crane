@@ -35,15 +35,17 @@ persisted under the data root). Submit and inspect jobs from another shell:
 
 ```sh
 ./bin/crane example-topology > topology.json
-./bin/crane submit  -config data/dev/configs/node-1.json -state ./client.state -topology topology.json
+./bin/crane submit  -config data/dev/configs/node-1.json -state data/dev/client.state -topology topology.json
 ./bin/crane jobs    -config data/dev/configs/node-1.json
 ./bin/crane status  -config data/dev/configs/node-1.json -job <job id>
 ./bin/crane results -config data/dev/configs/node-1.json -job <job id>
 ```
 
-The client keeps a durable identity file (`-state`): request sequences are
-reserved before they are sent, so a crashed client resumes the same request
-and receives the replicated cached answer rather than submitting twice.
+The client keeps a durable identity file (`-state`) in an owner-only
+directory (the data root qualifies; the repository root usually does not):
+request sequences are reserved before they are sent, so a crashed client
+resumes the same request and receives the replicated cached answer rather
+than submitting twice.
 
 To run the bundled example topology end-to-end without touching `./data/dev`
 (fresh cluster on port base 9000, submit, wait for success, print results,

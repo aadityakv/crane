@@ -77,10 +77,10 @@ service that redirects every request to the voters; they own no Raft storage.
 
 ```sh
 ./bin/crane example-topology > topology.json
-./bin/crane submit  -config examples/config/node-1.json -state ./client.state -topology topology.json
-./bin/crane status  -config examples/config/node-1.json -state ./client.state -job <32 hex>
-./bin/crane results -config examples/config/node-1.json -state ./client.state -job <32 hex> [-page-bytes N]
-./bin/crane cancel  -config examples/config/node-1.json -state ./client.state -job <32 hex> -expected-revision <job-control revision from status>
+./bin/crane submit  -config examples/config/node-1.json -state <owner-only dir>/client.state -topology topology.json
+./bin/crane status  -config examples/config/node-1.json -state <owner-only dir>/client.state -job <32 hex>
+./bin/crane results -config examples/config/node-1.json -state <owner-only dir>/client.state -job <32 hex> [-page-bytes N]
+./bin/crane cancel  -config examples/config/node-1.json -state <owner-only dir>/client.state -job <32 hex> -expected-revision <job-control revision from status>
 ./bin/crane jobs    -config examples/config/node-1.json
 ```
 
