@@ -1,4 +1,4 @@
-.PHONY: build crane clean-build test race integration crane-integration sim vet staticcheck fmt-check verify
+.PHONY: build crane clean-build test race integration crane-integration sim vet staticcheck fmt-check verify dev demo
 
 build: | bin
 	go build -o bin/crane-node ./cmd/node
@@ -35,6 +35,12 @@ crane-integration:
 sim:
 	go test ./internal/crane/sim -run TestScripted -count=1
 	go test ./internal/crane/sim -run TestRandomized -count=1
+
+dev: build
+	./bin/crane-cluster -nodes 3 -base-port 8000 -data-root ./data/dev -secret-file ./local.secret -node-binary ./bin/crane-node -dashboard 127.0.0.1:8080
+
+demo:
+	sh scripts/demo.sh
 
 vet:
 	go vet ./...

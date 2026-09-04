@@ -24,25 +24,42 @@ replay-guarded.
 ## Run it locally
 
 ```sh
-make build                                    # bin/crane-node, bin/crane-cluster, bin/crane
-umask 077 && head -c 32 /dev/urandom > local.secret && chmod 600 local.secret
-./bin/crane-cluster -nodes 3 -base-port 8000 -data-root ./data/local \
-  -secret-file ./local.secret -node-binary ./bin/crane-node
+make dev
 ```
 
-Then, from another shell, submit a job through the client CLI and page its
-results:
+This builds the binaries, creates `./local.secret` with owner-only permissions
+on first run, starts a three-node cluster with data under `./data/dev`, and
+serves a read-only job dashboard at `http://127.0.0.1:8080`. Press Ctrl-C to
+stop the whole cluster; re-running `make dev` resumes it (the cluster ID is
+persisted under the data root). Submit and inspect jobs from another shell:
 
 ```sh
 ./bin/crane example-topology > topology.json
-./bin/crane submit  -config data/local/configs/node-1.json -state ./client.state -topology topology.json
-./bin/crane status  -config data/local/configs/node-1.json -state ./client.state -job <job id>
-./bin/crane results -config data/local/configs/node-1.json -state ./client.state -job <job id>
+./bin/crane submit  -config data/dev/configs/node-1.json -state ./client.state -topology topology.json
+./bin/crane jobs    -config data/dev/configs/node-1.json
+./bin/crane status  -config data/dev/configs/node-1.json -job <job id>
+./bin/crane results -config data/dev/configs/node-1.json -job <job id>
 ```
 
 The client keeps a durable identity file (`-state`): request sequences are
 reserved before they are sent, so a crashed client resumes the same request
 and receives the replicated cached answer rather than submitting twice.
+
+To run the bundled example topology end-to-end without touching `./data/dev`
+(fresh cluster on port base 9000, submit, wait for success, print results,
+tear down):
+
+```sh
+make demo
+```
+
+The manual equivalent of `make dev`:
+
+```sh
+make build
+./bin/crane-cluster -nodes 3 -base-port 8000 -data-root ./data/dev \
+  -secret-file ./local.secret -node-binary ./bin/crane-node -dashboard 127.0.0.1:8080
+```
 
 The full operations guide — every configuration field, the port table,
 multi-host deployment, the client contract, operator settings, recovery

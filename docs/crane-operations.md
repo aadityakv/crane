@@ -83,6 +83,7 @@ service that redirects every request to the voters; they own no Raft storage.
 ./bin/crane status  -config examples/config/node-1.json -state ./client.state -job <32 hex>
 ./bin/crane results -config examples/config/node-1.json -state ./client.state -job <32 hex> [-page-bytes N]
 ./bin/crane cancel  -config examples/config/node-1.json -state ./client.state -job <32 hex> -expected-revision <job-control revision from status>
+./bin/crane jobs    -config examples/config/node-1.json
 ```
 
 Every network subcommand also accepts `-attempts N` (complete request
@@ -92,7 +93,8 @@ override; zero keeps the configured `worker_control_timeout`). The submit
 and cancel outputs carry the durable job-control revision the client
 validated in the response.
 
-`-state` names an owner-only file that holds the durable client identity:
+`jobs` prints one JSON line summarizing every retained job, served linearizably by
+the leader (the local launcher's dashboard reads the same listing). `-state` names an owner-only file that holds the durable client identity:
 the client ID, the next request sequence, and any pending mutation. A
 sequence is reserved and persisted before the request is sent, so a crash
 never reuses a sequence; a restarted client resumes the pending request with
