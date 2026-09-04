@@ -5,16 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/crane/model"
 	"github.com/aadityakv/crane/internal/swim"
 )
 
 const localNodePortStride = 100
+
+// consensusStampFilename names the data-root file recording the consensus
+// fingerprint of the binary that bootstrapped the persisted cluster state.
+const consensusStampFilename = "consensus-fingerprint"
 
 // ClusterOptions describes the local cluster to generate node configurations for.
 type ClusterOptions struct {
@@ -243,12 +249,8 @@ func resolveClusterID(dataRoot string) (string, error) {
 	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
 		return "", fmt.Errorf("prepare data root: %w", err)
 	}
-	if entries, err := os.ReadDir(dataRoot); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() && strings.HasPrefix(entry.Name(), "node-") {
-				return "", fmt.Errorf("data root %s holds existing node storage without %s; choose a fresh data root or restore the cluster-id file", dataRoot, path)
-			}
-		}
+	if holdsNodeStorage(dataRoot) {
+		return "", fmt.Errorf("data root %s holds existing node storage without %s; choose a fresh data root or restore the cluster-id file", dataRoot, path)
 	}
 	clusterID, err := newClusterID()
 	if err != nil {
@@ -258,4 +260,100 @@ func resolveClusterID(dataRoot string) (string, error) {
 		return "", fmt.Errorf("persist cluster ID: %w", err)
 	}
 	return clusterID, nil
+}
+
+// holdsNodeStorage reports whether the data root already contains node-*
+// storage directories.
+func holdsNodeStorage(dataRoot string) bool {
+	entries, err := os.ReadDir(dataRoot)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "node-") {
+			return true
+		}
+	}
+	return false
+}
+
+// reconcileDataRoot keeps local development resume-and-reset semantics
+// honest: it compares the persisted consensus fingerprint stamp with the
+// compiled one and either resumes a compatible data root, wipes and
+// re-stamps an incompatible one under resetIncompatible, or refuses the
+// mismatch up front with an actionable error. The stamp is written only
+// when a fresh bootstrap begins, never onto an existing unstamped legacy
+// root whose compatibility is unknowable.
+func reconcileDataRoot(dataRoot string, resetIncompatible bool, stdout io.Writer) error {
+	path := filepath.Join(dataRoot, consensusStampFilename)
+	current := model.ConsensusFingerprintHex()
+	persisted, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		stored := strings.TrimSpace(string(persisted))
+		if stored == current {
+			return nil
+		}
+		if !resetIncompatible {
+			return fmt.Errorf("data root %s holds state written under consensus fingerprint %s but this binary requires %s; pass -reset-incompatible to reset it or choose a fresh -data-root", dataRoot, stored, current)
+		}
+		if err := wipeIncompatibleDataRoot(dataRoot); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "cluster: data root %s was written under consensus fingerprint %s; reset for %s\n", dataRoot, stored, current)
+		return nil
+	case errors.Is(err, os.ErrNotExist):
+		if !holdsNodeStorage(dataRoot) {
+			return writeConsensusStamp(dataRoot)
+		}
+		if !resetIncompatible {
+			return nil
+		}
+		if err := wipeIncompatibleDataRoot(dataRoot); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "cluster: data root %s predates consensus fingerprint stamping; reset for %s\n", dataRoot, current)
+		return nil
+	default:
+		return fmt.Errorf("read consensus fingerprint stamp: %w", err)
+	}
+}
+
+// wipeIncompatibleDataRoot removes the data root contents and writes a
+// fresh stamp so the launcher bootstraps a clean cluster under the current
+// binary.
+func wipeIncompatibleDataRoot(dataRoot string) error {
+	if err := resetDataRoot(dataRoot); err != nil {
+		return err
+	}
+	return writeConsensusStamp(dataRoot)
+}
+
+// resetDataRoot removes every child of the data root, refusing paths that
+// would erase the working directory or a filesystem root.
+func resetDataRoot(dataRoot string) error {
+	cleaned := filepath.Clean(dataRoot)
+	if cleaned == "." || cleaned == string(filepath.Separator) || filepath.Dir(cleaned) == cleaned {
+		return fmt.Errorf("refusing to reset unsafe data root %q", dataRoot)
+	}
+	if err := os.RemoveAll(dataRoot); err != nil {
+		return fmt.Errorf("remove incompatible data root: %w", err)
+	}
+	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
+		return fmt.Errorf("recreate data root: %w", err)
+	}
+	return nil
+}
+
+// writeConsensusStamp records the compiled consensus fingerprint in the
+// data root so later runs can tell compatible persisted state from
+// incompatible.
+func writeConsensusStamp(dataRoot string) error {
+	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
+		return fmt.Errorf("prepare data root: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataRoot, consensusStampFilename), []byte(model.ConsensusFingerprintHex()+"\n"), 0o600); err != nil {
+		return fmt.Errorf("persist consensus fingerprint stamp: %w", err)
+	}
+	return nil
 }

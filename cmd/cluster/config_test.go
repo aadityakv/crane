@@ -420,3 +420,94 @@ func TestResolveClusterIDPersistsReusesAndRefusesAmbiguousStorage(t *testing.T) 
 		t.Fatal("existing node storage without cluster-id was accepted")
 	}
 }
+
+// TestReconcileDataRootResumesResetsAndRefuses covers the stamp matrix: a
+// compatible data root is resumed untouched, an incompatible one is wiped
+// and re-stamped only under -reset-incompatible, a mismatch without the flag
+// is refused up front, and a legacy unstamped root with node storage is
+// left alone unless the flag asks for a reset.
+func TestReconcileDataRootResumesResetsAndRefuses(t *testing.T) {
+	other := strings.Repeat("ab", 32)
+	tests := []struct {
+		name              string
+		stamp             string // "" means no stamp file
+		nodeStorage       bool
+		resetIncompatible bool
+		wantErr           string
+		wantReset         bool
+		wantStamp         bool
+		wantNotice        string
+	}{
+		{name: "matching stamp resumes", stamp: model.ConsensusFingerprintHex(), wantStamp: true},
+		{name: "fresh root stamps", wantStamp: true},
+		{name: "mismatch without flag refuses up front", stamp: other, wantErr: "-reset-incompatible"},
+		{name: "mismatch with flag resets and restamps", stamp: other, resetIncompatible: true, wantReset: true, wantStamp: true, wantNotice: "was written under consensus fingerprint"},
+		{name: "legacy node storage without flag proceeds", nodeStorage: true},
+		{name: "legacy node storage with flag resets", nodeStorage: true, resetIncompatible: true, wantReset: true, wantStamp: true, wantNotice: "predates consensus fingerprint stamping"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if test.stamp != "" {
+				if err := os.WriteFile(filepath.Join(root, consensusStampFilename), []byte(test.stamp+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.nodeStorage {
+				if err := os.MkdirAll(filepath.Join(root, "node-1"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var output bytes.Buffer
+			err := reconcileDataRoot(root, test.resetIncompatible, &output)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("reconcileDataRoot error = %v, want it to mention %q", err, test.wantErr)
+				}
+				persisted, readErr := os.ReadFile(filepath.Join(root, consensusStampFilename))
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if got := strings.TrimSpace(string(persisted)); got != test.stamp {
+					t.Fatalf("refused run rewrote the stamp to %q, want %q untouched", got, test.stamp)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("reconcileDataRoot: %v", err)
+			}
+			if test.wantReset {
+				if _, statErr := os.Stat(filepath.Join(root, "node-1")); !os.IsNotExist(statErr) {
+					t.Fatalf("node storage survived the reset (stat err = %v)", statErr)
+				}
+			}
+			stamped, readErr := os.ReadFile(filepath.Join(root, consensusStampFilename))
+			if test.wantStamp {
+				if readErr != nil {
+					t.Fatalf("read stamp: %v", readErr)
+				}
+				if got := strings.TrimSpace(string(stamped)); got != model.ConsensusFingerprintHex() {
+					t.Fatalf("stamp = %s, want compiled %s", got, model.ConsensusFingerprintHex())
+				}
+			} else if !os.IsNotExist(readErr) {
+				t.Fatalf("stamp written on a legacy root: %q", stamped)
+			}
+			if test.wantNotice != "" && !strings.Contains(output.String(), test.wantNotice) {
+				t.Fatalf("notice = %q, want it to mention %q", output.String(), test.wantNotice)
+			}
+			if test.wantNotice == "" && output.Len() != 0 {
+				t.Fatalf("unexpected notice %q", output.String())
+			}
+		})
+	}
+}
+
+// TestResetDataRootRefusesUnsafeRoots pins the wipe guard: a mistyped data
+// root must error out before anything is removed.
+func TestResetDataRootRefusesUnsafeRoots(t *testing.T) {
+	for _, unsafe := range []string{"", ".", string(filepath.Separator)} {
+		if err := resetDataRoot(unsafe); err == nil {
+			t.Fatalf("resetDataRoot(%q) accepted an unsafe root", unsafe)
+		}
+	}
+}
