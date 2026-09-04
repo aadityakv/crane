@@ -82,7 +82,7 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 		if delivery.State != store.Processed {
 			continue
 		}
-		assignment, ok := engine.repository.InstalledAssignment(id.Tuple.JobID)
+		assignment, ok := engine.installedAssignment(id.Tuple.JobID)
 		if !ok {
 			return errors.New("processed sink references missing assignment")
 		}
@@ -150,7 +150,7 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 		if !ok || parent.State != store.Processed {
 			continue
 		}
-		assignment, ok := engine.repository.InstalledAssignment(result.record.TupleID.JobID)
+		assignment, ok := engine.installedAssignment(result.record.TupleID.JobID)
 		if !ok || assignment.SchedulingState != model.Running {
 			continue
 		}
@@ -193,7 +193,7 @@ func (engine *Engine) dispatchResult(key resultIdentity, result *ownedResult, ta
 // grant covers stay with the grant. Senders that are not current members and
 // copies whose envelope is not strictly superseded never move.
 func (engine *Engine) readoptRetainedResults(ctx context.Context) error {
-	fence := engine.repository.CurrentFence()
+	fence := engine.installedFence()
 	if err := engine.adoptDurableResults(); err != nil {
 		return err
 	}
@@ -209,7 +209,7 @@ func (engine *Engine) readoptRetainedResults(ctx context.Context) error {
 		if !seen {
 			work = &jobWork{}
 			jobs[job] = work
-			assignment, ok := engine.repository.InstalledAssignment(job)
+			assignment, ok := engine.installedAssignment(job)
 			if ok && assignment.CoordinatorEpoch == fence && replicationAdmitted(assignment.SchedulingState) {
 				work.assignment, work.admitted = assignment, true
 				envelope := resultEnvelope{revision: assignment.Assignment.Revision, digest: assignment.Assignment.Digest, epoch: assignment.CoordinatorEpoch}
@@ -280,7 +280,7 @@ func (engine *Engine) adoptDurableResults() error {
 	engine.readoptPending = make(map[model.JobID]struct{})
 	needed := false
 	for job := range pending {
-		if assignment, ok := engine.repository.InstalledAssignment(job); ok && assignment.CoordinatorEpoch == engine.repository.CurrentFence() && replicationAdmitted(assignment.SchedulingState) {
+		if assignment, ok := engine.installedAssignment(job); ok && assignment.CoordinatorEpoch == engine.installedFence() && replicationAdmitted(assignment.SchedulingState) {
 			needed = true
 		}
 	}
@@ -334,7 +334,7 @@ func grantCoversRetainedResult(repairs []store.ResultRepairRecord, fence model.C
 // exact worker incarnation is one endpoint of a two-distinct-node replica set.
 func (engine *Engine) currentCopyEnvelope(assignment store.InstalledAssignment, sink model.TaskID) (model.ResultCopyProvenance, model.ResultCopyProvenance, bool) {
 	replica, ok := findResultReplica(assignment.Assignment, sink)
-	if !ok || assignment.CoordinatorEpoch != engine.repository.CurrentFence() || !replicationAdmitted(assignment.SchedulingState) || replica.PrimaryNodeID == replica.SecondaryNodeID {
+	if !ok || assignment.CoordinatorEpoch != engine.installedFence() || !replicationAdmitted(assignment.SchedulingState) || replica.PrimaryNodeID == replica.SecondaryNodeID {
 		return model.ResultCopyProvenance{}, model.ResultCopyProvenance{}, false
 	}
 	envelope := model.ResultCopyProvenance{AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, ReplicaSet: replica, CoordinatorEpoch: assignment.CoordinatorEpoch}
@@ -373,7 +373,7 @@ func (engine *Engine) handleResultResponse(response resultResponse) error {
 	if response.err != nil {
 		return engine.ownerError("replicate result", response.err)
 	}
-	assignment, ok := engine.repository.InstalledAssignment(result.record.TupleID.JobID)
+	assignment, ok := engine.installedAssignment(result.record.TupleID.JobID)
 	if !ok {
 		return nil
 	}
@@ -430,7 +430,7 @@ func (engine *Engine) handleResultResponse(response resultResponse) error {
 // (Task 24 defect #5 and #4 rulings) is current custody; a replaced sink task
 // never qualifies.
 func (engine *Engine) currentSinkAuthority(assignment store.InstalledAssignment, delivery store.DeliveryRecord) bool {
-	fence := engine.repository.CurrentFence()
+	fence := engine.installedFence()
 	if assignment.SchedulingState != model.Running || assignment.CoordinatorEpoch != fence {
 		return false
 	}
@@ -446,7 +446,7 @@ func (engine *Engine) currentSinkAuthority(assignment store.InstalledAssignment,
 
 func (engine *Engine) currentResultProvenance(assignment store.InstalledAssignment, result *ownedResult) bool {
 	replica, ok := findResultReplica(assignment.Assignment, result.record.SinkTask)
-	return ok && assignment.SchedulingState == model.Running && assignment.CoordinatorEpoch == engine.repository.CurrentFence() && result.provenance.AssignmentRevision == assignment.Assignment.Revision && result.provenance.AssignmentDigest == assignment.Assignment.Digest && result.provenance.CoordinatorEpoch == assignment.CoordinatorEpoch && result.provenance.ReplicaSet == replica && result.provenance.DestinationRole == model.PrimaryReplica && replica.PrimaryNodeID == engine.localNode && replica.PrimaryEpoch == engine.localEpoch && replica.SecondaryNodeID != engine.localNode
+	return ok && assignment.SchedulingState == model.Running && assignment.CoordinatorEpoch == engine.installedFence() && result.provenance.AssignmentRevision == assignment.Assignment.Revision && result.provenance.AssignmentDigest == assignment.Assignment.Digest && result.provenance.CoordinatorEpoch == assignment.CoordinatorEpoch && result.provenance.ReplicaSet == replica && result.provenance.DestinationRole == model.PrimaryReplica && replica.PrimaryNodeID == engine.localNode && replica.PrimaryEpoch == engine.localEpoch && replica.SecondaryNodeID != engine.localNode
 }
 
 func findResultReplica(set model.AssignmentSet, task model.TaskID) (model.ResultReplicaSet, bool) {

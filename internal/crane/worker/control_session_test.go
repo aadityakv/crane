@@ -162,6 +162,9 @@ func TestControlFenceDrainsGatePersistsThenClosesOlderSessions(t *testing.T) {
 	if fixture.repository.log[0] != "fence" {
 		t.Fatalf("durable order = %v", fixture.repository.log)
 	}
+	if len(fixture.repository.log) < 2 || fixture.repository.log[1] != "engine-fence" {
+		t.Fatalf("fence did not reach the serialized engine owner: %v", fixture.repository.log)
+	}
 	select {
 	case <-oldClosed:
 	default:
@@ -1387,6 +1390,9 @@ type controlTestEngine struct{ repository *controlTestRepository }
 type controlNoopEngine struct{}
 
 func (*controlNoopEngine) ReconcileAssignment(context.Context, model.JobID) error { return nil }
+func (*controlNoopEngine) ObserveFence(context.Context) error {
+	return nil
+}
 func (*controlNoopEngine) ApplyCheckpoint(context.Context, protocol.CheckpointNotice) error {
 	return nil
 }
@@ -1396,6 +1402,12 @@ func (engine *controlTestEngine) ReconcileAssignment(_ context.Context, _ model.
 	engine.repository.mu.Lock()
 	defer engine.repository.mu.Unlock()
 	engine.repository.log = append(engine.repository.log, "reconcile")
+	return nil
+}
+func (engine *controlTestEngine) ObserveFence(_ context.Context) error {
+	engine.repository.mu.Lock()
+	defer engine.repository.mu.Unlock()
+	engine.repository.log = append(engine.repository.log, "engine-fence")
 	return nil
 }
 func (engine *controlTestEngine) ApplyCheckpoint(_ context.Context, _ protocol.CheckpointNotice) error {

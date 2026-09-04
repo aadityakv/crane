@@ -258,6 +258,12 @@ func TestDeliveryRequiresGateThenExactDurableRunningFence(t *testing.T) {
 			value := repository.assignments[fixture.assignment.Assignment.JobID]
 			value.SchedulingState = model.Closed
 			repository.assignments[value.Assignment.JobID] = value
+			// engine cache: the durable installation this fixture models is
+			// read back at recovery, so the recovered snapshot carries the
+			// Closed state too.
+			repository.mu.Lock()
+			repository.work.Assignments = []store.InstalledAssignment{value}
+			repository.mu.Unlock()
 		}},
 		{name: "old running install", configure: func(repository *fakeRepository, gate *admission.Gate) {
 			newer := fixture.epoch

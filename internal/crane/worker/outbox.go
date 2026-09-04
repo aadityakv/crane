@@ -208,7 +208,7 @@ func (engine *Engine) completeSatisfiedParents() error {
 		if !complete {
 			continue
 		}
-		assignment, present := engine.repository.InstalledAssignment(parent.ID.Tuple.JobID)
+		assignment, present := engine.installedAssignment(parent.ID.Tuple.JobID)
 		if !present {
 			return errors.New("completed outbox parent has no installed assignment")
 		}

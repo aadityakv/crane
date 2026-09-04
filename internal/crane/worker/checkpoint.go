@@ -85,8 +85,8 @@ func (engine *Engine) publishContiguousCompletions() error {
 		if cursor.EOF == 0 || cursor.Watermark >= cursor.EOF || engine.pendingCompletion(source) {
 			continue
 		}
-		assignment, ok := engine.repository.InstalledAssignment(source.JobID)
-		if !ok || assignment.CoordinatorEpoch != engine.repository.CurrentFence() {
+		assignment, ok := engine.installedAssignment(source.JobID)
+		if !ok || assignment.CoordinatorEpoch != engine.installedFence() {
 			continue
 		}
 		token, ok := findAssignmentToken(assignment.Assignment, source)
@@ -168,8 +168,8 @@ func (engine *Engine) applyCheckpoint(notice protocol.CheckpointNotice) error {
 	if hasCursor && notice.Notice.Watermark == cursor.Watermark {
 		proof := cursor.CheckpointAuthority
 		if cursor.CheckpointRevision == 0 && proof == (store.CheckpointAuthority{}) {
-			assignment, current := engine.repository.InstalledAssignment(notice.Notice.JobID)
-			if !current || assignment.CoordinatorEpoch != engine.repository.CurrentFence() || notice.Notice.Epoch != assignment.CoordinatorEpoch || notice.JobControlRevision != assignment.JobControlRevision || notice.AssignmentRevision != assignment.Assignment.Revision || notice.AssignmentDigest != assignment.Assignment.Digest {
+			assignment, current := engine.installedAssignment(notice.Notice.JobID)
+			if !current || assignment.CoordinatorEpoch != engine.installedFence() || notice.Notice.Epoch != assignment.CoordinatorEpoch || notice.JobControlRevision != assignment.JobControlRevision || notice.AssignmentRevision != assignment.Assignment.Revision || notice.AssignmentDigest != assignment.Assignment.Digest {
 				return errors.New("legacy checkpoint authority does not match durable installation")
 			}
 			event, exists := engine.completionReports[notice.Notice.Source]
@@ -197,8 +197,8 @@ func (engine *Engine) applyCheckpoint(notice protocol.CheckpointNotice) error {
 		// CONFIRM (below): a stale resend under the durable committed cursor.
 		return nil
 	}
-	assignment, ok := engine.repository.InstalledAssignment(notice.Notice.JobID)
-	if !ok || assignment.CoordinatorEpoch != engine.repository.CurrentFence() || notice.Notice.Epoch != assignment.CoordinatorEpoch || notice.JobControlRevision != assignment.JobControlRevision || notice.AssignmentRevision != assignment.Assignment.Revision || notice.AssignmentDigest != assignment.Assignment.Digest {
+	assignment, ok := engine.installedAssignment(notice.Notice.JobID)
+	if !ok || assignment.CoordinatorEpoch != engine.installedFence() || notice.Notice.Epoch != assignment.CoordinatorEpoch || notice.JobControlRevision != assignment.JobControlRevision || notice.AssignmentRevision != assignment.Assignment.Revision || notice.AssignmentDigest != assignment.Assignment.Digest {
 		return errors.New("checkpoint notice authority does not match durable installation")
 	}
 	token, tokenOK := findAssignmentToken(assignment.Assignment, notice.Notice.Source)
@@ -308,7 +308,7 @@ func (engine *Engine) completionEventResolved(source model.TaskID, event model.W
 			return true
 		}
 	}
-	assignment, ok := engine.repository.InstalledAssignment(report.JobID)
+	assignment, ok := engine.installedAssignment(report.JobID)
 	if !ok || assignment.JobControlRevision < report.JobControlRevision || assignment.Assignment.Revision < report.AssignmentRevision || assignment.JobControlRevision == report.JobControlRevision && assignment.Assignment.Revision == report.AssignmentRevision {
 		return false
 	}

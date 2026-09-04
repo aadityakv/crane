@@ -478,11 +478,14 @@ func TestCheckpointSupersededUnappliedReportCanBeAcknowledgedAndRepublished(t *t
 	repository.mu.Lock()
 	repository.assignments[replacement.JobID] = installed
 	repository.mu.Unlock()
-	if err := engine.AcknowledgeEvents(ctx, 1); err != nil {
-		t.Fatalf("strict successor did not prove stale report: %v", err)
-	}
+	// engine cache: the replacement reaches the serialized owner as an
+	// assignment command before any later status exchange, exactly as the
+	// control session persists and reconciles it.
 	if err := engine.ReconcileAssignment(ctx, replacement.JobID); err != nil {
 		t.Fatal(err)
+	}
+	if err := engine.AcknowledgeEvents(ctx, 1); err != nil {
+		t.Fatalf("strict successor did not prove stale report: %v", err)
 	}
 	waitFor(t, func() bool {
 		repository.mu.Lock()
@@ -507,6 +510,15 @@ func TestCheckpointCompactionNeverCollectsAboveWatermarkOrResults(t *testing.T) 
 		t.Fatal(err)
 	}
 	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	// engine cache: the serialized view is seeded by recovery before any
+	// direct-drive checkpoint application.
+	recovered, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err := engine.consumeRecovery(recovered); err != nil {
+		t.Fatal(err)
+	}
 	source := fixture.source.Task
 	cursor := store.SourceCursor{Source: source, NextSequence: 3, EOF: 2}
 	engine.sources[source] = cursor
@@ -717,6 +729,15 @@ func TestCheckpointNoticeAboveCursorAdoptsCommittedWatermarkWithoutPendingReport
 		t.Fatal(err)
 	}
 	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	// engine cache: the serialized view is seeded by recovery before any
+	// direct-drive checkpoint application.
+	recovered, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err := engine.consumeRecovery(recovered); err != nil {
+		t.Fatal(err)
+	}
 	source := fixture.source.Task
 	proof := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, SourceToken: fixture.source, CoordinatorEpoch: fixture.epoch}
 	cursor := store.SourceCursor{Source: source, NextSequence: 2, EOF: 2, Watermark: 1, RaftIndex: 9, CheckpointRevision: 1, CheckpointAuthority: proof}
@@ -788,6 +809,15 @@ func TestCheckpointNoticeAdoptsCommittedWatermarkForReassignedOwnerWithoutCursor
 		t.Fatal(err)
 	}
 	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	// engine cache: the serialized view is seeded by recovery before any
+	// direct-drive checkpoint application.
+	recovered, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err := engine.consumeRecovery(recovered); err != nil {
+		t.Fatal(err)
+	}
 	source := fixture.source.Task
 	if _, exists := engine.sources[source]; exists {
 		t.Fatal("reassigned-owner fixture must start without a local cursor")

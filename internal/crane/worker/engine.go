@@ -85,7 +85,12 @@ type Engine struct {
 	resultResponses chan resultResponse
 	workers         sync.WaitGroup
 
-	deliveries        map[model.DeliveryID]store.DeliveryRecord
+	deliveries map[model.DeliveryID]store.DeliveryRecord
+	// assignments and fence hold the serialized authoritative view of the
+	// durable installation, maintained at recovery and at every assignment
+	// or fence transition so hot paths never re-read the store per lookup.
+	assignments       map[model.JobID]store.InstalledAssignment
+	fence             model.CoordinatorEpoch
 	outboxes          map[model.DeliveryID]*ownedOutbox
 	parents           map[model.DeliveryID]map[model.DeliveryID]struct{}
 	sources           map[model.TaskID]store.SourceCursor
@@ -104,6 +109,10 @@ type Engine struct {
 
 type assignmentCommand struct {
 	job      model.JobID
+	response chan error
+}
+
+type fenceCommand struct {
 	response chan error
 }
 
@@ -151,7 +160,8 @@ func NewEngine(options EngineOptions) (*Engine, error) {
 		dispatchStarts: make(chan dispatchStart, options.MaxPendingOutboxes),
 		resultJobs:     make(chan resultJob, options.MaxPendingWork), resultResponses: make(chan resultResponse, options.MaxPendingWork),
 		deliveries: make(map[model.DeliveryID]store.DeliveryRecord), outboxes: make(map[model.DeliveryID]*ownedOutbox),
-		parents: make(map[model.DeliveryID]map[model.DeliveryID]struct{}), sources: make(map[model.TaskID]store.SourceCursor),
+		assignments: make(map[model.JobID]store.InstalledAssignment),
+		parents:     make(map[model.DeliveryID]map[model.DeliveryID]struct{}), sources: make(map[model.TaskID]store.SourceCursor),
 		executing: make(map[model.DeliveryID]struct{}), failedTasks: make(map[model.TaskID]struct{}),
 		jobs:              make(map[model.JobID]struct{}),
 		results:           make(map[resultIdentity]*ownedResult),
@@ -180,6 +190,27 @@ func (engine *Engine) ReconcileAssignment(ctx context.Context, job model.JobID) 
 	}
 	response := make(chan error, 1)
 	if err := engine.enqueue(assignmentCommand{job: job, response: response}, ctx); err != nil {
+		return err
+	}
+	select {
+	case err := <-response:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-engine.done:
+		return ErrNotReady
+	}
+}
+
+// ObserveFence observes one already-durable coordinator fence transition on
+// the serialized owner, so the installed view never keeps serving a
+// superseded fence after a fence-only durable change.
+func (engine *Engine) ObserveFence(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("nil fence observation context")
+	}
+	response := make(chan error, 1)
+	if err := engine.enqueue(fenceCommand{response: response}, ctx); err != nil {
 		return err
 	}
 	select {
@@ -305,8 +336,10 @@ func (engine *Engine) consumeRecovery(work store.RecoveredWork) error {
 	if engine.localNode == 0 || engine.localEpoch.Validate() != nil {
 		return errors.New("repository returned invalid local worker identity")
 	}
+	engine.fence = work.Fence
 	for _, assignment := range work.Assignments {
 		engine.jobs[assignment.Assignment.JobID] = struct{}{}
+		engine.assignments[assignment.Assignment.JobID] = cloneInstalledAssignment(assignment)
 	}
 	for _, cursor := range work.Sources {
 		engine.sources[cursor.Source] = cursor
@@ -398,6 +431,8 @@ func (engine *Engine) failPendingCommands(cause error) {
 				value.response <- cause
 			case assignmentCommand:
 				value.response <- cause
+			case fenceCommand:
+				value.response <- cause
 			case checkpointCommand:
 				value.response <- cause
 			case eventAckCommand:
@@ -439,6 +474,7 @@ func (engine *Engine) handleCommand(ctx context.Context, command any) {
 	case ackCommand:
 		value.response <- engine.receiveACK(value.ack)
 	case assignmentCommand:
+		engine.refreshInstalledAssignment(value.job)
 		assignment, ok := engine.currentRunning(value.job)
 		if ok && assignment.Assignment.JobID == value.job {
 			engine.jobs[value.job] = struct{}{}
@@ -448,6 +484,9 @@ func (engine *Engine) handleCommand(ctx context.Context, command any) {
 		// Every install re-evaluates the job's retained result copies against
 		// the (possibly partner-changing) installed envelope.
 		engine.readoptPending[value.job] = struct{}{}
+		value.response <- nil
+	case fenceCommand:
+		engine.refreshInstalledFence()
 		value.response <- nil
 	case checkpointCommand:
 		value.response <- engine.applyCheckpoint(value.notice)
@@ -471,9 +510,60 @@ func (engine *Engine) reconcile(ctx context.Context, now time.Time) error {
 	return engine.publishContiguousCompletions()
 }
 
+// installedAssignment reports the engine's serialized view of the durable
+// assignment for job, maintained at recovery and on every assignment
+// transition so hot paths never re-read the store.
+func (engine *Engine) installedAssignment(job model.JobID) (store.InstalledAssignment, bool) {
+	assignment, ok := engine.assignments[job]
+	return assignment, ok
+}
+
+// installedFence reports the serialized coordinator-fence view.
+func (engine *Engine) installedFence() model.CoordinatorEpoch { return engine.fence }
+
+// refreshInstalledFence re-establishes the serialized fence view at one
+// durable fence transition. A fence change republishes the complete
+// assignment view from the same recovery read; a read failure keeps the
+// prior view (the repository independently signals fatal errors).
+func (engine *Engine) refreshInstalledFence() {
+	work, err := engine.repository.RecoverWork()
+	if err != nil || work.Fence == engine.fence {
+		return
+	}
+	engine.fence = work.Fence
+	assignments := make(map[model.JobID]store.InstalledAssignment, len(work.Assignments))
+	for _, assignment := range work.Assignments {
+		assignments[assignment.Assignment.JobID] = cloneInstalledAssignment(assignment)
+	}
+	engine.assignments = assignments
+}
+
+// refreshInstalledAssignment republishes one job's assignment after a
+// durable install or replacement has already reached the serialized owner.
+func (engine *Engine) refreshInstalledAssignment(job model.JobID) {
+	engine.refreshInstalledFence()
+	if assignment, ok := engine.repository.InstalledAssignment(job); ok {
+		engine.assignments[job] = cloneInstalledAssignment(assignment)
+	} else {
+		delete(engine.assignments, job)
+	}
+}
+
+// cloneInstalledAssignment returns one deeply owned copy of a recovered
+// installation so the serialized view never aliases caller memory.
+func cloneInstalledAssignment(assignment store.InstalledAssignment) store.InstalledAssignment {
+	assignment.Assignment.Tasks = append([]model.AssignmentToken(nil), assignment.Assignment.Tasks...)
+	assignment.Assignment.ResultReplicas = append([]model.ResultReplicaSet(nil), assignment.Assignment.ResultReplicas...)
+	assignment.SpecificationBytes = append([]byte(nil), assignment.SpecificationBytes...)
+	if len(assignment.SpecificationBytes) != 0 {
+		assignment.Topology, _ = model.DecodeTopology(assignment.SpecificationBytes)
+	}
+	return assignment
+}
+
 func (engine *Engine) currentRunning(job model.JobID) (store.InstalledAssignment, bool) {
-	assignment, ok := engine.repository.InstalledAssignment(job)
-	if !ok || assignment.SchedulingState != model.Running || assignment.CoordinatorEpoch != engine.repository.CurrentFence() {
+	assignment, ok := engine.installedAssignment(job)
+	if !ok || assignment.SchedulingState != model.Running || assignment.CoordinatorEpoch != engine.installedFence() {
 		return store.InstalledAssignment{}, false
 	}
 	return assignment, true

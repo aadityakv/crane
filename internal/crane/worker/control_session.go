@@ -65,6 +65,7 @@ type controlRepository interface {
 
 type controlEngine interface {
 	ReconcileAssignment(context.Context, model.JobID) error
+	ObserveFence(context.Context) error
 	ApplyCheckpoint(context.Context, protocol.CheckpointNotice) error
 	AcknowledgeEvents(context.Context, uint64) error
 }
@@ -657,6 +658,12 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 		return nil, err
 	}
 	if err := owner.repository.Fence(request.CoordinatorEpoch); err != nil {
+		return nil, err
+	}
+	// The durable fence changed: the serialized engine owner re-establishes
+	// its installed view at this exact transition, exactly as an install
+	// command does, so it never keeps serving the superseded fence.
+	if err := owner.engine.ObserveFence(ctx); err != nil {
 		return nil, err
 	}
 	owner.closeOlderCoordinatorSessions(session, request.CoordinatorEpoch)

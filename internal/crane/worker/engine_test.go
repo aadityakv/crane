@@ -574,15 +574,19 @@ func (fixture workerTestFixture) failureEvent(transaction uint64) model.WorkerEv
 }
 
 type fakeRepository struct {
-	mu                    sync.Mutex
-	work                  store.RecoveredWork
-	assignments           map[model.JobID]store.InstalledAssignment
-	deliveries            map[model.DeliveryID]store.DeliveryRecord
-	outboxes              map[model.DeliveryID]store.OutboxRecord
-	results               []store.StoredResult
-	sources               map[model.TaskID]store.SourceCursor
-	log                   []string
-	recoverCalls          int
+	mu           sync.Mutex
+	work         store.RecoveredWork
+	assignments  map[model.JobID]store.InstalledAssignment
+	deliveries   map[model.DeliveryID]store.DeliveryRecord
+	outboxes     map[model.DeliveryID]store.OutboxRecord
+	results      []store.StoredResult
+	sources      map[model.TaskID]store.SourceCursor
+	log          []string
+	recoverCalls int
+	// installedCalls and fenceCalls count per-lookup reads that the real
+	// serviceRepository answers with a full RecoverWork recovery.
+	installedCalls        int
+	fenceCalls            int
 	recoverStarted        chan struct{}
 	recoverRelease        chan struct{}
 	processedStarted      chan struct{}
@@ -636,11 +640,13 @@ func (repository *fakeRepository) RecoverWork() (store.RecoveredWork, error) {
 func (repository *fakeRepository) CurrentFence() model.CoordinatorEpoch {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	repository.fenceCalls++
 	return repository.work.Fence
 }
 func (repository *fakeRepository) InstalledAssignment(job model.JobID) (store.InstalledAssignment, bool) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	repository.installedCalls++
 	value, ok := repository.assignments[job]
 	return value, ok
 }
@@ -1008,4 +1014,166 @@ func (sender *fakeSender) sendTimes() []time.Time {
 
 func deliveryMessage(record store.DeliveryRecord) protocol.TupleDelivery {
 	return protocol.TupleDelivery{DeliveryID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: record.ID.Tuple.JobID, Revision: record.AssignmentRevision, Digest: record.AssignmentDigest}, Coordinator: record.CoordinatorEpoch}
+}
+
+// TestEngineAssignmentCacheEliminatesPerLookupStoreRecovery pins that after
+// recovery and after each assignment transition the engine answers
+// assignment and fence queries from its serialized view, never re-reading
+// the durable store per lookup, and that replacements invalidate the cache.
+func TestEngineAssignmentCacheEliminatesPerLookupStoreRecovery(t *testing.T) {
+	fixture := workerFixture(t)
+	job := fixture.assignment.Assignment.JobID
+
+	repository := newFakeRepository(fixture)
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err = engine.consumeRecovery(work); err != nil {
+		t.Fatal(err)
+	}
+	assignment, ok := engine.installedAssignment(job)
+	if !ok || assignment.Assignment.JobID != job || assignment.Assignment.Revision != 1 || assignment.SchedulingState != model.Running || assignment.CoordinatorEpoch != fixture.epoch {
+		t.Fatalf("serialized recovered assignment = %+v, %t", assignment, ok)
+	}
+	if engine.installedFence() != fixture.epoch {
+		t.Fatalf("serialized recovered fence = %+v", engine.installedFence())
+	}
+	repository.mu.Lock()
+	recoverBefore, installedBefore, fenceBefore := repository.recoverCalls, repository.installedCalls, repository.fenceCalls
+	repository.mu.Unlock()
+	if err = engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	repository.mu.Lock()
+	recoverAfter, installedAfter, fenceAfter := repository.recoverCalls, repository.installedCalls, repository.fenceCalls
+	repository.mu.Unlock()
+	if recoverAfter != recoverBefore || installedAfter != installedBefore || fenceAfter != fenceBefore {
+		t.Fatalf("reconcile re-read durable state per lookup: recover %d->%d installed %d->%d fence %d->%d", recoverBefore, recoverAfter, installedBefore, installedAfter, fenceBefore, fenceAfter)
+	}
+
+	// A replacement install that reached the engine as an assignment command
+	// overwrites the cached entry with the new revision.
+	runningRepository := newFakeRepository(fixture)
+	gate := admission.NewGate()
+	if err = gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	runningEngine, err := NewEngine(testEngineOptions(runningRepository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, runningEngine)
+	<-runningEngine.Ready()
+	tokens := append([]model.AssignmentToken(nil), fixture.assignment.Assignment.Tasks...)
+	for index := range tokens {
+		tokens[index].AssignmentRevision++
+	}
+	replacement, replaceErr := model.NewAssignmentSet(job, fixture.assignment.Assignment.Revision+1, tokens, fixture.assignment.Assignment.ResultReplicas, fixture.topology)
+	if replaceErr != nil {
+		t.Fatal(replaceErr)
+	}
+	replaced := fixture.assignment
+	replaced.Assignment = replacement
+	replaced.JobControlRevision++
+	runningRepository.mu.Lock()
+	runningRepository.assignments[job] = replaced
+	runningRepository.mu.Unlock()
+	if err = runningEngine.ReconcileAssignment(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-done
+	cached, ok := runningEngine.installedAssignment(job)
+	if !ok || cached.Assignment.Revision != 2 || cached.Assignment.Digest != replacement.Digest {
+		t.Fatalf("serialized replaced assignment = %+v, %t", cached, ok)
+	}
+
+	// A begin-epoch rebind (identical content under a strictly newer fence)
+	// republishes the fence view and retires the old-epoch entry, exactly as
+	// per-lookup repository reads did.
+	rebindRepository := newFakeRepository(fixture)
+	rebindGate := admission.NewGate()
+	if err = rebindGate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	rebindEngine, err := NewEngine(testEngineOptions(rebindRepository, rebindGate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx, rebindCancel := context.WithCancel(context.Background())
+	rebindDone := runEngine(t, rebindCtx, rebindEngine)
+	<-rebindEngine.Ready()
+	newer := fixture.epoch
+	newer.Term++
+	newer.BeginIndex++
+	newer.Nonce[0]++
+	rebound := fixture.assignment
+	rebound.CoordinatorEpoch = newer
+	rebindRepository.mu.Lock()
+	rebindRepository.assignments[job] = rebound
+	rebindRepository.work.Assignments = []store.InstalledAssignment{rebound}
+	rebindRepository.work.Fence = newer
+	rebindRepository.mu.Unlock()
+	if err = rebindEngine.ReconcileAssignment(rebindCtx, job); err != nil {
+		t.Fatal(err)
+	}
+	rebindCancel()
+	<-rebindDone
+	if rebindEngine.installedFence() != newer {
+		t.Fatalf("serialized fence after rebind = %+v", rebindEngine.installedFence())
+	}
+	if runningAssignment, current := rebindEngine.currentRunning(job); !current || runningAssignment.CoordinatorEpoch != newer || runningAssignment.Assignment.JobID != job {
+		t.Fatalf("current running after rebind = %+v, %t", runningAssignment, current)
+	}
+	if cached, ok = rebindEngine.installedAssignment(job); !ok || cached.CoordinatorEpoch != newer {
+		t.Fatalf("serialized rebound assignment = %+v, %t", cached, ok)
+	}
+}
+
+// TestEngineObserveFenceRepublishesSerializedView pins that a durable fence
+// advance persisted without any assignment (the control owner's fence
+// command) still reaches the serialized owner: the fence view republishes
+// and retained old-epoch installations stop serving as current authority.
+func TestEngineObserveFenceRepublishesSerializedView(t *testing.T) {
+	fixture := workerFixture(t)
+	job := fixture.assignment.Assignment.JobID
+	repository := newFakeRepository(fixture)
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	newer := fixture.epoch
+	newer.Term++
+	newer.BeginIndex++
+	newer.Nonce[0]++
+	repository.mu.Lock()
+	repository.work.Fence = newer
+	repository.mu.Unlock()
+	if err = engine.ObserveFence(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-done
+	if engine.installedFence() != newer {
+		t.Fatalf("serialized fence after observation = %+v", engine.installedFence())
+	}
+	if assignment, current := engine.currentRunning(job); current {
+		t.Fatalf("old-epoch assignment remained current after the fence change: %+v", assignment)
+	}
 }
