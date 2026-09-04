@@ -103,6 +103,11 @@ type Engine struct {
 	eventQueue        []model.WorkerEvent
 	completionReports map[model.TaskID]model.WorkerEvent
 	results           map[resultIdentity]*ownedResult
+	// materialized records, per processed sink delivery, the provenance
+	// under which its owned result was already derived; entries are
+	// invalidated when the job's installed assignment revision, digest, or
+	// coordinator epoch changes. Guarded by the engine's serialized owner.
+	materialized      map[model.DeliveryID]model.ResultCopyProvenance
 	readoptEnvelopes  map[model.JobID]resultEnvelope
 	readoptPending    map[model.JobID]struct{}
 	nextTransactionID uint64
@@ -168,6 +173,7 @@ func NewEngine(options EngineOptions) (*Engine, error) {
 		executing: make(map[model.DeliveryID]struct{}), failedTasks: make(map[model.TaskID]struct{}),
 		jobs:              make(map[model.JobID]struct{}),
 		results:           make(map[resultIdentity]*ownedResult),
+		materialized:      make(map[model.DeliveryID]model.ResultCopyProvenance),
 		readoptEnvelopes:  make(map[model.JobID]resultEnvelope),
 		readoptPending:    make(map[model.JobID]struct{}),
 		completionReports: make(map[model.TaskID]model.WorkerEvent),
@@ -569,6 +575,9 @@ func (engine *Engine) refreshInstalledFence() {
 		assignments[assignment.Assignment.JobID] = cloneInstalledAssignment(assignment)
 	}
 	engine.publishView(assignments)
+	// The rebuilt view may carry new-epoch installations, so every
+	// materialized-delivery provenance is invalid until re-derived.
+	engine.materialized = make(map[model.DeliveryID]model.ResultCopyProvenance)
 }
 
 // refreshInstalledAssignment republishes one job's assignment after a
@@ -588,6 +597,13 @@ func (engine *Engine) refreshInstalledAssignment(job model.JobID) {
 		delete(published, job)
 	}
 	engine.publishView(published)
+	// An install or replacement re-derives the job's sink results under the
+	// new envelope before any delivery may skip again.
+	for id := range engine.materialized {
+		if id.Tuple.JobID == job {
+			delete(engine.materialized, id)
+		}
+	}
 }
 
 // cloneInstalledAssignment returns one deeply owned copy of a recovered

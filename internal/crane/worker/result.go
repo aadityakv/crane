@@ -53,8 +53,22 @@ type resultIdentity struct {
 	tuple model.TupleID
 }
 
+// marshalTuple and newResultRecord seam the sink-result derivation path so
+// tests can instrument tuple marshaling and record construction; production
+// behavior is exactly the model functions.
+var (
+	marshalTuple    = model.MarshalTuple
+	newResultRecord = model.NewResultRecord
+)
+
 func resultID(record model.ResultRecord) resultIdentity {
 	return resultIdentity{sink: record.SinkTask, tuple: record.TupleID}
+}
+
+// resultIdentityFor returns the owned-result identity for one processed
+// sink delivery under the installed assignment.
+func resultIdentityFor(delivery store.DeliveryRecord, assignment store.InstalledAssignment) resultIdentity {
+	return resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
 }
 
 func (engine *Engine) resultWorker(ctx context.Context) {
@@ -86,6 +100,17 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 		if !ok {
 			return errors.New("processed sink references missing assignment")
 		}
+		if provenance, done := engine.materialized[id]; done &&
+			provenance.AssignmentRevision == assignment.Assignment.Revision &&
+			provenance.AssignmentDigest == assignment.Assignment.Digest &&
+			provenance.CoordinatorEpoch == assignment.CoordinatorEpoch {
+			// The owned result was already derived under this exact
+			// envelope; relink the parent without re-marshaling.
+			if owned, exists := engine.results[resultIdentityFor(delivery, assignment)]; exists {
+				owned.parents = append(owned.parents, id)
+				continue
+			}
+		}
 		stage, ok := findStage(assignment.Topology, delivery.Destination.Task.StageID)
 		if !ok || stage.Role != model.StageSink {
 			continue
@@ -98,11 +123,11 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 		if len(delivery.Outputs) != 1 {
 			return errors.New("processed sink does not contain one canonical output")
 		}
-		encoded, err := model.MarshalTuple(delivery.Outputs[0])
+		encoded, err := marshalTuple(delivery.Outputs[0])
 		if err != nil {
 			return err
 		}
-		record, err := model.NewResultRecord(delivery.ID.Tuple, delivery.Destination.Task, delivery.Destination.SpecificationHash, encoded)
+		record, err := newResultRecord(delivery.ID.Tuple, delivery.Destination.Task, delivery.Destination.SpecificationHash, encoded)
 		if err != nil {
 			return err
 		}
@@ -111,7 +136,7 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 			return errors.New("sink task is not the exact local primary result replica")
 		}
 		provenance := model.ResultCopyProvenance{AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, ReplicaSet: replica, DestinationRole: model.PrimaryReplica, CoordinatorEpoch: assignment.CoordinatorEpoch}
-		key := resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
+		key := resultIdentityFor(delivery, assignment)
 		owned, exists := engine.results[key]
 		if !exists {
 			if err := engine.repository.UpsertResult(record, provenance); err != nil {
@@ -124,6 +149,7 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 			// logical record; it re-binds on its next durable partner receipt.
 			return model.ErrIdentityReuse
 		}
+		engine.materialized[id] = provenance
 		owned.parents = append(owned.parents, id)
 	}
 	if err := engine.readoptRetainedResults(ctx); err != nil {
