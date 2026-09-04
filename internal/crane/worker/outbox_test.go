@@ -292,6 +292,14 @@ func TestOutboxAcceptedAndCompletedRetryIntervalsRemainDistinct(t *testing.T) {
 		defer repository.mu.Unlock()
 		return repository.outboxes[outbox.ID].Accepted
 	})
+	// The durable mark lands inside the owner's critical section, a hair
+	// before the in-memory retry deadline is rebound; give the owner real
+	// time to finish that section before the clock moves, otherwise the
+	// still-armed custody deadline legitimately fires (seen under -race).
+	for i := 0; i < 20; i++ {
+		runtimeYield()
+		time.Sleep(time.Millisecond)
+	}
 	acceptedAt := manual.Now()
 	manual.Advance(99 * time.Millisecond)
 	runtimeYield()
