@@ -359,3 +359,64 @@ func TestPrefixWriterPrefixesEveryLineAcrossChunkBoundaries(t *testing.T) {
 		t.Fatalf("prefixed output = %q, want %q", got, want)
 	}
 }
+
+func TestEnsureClusterSecretCreatesMissingSecretOwnerOnly(t *testing.T) {
+	root := t.TempDir()
+	secretFile := filepath.Join(root, "local.secret")
+	if err := ensureClusterSecret(secretFile); err != nil {
+		t.Fatalf("ensureClusterSecret: %v", err)
+	}
+	info, err := os.Stat(secretFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("secret mode = %v, want owner-only", info.Mode().Perm())
+	}
+	if info.Size() < 32 {
+		t.Fatalf("secret size = %d, want at least 32", info.Size())
+	}
+	before, err := os.ReadFile(secretFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureClusterSecret(secretFile); err != nil {
+		t.Fatalf("ensureClusterSecret second run: %v", err)
+	}
+	after, err := os.ReadFile(secretFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("existing secret was rewritten")
+	}
+}
+
+func TestResolveClusterIDPersistsReusesAndRefusesAmbiguousStorage(t *testing.T) {
+	root := t.TempDir()
+	first, err := resolveClusterID(root)
+	if err != nil {
+		t.Fatalf("resolveClusterID fresh: %v", err)
+	}
+	persisted, err := os.ReadFile(filepath.Join(root, "cluster-id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(persisted)) != first {
+		t.Fatalf("persisted %q does not match resolved %q", persisted, first)
+	}
+	second, err := resolveClusterID(root)
+	if err != nil {
+		t.Fatalf("resolveClusterID reuse: %v", err)
+	}
+	if second != first {
+		t.Fatalf("cluster ID changed across runs: %q then %q", first, second)
+	}
+	ambiguous := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ambiguous, "node-1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveClusterID(ambiguous); err == nil {
+		t.Fatal("existing node storage without cluster-id was accepted")
+	}
+}

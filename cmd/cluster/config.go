@@ -3,10 +3,12 @@ package main
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"crane/internal/config"
 	"crane/internal/swim"
@@ -21,6 +23,9 @@ type ClusterOptions struct {
 	StartingBasePort uint16
 	DataRoot         string
 	SecretFile       string
+	// ClusterID, when set, is the persisted cluster UUID to reuse instead of
+	// minting a fresh one (see resolveClusterID).
+	ClusterID string
 }
 
 func GenerateConfigs(options ClusterOptions) ([]config.NodeConfig, error) {
@@ -61,9 +66,13 @@ func GenerateConfigs(options ClusterOptions) ([]config.NodeConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("derive introducer endpoint: %w", err)
 	}
-	clusterID, err := newClusterID()
-	if err != nil {
-		return nil, err
+	clusterID := options.ClusterID
+	if clusterID == "" {
+		fresh, err := newClusterID()
+		if err != nil {
+			return nil, err
+		}
+		clusterID = fresh
 	}
 
 	result := make([]config.NodeConfig, options.Nodes)
@@ -182,4 +191,66 @@ func prepareClusterFiles(dataRoot string, configurations []config.NodeConfig) ([
 		paths[index] = path
 	}
 	return paths, nil
+}
+
+// ensureClusterSecret creates a missing cluster secret with owner-only
+// permissions and leaves an existing secret untouched. A lost creation race
+// surfaces as an error rather than a silent overwrite.
+func ensureClusterSecret(secretFile string) error {
+	if _, err := os.Stat(secretFile); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect cluster secret: %w", err)
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return fmt.Errorf("generate cluster secret: %w", err)
+	}
+	file, err := os.OpenFile(secretFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create cluster secret: %w", err)
+	}
+	if _, err := file.Write(secret); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write cluster secret: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync cluster secret: %w", err)
+	}
+	return file.Close()
+}
+
+// resolveClusterID returns the persisted data-root cluster UUID, creating one
+// for a fresh data root and refusing existing node storage without one, so a
+// re-run resumes the same cluster instead of invalidating its state.
+func resolveClusterID(dataRoot string) (string, error) {
+	path := filepath.Join(dataRoot, "cluster-id")
+	if persisted, err := os.ReadFile(path); err == nil {
+		value := strings.TrimSpace(string(persisted))
+		if value == "" {
+			return "", fmt.Errorf("cluster ID file %s is empty", path)
+		}
+		return value, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("read cluster ID: %w", err)
+	}
+	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
+		return "", fmt.Errorf("prepare data root: %w", err)
+	}
+	if entries, err := os.ReadDir(dataRoot); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() && strings.HasPrefix(entry.Name(), "node-") {
+				return "", fmt.Errorf("data root %s holds existing node storage without %s; choose a fresh data root or restore the cluster-id file", dataRoot, path)
+			}
+		}
+	}
+	clusterID, err := newClusterID()
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(clusterID+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("persist cluster ID: %w", err)
+	}
+	return clusterID, nil
 }

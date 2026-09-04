@@ -42,6 +42,14 @@ func executeCluster(ctx context.Context, args []string, signals <-chan os.Signal
 	if err != nil {
 		return err
 	}
+	if err := ensureClusterSecret(options.SecretFile); err != nil {
+		return err
+	}
+	clusterID, err := resolveClusterID(options.DataRoot)
+	if err != nil {
+		return err
+	}
+	options.ClusterID = clusterID
 	configurations, err := GenerateConfigs(options)
 	if err != nil {
 		return err
