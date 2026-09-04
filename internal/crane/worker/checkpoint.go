@@ -263,6 +263,7 @@ func (engine *Engine) compactCheckpoint(source model.TaskID, watermark uint64) {
 	for id := range engine.deliveries {
 		if id.Tuple.SourceTask == source && id.Tuple.SourceSequence <= watermark {
 			delete(engine.deliveries, id)
+			delete(engine.materialized, id)
 		}
 	}
 	for id := range engine.outboxes {

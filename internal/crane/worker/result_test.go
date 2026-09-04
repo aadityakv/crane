@@ -1085,3 +1085,98 @@ func TestReconcileResultsSkipsMaterializedDeliveries(t *testing.T) {
 		t.Fatalf("fourth pass rebuilt owned=%t parents=%+v", exists, owned.parents)
 	}
 }
+
+// TestReconcileResultsFenceAdvanceInvalidatesMaterializedDeliveries pins the
+// fence invalidation path of the materialized-skip index: a coordinator
+// fence advance that reaches the engine through the durable fence command
+// republishes the assignment view and clears the index, so a previously
+// skipping processed sink delivery is re-derived under the new epoch and
+// then skips again once re-recorded.
+func TestReconcileResultsFenceAdvanceInvalidatesMaterializedDeliveries(t *testing.T) {
+	fixture, sink, replica := workerFixtureWithLocalPrimarySink(t)
+	repository := newFakeRepository(fixture)
+	delivery := fixture.sinkDelivery(t, sink, 1)
+	delivery.State = store.Processed
+	delivery.Outputs = []model.Tuple{cloneTuple(delivery.Tuple)}
+	repository.work.Deliveries = []store.DeliveryRecord{delivery}
+	repository.deliveries[delivery.ID] = delivery
+	replicator := &fakeResultReplicator{calls: make(chan resultReplicationCall, 1)}
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	options := testEngineOptions(repository, gate, &fakeSender{})
+	options.Replicator = replicator
+	engine, err := NewEngine(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marshals, records := 0, 0
+	marshalTuple = func(tuple model.Tuple) ([]byte, error) {
+		marshals++
+		return model.MarshalTuple(tuple)
+	}
+	newResultRecord = func(tupleID model.TupleID, sinkTask model.TaskID, specificationHash [32]byte, value []byte) (model.ResultRecord, error) {
+		records++
+		return model.NewResultRecord(tupleID, sinkTask, specificationHash, value)
+	}
+	defer func() { marshalTuple, newResultRecord = model.MarshalTuple, model.NewResultRecord }()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	if marshals != 1 || records != 1 {
+		t.Fatalf("initial reconcile derivations marshals=%d records=%d, want 1 and 1", marshals, records)
+	}
+	// The dispatched replication stays blocked in the fake replicator, so the
+	// delivery remains Processed and owned by the derivation path.
+	call := <-replicator.calls
+	defer func() { call.response <- resultReplicationResponse{} }()
+
+	// A durable fence advance rebinds the installation at a strictly newer
+	// epoch; the fence command drives the same republish the service sees.
+	newer := fixture.epoch
+	newer.Term++
+	newer.BeginIndex++
+	newer.Nonce[0]++
+	rebound := fixture.assignment
+	rebound.CoordinatorEpoch = newer
+	repository.mu.Lock()
+	repository.assignments[fixture.assignment.Assignment.JobID] = rebound
+	repository.work.Assignments = []store.InstalledAssignment{rebound}
+	repository.work.Fence = newer
+	repository.mu.Unlock()
+	if err := engine.ObserveFence(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-done
+
+	// The cleared index re-derives the delivery under the new epoch.
+	if err := engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if marshals != 2 || records != 2 {
+		t.Fatalf("fence advance did not re-derive: marshals=%d records=%d, want 2 and 2", marshals, records)
+	}
+	wantProvenance := model.ResultCopyProvenance{AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, ReplicaSet: replica, DestinationRole: model.PrimaryReplica, CoordinatorEpoch: newer}
+	if recorded := engine.materialized[delivery.ID]; recorded != wantProvenance {
+		t.Fatalf("re-derived provenance=%+v want=%+v", recorded, wantProvenance)
+	}
+	key := resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
+	owned, exists := engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("fence pass rebuilt owned=%t parents=%+v", exists, owned.parents)
+	}
+
+	// The re-recorded entry skips again at the new fence.
+	if err := engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if marshals != 2 || records != 2 {
+		t.Fatalf("post-fence skip failed: marshals=%d records=%d, want 2 and 2", marshals, records)
+	}
+	owned, exists = engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("post-fence pass rebuilt owned=%t parents=%+v", exists, owned.parents)
+	}
+}

@@ -55,7 +55,8 @@ type resultIdentity struct {
 
 // marshalTuple and newResultRecord seam the sink-result derivation path so
 // tests can instrument tuple marshaling and record construction; production
-// behavior is exactly the model functions.
+// behavior is exactly the model functions. Test-only mutation: never rebind
+// these while an engine's owner goroutine is running.
 var (
 	marshalTuple    = model.MarshalTuple
 	newResultRecord = model.NewResultRecord
@@ -66,8 +67,8 @@ func resultID(record model.ResultRecord) resultIdentity {
 }
 
 // resultIdentityFor returns the owned-result identity for one processed
-// sink delivery under the installed assignment.
-func resultIdentityFor(delivery store.DeliveryRecord, assignment store.InstalledAssignment) resultIdentity {
+// sink delivery.
+func resultIdentityFor(delivery store.DeliveryRecord) resultIdentity {
 	return resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
 }
 
@@ -106,7 +107,7 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 			provenance.CoordinatorEpoch == assignment.CoordinatorEpoch {
 			// The owned result was already derived under this exact
 			// envelope; relink the parent without re-marshaling.
-			if owned, exists := engine.results[resultIdentityFor(delivery, assignment)]; exists {
+			if owned, exists := engine.results[resultIdentityFor(delivery)]; exists {
 				owned.parents = append(owned.parents, id)
 				continue
 			}
@@ -136,7 +137,7 @@ func (engine *Engine) reconcileResults(ctx context.Context) error {
 			return errors.New("sink task is not the exact local primary result replica")
 		}
 		provenance := model.ResultCopyProvenance{AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, ReplicaSet: replica, DestinationRole: model.PrimaryReplica, CoordinatorEpoch: assignment.CoordinatorEpoch}
-		key := resultIdentityFor(delivery, assignment)
+		key := resultIdentityFor(delivery)
 		owned, exists := engine.results[key]
 		if !exists {
 			if err := engine.repository.UpsertResult(record, provenance); err != nil {
