@@ -2,9 +2,9 @@ package raft
 
 import (
 	"context"
-	"github.com/aadityakv/crane/internal/testutil"
 	"errors"
 	"fmt"
+	"github.com/aadityakv/crane/internal/testutil"
 	"net"
 	"os"
 	"path/filepath"

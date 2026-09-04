@@ -2,10 +2,10 @@ package swim
 
 import (
 	"context"
-	"github.com/aadityakv/crane/internal/testutil"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"net/netip"

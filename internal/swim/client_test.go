@@ -2,9 +2,9 @@ package swim
 
 import (
 	"context"
-	"github.com/aadityakv/crane/internal/testutil"
 	"errors"
 	"fmt"
+	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"net/netip"

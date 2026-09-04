@@ -2,9 +2,9 @@ package raft
 
 import (
 	"context"
-	"github.com/aadityakv/crane/internal/testutil"
 	"encoding/binary"
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"io"
 	"net"
 	"reflect"

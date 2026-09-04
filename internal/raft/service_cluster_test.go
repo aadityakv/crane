@@ -2,10 +2,10 @@ package raft
 
 import (
 	"context"
-	"github.com/aadityakv/crane/internal/testutil"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"os"

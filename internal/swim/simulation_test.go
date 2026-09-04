@@ -2,9 +2,9 @@ package swim
 
 import (
 	"context"
-	"github.com/aadityakv/crane/internal/testutil"
 	"encoding/binary"
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"net"
 	"runtime"
 	"sync"
