@@ -147,6 +147,10 @@ const (
 	MessageCraneLeaderRedirect MessageType = 248
 	// MessageCraneControlError carries a typed client-control protocol failure.
 	MessageCraneControlError MessageType = 249
+	// MessageCraneJobListRequest requests every retained-job summary.
+	MessageCraneJobListRequest MessageType = 250
+	// MessageCraneJobListResponse returns every retained-job summary.
+	MessageCraneJobListResponse MessageType = 251
 	// MessageCraneTupleDelivery carries one attempt-fenced tuple delivery.
 	MessageCraneTupleDelivery MessageType = 280
 	// MessageCraneTupleDeliveryAck acknowledges durable tuple acceptance.

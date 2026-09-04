@@ -70,6 +70,8 @@ func TestCraneWireContractMatchesIndependentWireRegistryAndBehavior(t *testing.T
 			{Name: "result_page_response", MessageType: uint16(wire.MessageCraneResultPageResponse)},
 			{Name: "leader_redirect", MessageType: uint16(wire.MessageCraneLeaderRedirect)},
 			{Name: "control_error", MessageType: uint16(wire.MessageCraneControlError)},
+			{Name: "job_list_request", MessageType: uint16(wire.MessageCraneJobListRequest)},
+			{Name: "job_list_response", MessageType: uint16(wire.MessageCraneJobListResponse)},
 			{Name: "tuple_delivery", MessageType: uint16(wire.MessageCraneTupleDelivery), Datagram: true},
 			{Name: "tuple_delivery_ack", MessageType: uint16(wire.MessageCraneTupleDeliveryAck), Datagram: true},
 			{Name: "tuple_delivery_nack", MessageType: uint16(wire.MessageCraneTupleDeliveryNack), Datagram: true},

@@ -23,11 +23,11 @@ func TestWorkerMessageTableValidInvalidGoldenTruncationAndOwnership(t *testing.T
 		invalid WorkerMessage
 		golden  string
 	}{
-		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "0f5ecfd1e4ab3a394a654302b03abf14affba8de26be0f0207175320b9ac8da9"},
-		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "60a4bc848e5002f6d0c2ba559192773b325f4074905cadd2092341629e1c8f24"},
+		{"handshake", 200, fixture.handshake, WorkerHandshake{}, "1835602e5103b9d7a4f455404d043531b748c7ae276e9dbf842f63d50807c3a8"},
+		{"handshake_ack", 201, fixture.handshakeAck, WorkerHandshakeAck{}, "f8bf3de60db32681967d2205558ba5a18dc419dd4d8e1a4b3c1d58fb2a7e3477"},
 		{"fence_request", 202, fixture.fence, FenceRequest{}, "188908a1e60279df9bdf19b5f3f559c2a3749a3d5637c769a1f4947060cb236a"},
 		{"fence_response", 203, fixture.fenceResponse, FenceResponse{}, "d4b8e6ec7790fa83a009b8944bd2c12889059da4e9bd27ed68ed1ae4f92db417"},
-		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "278db993ad8b92d783b8bf23eefa7c585e71fddd98c400f7b9ba4e2c35f622e9"},
+		{"register_request", 204, fixture.register, WorkerRegisterRequest{}, "c0fa742d601e0c08d83883c781240beb7e2e6985da8d8acbf5cf4a5771f9c035"},
 		{"register_response", 205, fixture.registerResponse, WorkerRegisterResponse{}, "754be824632090c1ccdc0a08ed2ff6d599c6c461d1f7027618687c691e41a4ad"},
 		{"assignment_install", 206, fixture.install, AssignmentSetInstall{}, "a5bc56316bd81662214685ff417341029886cc11cb621504ebfd150f57c2ffa9"},
 		{"assignment_ack", 207, fixture.installAck, AssignmentSetInstallAck{}, "0ab295da7b19e4b24553fea9a78ee52cf071cd3af6a68a4151ca2318f0965ca8"},

@@ -124,6 +124,8 @@ func TestCraneMessageRegistryUsesExactUniqueIDs(t *testing.T) {
 		{name: "result_page_response", got: MessageCraneResultPageResponse, want: 247},
 		{name: "leader_redirect", got: MessageCraneLeaderRedirect, want: 248},
 		{name: "control_error", got: MessageCraneControlError, want: 249},
+		{name: "job_list_request", got: MessageCraneJobListRequest, want: 250},
+		{name: "job_list_response", got: MessageCraneJobListResponse, want: 251},
 		{name: "tuple_delivery", got: MessageCraneTupleDelivery, want: 280},
 		{name: "tuple_delivery_ack", got: MessageCraneTupleDeliveryAck, want: 281},
 		{name: "tuple_delivery_nack", got: MessageCraneTupleDeliveryNack, want: 282},

@@ -63,7 +63,7 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 	want := PublicControlContract{
 		SchemaVersion:               1,
 		MessageTypeMin:              240,
-		MessageTypeMax:              249,
+		MessageTypeMax:              251,
 		MaxControlFrameBytes:        1 << 20,
 		MaxResultPageBytes:          512 << 10,
 		MaxResultPageRecords:        3084,
@@ -83,6 +83,8 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 			{Name: "ResultPageResponse", MessageType: 247, SchemaVersion: 1, Fields: fields("JobID:JobID", "ManifestDigest:sha256", "RequestHasLastTuple:bool", "RequestLast:TupleID", "PageBytes:u32", "Records:list(ResultRecordEntry)", "NextHasLastTuple:bool", "NextLast:TupleID", "End:bool")},
 			{Name: "LeaderRedirect", MessageType: 248, SchemaVersion: 1, Fields: fields("Endpoints:list(string16)")},
 			{Name: "ControlError", MessageType: 249, SchemaVersion: 1, Fields: fields("RelatedMessage:u16", "Code:u16", "Retryable:bool", "HasClientRequest:bool", "ClientRequest:ClientRequestID", "ClientDigest:sha256", "HasStatusRequest:bool", "StatusJobID:JobID", "HasResultPage:bool", "ResultPage:ResultPageBinding", "RequiredBytes:u32", "Detail:bytes16")},
+			{Name: "JobListRequest", MessageType: 250, SchemaVersion: 1},
+			{Name: "JobListResponse", MessageType: 251, SchemaVersion: 1, Fields: fields("LeaderNodeID:u16", "AppliedIndex:u64", "Jobs:list(StatusResponse)")},
 		},
 		NestedLayouts: []PublicControlNestedDescriptor{
 			{Name: "ClientRequestID", Fields: fields("ClientID:bytes16(nonzero)", "Sequence:u64(nonzero)")},
@@ -108,6 +110,7 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 			"CancelRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,NotFound,RevisionMismatch,ResultTooLarge",
 			"StatusRequest=Starting,NotLeader,NotFound",
 			"ResultPageRequest=Starting,NotLeader,NotFound,PageLimitTooSmall,ResultUnavailable,CorruptResult",
+			"JobListRequest=Starting,NotLeader",
 		},
 		Rules: []string{
 			"payload-prefix-is-schema-version-then-message-type",
@@ -130,6 +133,7 @@ func TestPublicControlContractV1PinsOwnedLayoutsBoundsEnumsDomainsAndRules(t *te
 			"mutation-control-errors-echo-client-request-and-candidate-command-digest",
 			"control-error-request-type-and-code-follow-the-fingerprinted-compatibility-matrix",
 			"unbound-control-errors-are-limited-to-malformed-unsupported-schema-or-invalid-request-before-trust",
+			"job-list-errors-bind-only-the-related-request-without-a-selector",
 			"decoded-variable-values-are-owned",
 			"bounds-and-declared-lengths-are-checked-before-allocation",
 			"unknown-enums-trailing-bytes-type-mismatches-and-noncanonical-bytes-are-rejected",

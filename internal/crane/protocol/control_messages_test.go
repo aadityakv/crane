@@ -33,6 +33,8 @@ func TestControlMessageTableExactIDsIndependentGoldensTruncationTrailingAndOwner
 		{"result_page_response", 247, fixture.pageResponse, invalidReorderedPage(fixture.pageResponse), goldenResultPageResponse},
 		{"leader_redirect", 248, fixture.redirect, LeaderRedirect{Endpoints: []string{"node-1.example.test:8006", "node-1.example.test:8006"}}, goldenLeaderRedirect},
 		{"control_error", 249, fixture.controlError, ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: ControlErrorPageLimitTooSmall}, goldenControlError},
+		{"job_list_request", 250, fixture.jobListRequest, nil, goldenJobListRequest},
+		{"job_list_response", 251, fixture.jobListResponse, JobListResponse{LeaderNodeID: 0, Jobs: nil}, goldenJobListResponse},
 	}
 
 	for _, test := range cases {
@@ -70,13 +72,15 @@ func TestControlMessageTableExactIDsIndependentGoldensTruncationTrailingAndOwner
 			if _, err := UnmarshalControlMessage(test.typeID, trailing); err == nil {
 				t.Fatal("accepted trailing byte")
 			}
-			if _, err := MarshalControlMessage(test.invalid); err == nil {
-				t.Fatalf("accepted invalid message %#v", test.invalid)
+			if test.invalid != nil {
+				if _, err := MarshalControlMessage(test.invalid); err == nil {
+					t.Fatalf("accepted invalid message %#v", test.invalid)
+				}
 			}
 		})
 	}
 
-	for _, unknown := range []wire.MessageType{239, 250, wire.MessageCraneWorkerReserved} {
+	for _, unknown := range []wire.MessageType{239, 252, wire.MessageCraneWorkerReserved} {
 		if _, err := UnmarshalControlMessage(unknown, []byte{0, 1, 0, byte(unknown)}); !errors.Is(err, ErrUnexpectedControlMessage) {
 			t.Fatalf("unknown type %d error = %v", unknown, err)
 		}
@@ -123,6 +127,22 @@ func TestControlMessageTableExactIDsIndependentGoldensTruncationTrailingAndOwner
 	redirectBytes[8] ^= 0xff
 	if ownedRedirect.Endpoints[0] != "node-1.example.test:8006" {
 		t.Fatal("decoded redirect endpoint is not owned")
+	}
+}
+
+func TestJobListSummaryBytesMatchStatusResponseEncoding(t *testing.T) {
+	fixture := controlFixture(t)
+	listBytes, err := MarshalJobListResponse(fixture.jobListResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusBytes, err := MarshalStatusResponse(fixture.statusResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := listBytes[4+2+8+2:]
+	if !bytes.HasPrefix(summary, statusBytes[4:]) {
+		t.Fatalf("list summary %x does not embed the canonical status encoding %x", summary, statusBytes[4:])
 	}
 }
 
@@ -210,6 +230,22 @@ func TestTypedControlCodecWrappersUseExactMessageAssociations(t *testing.T) {
 				return e
 			}
 			_, e = UnmarshalControlError(b)
+			return e
+		}},
+		{"job list request", func() error {
+			b, e := MarshalJobListRequest(fixture.jobListRequest)
+			if e != nil {
+				return e
+			}
+			_, e = UnmarshalJobListRequest(b)
+			return e
+		}},
+		{"job list response", func() error {
+			b, e := MarshalJobListResponse(fixture.jobListResponse)
+			if e != nil {
+				return e
+			}
+			_, e = UnmarshalJobListResponse(b)
 			return e
 		}},
 	}
@@ -716,27 +752,29 @@ func FuzzUnmarshalControlMessage(f *testing.F) {
 }
 
 type controlMessageFixture struct {
-	request        model.ClientRequestID
-	topology       model.TopologySpec
-	topologyDigest [32]byte
-	job            model.JobID
-	manifestDigest [32]byte
-	submitDigest   [32]byte
-	cancelDigest   [32]byte
-	submitRequest  SubmitRequest
-	submitResponse SubmitResponse
-	cancelRequest  CancelRequest
-	cancelResponse CancelResponse
-	statusRequest  StatusRequest
-	statusResponse StatusResponse
-	pageRequest    ResultPageRequest
-	pageResponse   ResultPageResponse
-	redirect       LeaderRedirect
-	controlError   ControlError
+	request         model.ClientRequestID
+	topology        model.TopologySpec
+	topologyDigest  [32]byte
+	job             model.JobID
+	manifestDigest  [32]byte
+	submitDigest    [32]byte
+	cancelDigest    [32]byte
+	submitRequest   SubmitRequest
+	submitResponse  SubmitResponse
+	cancelRequest   CancelRequest
+	cancelResponse  CancelResponse
+	statusRequest   StatusRequest
+	statusResponse  StatusResponse
+	jobListRequest  JobListRequest
+	jobListResponse JobListResponse
+	pageRequest     ResultPageRequest
+	pageResponse    ResultPageResponse
+	redirect        LeaderRedirect
+	controlError    ControlError
 }
 
 func (fixture controlMessageFixture) messages() []ControlMessage {
-	return []ControlMessage{fixture.submitRequest, fixture.submitResponse, fixture.cancelRequest, fixture.cancelResponse, fixture.statusRequest, fixture.statusResponse, fixture.pageRequest, fixture.pageResponse, fixture.redirect, fixture.controlError}
+	return []ControlMessage{fixture.submitRequest, fixture.submitResponse, fixture.cancelRequest, fixture.cancelResponse, fixture.statusRequest, fixture.statusResponse, fixture.pageRequest, fixture.pageResponse, fixture.redirect, fixture.controlError, fixture.jobListRequest, fixture.jobListResponse}
 }
 
 func controlFixture(t *testing.T) controlMessageFixture {
@@ -788,15 +826,17 @@ func makeControlFixture() (controlMessageFixture, error) {
 	pageResponse := ResultPageResponse{JobID: job, ManifestDigest: manifestDigest, RequestHasLastTuple: true, RequestLast: last, PageBytes: uint32(pageBytes), Records: records, NextHasLastTuple: true, NextLast: records[len(records)-1].TupleID, End: false}
 	pageLimitRequest := pageRequest
 	pageLimitRequest.PageBytes = 1
+	status := StatusResponse{JobID: job, AppliedIndex: 11, TopologyDigest: validated.Digest(), JobControlRevision: 10, State: JobDraining, HasAssignment: true, AssignmentRevision: 3, AssignmentDigest: [32]byte{0x22}, SourceTaskCount: 1, ResultPartitionCount: 1, CompletedSourceTasks: 1, ManifestCount: 1, HasManifestSet: true, ManifestSetDigest: manifestDigest}
 	return controlMessageFixture{
 		request: request, topology: topology, topologyDigest: validated.Digest(), job: job, manifestDigest: manifestDigest, submitDigest: submitDigest, cancelDigest: cancelDigest,
 		submitRequest:  SubmitRequest{Request: request, Topology: topology, Digest: submitDigest},
 		submitResponse: SubmitResponse{Request: request, Digest: submitDigest, JobID: job, JobControlRevision: 1, State: JobPending},
 		cancelRequest:  CancelRequest{Request: request, JobID: job, ExpectedJobControlRevision: 9, Digest: cancelDigest},
 		cancelResponse: CancelResponse{Request: request, Digest: cancelDigest, JobID: job, JobControlRevision: 10, State: JobCanceled},
-		statusRequest:  StatusRequest{JobID: job},
-		statusResponse: StatusResponse{JobID: job, AppliedIndex: 11, TopologyDigest: validated.Digest(), JobControlRevision: 10, State: JobDraining, HasAssignment: true, AssignmentRevision: 3, AssignmentDigest: [32]byte{0x22}, SourceTaskCount: 1, ResultPartitionCount: 1, CompletedSourceTasks: 1, ManifestCount: 1, HasManifestSet: true, ManifestSetDigest: manifestDigest},
-		pageRequest:    pageRequest, pageResponse: pageResponse,
+		statusRequest:  StatusRequest{JobID: job}, statusResponse: status,
+		jobListRequest:  JobListRequest{},
+		jobListResponse: JobListResponse{LeaderNodeID: 2, AppliedIndex: 11, Jobs: []StatusResponse{status}},
+		pageRequest:     pageRequest, pageResponse: pageResponse,
 		redirect:     LeaderRedirect{Endpoints: []string{"node-1.example.test:8006", "node-2.example.test:8106", "node-3.example.test:8206"}},
 		controlError: ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: ControlErrorPageLimitTooSmall, HasResultPage: true, ResultPage: pageLimitRequest, RequiredBytes: uint32(4 + mustResultStreamLength(records[0])), Detail: []byte("page too small")},
 	}, nil
@@ -944,25 +984,43 @@ func goldenStatusRequest(f controlMessageFixture) []byte {
 	return append(goldenPrefix(f.statusRequest.MessageType()), f.job[:]...)
 }
 
+func appendStatusSummaryGolden(destination []byte, m StatusResponse) []byte {
+	destination = append(destination, m.JobID[:]...)
+	destination = appendU64Golden(destination, m.AppliedIndex)
+	destination = append(destination, m.TopologyDigest[:]...)
+	destination = appendU64Golden(destination, m.JobControlRevision)
+	destination = append(destination, byte(m.State))
+	destination = appendBoolGolden(destination, m.HasAssignment)
+	destination = appendU64Golden(destination, m.AssignmentRevision)
+	destination = append(destination, m.AssignmentDigest[:]...)
+	destination = appendU16Golden(destination, m.SourceTaskCount)
+	destination = appendU16Golden(destination, m.ResultPartitionCount)
+	destination = appendU16Golden(destination, m.CompletedSourceTasks)
+	destination = appendU16Golden(destination, m.ManifestCount)
+	destination = appendBoolGolden(destination, m.HasManifestSet)
+	destination = append(destination, m.ManifestSetDigest[:]...)
+	destination = appendBoolGolden(destination, m.HasFailure)
+	destination = appendU16Golden(destination, uint16(m.FailureCode))
+	return append(destination, m.FailureDetailDigest[:]...)
+}
+
 func goldenStatusResponse(f controlMessageFixture) []byte {
-	m := f.statusResponse
-	encoded := append(goldenPrefix(m.MessageType()), m.JobID[:]...)
+	return appendStatusSummaryGolden(goldenPrefix(f.statusResponse.MessageType()), f.statusResponse)
+}
+
+func goldenJobListRequest(f controlMessageFixture) []byte {
+	return goldenPrefix(f.jobListRequest.MessageType())
+}
+
+func goldenJobListResponse(f controlMessageFixture) []byte {
+	m := f.jobListResponse
+	encoded := appendU16Golden(goldenPrefix(m.MessageType()), m.LeaderNodeID)
 	encoded = appendU64Golden(encoded, m.AppliedIndex)
-	encoded = append(encoded, m.TopologyDigest[:]...)
-	encoded = appendU64Golden(encoded, m.JobControlRevision)
-	encoded = append(encoded, byte(m.State))
-	encoded = appendBoolGolden(encoded, m.HasAssignment)
-	encoded = appendU64Golden(encoded, m.AssignmentRevision)
-	encoded = append(encoded, m.AssignmentDigest[:]...)
-	encoded = appendU16Golden(encoded, m.SourceTaskCount)
-	encoded = appendU16Golden(encoded, m.ResultPartitionCount)
-	encoded = appendU16Golden(encoded, m.CompletedSourceTasks)
-	encoded = appendU16Golden(encoded, m.ManifestCount)
-	encoded = appendBoolGolden(encoded, m.HasManifestSet)
-	encoded = append(encoded, m.ManifestSetDigest[:]...)
-	encoded = appendBoolGolden(encoded, m.HasFailure)
-	encoded = appendU16Golden(encoded, uint16(m.FailureCode))
-	return append(encoded, m.FailureDetailDigest[:]...)
+	encoded = appendU16Golden(encoded, uint16(len(m.Jobs)))
+	for _, summary := range m.Jobs {
+		encoded = appendStatusSummaryGolden(encoded, summary)
+	}
+	return encoded
 }
 
 func goldenResultPageRequest(f controlMessageFixture) []byte {

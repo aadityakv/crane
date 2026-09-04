@@ -171,7 +171,7 @@ func isCraneDatagramMessage(message MessageType) bool {
 
 func isActiveCraneMessage(message MessageType) bool {
 	return (message >= MessageCraneWorkerHandshake && message <= MessageCraneWorkerError) ||
-		(message >= MessageCraneSubmitRequest && message <= MessageCraneControlError) ||
+		(message >= MessageCraneSubmitRequest && message <= MessageCraneJobListResponse) ||
 		isCraneDatagramMessage(message)
 }
 

@@ -68,6 +68,8 @@ var wireContractV1 = WireContractDescriptor{
 		{Name: "result_page_response", MessageType: 247},
 		{Name: "leader_redirect", MessageType: 248},
 		{Name: "control_error", MessageType: 249},
+		{Name: "job_list_request", MessageType: 250},
+		{Name: "job_list_response", MessageType: 251},
 		{Name: "tuple_delivery", MessageType: 280, Datagram: true},
 		{Name: "tuple_delivery_ack", MessageType: 281, Datagram: true},
 		{Name: "tuple_delivery_nack", MessageType: 282, Datagram: true},

@@ -135,6 +135,8 @@ var publicControlMessageDescriptorsV1 = []PublicControlMessageDescriptor{
 	{Name: "ResultPageResponse", MessageType: 247, SchemaVersion: 1, Fields: controlFields("JobID", "JobID", "ManifestDigest", "sha256", "RequestHasLastTuple", "bool", "RequestLast", "TupleID", "PageBytes", "u32", "Records", "list(ResultRecordEntry)", "NextHasLastTuple", "bool", "NextLast", "TupleID", "End", "bool")},
 	{Name: "LeaderRedirect", MessageType: 248, SchemaVersion: 1, Fields: controlFields("Endpoints", "list(string16)")},
 	{Name: "ControlError", MessageType: 249, SchemaVersion: 1, Fields: controlFields("RelatedMessage", "u16", "Code", "u16", "Retryable", "bool", "HasClientRequest", "bool", "ClientRequest", "ClientRequestID", "ClientDigest", "sha256", "HasStatusRequest", "bool", "StatusJobID", "JobID", "HasResultPage", "bool", "ResultPage", "ResultPageBinding", "RequiredBytes", "u32", "Detail", "bytes16")},
+	{Name: "JobListRequest", MessageType: 250, SchemaVersion: 1, Fields: controlFields()},
+	{Name: "JobListResponse", MessageType: 251, SchemaVersion: 1, Fields: controlFields("LeaderNodeID", "u16", "AppliedIndex", "u64", "Jobs", "list(StatusResponse)")},
 }
 
 var publicControlNestedLayoutsV1 = []PublicControlNestedDescriptor{
@@ -164,6 +166,7 @@ var publicControlErrorCodeMatrixV1 = []string{
 	"CancelRequest=Starting,NotLeader,StaleRequest,SkippedRequest,IdentityReuse,NotFound,RevisionMismatch,ResultTooLarge",
 	"StatusRequest=Starting,NotLeader,NotFound",
 	"ResultPageRequest=Starting,NotLeader,NotFound,PageLimitTooSmall,ResultUnavailable,CorruptResult",
+	"JobListRequest=Starting,NotLeader",
 }
 
 var publicControlRulesV1 = []string{
@@ -187,6 +190,7 @@ var publicControlRulesV1 = []string{
 	"mutation-control-errors-echo-client-request-and-candidate-command-digest",
 	"control-error-request-type-and-code-follow-the-fingerprinted-compatibility-matrix",
 	"unbound-control-errors-are-limited-to-malformed-unsupported-schema-or-invalid-request-before-trust",
+	"job-list-errors-bind-only-the-related-request-without-a-selector",
 	"decoded-variable-values-are-owned",
 	"bounds-and-declared-lengths-are-checked-before-allocation",
 	"unknown-enums-trailing-bytes-type-mismatches-and-noncanonical-bytes-are-rejected",
@@ -195,7 +199,7 @@ var publicControlRulesV1 = []string{
 // PublicControlContractV1 returns the immutable v1 +6 public-control contract.
 func PublicControlContractV1() PublicControlContract {
 	return PublicControlContract{
-		SchemaVersion: PublicControlSchemaVersionV1, MessageTypeMin: 240, MessageTypeMax: 249,
+		SchemaVersion: PublicControlSchemaVersionV1, MessageTypeMin: 240, MessageTypeMax: 251,
 		Messages:                    cloneControlMessages(publicControlMessageDescriptorsV1),
 		NestedLayouts:               cloneControlNested(publicControlNestedLayoutsV1),
 		EnumDomains:                 cloneControlEnums(publicControlEnumDomainsV1),

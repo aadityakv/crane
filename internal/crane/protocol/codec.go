@@ -2164,9 +2164,9 @@ func newTupleDecoder(input []byte, schema uint16, message wire.MessageType) (tup
 	return decoder, nil
 }
 
-// MarshalControlMessage validates and emits the sole canonical payload for IDs 240-249.
+// MarshalControlMessage validates and emits the sole canonical payload for IDs 240-251.
 func MarshalControlMessage(message ControlMessage) ([]byte, error) {
-	if message == nil || message.MessageType() < wire.MessageCraneSubmitRequest || message.MessageType() > wire.MessageCraneControlError {
+	if message == nil || message.MessageType() < wire.MessageCraneSubmitRequest || message.MessageType() > wire.MessageCraneJobListResponse {
 		return nil, ErrUnexpectedControlMessage
 	}
 	if err := validateControlMessage(message); err != nil {
@@ -2181,14 +2181,14 @@ func MarshalControlMessage(message ControlMessage) ([]byte, error) {
 	return encoder.owned(), nil
 }
 
-// UnmarshalControlMessage decodes one complete canonical payload for IDs 240-249.
+// UnmarshalControlMessage decodes one complete canonical payload for IDs 240-251.
 func UnmarshalControlMessage(messageType wire.MessageType, encoded []byte) (ControlMessage, error) {
 	return unmarshalControlMessageWith(messageType, encoded, model.DecodeTopology)
 }
 
 // ControlEncodingLayout returns the top-level order exercised by the actual encoder.
 func ControlEncodingLayout(message ControlMessage) ([]model.PublicControlFieldDescriptor, error) {
-	if message == nil || message.MessageType() < wire.MessageCraneSubmitRequest || message.MessageType() > wire.MessageCraneControlError {
+	if message == nil || message.MessageType() < wire.MessageCraneSubmitRequest || message.MessageType() > wire.MessageCraneJobListResponse {
 		return nil, ErrUnexpectedControlMessage
 	}
 	if err := validateControlMessage(message); err != nil {
@@ -2239,6 +2239,7 @@ func ControlErrorCodeMatrix() []string {
 		{name: "CancelRequest", message: wire.MessageCraneCancelRequest},
 		{name: "StatusRequest", message: wire.MessageCraneStatusRequest},
 		{name: "ResultPageRequest", message: wire.MessageCraneResultPageRequest},
+		{name: "JobListRequest", message: wire.MessageCraneJobListRequest},
 	}
 	result := make([]string, len(rows))
 	for index, row := range rows {
@@ -2362,6 +2363,32 @@ func UnmarshalStatusResponse(encoded []byte) (StatusResponse, error) {
 	return value.(StatusResponse), nil
 }
 
+// MarshalJobListRequest emits a canonical job-list request.
+func MarshalJobListRequest(value JobListRequest) ([]byte, error) { return MarshalControlMessage(value) }
+
+// UnmarshalJobListRequest decodes a canonical job-list request.
+func UnmarshalJobListRequest(encoded []byte) (JobListRequest, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneJobListRequest, encoded)
+	if err != nil {
+		return JobListRequest{}, err
+	}
+	return value.(JobListRequest), nil
+}
+
+// MarshalJobListResponse emits a canonical job-list response.
+func MarshalJobListResponse(value JobListResponse) ([]byte, error) {
+	return MarshalControlMessage(value)
+}
+
+// UnmarshalJobListResponse decodes a canonical job-list response.
+func UnmarshalJobListResponse(encoded []byte) (JobListResponse, error) {
+	value, err := UnmarshalControlMessage(wire.MessageCraneJobListResponse, encoded)
+	if err != nil {
+		return JobListResponse{}, err
+	}
+	return value.(JobListResponse), nil
+}
+
 // MarshalResultPageRequest emits a canonical result-page request.
 func MarshalResultPageRequest(value ResultPageRequest) ([]byte, error) {
 	return MarshalControlMessage(value)
@@ -2423,7 +2450,7 @@ func unmarshalSubmitRequestWith(encoded []byte, decode topologyDecodeFunc) (Subm
 }
 
 func unmarshalControlMessageWith(messageType wire.MessageType, encoded []byte, decode topologyDecodeFunc) (ControlMessage, error) {
-	if messageType < wire.MessageCraneSubmitRequest || messageType > wire.MessageCraneControlError {
+	if messageType < wire.MessageCraneSubmitRequest || messageType > wire.MessageCraneJobListResponse {
 		return nil, ErrUnexpectedControlMessage
 	}
 	if len(encoded) > MaxControlPayloadBytes {
@@ -2589,6 +2616,25 @@ func (encoder *controlEncoder) pageBinding(value ResultPageRequest) {
 		field("PageBytes", "u32", func() { encoder.u32(value.PageBytes) })
 	})
 }
+func (encoder *controlEncoder) statusSummaryBytes(value StatusResponse) {
+	encoder.job(value.JobID)
+	encoder.u64(value.AppliedIndex)
+	encoder.add(value.TopologyDigest[:])
+	encoder.u64(value.JobControlRevision)
+	encoder.u8(byte(value.State))
+	encoder.bool(value.HasAssignment)
+	encoder.u64(value.AssignmentRevision)
+	encoder.add(value.AssignmentDigest[:])
+	encoder.u16(value.SourceTaskCount)
+	encoder.u16(value.ResultPartitionCount)
+	encoder.u16(value.CompletedSourceTasks)
+	encoder.u16(value.ManifestCount)
+	encoder.bool(value.HasManifestSet)
+	encoder.add(value.ManifestSetDigest[:])
+	encoder.bool(value.HasFailure)
+	encoder.u16(uint16(value.FailureCode))
+	encoder.add(value.FailureDetailDigest[:])
+}
 
 func (encoder *controlEncoder) message(message ControlMessage) error {
 	switch value := message.(type) {
@@ -2674,6 +2720,16 @@ func (encoder *controlEncoder) message(message ControlMessage) error {
 		encoder.field("ResultPage", "ResultPageBinding", func() { encoder.pageBinding(value.ResultPage) })
 		encoder.field("RequiredBytes", "u32", func() { encoder.u32(value.RequiredBytes) })
 		encoder.field("Detail", "bytes16", func() { encoder.bytes16(value.Detail) })
+	case JobListRequest:
+	case JobListResponse:
+		encoder.field("LeaderNodeID", "u16", func() { encoder.u16(value.LeaderNodeID) })
+		encoder.field("AppliedIndex", "u64", func() { encoder.u64(value.AppliedIndex) })
+		encoder.field("Jobs", "list(StatusResponse)", func() {
+			encoder.u16(uint16(len(value.Jobs)))
+			for _, summary := range value.Jobs {
+				encoder.statusSummaryBytes(summary)
+			}
+		})
 	default:
 		return ErrUnexpectedControlMessage
 	}
@@ -2956,6 +3012,10 @@ func (decoder *controlDecoder) message(messageType wire.MessageType) (ControlMes
 		return decoder.leaderRedirect()
 	case wire.MessageCraneControlError:
 		return decoder.controlError()
+	case wire.MessageCraneJobListRequest:
+		return JobListRequest{}, nil
+	case wire.MessageCraneJobListResponse:
+		return decoder.jobListResponse()
 	default:
 		return nil, ErrUnexpectedControlMessage
 	}
@@ -3028,6 +3088,39 @@ func (decoder *controlDecoder) statusResponse() (ControlMessage, error) {
 	}
 	failureDigest, err := decoder.digest()
 	return StatusResponse{JobID: job, AppliedIndex: applied, TopologyDigest: topology, JobControlRevision: jobRevision, State: JobState(state), HasAssignment: hasAssignment, AssignmentRevision: assignmentRevision, AssignmentDigest: assignmentDigest, SourceTaskCount: sources, ResultPartitionCount: resultPartitions, CompletedSourceTasks: completed, ManifestCount: manifests, HasManifestSet: hasManifest, ManifestSetDigest: manifestDigest, HasFailure: hasFailure, FailureCode: model.FailureCode(failureCode), FailureDetailDigest: failureDigest}, err
+}
+
+const minStatusSummaryBytes = 16 + 8 + 32 + 8 + 1 + 1 + 8 + 32 + 2 + 2 + 2 + 2 + 1 + 32 + 1 + 2 + 32
+
+func (decoder *controlDecoder) jobListResponse() (ControlMessage, error) {
+	leader, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	applied, err := decoder.u64()
+	if err != nil {
+		return nil, err
+	}
+	count, err := decoder.u16()
+	if err != nil {
+		return nil, err
+	}
+	if int(count) > decoder.remaining()/minStatusSummaryBytes {
+		return nil, fmt.Errorf("%w: job count %d exceeds remaining bytes", ErrMalformedControlMessage, count)
+	}
+	jobs := make([]StatusResponse, 0, count)
+	for index := uint16(0); index < count; index++ {
+		summary, err := decoder.statusResponse()
+		if err != nil {
+			return nil, err
+		}
+		status, ok := summary.(StatusResponse)
+		if !ok {
+			return nil, ErrMalformedControlMessage
+		}
+		jobs = append(jobs, status)
+	}
+	return JobListResponse{LeaderNodeID: leader, AppliedIndex: applied, Jobs: jobs}, nil
 }
 
 func (decoder *controlDecoder) resultPageResponse() (ControlMessage, error) {

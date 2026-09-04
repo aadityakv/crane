@@ -119,7 +119,7 @@ func TestCraneBinaryFramesRoundTrip(t *testing.T) {
 
 func TestCraneReservedAndUnknownRegionMessagesAreRejected(t *testing.T) {
 	auth := NewHMACAuthenticator(testKey)
-	for _, message := range []MessageType{MessageCraneWorkerReserved, 220, 239, 250, 279, 283, 299} {
+	for _, message := range []MessageType{MessageCraneWorkerReserved, 220, 239, 252, 279, 283, 299} {
 		t.Run(fmt.Sprint(message), func(t *testing.T) {
 			header := testHeader()
 			header.Message = message
@@ -460,6 +460,7 @@ func activeCraneMessageTypesForTest() []MessageType {
 		MessageCraneStatusRequest, MessageCraneStatusResponse,
 		MessageCraneResultPageRequest, MessageCraneResultPageResponse,
 		MessageCraneLeaderRedirect, MessageCraneControlError,
+		MessageCraneJobListRequest, MessageCraneJobListResponse,
 		MessageCraneTupleDelivery, MessageCraneTupleDeliveryAck, MessageCraneTupleDeliveryNack,
 	}
 }

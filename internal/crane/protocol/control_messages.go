@@ -220,6 +220,25 @@ type StatusResponse struct {
 // MessageType returns the stable status-response ID.
 func (StatusResponse) MessageType() wire.MessageType { return wire.MessageCraneStatusResponse }
 
+// JobListRequest asks for every retained-job summary in one atomic read.
+type JobListRequest struct{}
+
+// MessageType returns the stable job-list-request ID.
+func (JobListRequest) MessageType() wire.MessageType { return wire.MessageCraneJobListRequest }
+
+// JobListResponse is the complete bounded summary of every retained job.
+type JobListResponse struct {
+	// LeaderNodeID identifies the serving leader after its read barrier.
+	LeaderNodeID uint16
+	// AppliedIndex tags the atomic Crane view used after the read barrier.
+	AppliedIndex uint64
+	// Jobs are complete per-job summaries sorted by JobID.
+	Jobs []StatusResponse
+}
+
+// MessageType returns the stable job-list-response ID.
+func (JobListResponse) MessageType() wire.MessageType { return wire.MessageCraneJobListResponse }
+
 // ResultPageRequest names a stateless global result cursor.
 type ResultPageRequest struct {
 	// JobID names the retained job.
@@ -404,6 +423,20 @@ func ValidateStatusErrorCorrelation(request StatusRequest, controlError ControlE
 	return nil
 }
 
+// ValidateJobListErrorCorrelation binds an error to one stateless job-list request.
+func ValidateJobListErrorCorrelation(request JobListRequest, controlError ControlError) error {
+	if err := validateControlMessage(request); err != nil {
+		return err
+	}
+	if err := validateControlError(controlError); err != nil {
+		return err
+	}
+	if controlError.RelatedMessage != wire.MessageCraneJobListRequest || controlError.HasClientRequest || controlError.HasStatusRequest || controlError.HasResultPage {
+		return errors.New("job-list error does not bind the exact request")
+	}
+	return nil
+}
+
 // ValidateResultPageErrorCorrelation binds an error to one exact stateless page request.
 func ValidateResultPageErrorCorrelation(request ResultPageRequest, controlError ControlError) error {
 	if err := validateControlMessage(request); err != nil {
@@ -471,6 +504,10 @@ func validateControlMessage(message ControlMessage) error {
 		return value.JobID.Validate()
 	case StatusResponse:
 		return validateStatusResponse(value)
+	case JobListRequest:
+		return nil
+	case JobListResponse:
+		return validateJobListResponse(value)
 	case ResultPageRequest:
 		return validateResultPageRequest(value)
 	case ResultPageResponse:
@@ -481,6 +518,24 @@ func validateControlMessage(message ControlMessage) error {
 		return validateControlError(value)
 	default:
 		return ErrUnexpectedControlMessage
+	}
+	return nil
+}
+
+func validateJobListResponse(value JobListResponse) error {
+	if value.LeaderNodeID == 0 {
+		return errors.New("job list has no leader")
+	}
+	for index := range value.Jobs {
+		if err := validateStatusResponse(value.Jobs[index]); err != nil {
+			return errors.New("invalid job summary")
+		}
+		if index > 0 && bytes.Compare(value.Jobs[index-1].JobID[:], value.Jobs[index].JobID[:]) >= 0 {
+			return errors.New("job summaries are not strictly ascending")
+		}
+	}
+	if len(value.Jobs) > 0 && value.AppliedIndex == 0 {
+		return errors.New("job list without an applied index")
 	}
 	return nil
 }
@@ -661,7 +716,7 @@ func validateControlError(value ControlError) error {
 		return errors.New("control error bindings are mutually exclusive")
 	}
 	switch value.RelatedMessage {
-	case wire.MessageCraneSubmitRequest, wire.MessageCraneCancelRequest, wire.MessageCraneStatusRequest, wire.MessageCraneResultPageRequest:
+	case wire.MessageCraneSubmitRequest, wire.MessageCraneCancelRequest, wire.MessageCraneStatusRequest, wire.MessageCraneResultPageRequest, wire.MessageCraneJobListRequest:
 	default:
 		return errors.New("control error relates to a non-request message")
 	}
@@ -686,7 +741,11 @@ func validateControlError(value ControlError) error {
 	} else if value.ResultPage != (ResultPageRequest{}) {
 		return errors.New("unselected page binding is nonzero")
 	}
-	if selectors == 0 && !predecodeControlError(value.Code) {
+	if selectors == 0 && value.RelatedMessage == wire.MessageCraneJobListRequest {
+		if value.Code != ControlErrorStarting && value.Code != ControlErrorNotLeader {
+			return errors.New("job-list error code is incompatible with the stateless binding")
+		}
+	} else if selectors == 0 && !predecodeControlError(value.Code) {
 		return errors.New("unbound error is not a predecode rejection")
 	}
 	if selectors > 0 && !controlErrorCodeCompatible(value.RelatedMessage, value.Code) {
@@ -719,6 +778,8 @@ func controlErrorCodeCompatible(message wire.MessageType, code ControlErrorCode)
 		return code == ControlErrorNotFound
 	case wire.MessageCraneResultPageRequest:
 		return code == ControlErrorNotFound || code == ControlErrorPageLimitTooSmall || code == ControlErrorResultUnavailable || code == ControlErrorCorruptResult
+	case wire.MessageCraneJobListRequest:
+		return false
 	default:
 		return false
 	}

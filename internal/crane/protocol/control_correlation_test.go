@@ -303,6 +303,7 @@ func TestEveryFingerprintedPublicControlRuleHasBlackBoxCoverage(t *testing.T) {
 	badSelectors.ClientDigest = fixture.submitDigest
 	badMutationError := ControlError{RelatedMessage: wire.MessageCraneSubmitRequest, Code: ControlErrorCapacityExhausted, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.cancelDigest}
 	badMatrixError := ControlError{RelatedMessage: wire.MessageCraneStatusRequest, Code: ControlErrorIdentityReuse, HasStatusRequest: true, StatusJobID: fixture.job}
+	badJobListError := ControlError{RelatedMessage: wire.MessageCraneJobListRequest, Code: ControlErrorNotLeader, HasStatusRequest: true, StatusJobID: fixture.job}
 	unboundStarting := ControlError{RelatedMessage: wire.MessageCraneSubmitRequest, Code: ControlErrorStarting}
 	unknownState := fixture.statusResponse
 	unknownState.State = 99
@@ -370,6 +371,7 @@ func TestEveryFingerprintedPublicControlRuleHasBlackBoxCoverage(t *testing.T) {
 		},
 		"control-error-request-type-and-code-follow-the-fingerprinted-compatibility-matrix":                  reject(badMatrixError),
 		"unbound-control-errors-are-limited-to-malformed-unsupported-schema-or-invalid-request-before-trust": reject(unboundStarting),
+		"job-list-errors-bind-only-the-related-request-without-a-selector":                                   reject(badJobListError),
 		"decoded-variable-values-are-owned": func(t *testing.T) {
 			encoded, _ := MarshalControlError(fixture.controlError)
 			decoded, err := UnmarshalControlError(encoded)
