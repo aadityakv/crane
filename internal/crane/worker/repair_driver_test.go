@@ -216,12 +216,18 @@ func (fixture *repairDriverFixture) sourceRepair(t *testing.T) store.ResultRepai
 // the simulated clock in small quanta until condition holds.
 func (fixture *repairDriverFixture) advanceUntil(condition func() bool) bool {
 	deadline := fixture.clock.Now().Add(2 * time.Minute)
-	for !condition() {
+	for iteration := 0; !condition(); iteration++ {
 		if fixture.clock.Now().After(deadline) {
 			return false
 		}
 		fixture.clock.Advance(10 * time.Millisecond)
 		runtime.Gosched()
+		if iteration%8 == 7 {
+			// Yielding alone does not guarantee the driver goroutine runs on
+			// a small CI runner before the virtual budget is spent; grant a
+			// sliver of wall time periodically.
+			time.Sleep(200 * time.Microsecond)
+		}
 	}
 	return true
 }
