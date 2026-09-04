@@ -1,4 +1,4 @@
-// Package control owns Crane's public +6 control-plane logic. This file
+// Package control owns Crane's public +4 control-plane logic. This file
 // tests the memory-bounded global result-page query engine.
 package control
 

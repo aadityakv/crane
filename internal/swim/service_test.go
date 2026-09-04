@@ -81,7 +81,7 @@ func TestServiceRecognizesCanonicalSelfIntroducer(t *testing.T) {
 	configuration := serviceTestConfig(t, 1)
 	configuration.AdvertiseHost = "LOCALHOST."
 	configuration.Introducer = config.Endpoint{Host: "localhost", Port: configuration.BasePort + 2}.String()
-	configuration.RaftVoters[0].Endpoint = config.Endpoint{Host: "localhost", Port: configuration.BasePort + 8}.String()
+	configuration.RaftVoters[0].Endpoint = config.Endpoint{Host: "localhost", Port: configuration.BasePort + 6}.String()
 	if err := configuration.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -2567,9 +2567,9 @@ func serviceTestConfig(t *testing.T, nodeID uint16) config.NodeConfig {
 		Raft:              config.DefaultRaftConfig(),
 		Crane:             config.DefaultCraneConfig(),
 		RaftVoters: []config.RaftVoter{
-			{NodeID: nodeID, Endpoint: config.Endpoint{Host: "127.0.0.1", Port: basePort + 8}.String()},
-			{NodeID: nodeID + 100, Endpoint: "127.0.0.2:30008"},
-			{NodeID: nodeID + 200, Endpoint: "127.0.0.3:30108"},
+			{NodeID: nodeID, Endpoint: config.Endpoint{Host: "127.0.0.1", Port: basePort + 6}.String()},
+			{NodeID: nodeID + 100, Endpoint: "127.0.0.2:30006"},
+			{NodeID: nodeID + 200, Endpoint: "127.0.0.3:30106"},
 		},
 	}
 	snapshotEndpoint, err := configuration.AdvertiseEndpoint(config.ServiceSWIMSnapshot)
@@ -2606,7 +2606,7 @@ func reserveServiceTestBase(t *testing.T) uint16 {
 		serviceTestPortsMu.Lock()
 		overlaps := false
 		for _, used := range serviceTestBases {
-			if uint32(candidate) <= uint32(used)+8 && uint32(used) <= uint32(candidate)+8 {
+			if uint32(candidate) <= uint32(used)+6 && uint32(used) <= uint32(candidate)+6 {
 				overlaps = true
 				break
 			}

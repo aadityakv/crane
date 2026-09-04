@@ -28,7 +28,7 @@ const (
 	MaxEncodedResultRecordBytes = model.PublicControlMaxEncodedResultRecordBytesV1
 	// MaxLeaderRedirectEndpoints is the fixed five-voter ceiling.
 	MaxLeaderRedirectEndpoints = model.PublicControlMaxRedirectEndpointsV1
-	// MaxControlEndpointBytes bounds one canonical +6 host:port spelling.
+	// MaxControlEndpointBytes bounds one canonical +4 host:port spelling.
 	MaxControlEndpointBytes = model.PublicControlMaxEndpointBytesV1
 	// MaxControlErrorDetailBytes bounds typed error detail.
 	MaxControlErrorDetailBytes = model.PublicControlMaxErrorDetailBytesV1
@@ -37,9 +37,9 @@ const (
 var (
 	// ErrMalformedControlMessage classifies truncated, trailing, or noncanonical payloads.
 	ErrMalformedControlMessage = errors.New("malformed Crane public-control message")
-	// ErrUnsupportedControlSchema classifies an unknown +6 payload schema.
+	// ErrUnsupportedControlSchema classifies an unknown +4 payload schema.
 	ErrUnsupportedControlSchema = errors.New("unsupported Crane public-control schema")
-	// ErrUnexpectedControlMessage classifies an unknown or mismatched +6 message type.
+	// ErrUnexpectedControlMessage classifies an unknown or mismatched +4 message type.
 	ErrUnexpectedControlMessage = errors.New("unexpected Crane public-control message type")
 	// ErrInvalidControlMessage classifies a well-formed payload violating its schema.
 	ErrInvalidControlMessage = errors.New("invalid Crane public-control message")
@@ -283,7 +283,7 @@ func (ResultPageResponse) MessageType() wire.MessageType { return wire.MessageCr
 
 // LeaderRedirect returns one known leader or the complete static voter alternatives.
 type LeaderRedirect struct {
-	// Endpoints contains exactly one, three, or five sorted unique canonical +6 endpoints.
+	// Endpoints contains exactly one, three, or five sorted unique canonical +4 endpoints.
 	Endpoints []string
 }
 

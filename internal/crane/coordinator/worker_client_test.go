@@ -18,7 +18,7 @@ import (
 
 var testClusterID = [16]byte{0xC1}
 
-// scriptedControlServer speaks the authenticated +5 framing for one worker.
+// scriptedControlServer speaks the authenticated +3 framing for one worker.
 type scriptedControlServer struct {
 	t         *testing.T
 	listener  net.Listener
@@ -108,7 +108,7 @@ func (server *scriptedControlServer) serve(connection net.Conn) {
 
 func (server *scriptedControlServer) member() swim.Member {
 	port := server.listener.Addr().(*net.TCPAddr).Port
-	return swim.Member{NodeID: server.nodeID, Host: "127.0.0.1", BasePort: uint16(port - 5), Incarnation: 1, Status: swim.Alive}
+	return swim.Member{NodeID: server.nodeID, Host: "127.0.0.1", BasePort: uint16(port - 3), Incarnation: 1, Status: swim.Alive}
 }
 
 func (server *scriptedControlServer) messages() []protocol.WorkerMessage {

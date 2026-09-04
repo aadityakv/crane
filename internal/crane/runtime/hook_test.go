@@ -14,7 +14,7 @@ func (markerHook) DatagramAction(integrationhook.Direction, wire.MessageType) in
 }
 
 // TestNewThreadsIntegrationHookIntoWorkerComposition proves the runtime hands
-// exactly one hook to the worker service (store boundaries and the real +7
+// exactly one hook to the worker service (store boundaries and the real +5
 // paths) and that the ordinary build's default is the production no-op
 // loaded from LoadFromInheritedFD, never an activated seam.
 func TestNewThreadsIntegrationHookIntoWorkerComposition(t *testing.T) {

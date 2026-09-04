@@ -204,8 +204,8 @@ func applyRandomFaultAction(cluster *simCluster, schedule *randomScheduleState, 
 	action := cluster.randomChoice(10)
 	switch {
 	case action < 2 && tupleTraffic:
-		// Bounded +7 drop window toward one random victim. Tracked only when
-		// the victim actually sent +7 traffic inside the window; an
+		// Bounded +5 drop window toward one random victim. Tracked only when
+		// the victim actually sent +5 traffic inside the window; an
 		// unconsumed window is a no-op, not an injected fault.
 		victim := cluster.ids[cluster.randomChoice(len(cluster.ids))]
 		name := fmt.Sprintf("rand-drop-%d", victim)
@@ -332,7 +332,7 @@ func anyRuleConsumed(rules []*datagramRule) func() bool {
 }
 
 // tupleTrafficActive reports whether any live store still has an
-// unacknowledged +7 outbox, so datagram faults can actually consume.
+// unacknowledged +5 outbox, so datagram faults can actually consume.
 func (cluster *simCluster) tupleTrafficActive(job model.JobID) bool {
 	for _, id := range cluster.ids {
 		handle := cluster.workerStore(id)

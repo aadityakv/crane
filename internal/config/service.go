@@ -21,15 +21,11 @@ const (
 	ServiceSWIMACK
 	// ServiceSWIMSnapshot carries join and membership snapshot exchanges.
 	ServiceSWIMSnapshot
-	// ServiceFileRPC reserves the future distributed-file RPC endpoint.
-	ServiceFileRPC
-	// ServiceGrepRPC reserves the future distributed-grep RPC endpoint.
-	ServiceGrepRPC
-	// ServiceCraneWorker reserves the future Crane worker-control endpoint.
+	// ServiceCraneWorker carries coordinator-to-worker control sessions and worker-to-worker result transfer.
 	ServiceCraneWorker
-	// ServiceTopologyControl reserves the future topology-control endpoint.
+	// ServiceTopologyControl carries the public client API (submit, cancel, status, results).
 	ServiceTopologyControl
-	// ServiceCraneTupleACK reserves the future Crane tuple-acknowledgment endpoint.
+	// ServiceCraneTupleACK carries authenticated tuple deliveries and their acknowledgments.
 	ServiceCraneTupleACK
 	// ServiceRaftRPC identifies the active fixed-voter Raft RPC endpoint.
 	ServiceRaftRPC
@@ -47,16 +43,14 @@ type ServiceSpec struct {
 	Transport Transport
 }
 
-var serviceSpecs = [9]ServiceSpec{
+var serviceSpecs = [7]ServiceSpec{
 	{Service: ServiceSWIMPing, Name: "swim-ping", Offset: 0, Transport: TransportUDP},
 	{Service: ServiceSWIMACK, Name: "swim-ack", Offset: 1, Transport: TransportUDP},
 	{Service: ServiceSWIMSnapshot, Name: "swim-snapshot", Offset: 2, Transport: TransportTCP},
-	{Service: ServiceFileRPC, Name: "file-rpc", Offset: 3, Transport: TransportTCP},
-	{Service: ServiceGrepRPC, Name: "grep-rpc", Offset: 4, Transport: TransportTCP},
-	{Service: ServiceCraneWorker, Name: "crane-worker", Offset: 5, Transport: TransportTCP},
-	{Service: ServiceTopologyControl, Name: "topology-control", Offset: 6, Transport: TransportTCP},
-	{Service: ServiceCraneTupleACK, Name: "crane-tuple-ack", Offset: 7, Transport: TransportUDP},
-	{Service: ServiceRaftRPC, Name: "raft-rpc", Offset: 8, Transport: TransportTCP},
+	{Service: ServiceCraneWorker, Name: "crane-worker", Offset: 3, Transport: TransportTCP},
+	{Service: ServiceTopologyControl, Name: "topology-control", Offset: 4, Transport: TransportTCP},
+	{Service: ServiceCraneTupleACK, Name: "crane-tuple-ack", Offset: 5, Transport: TransportUDP},
+	{Service: ServiceRaftRPC, Name: "raft-rpc", Offset: 6, Transport: TransportTCP},
 }
 
 // Services returns a copy of the authoritative service registry.

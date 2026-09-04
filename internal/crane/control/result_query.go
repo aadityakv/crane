@@ -1,6 +1,6 @@
-// Package control owns Crane's public +6 control-plane logic: the
+// Package control owns Crane's public +4 control-plane logic: the
 // memory-bounded global result-page query engine over committed manifests.
-// The +6 TCP service itself is built by a later task; this package provides
+// The +4 TCP service itself is built by a later task; this package provides
 // its verified, transport-independent core.
 package control
 
@@ -55,7 +55,7 @@ type RecordStream interface {
 }
 
 // ResultFetcher opens one sealed partition copy for streaming. Production
-// wiring speaks the authenticated +5 leader fetch; Task 21 binds it to the
+// wiring speaks the authenticated +3 leader fetch; Task 21 binds it to the
 // committed manifest identity and barrier semantics.
 type ResultFetcher interface {
 	// OpenPartition opens the requested replica copy of one sealed artifact.

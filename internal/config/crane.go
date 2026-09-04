@@ -19,10 +19,10 @@ type CraneConfig struct {
 	// WorkerSlots is the number of task slots this worker offers the cluster
 	// (1..MaxWorkerSlots); placement never exceeds the cluster-wide total.
 	WorkerSlots uint16 `json:"worker_slots"`
-	// WorkerControlTimeout bounds every +5 worker-control and +6
+	// WorkerControlTimeout bounds every +3 worker-control and +4
 	// public-control request exchange, including dial and handshake.
 	WorkerControlTimeout Duration `json:"worker_control_timeout"`
-	// TupleRetryInterval is the resend interval for +7 tuple deliveries that
+	// TupleRetryInterval is the resend interval for +5 tuple deliveries that
 	// have not been acknowledged by the destination.
 	TupleRetryInterval Duration `json:"tuple_retry_interval"`
 	// TupleCompletionRetryInterval is the resend interval for completion
@@ -109,7 +109,7 @@ func requiredCraneSnapshotBytes() uint64 {
 	return model.LimitsV1().MaxSnapshotBytes
 }
 
-// CraneControlEndpointFromRaft derives a canonical +6 control endpoint from a canonical +8 voter endpoint.
+// CraneControlEndpointFromRaft derives a canonical +4 control endpoint from a canonical +6 voter endpoint.
 func CraneControlEndpointFromRaft(raft Endpoint) (Endpoint, error) {
 	canonical, err := CanonicalEndpoint(raft)
 	if err != nil {
@@ -127,7 +127,7 @@ func CraneControlEndpointFromRaft(raft Endpoint) (Endpoint, error) {
 		return Endpoint{}, fmt.Errorf("invalid service registry for Crane control derivation")
 	}
 	if canonical.Port < raftSpec.Offset {
-		return Endpoint{}, fmt.Errorf("raft endpoint port %d is below required +8 to +6 offset", canonical.Port)
+		return Endpoint{}, fmt.Errorf("raft endpoint port %d is below required +6 to +4 offset", canonical.Port)
 	}
 	return Endpoint{Host: canonical.Host, Port: canonical.Port - (raftSpec.Offset - controlSpec.Offset)}, nil
 }

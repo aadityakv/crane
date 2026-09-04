@@ -329,7 +329,7 @@ func tupleTestConfig(t *testing.T) config.NodeConfig {
 	configuration := config.NodeConfig{
 		NodeID: 1, ClusterID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", BindHost: "127.0.0.1", AdvertiseHost: "127.0.0.1",
 		BasePort: 19100, Introducer: "127.0.0.1:19102", StorageDir: t.TempDir(), ClusterSecretFile: secret,
-		RaftVoters: []config.RaftVoter{{NodeID: 1, Endpoint: "127.0.0.1:19108"}, {NodeID: 2, Endpoint: "127.0.0.2:19208"}, {NodeID: 3, Endpoint: "127.0.0.3:19308"}},
+		RaftVoters: []config.RaftVoter{{NodeID: 1, Endpoint: "127.0.0.1:19106"}, {NodeID: 2, Endpoint: "127.0.0.2:19206"}, {NodeID: 3, Endpoint: "127.0.0.3:19306"}},
 		Raft:       config.DefaultRaftConfig(), Crane: config.DefaultCraneConfig(), Timing: config.DefaultTimingConfig(),
 	}
 	if err := configuration.Validate(); err != nil {

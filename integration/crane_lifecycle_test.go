@@ -570,7 +570,7 @@ func (c *craneCluster) assertRulesConsumed() {
 // Public client ---------------------------------------------------------------
 
 // identity is the member the harness authenticates as: the lowest node
-// whose process is currently running. +6 and +5 fail closed on senders that
+// whose process is currently running. +4 and +3 fail closed on senders that
 // are not live members, so a fixed identity would go dark whenever that
 // node is the one being crashed.
 func (c *craneCluster) identity() uint16 {
@@ -580,7 +580,7 @@ func (c *craneCluster) identity() uint16 {
 	return 1
 }
 
-// client returns a real +6 client authenticated as the current identity;
+// client returns a real +4 client authenticated as the current identity;
 // one durable client identity store is kept per node identity.
 func (c *craneCluster) client() *control.Client {
 	c.t.Helper()
@@ -621,7 +621,7 @@ func (c *craneCluster) newClientWithDialRecorder(identity uint16, record func(st
 	return client
 }
 
-// controlEndpoint is a voter's +6 address.
+// controlEndpoint is a voter's +4 address.
 func (c *craneCluster) controlEndpoint(id uint16) string {
 	endpoint, err := c.nodes[id].configuration.AdvertiseEndpoint(config.ServiceTopologyControl)
 	if err != nil {
@@ -630,7 +630,7 @@ func (c *craneCluster) controlEndpoint(id uint16) string {
 	return endpoint.String()
 }
 
-// probeLeadership asks one voter's +6 for an unknown job: a follower answers
+// probeLeadership asks one voter's +4 for an unknown job: a follower answers
 // with a LeaderRedirect, the leader with a bound NotFound-class rejection.
 func (c *craneCluster) probeLeadership(id uint16) (isLeader bool, err error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
@@ -703,7 +703,7 @@ func (c *craneCluster) awaitLeader(voters ...uint16) uint16 {
 			c.t.Logf("last leadership probes: %v", last)
 		}
 	}()
-	// +6 admits at most four concurrent connections per source address and
+	// +4 admits at most four concurrent connections per source address and
 	// closes the rest before reading; probe at a civil rate so the harness
 	// never starves its own probes during an election.
 	err := waitCondition(ctx, 250*time.Millisecond, func() (bool, error) {
@@ -975,7 +975,7 @@ func (c *craneCluster) awaitSucceeded(job craneJob, timeout time.Duration) proto
 	})
 }
 
-// results pages the complete result set through the +6 protocol.
+// results pages the complete result set through the +4 protocol.
 func (c *craneCluster) results(job craneJob) []model.ResultRecord {
 	c.t.Helper()
 	status := c.status(job)
@@ -1292,7 +1292,7 @@ func TestCraneLifecycle(t *testing.T) {
 	})
 
 	cluster.phase("submit_through_follower", func() {
-		// The public client always starts at the lowest-sorted voter +6
+		// The public client always starts at the lowest-sorted voter +4
 		// endpoint. When that voter currently leads, step it down gracefully
 		// so the submission provably enters through a follower and follows
 		// the redirect to the leader.
@@ -1359,7 +1359,7 @@ func TestCraneLifecycle(t *testing.T) {
 		}
 		raftEndpoint, _ := cluster.nodes[4].configuration.BindEndpoint(config.ServiceRaftRPC)
 		if !endpointBindable(raftEndpoint, config.TransportTCP) {
-			cluster.fatalf("nonvoter 4 holds its +8 endpoint %s", raftEndpoint)
+			cluster.fatalf("nonvoter 4 holds its +6 endpoint %s", raftEndpoint)
 		}
 	})
 
@@ -2167,7 +2167,7 @@ func TestCraneLifecycleFingerprintMismatch(t *testing.T) {
 		cluster.verifyResults(job)
 		// The variant voter never learned a leader: its handshake with the
 		// production voters fails before it counts for RPC contact, votes,
-		// or quorum, so its +6 keeps answering "no leader" while the
+		// or quorum, so its +4 keeps answering "no leader" while the
 		// production pair served a whole job.
 		for probe := 0; probe < 5; probe++ {
 			isLeader, err := cluster.probeLeadership(3)
@@ -2179,7 +2179,7 @@ func TestCraneLifecycleFingerprintMismatch(t *testing.T) {
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		// Neither variant node was registered or assigned: +5 refused their
+		// Neither variant node was registered or assigned: +3 refused their
 		// registration, so no fence, install, or custody ever reached them.
 		for _, id := range []uint16{3, 4} {
 			for _, name := range []string{store.BoundaryFence, store.BoundaryAssignmentClosed, store.BoundaryAssignmentRunning, store.BoundaryDeliveryReceived, store.BoundaryResultUpserted} {

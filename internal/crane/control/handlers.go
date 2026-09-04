@@ -15,7 +15,7 @@ import (
 	"github.com/aadityakv/crane/internal/wire"
 )
 
-// ErrControlRequestUnauthorized classifies +6 frames that fail cluster,
+// ErrControlRequestUnauthorized classifies +4 frames that fail cluster,
 // membership, source-IP, or replay admission and are dropped without response.
 var ErrControlRequestUnauthorized = errors.New("crane control request unauthorized")
 
@@ -83,7 +83,7 @@ func (service *Service) serveFrame(ctx context.Context, remote net.Addr, frame w
 	return service.dispatch(ctx, message)
 }
 
-// validateControlRequestHeader accepts only canonical +6 request frames.
+// validateControlRequestHeader accepts only canonical +4 request frames.
 func validateControlRequestHeader(clusterID [16]byte, header wire.Header) error {
 	if header.Version != wire.Version1 || header.Codec != wire.CodecBinary || header.ClusterID != clusterID || header.SenderID == 0 || header.RequestID == (wire.RequestID{}) {
 		return ErrControlRequestUnauthorized

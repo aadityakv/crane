@@ -18,7 +18,7 @@ import (
 )
 
 // controlSessionCacheOptions fixes the local identity and dependencies one
-// worker-to-worker +5 session cache dials and authenticates with.
+// worker-to-worker +3 session cache dials and authenticates with.
 type controlSessionCacheOptions struct {
 	ClusterID     [16]byte
 	Authenticator wire.Authenticator
@@ -31,7 +31,7 @@ type controlSessionCacheOptions struct {
 	Dial    func(context.Context, string, string) (net.Conn, error)
 }
 
-// controlSessionCache caches one authenticated +5 session per peer worker
+// controlSessionCache caches one authenticated +3 session per peer worker
 // incarnation for high-rate peer-to-peer streams (result replication, repair
 // pulls). Every handshake commits a request identity into the peer's bounded
 // per-peer replay cache, so a session per record (or per retry) exhausts it

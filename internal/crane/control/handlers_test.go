@@ -219,7 +219,7 @@ func TestSubmitMaximalTopologyBoundsAndOverBoundRejectionBeforePropose(t *testin
 		t.Fatalf("marshal maximal submit request: %v", err)
 	}
 	if len(payload) > protocol.MaxControlPayloadBytes {
-		t.Fatalf("maximal submit payload = %d, exceeds +6 payload bound %d", len(payload), protocol.MaxControlPayloadBytes)
+		t.Fatalf("maximal submit payload = %d, exceeds +4 payload bound %d", len(payload), protocol.MaxControlPayloadBytes)
 	}
 	view := fixture.machine.View()
 	command, err := state.NewSubmitJob(request.Request, topology, view.CoordinatorEpoch)

@@ -51,7 +51,7 @@ type serviceTransport interface {
 type serviceStoreOpener func(string, StorageIdentity, VoterSet, StoreOptions) (StableStore, error)
 type serviceTransportFactory func(TCPTransportOptions) (serviceTransport, error)
 
-// Service composes durable recovery, authenticated +8 TCP ownership, and one serialized Node.
+// Service composes durable recovery, authenticated +6 TCP ownership, and one serialized Node.
 type Service struct {
 	options       ServiceOptions
 	voters        VoterSet
@@ -126,7 +126,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 // Name returns the supervisor registration name.
 func (*Service) Name() string { return "raft" }
 
-// Ready closes after recovery, exact +8 binding, transport ownership, and Node owner startup.
+// Ready closes after recovery, exact +6 binding, transport ownership, and Node owner startup.
 func (service *Service) Ready() <-chan struct{} {
 	if service == nil {
 		return nil
@@ -170,7 +170,7 @@ func (service *Service) SubscribeLeadership(ctx context.Context, capacity int) (
 	return service.node.Load().SubscribeLeadership(ctx, capacity)
 }
 
-// Run recovers before binding +8, then starts transport ownership before the Node owner.
+// Run recovers before binding +6, then starts transport ownership before the Node owner.
 func (service *Service) Run(ctx context.Context) (runErr error) {
 	if service == nil || ctx == nil {
 		return fmt.Errorf("%w: nil service or context", ErrInvalidCoreState)

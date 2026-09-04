@@ -235,7 +235,7 @@ func reserveConfiguredRaftEndpoint(t *testing.T, configuration *config.NodeConfi
 			_ = listener.Close()
 			continue
 		}
-		configuration.BasePort = uint16(port - 8)
+		configuration.BasePort = uint16(port - 6)
 		if _, voter := configuration.RaftVoterByID(configuration.NodeID); voter {
 			for index := range configuration.RaftVoters {
 				if configuration.RaftVoters[index].NodeID == configuration.NodeID {
@@ -401,9 +401,9 @@ func writeNodeTestConfig(t *testing.T) config.NodeConfig {
 		StorageDir:        storageDir,
 		ClusterSecretFile: secretFile,
 		RaftVoters: []config.RaftVoter{
-			{NodeID: 1, Endpoint: "127.0.0.1:8008"},
-			{NodeID: 2, Endpoint: "127.0.0.1:8108"},
-			{NodeID: 3, Endpoint: "127.0.0.1:8208"},
+			{NodeID: 1, Endpoint: "127.0.0.1:8006"},
+			{NodeID: 2, Endpoint: "127.0.0.1:8106"},
+			{NodeID: 3, Endpoint: "127.0.0.1:8206"},
 		},
 		Timing: config.DefaultTimingConfig(),
 		Raft:   config.DefaultRaftConfig(),

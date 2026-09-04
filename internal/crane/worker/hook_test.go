@@ -110,7 +110,7 @@ func TestTupleEndpointConsultsHookOnRealSendPath(t *testing.T) {
 	source, _ := configuration.BindEndpoint(config.ServiceCraneTupleACK)
 	for index, sent := range sends {
 		if sent.source != source {
-			t.Fatalf("send %d left source %s, want the bound +7 endpoint %s", index, sent.source, source)
+			t.Fatalf("send %d left source %s, want the bound +5 endpoint %s", index, sent.source, source)
 		}
 	}
 	if !bytes.Equal(sends[0].payload, sends[1].payload) {

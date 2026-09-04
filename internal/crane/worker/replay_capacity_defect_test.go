@@ -19,7 +19,7 @@ import (
 //	    message 200 rejected with code 1   (43x, plus 44x on node 1)
 //	T25DBG controlError msg=200 raw=wire replay cache full
 //
-// Defect: the coordinator's +5 dial client opens one TCP connection per
+// Defect: the coordinator's +3 dial client opens one TCP connection per
 // command, and every authenticated handshake on a fresh connection commits one
 // entry into the worker's per-sender replay guard for a full ReplayWindow.
 // With the mandated coordinator pacing (DefaultRescanInterval 500ms drives

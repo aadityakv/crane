@@ -23,13 +23,13 @@ const tupleIngressQueueSize = 4096
 // TupleServiceOptions binds exactly one TupleEndpoint to the Engine that uses
 // that same endpoint as its durable outbox Sender.
 type TupleServiceOptions struct {
-	// Endpoint is the single local owner of the +7 socket.
+	// Endpoint is the single local owner of the +5 socket.
 	Endpoint *TupleEndpoint
 	// Engine receives validated deliveries and ACKs from this service.
 	Engine *Engine
 }
 
-// TupleService activates and receives from exactly one +7 endpoint.
+// TupleService activates and receives from exactly one +5 endpoint.
 type TupleService struct {
 	endpoint *TupleEndpoint
 	engine   *Engine
@@ -53,7 +53,7 @@ func NewTupleService(options TupleServiceOptions) (*TupleService, error) {
 	return &TupleService{endpoint: options.Endpoint, engine: options.Engine, replay: newTupleReplay(options.Endpoint.clock, time.Duration(options.Endpoint.configuration.Timing.ReplayWindow), config.ReplayFutureSkewAllowance, tupleReplayEntries, tupleReplayEntriesPerSender), ready: make(chan struct{})}, nil
 }
 
-// Ready closes after the one +7 datagram has been activated for sends and receives.
+// Ready closes after the one +5 datagram has been activated for sends and receives.
 func (service *TupleService) Ready() <-chan struct{} { return service.ready }
 
 // Run activates the endpoint once and receives until cancellation or a fatal
@@ -113,7 +113,7 @@ func (service *TupleService) Run(ctx context.Context) (runErr error) {
 			if errors.Is(receiveErr, transport.ErrDatagramClosed) {
 				return receiveErr
 			}
-			return fmt.Errorf("receive Crane +7 datagram: %w", receiveErr)
+			return fmt.Errorf("receive Crane +5 datagram: %w", receiveErr)
 		case packet := <-packets:
 			if processErr := service.process(ctx, datagram, packet); processErr != nil {
 				return processErr
@@ -131,7 +131,7 @@ func (service *TupleService) process(ctx context.Context, datagram transport.Sou
 		return nil
 	}
 	timestamp := time.UnixMilli(frame.Header.TimestampMillis)
-	// Every +7 handler is idempotent by construction (custody is deduplicated
+	// Every +5 handler is idempotent by construction (custody is deduplicated
 	// by durable delivery identity; ACK/NACK are idempotent transitions), so
 	// the replay guard is a cost bound, not a correctness gate. When an
 	// authenticated peer's legitimate retry rate exhausts its bounded replay

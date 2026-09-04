@@ -15,12 +15,10 @@ func TestServiceRegistryMatchesApprovedLayout(t *testing.T) {
 		{Service: ServiceSWIMPing, Name: "swim-ping", Offset: 0, Transport: TransportUDP},
 		{Service: ServiceSWIMACK, Name: "swim-ack", Offset: 1, Transport: TransportUDP},
 		{Service: ServiceSWIMSnapshot, Name: "swim-snapshot", Offset: 2, Transport: TransportTCP},
-		{Service: ServiceFileRPC, Name: "file-rpc", Offset: 3, Transport: TransportTCP},
-		{Service: ServiceGrepRPC, Name: "grep-rpc", Offset: 4, Transport: TransportTCP},
-		{Service: ServiceCraneWorker, Name: "crane-worker", Offset: 5, Transport: TransportTCP},
-		{Service: ServiceTopologyControl, Name: "topology-control", Offset: 6, Transport: TransportTCP},
-		{Service: ServiceCraneTupleACK, Name: "crane-tuple-ack", Offset: 7, Transport: TransportUDP},
-		{Service: ServiceRaftRPC, Name: "raft-rpc", Offset: 8, Transport: TransportTCP},
+		{Service: ServiceCraneWorker, Name: "crane-worker", Offset: 3, Transport: TransportTCP},
+		{Service: ServiceTopologyControl, Name: "topology-control", Offset: 4, Transport: TransportTCP},
+		{Service: ServiceCraneTupleACK, Name: "crane-tuple-ack", Offset: 5, Transport: TransportUDP},
+		{Service: ServiceRaftRPC, Name: "raft-rpc", Offset: 6, Transport: TransportTCP},
 	}
 	got := Services()
 	if len(got) != len(want) {
@@ -66,7 +64,7 @@ func TestServiceRegistryHasUniqueFields(t *testing.T) {
 			return true
 		}},
 		{name: "offset range", check: func(spec ServiceSpec, _ map[Service]bool, _ map[string]bool, _ map[uint16]bool) bool {
-			return spec.Offset <= 8
+			return spec.Offset <= 6
 		}},
 	}
 	for _, check := range checks {
@@ -89,9 +87,9 @@ func TestLookupServiceRejectsUnknownIDs(t *testing.T) {
 		service Service
 		found   bool
 	}{
-		{name: "registered", service: ServiceFileRPC, found: true},
+		{name: "registered", service: ServiceCraneWorker, found: true},
 		{name: "negative", service: Service(^uint8(0)), found: false},
-		{name: "after registry", service: Service(9), found: false},
+		{name: "after registry", service: Service(7), found: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

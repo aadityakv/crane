@@ -87,7 +87,7 @@ func joinProbeStrings(parts []string) string {
 
 // runStallProbe drives the crash-received shape with bounded awaits and
 // periodic world dumps. dropAck selects whether the crashed node's outbound
-// +7 datagrams are dropped (the ACK-loss fault); crashTarget 0 picks
+// +5 datagrams are dropped (the ACK-loss fault); crashTarget 0 picks
 // whichever node first holds a Received delivery (the scenario's own rule).
 // The wedge requires that node to be the current Raft leader — the real-TCP
 // interleavings decide placement per seed, so the hunt loops a few seeds.

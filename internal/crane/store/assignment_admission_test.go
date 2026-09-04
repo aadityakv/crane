@@ -10,7 +10,7 @@ import (
 
 // seedAdmissionWorkForTest fences one epoch and installs the complete
 // assignment set in the requested worker-local scheduling state at the given
-// JobControlRevision, exactly the coordinator's +5 install protocol shape.
+// JobControlRevision, exactly the coordinator's +3 install protocol shape.
 func seedAdmissionWorkForTest(t *testing.T, store *Store, identity Identity, scheduling model.SchedulingState, jobControlRevision uint64) (model.ValidatedTopology, model.AssignmentSet, model.CoordinatorEpoch) {
 	t.Helper()
 	topology, assignment, epoch := domainAssignment(t, store.WorkerEpoch(), identity.NodeID)

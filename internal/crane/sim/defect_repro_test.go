@@ -23,8 +23,8 @@ import (
 //
 //	coordinator.activateJob        internal/crane/coordinator/reconcile.go
 //	  installAssignment(Closed)    -> store.InstallAssignment ... accepted
-//	  resendCheckpointNotices     -> +5 210 notices ... accepted
-//	  repairResults               -> +5 208 inventories ... accepted
+//	  resendCheckpointNotices     -> +3 210 notices ... accepted
+//	  repairResults               -> +3 208 inventories ... accepted
 //	  installAssignment(Running)  -> store.applyAssignment records.go
 //	                                 admission progression ... accepted
 func TestActivationRunningInstallAcceptedAtEqualJobControlRevision(t *testing.T) {

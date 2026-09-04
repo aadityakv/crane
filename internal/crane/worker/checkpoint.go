@@ -155,7 +155,7 @@ func (engine *Engine) pendingCompletion(source model.TaskID) bool {
 
 // applyCheckpoint applies one authenticated committed-watermark notice on the
 // serialized owner under the Task 24 defect #2 ruling. The notice arrived over
-// a valid current-fence authenticated +5 session, so it is the current
+// a valid current-fence authenticated +3 session, so it is the current
 // coordinator's authoritative statement of the replicated committed watermark:
 // CONFIRM (equal) answers an equal-watermark resend without mutation
 // regardless of authority age, CONFIRM (below) answers a stale resend without

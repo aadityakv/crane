@@ -10,15 +10,15 @@
   "raft_voters": [
     {
       "node_id": 1,
-      "endpoint": "127.0.0.1:8008"
+      "endpoint": "127.0.0.1:8006"
     },
     {
       "node_id": 2,
-      "endpoint": "127.0.0.1:8108"
+      "endpoint": "127.0.0.1:8106"
     },
     {
       "node_id": 3,
-      "endpoint": "127.0.0.1:8208"
+      "endpoint": "127.0.0.1:8206"
     }
   ],
   "raft": {

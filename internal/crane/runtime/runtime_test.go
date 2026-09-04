@@ -41,7 +41,7 @@ const runtimeReadyTimeout = 30 * time.Second
 var runtimePortRandom = mathrand.New(mathrand.NewSource(time.Now().UnixNano() ^ int64(os.Getpid())<<20))
 var runtimePortRandomMu sync.Mutex
 
-// reserveRuntimeBasePort finds one base port whose complete +0..+8 service
+// reserveRuntimeBasePort finds one base port whose complete +0..+6 service
 // block is currently bindable on the loopback host. Bases stay below the OS
 // ephemeral port range so concurrent test binaries' outbound connections
 // cannot steal a probed port before the runtime binds it.
@@ -67,14 +67,14 @@ func isBindConflict(err error) bool {
 
 func probeRuntimePortBlock(t *testing.T, base uint16) bool {
 	t.Helper()
-	for _, offset := range []uint16{2, 5, 6, 8} {
+	for _, offset := range []uint16{2, 3, 4, 6} {
 		listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+offset))
 		if err != nil {
 			return false
 		}
 		_ = listener.Close()
 	}
-	for _, offset := range []uint16{0, 1, 7} {
+	for _, offset := range []uint16{0, 1, 5} {
 		connection, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", base+offset))
 		if err != nil {
 			return false
@@ -107,9 +107,9 @@ func runtimeTestConfig(t *testing.T, nodeID uint16, base uint16) config.NodeConf
 		StorageDir:        filepath.Join(t.TempDir(), fmt.Sprintf("node-%d", nodeID)),
 		ClusterSecretFile: secretPath,
 		RaftVoters: []config.RaftVoter{
-			{NodeID: 1, Endpoint: fmt.Sprintf("127.0.0.1:%d", voterBase+8)},
-			{NodeID: 2, Endpoint: fmt.Sprintf("127.0.0.1:%d", voterBase+108)},
-			{NodeID: 3, Endpoint: fmt.Sprintf("127.0.0.1:%d", voterBase+208)},
+			{NodeID: 1, Endpoint: fmt.Sprintf("127.0.0.1:%d", voterBase+6)},
+			{NodeID: 2, Endpoint: fmt.Sprintf("127.0.0.1:%d", voterBase+106)},
+			{NodeID: 3, Endpoint: fmt.Sprintf("127.0.0.1:%d", voterBase+206)},
 		},
 		Timing: config.DefaultTimingConfig(),
 		Raft:   config.DefaultRaftConfig(),
@@ -160,12 +160,10 @@ func TestServiceEndpointRegistryTable(t *testing.T) {
 		{Service: config.ServiceSWIMPing, Name: "swim-ping", Offset: 0, Transport: config.TransportUDP},
 		{Service: config.ServiceSWIMACK, Name: "swim-ack", Offset: 1, Transport: config.TransportUDP},
 		{Service: config.ServiceSWIMSnapshot, Name: "swim-snapshot", Offset: 2, Transport: config.TransportTCP},
-		{Service: config.ServiceFileRPC, Name: "file-rpc", Offset: 3, Transport: config.TransportTCP},
-		{Service: config.ServiceGrepRPC, Name: "grep-rpc", Offset: 4, Transport: config.TransportTCP},
-		{Service: config.ServiceCraneWorker, Name: "crane-worker", Offset: 5, Transport: config.TransportTCP},
-		{Service: config.ServiceTopologyControl, Name: "topology-control", Offset: 6, Transport: config.TransportTCP},
-		{Service: config.ServiceCraneTupleACK, Name: "crane-tuple-ack", Offset: 7, Transport: config.TransportUDP},
-		{Service: config.ServiceRaftRPC, Name: "raft-rpc", Offset: 8, Transport: config.TransportTCP},
+		{Service: config.ServiceCraneWorker, Name: "crane-worker", Offset: 3, Transport: config.TransportTCP},
+		{Service: config.ServiceTopologyControl, Name: "topology-control", Offset: 4, Transport: config.TransportTCP},
+		{Service: config.ServiceCraneTupleACK, Name: "crane-tuple-ack", Offset: 5, Transport: config.TransportUDP},
+		{Service: config.ServiceRaftRPC, Name: "raft-rpc", Offset: 6, Transport: config.TransportTCP},
 	}
 	if got := config.Services(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("service registry = %#v, want %#v", got, want)
@@ -557,9 +555,9 @@ func TestRunBecomesReadyWithoutLeaderAndReleasesEverythingOnCancel(t *testing.T)
 			t.Fatalf("process ready before service %d (%s) reported ready", index, service.Name())
 		}
 	}
-	dialRuntimePort(t, base, 5)
+	dialRuntimePort(t, base, 3)
+	dialRuntimePort(t, base, 4)
 	dialRuntimePort(t, base, 6)
-	dialRuntimePort(t, base, 8)
 	if _, open := running.runtime.Gate.AdmissionEpoch(); open {
 		t.Fatal("admission gate open without a committed coordinator epoch")
 	}
@@ -568,7 +566,7 @@ func TestRunBecomesReadyWithoutLeaderAndReleasesEverythingOnCancel(t *testing.T)
 		t.Fatalf("worker artifact store directory missing: %v", err)
 	}
 
-	// One authenticated +6 status request is answered with a bound typed
+	// One authenticated +4 status request is answered with a bound typed
 	// rejection (Starting or a checked static redirect), never served stale.
 	client, err := control.NewClient(control.ClientOptions{
 		Config:        configuration,
@@ -680,11 +678,11 @@ func TestRunCancellationAtEveryPartialStartJoinsCleanly(t *testing.T) {
 func TestNonvoterRunServesWithoutRaftState(t *testing.T) {
 	running, configuration, base := startReadyRuntime(t, 4, nil)
 
-	dialRuntimePort(t, base, 5)
-	dialRuntimePort(t, base, 6)
-	raftListener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+8))
+	dialRuntimePort(t, base, 3)
+	dialRuntimePort(t, base, 4)
+	raftListener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+6))
 	if err != nil {
-		t.Fatalf("nonvoter bound the +8 Raft endpoint: %v", err)
+		t.Fatalf("nonvoter bound the +6 Raft endpoint: %v", err)
 	}
 	_ = raftListener.Close()
 	raftDirectory := filepath.Join(configuration.StorageDir, raft.RaftStorageDirectoryName)
@@ -1059,12 +1057,12 @@ func TestArtifactFetcherRejectsUnorderedOrMiscountedRecords(t *testing.T) {
 
 func TestLazyTupleDatagramBindsOnFirstUseAndRefusesAfterClose(t *testing.T) {
 	base := reserveRuntimeBasePort(t)
-	endpoint := config.Endpoint{Host: "127.0.0.1", Port: base + 7}
+	endpoint := config.Endpoint{Host: "127.0.0.1", Port: base + 5}
 
 	t.Run("binds lazily and loops a datagram", func(t *testing.T) {
 		datagram := newLazyTupleDatagram(endpoint)
 		if !probeRuntimePortBlock(t, base) {
-			t.Fatal("construction bound the +7 socket")
+			t.Fatal("construction bound the +5 socket")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -1085,7 +1083,7 @@ func TestLazyTupleDatagramBindsOnFirstUseAndRefusesAfterClose(t *testing.T) {
 			t.Fatal("SendFrom succeeded after Close")
 		}
 		if !probeRuntimePortBlock(t, base) {
-			t.Fatal("+7 socket survived Close")
+			t.Fatal("+5 socket survived Close")
 		}
 	})
 

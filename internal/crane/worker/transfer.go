@@ -15,12 +15,12 @@ import (
 )
 
 const (
-	// DefaultMaxActiveTransfersPerPeer bounds simultaneous +5 transfer work
+	// DefaultMaxActiveTransfersPerPeer bounds simultaneous +3 transfer work
 	// attributed to one authenticated worker incarnation.
 	DefaultMaxActiveTransfersPerPeer = 4
 	// DefaultMaxActiveTransfers bounds simultaneous transfer work process-wide.
 	DefaultMaxActiveTransfers = 64
-	// DefaultMaxQueuedTransferWork bounds admitted +5 work awaiting execution.
+	// DefaultMaxQueuedTransferWork bounds admitted +3 work awaiting execution.
 	DefaultMaxQueuedTransferWork = 256
 )
 
@@ -55,7 +55,7 @@ const (
 )
 
 // TransferPeer is the already-authenticated session identity supplied by the
-// +5 session owner. Possession of the cluster HMAC is deliberately not a role.
+// +3 session owner. Possession of the cluster HMAC is deliberately not a role.
 type TransferPeer struct {
 	NodeID      uint16
 	WorkerEpoch model.WorkerEpoch

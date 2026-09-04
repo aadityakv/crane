@@ -13,7 +13,7 @@ import (
 // The coordinator re-delivers a committed source checkpoint to every current
 // worker of a job (coordinator/reconcile.go resendCheckpointNotices during
 // every activateJob pass, and coordinator/checkpoint.go handleCompletionEvent
-// right after the checkpoint commits) as a +5 210 CheckpointNotice whose
+// right after the checkpoint commits) as a +3 210 CheckpointNotice whose
 // RaftIndex, CoordinatorEpoch, and JobControlRevision are the CURRENT view
 // values at send time — not the values under which that worker originally
 // applied the watermark. Before the fix the worker's idempotent-resend
@@ -25,7 +25,7 @@ import (
 // not adopt the prior committed watermark at all.
 //
 // Under the Task 24 defect #2 ruling a 210 notice arriving over a valid
-// current-fence authenticated +5 session is the current coordinator's
+// current-fence authenticated +3 session is the current coordinator's
 // authoritative statement of the replicated committed watermark: the worker
 // CONFIRMS equal- and below-watermark resends without mutation regardless of
 // authority age, ADOPTS strictly higher watermarks (including a reassigned

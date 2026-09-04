@@ -23,7 +23,7 @@ import (
 // The repair driver owns the destination side of every bilateral
 // RepairResultPartition grant this worker durably holds: on grant install and
 // on recovery it schedules the grant, then one serialized loop pulls the
-// covered record range from the named source over an authenticated +5
+// covered record range from the named source over an authenticated +3
 // worker-to-worker session — NextRepairRecord at the source, durable local
 // install through the existing ReceiveResultRecord path, progress acked by
 // the next pull's verified digest — until the source reports completion.
@@ -92,7 +92,7 @@ func (client *routingRepairClient) PullRepair(ctx context.Context, sourceNode ui
 	return chunk, nil
 }
 
-// repairPullCompleteResponse mirrors the +5 dispatch conversion from the
+// repairPullCompleteResponse mirrors the +3 dispatch conversion from the
 // serving owner's complete signal to the terminal WorkerStatus response.
 func repairPullCompleteResponse(source *transferRepository, sourceNode uint16, sourceEpoch model.WorkerEpoch, pulled protocol.ResultRepairStatus) protocol.WorkerMessage {
 	work, err := source.RecoverWork()
@@ -624,7 +624,7 @@ func TestRepairDriverRunJoinsPromptlyDuringBackoff(t *testing.T) {
 }
 
 // TestRepairDriverPullsOverAuthenticatedWorkerControlSession proves the full
-// production wire path: the destination driver dials the source's real +5
+// production wire path: the destination driver dials the source's real +3
 // control listener, handshakes, pulls with its durable status, installs each
 // response chunk durably, and observes the terminal source status — with the
 // historical source serving under a closed process admission gate.
@@ -677,7 +677,7 @@ func TestRepairDriverPullsOverAuthenticatedWorkerControlSession(t *testing.T) {
 	}
 }
 
-// serveRepairControlSessions mirrors the production +5 connection loop for
+// serveRepairControlSessions mirrors the production +3 connection loop for
 // the wire-level driver test.
 func serveRepairControlSessions(ctx context.Context, listener net.Listener, owner *ControlOwner, authenticator wire.Authenticator, clusterID [16]byte, node uint16, workerEpoch model.WorkerEpoch, epoch model.CoordinatorEpoch, source clock.Clock) error {
 	var handlers sync.WaitGroup
@@ -727,7 +727,7 @@ func serveRepairControlSessions(ctx context.Context, listener net.Listener, owne
 	}
 }
 
-// repairControlRepository adapts a transfer repository to the +5 command
+// repairControlRepository adapts a transfer repository to the +3 command
 // owner's durable surface for the wire-level driver test.
 type repairControlRepository struct {
 	repository *transferRepository
@@ -1031,7 +1031,7 @@ func TestRepairDriverStopsOnTypedSourceRejectionUntilRegrant(t *testing.T) {
 	}
 }
 
-// acceptRecorder records every accepted +5 connection so a test can count
+// acceptRecorder records every accepted +3 connection so a test can count
 // sessions and sever them.
 type acceptRecorder struct {
 	net.Listener
@@ -1066,7 +1066,7 @@ func (recorder *acceptRecorder) severAll() {
 
 // TestRepairSourceClientReusesSessionAcrossPullsAndRedialsAfterFailure pins
 // the repair-session-reuse ruling: every pull of one grant travels over one
-// authenticated +5 session to the source incarnation (one dial, one
+// authenticated +3 session to the source incarnation (one dial, one
 // handshake, one replay identity per record — the defect-#9 budget), a later
 // pull reuses it, and a failed exchange drops the session so the next pull
 // re-establishes exactly one.

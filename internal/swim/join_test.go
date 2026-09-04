@@ -202,7 +202,7 @@ func TestValidateJoinRejectsInvalidAnnouncement(t *testing.T) {
 		{name: "wildcard_ipv4", mutate: func(member *Member) { member.Host = "0.0.0.0" }},
 		{name: "wildcard_ipv6", mutate: func(member *Member) { member.Host = "::" }},
 		{name: "zero_base_port", mutate: func(member *Member) { member.BasePort = 0 }},
-		{name: "base_port_service_overflow", mutate: func(member *Member) { member.BasePort = 65528 }},
+		{name: "base_port_service_overflow", mutate: func(member *Member) { member.BasePort = 65530 }},
 	}
 
 	for _, tt := range tests {

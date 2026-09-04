@@ -1,6 +1,6 @@
 // Package coordinator implements Crane's fenced leader actor. The actor is an
 // idle follower until Raft leadership arrives, then owns exactly one
-// epoch-scoped reconciliation loop that registers workers, fences the +5
+// epoch-scoped reconciliation loop that registers workers, fences the +3
 // control plane, converges replicated assignments, repairs result replicas,
 // and only then opens the caller-owned admission gate.
 package coordinator
@@ -106,11 +106,11 @@ type ActorOptions struct {
 	Machine     *state.Machine  // Machine is the local replicated Crane state machine.
 	WorkerReady <-chan struct{} // WorkerReady gates startup on the co-located worker service.
 	Membership  Membership      // Membership provides the authorized SWIM projection.
-	Workers     WorkerClient    // Workers speaks the authenticated +5 control protocol.
+	Workers     WorkerClient    // Workers speaks the authenticated +3 control protocol.
 	Clock       clock.Clock     // Clock supplies time and rescan timers.
 	Nonces      NonceSource     // Nonces yields the stable per-leadership epoch nonce.
 	Gate        *admission.Gate // Gate is the caller-owned process admission gate.
-	// Results optionally supplies the authenticated +5 result-artifact
+	// Results optionally supplies the authenticated +3 result-artifact
 	// transfer surface; without it the terminal seal workflow stays disabled
 	// and terminal jobs simply remain Draining.
 	Results ResultTransferClient

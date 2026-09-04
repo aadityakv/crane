@@ -28,7 +28,7 @@ var (
 	ErrWorkerRejected = errors.New("crane worker rejected command")
 )
 
-// WorkerIdentity is the authenticated +5 handshake result for one worker.
+// WorkerIdentity is the authenticated +3 handshake result for one worker.
 type WorkerIdentity struct {
 	NodeID               uint16            // NodeID is the worker's stable cluster identity.
 	WorkerEpoch          model.WorkerEpoch // WorkerEpoch is the durable store incarnation.
@@ -37,7 +37,7 @@ type WorkerIdentity struct {
 	RegistryFingerprint  [32]byte          // RegistryFingerprint proves protocol compatibility.
 }
 
-// WorkerClient is the coordinator's bounded +5 worker-control surface.
+// WorkerClient is the coordinator's bounded +3 worker-control surface.
 type WorkerClient interface {
 	// Handshake authenticates one advertised member and returns exactly the
 	// worker's validated handshake response fields.
@@ -71,7 +71,7 @@ type DialWorkerClientOptions struct {
 	Dial func(context.Context, string, string) (net.Conn, error)
 }
 
-// DialWorkerClient speaks the authenticated +5 protocol over one TCP
+// DialWorkerClient speaks the authenticated +3 protocol over one TCP
 // connection per command.
 type DialWorkerClient struct {
 	options DialWorkerClientOptions
@@ -158,7 +158,7 @@ func (client *DialWorkerClient) Checkpoint(ctx context.Context, node uint16, not
 	})
 }
 
-// Fetch performs one authenticated +5 leader result-fetch exchange and
+// Fetch performs one authenticated +3 leader result-fetch exchange and
 // returns the source-correlated chunk; the caller validates artifact
 // identity, contiguity, and checksums exactly as the terminal drive requires.
 func (client *DialWorkerClient) Fetch(ctx context.Context, node uint16, request protocol.ResultFetchRequest) (protocol.ResultFetchChunk, error) {
@@ -298,7 +298,7 @@ func (client *DialWorkerClient) exchange(ctx context.Context, stream *wire.TCPFr
 	return message, nil
 }
 
-// workerControlEndpoint derives the advertised +5 control endpoint.
+// workerControlEndpoint derives the advertised +3 control endpoint.
 func workerControlEndpoint(member swim.Member) (config.Endpoint, error) {
 	specification, ok := config.LookupService(config.ServiceCraneWorker)
 	if !ok || uint32(member.BasePort)+uint32(specification.Offset) > 65535 {

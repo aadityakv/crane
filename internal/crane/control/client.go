@@ -51,7 +51,7 @@ var errClientRetryExchange = errors.New("retry Crane client exchange")
 // errClientDial marks an attempt that never reached its endpoint.
 var errClientDial = errors.New("dial Crane control")
 
-// RequestRejectedError is one typed terminal +6 rejection of a client request.
+// RequestRejectedError is one typed terminal +4 rejection of a client request.
 type RequestRejectedError struct {
 	// Code is the stable fingerprinted rejection category.
 	Code protocol.ControlErrorCode
@@ -71,10 +71,10 @@ func (rejection *RequestRejectedError) Error() string {
 // ClientOptions fixes every dependency of one durable Crane control client.
 type ClientOptions struct {
 	// Config is the complete validated local member configuration; the
-	// client authenticates as its NodeID and derives the static voter +6
+	// client authenticates as its NodeID and derives the static voter +4
 	// endpoint set from its RaftVoters.
 	Config config.NodeConfig
-	// Authenticator signs and verifies every +6 frame with the cluster secret.
+	// Authenticator signs and verifies every +4 frame with the cluster secret.
 	Authenticator wire.Authenticator
 	// Clock supplies frame timestamps and retry backoff timers.
 	Clock clock.Clock
@@ -98,7 +98,7 @@ type ClientOptions struct {
 }
 
 // Client performs crash-safe, exactly-correlated Crane public-control requests
-// against the configured static voter +6 endpoints.
+// against the configured static voter +4 endpoints.
 type Client struct {
 	authenticator wire.Authenticator
 	clock         clock.Clock

@@ -139,7 +139,7 @@ func TestTupleServiceRejectsTruncationAuthenticationSourceAndUnknownTaskBeforeMu
 
 // TestTupleServiceReplayCapacityProcessesUnrecordedWithoutEviction pins the
 // Task 24 defect #8 ruling: a bounded replay cache exhausted by an
-// authenticated peer never suppresses idempotent +7 handling. A fresh request
+// authenticated peer never suppresses idempotent +5 handling. A fresh request
 // at capacity is processed and answered without being recorded, the retained
 // identities are never evicted (their replays stay silent), and a replay of
 // the unrecorded identity is simply re-answered idempotently.

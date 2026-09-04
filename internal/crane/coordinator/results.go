@@ -30,7 +30,7 @@ var (
 	ErrResultSealIncomplete = errors.New("crane result seal incomplete")
 )
 
-// ResultTransferClient is the authenticated +5 result-artifact surface the
+// ResultTransferClient is the authenticated +3 result-artifact surface the
 // terminal workflow requires: the leader fetches sealed artifacts from a
 // current replica and installs durable artifact chunks on both current
 // replicas. Production dial wiring belongs to the node-composition task.

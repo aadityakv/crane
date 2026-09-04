@@ -418,12 +418,12 @@ func task10ClusterConfigurationsWithVoters(t *testing.T, voterCount int) ([]conf
 			t.Fatal(err)
 		}
 		port := listener.Addr().(*net.TCPAddr).Port
-		if port <= 8 {
+		if port <= 6 {
 			_ = listener.Close()
-			t.Fatalf("reserved port %d cannot model +8", port)
+			t.Fatalf("reserved port %d cannot model +6", port)
 		}
 		reservations[index] = listener
-		bases[index] = uint16(port - 8)
+		bases[index] = uint16(port - 6)
 		voters[index] = config.RaftVoter{NodeID: uint16(index + 1), Endpoint: listener.Addr().String()}
 	}
 	configurations := make([]config.NodeConfig, voterCount)

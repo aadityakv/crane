@@ -10,7 +10,7 @@ import (
 	"github.com/aadityakv/crane/internal/raft"
 )
 
-// redirectProbes returns one instance of every +6 request type.
+// redirectProbes returns one instance of every +4 request type.
 func redirectProbes(t *testing.T) []protocol.ControlMessage {
 	t.Helper()
 	page := protocol.ResultPageRequest{JobID: model.JobID{0x52}, ManifestDigest: [32]byte{1}, PageBytes: 1024}
@@ -39,7 +39,7 @@ func requireRedirect(t *testing.T, response protocol.ControlMessage, want []stri
 }
 
 func staticVoterControlEndpoints() []string {
-	endpoints := []string{"127.0.0.1:19106", "127.0.0.2:19206", "127.0.0.3:19306"}
+	endpoints := []string{"127.0.0.1:19104", "127.0.0.2:19204", "127.0.0.3:19304"}
 	sort.Strings(endpoints)
 	return endpoints
 }
@@ -50,7 +50,7 @@ func TestFollowerRedirectsToDerivedLeaderEndpoint(t *testing.T) {
 	fixture.raft.setLeader(false, 2)
 	fixture.start()
 	for _, probe := range redirectProbes(t) {
-		requireRedirect(t, fixture.exchange(probe), []string{"127.0.0.2:19206"})
+		requireRedirect(t, fixture.exchange(probe), []string{"127.0.0.2:19204"})
 	}
 	if got := len(fixture.raft.capturedProposals()); got != 0 {
 		t.Fatalf("follower proposed %d commands", got)
@@ -103,7 +103,7 @@ func TestRedirectLeaderLossDuringProposeRedirectsChecked(t *testing.T) {
 		return &raft.NotLeaderError{LeaderID: 3}
 	}
 	fixture.raft.mu.Unlock()
-	requireRedirect(t, fixture.exchange(submitRequestFor(t, 0x54, 1, queryTopology(1))), []string{"127.0.0.3:19306"})
+	requireRedirect(t, fixture.exchange(submitRequestFor(t, 0x54, 1, queryTopology(1))), []string{"127.0.0.3:19304"})
 	if fixture.wakes.Load() != 0 {
 		t.Fatal("redirected mutation woke the coordinator")
 	}

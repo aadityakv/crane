@@ -94,9 +94,9 @@ func TestGenerateConfigsBuildsStrictSharedLocalLayout(t *testing.T) {
 	}
 
 	wantVoters := []config.RaftVoter{
-		{NodeID: 1, Endpoint: "127.0.0.1:8008"},
-		{NodeID: 2, Endpoint: "127.0.0.1:8108"},
-		{NodeID: 3, Endpoint: "127.0.0.1:8208"},
+		{NodeID: 1, Endpoint: "127.0.0.1:8006"},
+		{NodeID: 2, Endpoint: "127.0.0.1:8106"},
+		{NodeID: 3, Endpoint: "127.0.0.1:8206"},
 	}
 	wantBases := []uint16{8000, 8100, 8200}
 	seenStorage := make(map[string]bool)
@@ -163,9 +163,9 @@ func TestGenerateConfigsBuildsFourNodesWithThreeOwnedFixedVoters(t *testing.T) {
 		t.Fatalf("len(configs) = %d, want 4", len(configs))
 	}
 	want := []config.RaftVoter{
-		{NodeID: 1, Endpoint: "127.0.0.1:9008"},
-		{NodeID: 2, Endpoint: "127.0.0.1:9108"},
-		{NodeID: 3, Endpoint: "127.0.0.1:9208"},
+		{NodeID: 1, Endpoint: "127.0.0.1:9006"},
+		{NodeID: 2, Endpoint: "127.0.0.1:9106"},
+		{NodeID: 3, Endpoint: "127.0.0.1:9206"},
 	}
 	for index := range configs {
 		if !reflect.DeepEqual(configs[index].RaftVoters, want) {
@@ -218,7 +218,7 @@ func TestGenerateConfigsRejectsInvalidClusterLayouts(t *testing.T) {
 func TestValidateGeneratedPortRangesRejectsOverlap(t *testing.T) {
 	services := []config.ServiceSpec{
 		{Service: config.ServiceSWIMPing, Name: "first", Offset: 0, Transport: config.TransportUDP},
-		{Service: config.ServiceRaftRPC, Name: "last", Offset: 8, Transport: config.TransportTCP},
+		{Service: config.ServiceRaftRPC, Name: "last", Offset: 6, Transport: config.TransportTCP},
 	}
 	err := validateGeneratedPortRanges([]uint64{8000, 8005}, services)
 	if err == nil || !strings.Contains(err.Error(), "overlaps") {

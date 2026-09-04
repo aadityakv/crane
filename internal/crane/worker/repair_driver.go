@@ -18,7 +18,7 @@ import (
 )
 
 // ErrRepairSourceUnavailable reports a repair source that could not be
-// reached or answered outside the authenticated +5 protocol.
+// reached or answered outside the authenticated +3 protocol.
 var ErrRepairSourceUnavailable = errors.New("crane repair source unavailable")
 
 // ErrRepairSourceRejected reports a repair source that answered one pull with
@@ -27,7 +27,7 @@ var ErrRepairSourceUnavailable = errors.New("crane repair source unavailable")
 var ErrRepairSourceRejected = errors.New("crane repair source rejected pull")
 
 // RepairDriverRepository is the durable authority the destination-side repair
-// driver reads and the +5 pull client identifies itself from.
+// driver reads and the +3 pull client identifies itself from.
 type RepairDriverRepository interface {
 	RecoverWork() (store.RecoveredWork, error)
 	LocalIdentity() (uint16, model.WorkerEpoch)
@@ -41,7 +41,7 @@ type RepairInstaller interface {
 	ReceiveResultRecord(context.Context, TransferPeer, protocol.ResultRecordChunk) (protocol.ResultRecordAck, error)
 }
 
-// RepairSourceClient performs one authenticated +5 repair pull exchange with
+// RepairSourceClient performs one authenticated +3 repair pull exchange with
 // the source endpoint of one durable repair grant: it submits the
 // destination's durable ResultRepairStatus and returns either the source's
 // next ResultRecordChunk or the terminal WorkerStatus carrying the source's
@@ -101,14 +101,14 @@ func (owner *TransferOwner) ServeRepairPull(ctx context.Context, peer TransferPe
 }
 
 // RepairDriverOptions fixes the destination-side repair driver's durable
-// dependencies, authenticated +5 pull client, shared gate, deterministic
+// dependencies, authenticated +3 pull client, shared gate, deterministic
 // clock, and bounded retry schedule.
 type RepairDriverOptions struct {
 	// Repository is the sole durable worker authority.
 	Repository RepairDriverRepository
 	// Transfer performs every durable local record install.
 	Transfer RepairInstaller
-	// Client performs each authenticated +5 pull exchange.
+	// Client performs each authenticated +3 pull exchange.
 	Client RepairSourceClient
 	// Clock schedules every retry deterministically.
 	Clock clock.Clock
@@ -395,7 +395,7 @@ func repairSourceRejected(err error) bool {
 	return errors.Is(err, ErrRepairSourceRejected) || repairPullTerminal(err)
 }
 
-// dialRepairSourceClientOptions fixes the destination's authenticated +5
+// dialRepairSourceClientOptions fixes the destination's authenticated +3
 // dial identity and dependencies.
 type dialRepairSourceClientOptions struct {
 	ClusterID     [16]byte
@@ -407,7 +407,7 @@ type dialRepairSourceClientOptions struct {
 	Dial          func(context.Context, string, string) (net.Conn, error)
 }
 
-// dialRepairSourceClient speaks the authenticated +5 worker-control protocol
+// dialRepairSourceClient speaks the authenticated +3 worker-control protocol
 // over one cached session per source incarnation — the reviewed
 // controlResultReplicator session cache (dial, authorize, handshake once;
 // correlated exchanges; drop on failure) — so a grant of N records costs the

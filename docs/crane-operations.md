@@ -23,8 +23,8 @@ the README; the Crane section is:
 | Field | Meaning |
 | --- | --- |
 | `crane.worker_slots` | Task slots this worker offers the cluster (1..256). Placement never exceeds the cluster-wide slot total. |
-| `crane.worker_control_timeout` | Per-request timeout for +5 worker-control and +6 public-control exchanges. |
-| `crane.tuple_retry_interval` | Resend interval for unacknowledged +7 tuple deliveries. |
+| `crane.worker_control_timeout` | Per-request timeout for +3 worker-control and +4 public-control exchanges. |
+| `crane.tuple_retry_interval` | Resend interval for unacknowledged +5 tuple deliveries. |
 | `crane.tuple_completion_retry_interval` | Resend interval for completion acknowledgments awaiting downstream durability. |
 | `crane.failure_grace_period` | How long a worker must be continuously Dead/Left and unreachable before its tasks are reassigned. Suspect alone never reassigns. |
 | `crane.max_worker_store_bytes` | Durable budget for the worker's write-ahead log plus snapshots; exhaustion fails closed with a retryable capacity error. |
@@ -46,12 +46,10 @@ is parsed from hostnames or node IDs.
 | +0 | `swim-ping` | UDP | membership probes |
 | +1 | `swim-ack` | UDP | membership acknowledgments |
 | +2 | `swim-snapshot` | TCP | membership join/snapshot |
-| +3 | `file-rpc` | TCP | reserved, unused |
-| +4 | `grep-rpc` | TCP | reserved, unused |
-| +5 | `crane-worker` | TCP | authenticated coordinator→worker control sessions, worker→worker result transfer and repair |
-| +6 | `topology-control` | TCP | public client API: submit, cancel, status, result paging; non-leaders answer with a checked redirect |
-| +7 | `crane-tuple-ack` | UDP | bounded 1,200-byte authenticated tuple deliveries and ACK/NACK |
-| +8 | `raft-rpc` | TCP | fixed-membership Raft among the configured voters |
+| +3 | `crane-worker` | TCP | authenticated coordinator→worker control sessions, worker→worker result transfer and repair |
+| +4 | `topology-control` | TCP | public client API: submit, cancel, status, result paging; non-leaders answer with a checked redirect |
+| +5 | `crane-tuple-ack` | UDP | bounded 1,200-byte authenticated tuple deliveries and ACK/NACK |
+| +6 | `raft-rpc` | TCP | fixed-membership Raft among the configured voters |
 
 ## Running
 

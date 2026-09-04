@@ -17,7 +17,7 @@ process:
   keeps two current copies of every result, and answers duplicates from
   durable state.
 
-Everything speaks over nine fixed ports derived from one `base_port` (see
+Everything speaks over seven fixed ports derived from one `base_port` (see
 [Ports](#ports)); all traffic is HMAC-authenticated with a cluster secret and
 replay-guarded.
 
@@ -148,12 +148,10 @@ duplicate voters, and port overflow fail validation before anything binds.
 | +0 | `swim-ping` | UDP | membership probes |
 | +1 | `swim-ack` | UDP | membership acknowledgments |
 | +2 | `swim-snapshot` | TCP | membership join and snapshots |
-| +3 | `file-rpc` | TCP | reserved, unused |
-| +4 | `grep-rpc` | TCP | reserved, unused |
-| +5 | `crane-worker` | TCP | coordinator→worker control, worker→worker result transfer |
-| +6 | `topology-control` | TCP | public client API; non-leaders answer with a checked redirect |
-| +7 | `crane-tuple-ack` | UDP | tuple deliveries and ACK/NACK |
-| +8 | `raft-rpc` | TCP | Raft among the configured voters |
+| +3 | `crane-worker` | TCP | coordinator→worker control, worker→worker result transfer |
+| +4 | `topology-control` | TCP | public client API; non-leaders answer with a checked redirect |
+| +5 | `crane-tuple-ack` | UDP | tuple deliveries and ACK/NACK |
+| +6 | `raft-rpc` | TCP | Raft among the configured voters |
 
 ## Cluster secret
 

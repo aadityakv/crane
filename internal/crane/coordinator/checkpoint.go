@@ -85,7 +85,7 @@ func (cursors *eventCursors) rewind(node uint16, epoch model.WorkerEpoch) {
 }
 
 // PollWorkerEvents drains one worker's durable event pages through the paged
-// +5 WorkerStatus exchange, using the last handled durable transaction ID for
+// +3 WorkerStatus exchange, using the last handled durable transaction ID for
 // the worker's exact current epoch. Every event is fully handled — committed,
 // its committed effect delivered back to the workers — before the leader-local
 // cursor advances past it, so the cursor doubles as the acknowledgment the

@@ -69,7 +69,7 @@ func TestCraneConfigValidateRejectsOutOfContractFields(t *testing.T) {
 		{name: "store below minimum", mutate: func(c *CraneConfig) { c.MaxWorkerStoreBytes = (1 << 20) - 1 }},
 		{name: "store above maximum", mutate: func(c *CraneConfig) { c.MaxWorkerStoreBytes = (1 << 40) + 1 }},
 		{name: "uppercase fingerprint", mutate: func(c *CraneConfig) {
-			c.ConsensusFingerprint = "C7E089BCBD46DEF764778DF97F4C4021B386CE7E1EAF8008BDA7E147E28BA7A8"
+			c.ConsensusFingerprint = "C7E089BCBD46DEF764778DF97F4C4021B386CE7E1EAF8006BDA7E147E28BA7A8"
 		}},
 		{name: "wrong fingerprint", mutate: func(c *CraneConfig) {
 			c.ConsensusFingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -91,9 +91,9 @@ func TestCraneControlEndpointFromRaftUsesCanonicalCheckedOffset(t *testing.T) {
 		raw  string
 		want Endpoint
 	}{
-		{name: "dns", raw: "Node.Example.Test.:8008", want: Endpoint{Host: "node.example.test", Port: 8006}},
-		{name: "ipv4", raw: "192.0.2.10:8008", want: Endpoint{Host: "192.0.2.10", Port: 8006}},
-		{name: "ipv6", raw: "[2001:0db8::1]:8008", want: Endpoint{Host: "2001:db8::1", Port: 8006}},
+		{name: "dns", raw: "Node.Example.Test.:8006", want: Endpoint{Host: "node.example.test", Port: 8004}},
+		{name: "ipv4", raw: "192.0.2.10:8006", want: Endpoint{Host: "192.0.2.10", Port: 8004}},
+		{name: "ipv6", raw: "[2001:0db8::1]:8006", want: Endpoint{Host: "2001:db8::1", Port: 8004}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			raftEndpoint, err := ParseRoutableEndpoint(test.raw)
@@ -109,7 +109,7 @@ func TestCraneControlEndpointFromRaftUsesCanonicalCheckedOffset(t *testing.T) {
 			}
 		})
 	}
-	for _, endpoint := range []Endpoint{{Host: "node.example.test", Port: 7}, {Host: "bad host", Port: 8008}} {
+	for _, endpoint := range []Endpoint{{Host: "node.example.test", Port: 5}, {Host: "bad host", Port: 8006}} {
 		if _, err := CraneControlEndpointFromRaft(endpoint); err == nil {
 			t.Fatalf("CraneControlEndpointFromRaft(%#v) succeeded", endpoint)
 		}
@@ -117,7 +117,7 @@ func TestCraneControlEndpointFromRaftUsesCanonicalCheckedOffset(t *testing.T) {
 }
 
 func TestNodeConfigRequiresCanonicalRaftVoterEndpointsAndCraneSnapshotBudget(t *testing.T) {
-	for _, endpoint := range []string{"Node.Example.Test.:8008", "[2001:0db8:0:0:0:0:0:1]:8008"} {
+	for _, endpoint := range []string{"Node.Example.Test.:8006", "[2001:0db8:0:0:0:0:0:1]:8006"} {
 		configuration := validConfig(createSecret(t, 0o600))
 		configuration.RaftVoters[1].Endpoint = endpoint
 		if err := configuration.Validate(); err == nil {

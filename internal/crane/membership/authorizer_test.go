@@ -85,7 +85,7 @@ func TestAuthorizerRequiresExactInitialSnapshotAndPublishesOwnedMonotonicViews(t
 			t.Fatalf("terminal/unknown node %d error=%v", nodeID, err)
 		}
 	}
-	tuplePort := uint16(9100 + 7)
+	tuplePort := uint16(9100 + 5)
 	if err := authorizer.AuthorizeUDP(1, &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: int(tuplePort)}, config.ServiceCraneTupleACK); err != nil {
 		t.Fatalf("exact UDP source: %v", err)
 	}
@@ -556,7 +556,7 @@ func authorizerTestConfig(t *testing.T) config.NodeConfig {
 	configuration := config.NodeConfig{
 		NodeID: 1, ClusterID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", BindHost: "127.0.0.1", AdvertiseHost: "127.0.0.1",
 		BasePort: 9100, Introducer: "127.0.0.1:9102", StorageDir: t.TempDir(), ClusterSecretFile: secret,
-		RaftVoters: []config.RaftVoter{{NodeID: 1, Endpoint: "127.0.0.1:9108"}, {NodeID: 2, Endpoint: "127.0.0.2:9208"}, {NodeID: 3, Endpoint: "127.0.0.3:9308"}},
+		RaftVoters: []config.RaftVoter{{NodeID: 1, Endpoint: "127.0.0.1:9106"}, {NodeID: 2, Endpoint: "127.0.0.2:9206"}, {NodeID: 3, Endpoint: "127.0.0.3:9306"}},
 		Raft:       config.DefaultRaftConfig(), Crane: config.DefaultCraneConfig(), Timing: config.DefaultTimingConfig(),
 	}
 	if err := configuration.Validate(); err != nil {

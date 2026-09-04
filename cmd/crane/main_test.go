@@ -28,7 +28,7 @@ var cliTestClusterID = [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 
 
 var cliTestSecret = bytes.Repeat([]byte{0x2a}, 32)
 
-// cliControlServer is one scripted +6 responder behind real authenticated framing.
+// cliControlServer is one scripted +4 responder behind real authenticated framing.
 type cliControlServer struct {
 	t        *testing.T
 	listener net.Listener
@@ -127,7 +127,7 @@ func closedLoopbackPort(t *testing.T) int {
 }
 
 // writeCLIConfig writes a valid strict node configuration whose first voter's
-// derived +6 endpoint is the scripted server.
+// derived +4 endpoint is the scripted server.
 func writeCLIConfig(t *testing.T, controlPort int) string {
 	t.Helper()
 	directory := t.TempDir()

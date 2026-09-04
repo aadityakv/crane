@@ -211,7 +211,7 @@ func (d *faultDatagram) stats() (sent, dropped, duplicated, held int) {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic +5 dial faults (production coordinator dial seam).
+// Deterministic +3 dial faults (production coordinator dial seam).
 // ---------------------------------------------------------------------------
 
 // dialRule is one active injected TCP dial cut on one exact address.
@@ -221,7 +221,7 @@ type dialRule struct {
 	blocked atomic.Int64
 }
 
-// faultDialer wraps the production dialer used by the coordinator's +5
+// faultDialer wraps the production dialer used by the coordinator's +3
 // worker-control and result-transfer client, cutting exact addresses.
 type faultDialer struct {
 	mu    sync.Mutex
@@ -322,7 +322,7 @@ func (cluster *simCluster) awaitFaultConsumed(name string) {
 // Harness fault helpers.
 // ---------------------------------------------------------------------------
 
-// tupleEndpointOf returns one node's advertised +7 datagram endpoint.
+// tupleEndpointOf returns one node's advertised +5 datagram endpoint.
 func (cluster *simCluster) tupleEndpointOf(id uint16) config.Endpoint {
 	cluster.t.Helper()
 	endpoint, err := cluster.nodes[id].config.AdvertiseEndpoint(config.ServiceCraneTupleACK)
@@ -347,7 +347,7 @@ func (cluster *simCluster) swimEndpointsOf(id uint16) []config.Endpoint {
 	return endpoints
 }
 
-// controlAddressOf returns one node's advertised +5 address.
+// controlAddressOf returns one node's advertised +3 address.
 func (cluster *simCluster) controlAddressOf(id uint16) string {
 	cluster.t.Helper()
 	endpoint, err := cluster.nodes[id].config.AdvertiseEndpoint(config.ServiceCraneWorker)
@@ -368,25 +368,25 @@ func (cluster *simCluster) trackRules(name string, rules ...*datagramRule) {
 	})
 }
 
-// dropTupleDatagrams drops one node's +7 sends toward optional destinations.
+// dropTupleDatagrams drops one node's +5 sends toward optional destinations.
 func (cluster *simCluster) dropTupleDatagrams(id uint16, name string, destinations ...config.Endpoint) {
 	cluster.t.Helper()
 	cluster.trackRules(name, cluster.nodes[id].tupleD.addRule(dgramFaultDrop, destinations...))
 }
 
 // dropSwimDatagrams drops one node's SWIM datagram sends toward optional
-// destinations, producing SWIM suspicion without touching +5 or +7.
+// destinations, producing SWIM suspicion without touching +3 or +5.
 func (cluster *simCluster) dropSwimDatagrams(id uint16, name string, destinations ...config.Endpoint) {
 	cluster.t.Helper()
 	cluster.trackRules(name, cluster.nodes[id].swimD.addRule(dgramFaultDrop, destinations...))
 }
 
-// isolateNode cuts every simulated datagram link and the coordinator's +5
+// isolateNode cuts every simulated datagram link and the coordinator's +3
 // dial to one node, in both directions, without crashing it. The partition
 // is one injected fault: it is consumed once any of its directional rules
 // blocks traffic (which link carries packets during the window depends on
 // the task placement — an isolated sink whose tuples were all acknowledged
-// sends nothing further on +7).
+// sends nothing further on +5).
 func (cluster *simCluster) isolateNode(id uint16, name string) {
 	cluster.t.Helper()
 	node := cluster.nodes[id]
@@ -407,9 +407,9 @@ func (cluster *simCluster) isolateNode(id uint16, name string) {
 	cluster.cutControl(id, name+"-dial")
 }
 
-// tupleDatagramFaultEverywhere installs one +7 fault rule on every node and
+// tupleDatagramFaultEverywhere installs one +5 fault rule on every node and
 // tracks the set as one injected fault: only nodes hosting a producing task
-// (or acknowledging sink) send +7 datagrams, so consumption is a property of
+// (or acknowledging sink) send +5 datagrams, so consumption is a property of
 // the cluster-wide fault, not of each node.
 func (cluster *simCluster) tupleDatagramFaultEverywhere(kind dgramFaultKind, name string) []*datagramRule {
 	cluster.t.Helper()
@@ -421,7 +421,7 @@ func (cluster *simCluster) tupleDatagramFaultEverywhere(kind dgramFaultKind, nam
 	return rules
 }
 
-// cutControl cuts only the coordinator's +5 dial to one node.
+// cutControl cuts only the coordinator's +3 dial to one node.
 func (cluster *simCluster) cutControl(id uint16, name string) {
 	cluster.t.Helper()
 	rule := cluster.dialer.cut(cluster.controlAddressOf(id))
@@ -520,7 +520,7 @@ func (conn *gatedConn) Close() error {
 	return conn.Conn.Close()
 }
 
-// pausableClientDial returns one +6 dial whose server responses are held
+// pausableClientDial returns one +4 dial whose server responses are held
 // until the gate releases, so a scenario can crash the client with the
 // response exactly in flight and its pending request still unresolved.
 func pausableClientDial(gate *pauseGate) func(context.Context, string) (net.Conn, error) {
@@ -909,7 +909,7 @@ func TestScriptedFailureScenarios(t *testing.T) {
 	})
 
 	// SWIM false suspicion: dropping only node 4's SWIM probes makes it
-	// Suspect while +5 and +7 stay healthy; Suspect alone never reassigns,
+	// Suspect while +3 and +5 stay healthy; Suspect alone never reassigns,
 	// and after the UDP heal the job completes with unchanged attempts.
 	t.Run("swim false suspicion never reassigns", func(t *testing.T) {
 		runScriptedScenario(t, 0x5CF00004, "false-suspicion", 6, simStageSpec{}, 1,
@@ -1070,7 +1070,7 @@ func TestScriptedFailureScenarios(t *testing.T) {
 	})
 
 	// Worker crash after Received before the sender observed the ACK: the
-	// node's outbound +7 is dropped, the process crashes with durable
+	// node's outbound +5 is dropped, the process crashes with durable
 	// custody, and the same-epoch restart re-acknowledges without rework.
 	t.Run("worker crash after received before ack", func(t *testing.T) {
 		runScriptedScenario(t, 0x5CF00006, "crash-received", 8, simStageSpec{}, 1,
@@ -1209,7 +1209,7 @@ func TestScriptedFailureScenarios(t *testing.T) {
 			})
 	})
 
-	// Checkpoint notice loss: the coordinator's +5 dial to the source worker
+	// Checkpoint notice loss: the coordinator's +3 dial to the source worker
 	// is cut across checkpoint commits and healed later; the worker applies
 	// the committed watermark idempotently and compaction still matches.
 	t.Run("checkpoint notice loss heals idempotently", func(t *testing.T) {

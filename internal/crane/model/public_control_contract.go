@@ -14,9 +14,9 @@ const (
 	publicControlResultRecordEntryPrefixBytesV1 = uint64(4)
 	publicControlMinimumTupleBytesV1            = v1Uint16Bytes
 
-	// PublicControlSchemaVersionV1 is the canonical +6 payload schema.
+	// PublicControlSchemaVersionV1 is the canonical +4 payload schema.
 	PublicControlSchemaVersionV1 uint16 = 1
-	// PublicControlMaxFrameBytesV1 bounds a complete authenticated +6 frame.
+	// PublicControlMaxFrameBytesV1 bounds a complete authenticated +4 frame.
 	PublicControlMaxFrameBytesV1 = 1 << 20
 	// PublicControlMaxResultPageBytesV1 bounds complete encoded result entries in one page.
 	PublicControlMaxResultPageBytesV1 = 512 << 10
@@ -51,7 +51,7 @@ func PublicControlResultRecordEntryBytesV1(tupleBytes uint64) (uint64, error) {
 	return result, nil
 }
 
-// PublicControlFieldDescriptor names one field emitted by the actual +6 encoder.
+// PublicControlFieldDescriptor names one field emitted by the actual +4 encoder.
 type PublicControlFieldDescriptor struct {
 	// Name is the stable field name.
 	Name string
@@ -59,7 +59,7 @@ type PublicControlFieldDescriptor struct {
 	Encoding string
 }
 
-// PublicControlMessageDescriptor identifies one owned +6 message schema.
+// PublicControlMessageDescriptor identifies one owned +4 message schema.
 type PublicControlMessageDescriptor struct {
 	// Name is the stable message name.
 	Name string
@@ -87,12 +87,12 @@ type PublicControlEnumDescriptor struct {
 	Values []string
 }
 
-// PublicControlContract contains every compatibility-sensitive +6 rule.
+// PublicControlContract contains every compatibility-sensitive +4 rule.
 // PublicControlContractV1 returns deep-owned slices to callers.
 type PublicControlContract struct {
 	// SchemaVersion is the common v1 payload schema.
 	SchemaVersion uint16
-	// MessageTypeMin and MessageTypeMax delimit the contiguous owned +6 range.
+	// MessageTypeMin and MessageTypeMax delimit the contiguous owned +4 range.
 	MessageTypeMin, MessageTypeMax uint16
 	// Messages pins every exact top-level layout.
 	Messages []PublicControlMessageDescriptor
@@ -196,7 +196,7 @@ var publicControlRulesV1 = []string{
 	"unknown-enums-trailing-bytes-type-mismatches-and-noncanonical-bytes-are-rejected",
 }
 
-// PublicControlContractV1 returns the immutable v1 +6 public-control contract.
+// PublicControlContractV1 returns the immutable v1 +4 public-control contract.
 func PublicControlContractV1() PublicControlContract {
 	return PublicControlContract{
 		SchemaVersion: PublicControlSchemaVersionV1, MessageTypeMin: 240, MessageTypeMax: 251,

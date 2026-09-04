@@ -98,11 +98,11 @@ func TestValidateRaftAcceptsElectionMinimumOfExactlyThreeHeartbeats(t *testing.T
 func TestNodeConfigRaftVoterByIDReturnsOwnedValue(t *testing.T) {
 	configuration := validConfig(createSecret(t, 0o600))
 	voter, ok := configuration.RaftVoterByID(2)
-	if !ok || voter != (RaftVoter{NodeID: 2, Endpoint: "127.0.0.1:8108"}) {
+	if !ok || voter != (RaftVoter{NodeID: 2, Endpoint: "127.0.0.1:8106"}) {
 		t.Fatalf("RaftVoterByID(2) = %#v, %t", voter, ok)
 	}
-	voter.Endpoint = "changed.example.test:8008"
-	if configuration.RaftVoters[1].Endpoint != "127.0.0.1:8108" {
+	voter.Endpoint = "changed.example.test:8006"
+	if configuration.RaftVoters[1].Endpoint != "127.0.0.1:8106" {
 		t.Fatalf("RaftVoterByID exposed configured voters: %#v", configuration.RaftVoters)
 	}
 	if voter, ok := configuration.RaftVoterByID(4); ok || voter != (RaftVoter{}) {
@@ -118,7 +118,7 @@ func TestNodeConfigRaftVoterByIDWorksForNonVoterNode(t *testing.T) {
 		t.Fatalf("Validate non-voter configuration: %v", err)
 	}
 	voter, ok := configuration.RaftVoterByID(2)
-	if !ok || voter != (RaftVoter{NodeID: 2, Endpoint: "127.0.0.1:8108"}) {
+	if !ok || voter != (RaftVoter{NodeID: 2, Endpoint: "127.0.0.1:8106"}) {
 		t.Fatalf("RaftVoterByID(2) on non-voter = %#v, %t", voter, ok)
 	}
 	if voter, ok := configuration.RaftVoterByID(configuration.NodeID); ok || voter != (RaftVoter{}) {

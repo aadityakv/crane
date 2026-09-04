@@ -19,7 +19,7 @@ import (
 // simJobPlan is the pure reference evaluation of one submitted job: the exact
 // expected sink records, per-source EOF bounds, every derived delivery
 // identity with its root source and sequence, and the globally ordered output
-// the +6 query protocol must return. Tuple identities are derived with the
+// the +4 query protocol must return. Tuple identities are derived with the
 // production canonical identity functions; operator semantics are re-derived
 // by independent harness arithmetic so the final comparison is a real oracle.
 type simJobPlan struct {

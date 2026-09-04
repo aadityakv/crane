@@ -87,7 +87,7 @@ type controlMembership interface {
 	AuthorizeTCP(uint16, net.Addr) error
 }
 
-// ControlOptions fixes the transport-independent +5 command owner's bounded
+// ControlOptions fixes the transport-independent +3 command owner's bounded
 // dependencies. Construction opens no file or socket and starts no goroutine.
 type ControlOptions struct {
 	Config                  config.NodeConfig

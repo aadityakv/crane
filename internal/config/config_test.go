@@ -136,9 +136,9 @@ func validConfig(secretPath string) NodeConfig {
 		StorageDir:        "data/node-1",
 		ClusterSecretFile: secretPath,
 		RaftVoters: []RaftVoter{
-			{NodeID: 1, Endpoint: "127.0.0.1:8008"},
-			{NodeID: 2, Endpoint: "127.0.0.1:8108"},
-			{NodeID: 3, Endpoint: "127.0.0.1:8208"},
+			{NodeID: 1, Endpoint: "127.0.0.1:8006"},
+			{NodeID: 2, Endpoint: "127.0.0.1:8106"},
+			{NodeID: 3, Endpoint: "127.0.0.1:8206"},
 		},
 		Timing: DefaultTimingConfig(),
 		Raft:   DefaultRaftConfig(),
@@ -161,16 +161,16 @@ func TestNodeConfigValidation(t *testing.T) {
 		{name: "malformed_bind_host", mutate: func(c *NodeConfig) { c.BindHost = "bad host" }},
 		{name: "malformed_advertise_host", mutate: func(c *NodeConfig) {
 			c.AdvertiseHost = "bad host"
-			c.RaftVoters[0].Endpoint = "bad host:8008"
+			c.RaftVoters[0].Endpoint = "bad host:8006"
 		}},
 		{name: "base_port_overflow", mutate: func(c *NodeConfig) { c.BasePort = 65535 }},
 		{name: "duplicate_voter_id", mutate: func(c *NodeConfig) { c.RaftVoters[1].NodeID = 1 }},
-		{name: "duplicate_voter_endpoint", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "127.0.0.1:8008" }},
+		{name: "duplicate_voter_endpoint", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "127.0.0.1:8006" }},
 		{name: "two_voters", mutate: func(c *NodeConfig) { c.RaftVoters = c.RaftVoters[:2] }},
 		{name: "insecure_secret_permissions", secret: 0o644, mutate: func(*NodeConfig) {}},
 		{name: "unsafe_storage_root", mutate: func(c *NodeConfig) { c.StorageDir = "/" }},
 		{name: "direct_plus_indirect_exceeds_interval", mutate: func(c *NodeConfig) { c.Timing.IndirectProbeTimeout = Duration(800000000) }},
-		{name: "local_voter_endpoint_mismatch", mutate: func(c *NodeConfig) { c.RaftVoters[0].Endpoint = "127.0.0.1:9008" }},
+		{name: "local_voter_endpoint_mismatch", mutate: func(c *NodeConfig) { c.RaftVoters[0].Endpoint = "127.0.0.1:9006" }},
 	}
 
 	for _, tt := range tests {
@@ -195,8 +195,8 @@ func TestNodeConfigRejectsWildcardIntroducerAndVoters(t *testing.T) {
 	}{
 		{name: "IPv4 introducer", mutate: func(c *NodeConfig) { c.Introducer = "0.0.0.0:8002" }},
 		{name: "IPv6 introducer", mutate: func(c *NodeConfig) { c.Introducer = "[::]:8002" }},
-		{name: "IPv4 voter", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "0.0.0.0:8108" }},
-		{name: "IPv6 voter", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "[::]:8108" }},
+		{name: "IPv4 voter", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "0.0.0.0:8106" }},
+		{name: "IPv6 voter", mutate: func(c *NodeConfig) { c.RaftVoters[1].Endpoint = "[::]:8106" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := validConfig(createSecret(t, 0o600))
@@ -214,8 +214,8 @@ func TestNodeConfigRejectsCanonicalDuplicateVoterEndpoints(t *testing.T) {
 		first  string
 		second string
 	}{
-		{name: "DNS case and root dot", first: "Node.Example.Test.:8108", second: "node.example.test:8108"},
-		{name: "equivalent IPv6", first: "[2001:0db8:0:0:0:0:0:1]:8108", second: "[2001:db8::1]:8108"},
+		{name: "DNS case and root dot", first: "Node.Example.Test.:8106", second: "node.example.test:8106"},
+		{name: "equivalent IPv6", first: "[2001:0db8:0:0:0:0:0:1]:8106", second: "[2001:db8::1]:8106"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := validConfig(createSecret(t, 0o600))
@@ -244,7 +244,7 @@ func TestNodeConfigAcceptsDNSHost(t *testing.T) {
 	cfg := validConfig(createSecret(t, 0o600))
 	cfg.BindHost = "localhost"
 	cfg.AdvertiseHost = "node-1.example.test"
-	cfg.RaftVoters[0].Endpoint = "node-1.example.test:8008"
+	cfg.RaftVoters[0].Endpoint = "node-1.example.test:8006"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestNodeConfigAcceptsAbsoluteDNSHosts(t *testing.T) {
 			cfg := validConfig(createSecret(t, 0o600))
 			cfg.BindHost = tt.bindHost
 			cfg.AdvertiseHost = tt.advertise
-			cfg.RaftVoters[0].Endpoint = strings.TrimSuffix(strings.ToLower(tt.advertise), ".") + ":8008"
+			cfg.RaftVoters[0].Endpoint = strings.TrimSuffix(strings.ToLower(tt.advertise), ".") + ":8006"
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("Validate: %v", err)
 			}
@@ -301,7 +301,7 @@ func TestDecode(t *testing.T) {
 "node_id":1,"cluster_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 "bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
 "introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
-"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}],
+"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8006"},{"node_id":2,"endpoint":"127.0.0.1:8106"},{"node_id":3,"endpoint":"127.0.0.1:8206"}],
 "unknown_json_field":true
 }`, secret)
 		if _, err := Decode(bytes.NewBufferString(input)); err == nil {
@@ -316,7 +316,7 @@ func TestDecodeAppliesTimingDefaults(t *testing.T) {
 "node_id":1,"cluster_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 "bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
 "introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
-"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}],
+"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8006"},{"node_id":2,"endpoint":"127.0.0.1:8106"},{"node_id":3,"endpoint":"127.0.0.1:8206"}],
 "crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"2b98e62384afd912506b032e751aba4504e905fe5d6cec53754a6675e9b93435"}
 }`, secret)
 	cfg, err := Decode(bytes.NewBufferString(input))
@@ -334,7 +334,7 @@ func TestDecodeAppliesAndMergesRaftDefaults(t *testing.T) {
 "node_id":1,"cluster_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 "bind_host":"127.0.0.1","advertise_host":"127.0.0.1","base_port":8000,
 "introducer":"127.0.0.1:8002","storage_dir":"data/node-1","cluster_secret_file":%q,
-"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8008"},{"node_id":2,"endpoint":"127.0.0.1:8108"},{"node_id":3,"endpoint":"127.0.0.1:8208"}],
+"raft_voters":[{"node_id":1,"endpoint":"127.0.0.1:8006"},{"node_id":2,"endpoint":"127.0.0.1:8106"},{"node_id":3,"endpoint":"127.0.0.1:8206"}],
 "crane":{"worker_slots":4,"worker_control_timeout":"2s","tuple_retry_interval":"200ms","tuple_completion_retry_interval":"1s","failure_grace_period":"5s","max_worker_store_bytes":1073741824,"consensus_fingerprint":"2b98e62384afd912506b032e751aba4504e905fe5d6cec53754a6675e9b93435"}`, secret)
 	t.Run("omitted", func(t *testing.T) {
 		cfg, err := Decode(bytes.NewBufferString(base + `}`))

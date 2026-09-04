@@ -24,14 +24,14 @@ import (
 )
 
 var (
-	// ErrTupleEndpointNotReady reports a +7 send attempted before its owning
+	// ErrTupleEndpointNotReady reports a +5 send attempted before its owning
 	// TupleService has activated the endpoint or after that service stopped.
 	ErrTupleEndpointNotReady = errors.New("crane tuple endpoint is not ready")
-	// ErrInvalidTupleEndpoint reports missing, mismatched, or unsafe +7 endpoint
+	// ErrInvalidTupleEndpoint reports missing, mismatched, or unsafe +5 endpoint
 	// construction and ownership dependencies.
 	ErrInvalidTupleEndpoint = errors.New("invalid Crane tuple endpoint")
 	// ErrTuplePeerUnavailable reports an outbound destination that is not an
-	// active member with a derivable +7 endpoint.
+	// active member with a derivable +5 endpoint.
 	ErrTuplePeerUnavailable = errors.New("crane tuple peer unavailable")
 	// ErrTupleEndpointInUse reports an endpoint already claimed by one service.
 	ErrTupleEndpointInUse = errors.New("crane tuple endpoint already in use")
@@ -153,18 +153,18 @@ func (replay *tupleReplay) recordInvalid(sender uint16, request wire.RequestID, 
 	_ = replay.commitInvalid(sender, request, timestamp)
 }
 
-// TupleEndpointOptions fixes the local +7 identity, authentication, clock,
+// TupleEndpointOptions fixes the local +5 identity, authentication, clock,
 // membership authority, and optional caller-provided datagram transport.
 type TupleEndpointOptions struct {
 	// Config is the fully validated local node and stable port registry model.
 	Config config.NodeConfig
-	// Authenticator signs and verifies complete canonical +7 frames.
+	// Authenticator signs and verifies complete canonical +5 frames.
 	Authenticator wire.Authenticator
 	// Clock timestamps outbound frames and enforces inbound replay windows.
 	Clock clock.Clock
-	// Membership authorizes current peer identities and exact +7 endpoints.
+	// Membership authorizes current peer identities and exact +5 endpoints.
 	Membership *membership.Authorizer
-	// Datagram optionally supplies one already-created deterministic +7 seam.
+	// Datagram optionally supplies one already-created deterministic +5 seam.
 	Datagram transport.SourceDatagram
 	// Hook optionally observes the real send/receive paths; nil selects the
 	// production no-op hook, which never alters a datagram.
@@ -209,10 +209,10 @@ func NewTupleEndpoint(options TupleEndpointOptions) (*TupleEndpoint, error) {
 	}
 	bind, err := options.Config.BindEndpoint(config.ServiceCraneTupleACK)
 	if err != nil {
-		return nil, fmt.Errorf("%w: derive +7 bind endpoint: %v", ErrInvalidTupleEndpoint, err)
+		return nil, fmt.Errorf("%w: derive +5 bind endpoint: %v", ErrInvalidTupleEndpoint, err)
 	}
 	if _, err = options.Config.AdvertiseEndpoint(config.ServiceCraneTupleACK); err != nil {
-		return nil, fmt.Errorf("%w: derive +7 advertise endpoint: %v", ErrInvalidTupleEndpoint, err)
+		return nil, fmt.Errorf("%w: derive +5 advertise endpoint: %v", ErrInvalidTupleEndpoint, err)
 	}
 	hook := options.Hook
 	if hook == nil {
@@ -230,7 +230,7 @@ func NewTupleEndpoint(options TupleEndpointOptions) (*TupleEndpoint, error) {
 	}, nil
 }
 
-// Send transmits one already-durable delivery from the owned +7 source socket.
+// Send transmits one already-durable delivery from the owned +5 source socket.
 func (endpoint *TupleEndpoint) Send(ctx context.Context, delivery protocol.TupleDelivery) error {
 	if endpoint == nil {
 		return ErrTupleEndpointNotReady
@@ -266,7 +266,7 @@ func (endpoint *TupleEndpoint) activate() (transport.SourceDatagram, error) {
 		var err error
 		datagram, err = transport.ListenUDPBounded(tupleDatagramMaximumBytes, endpoint.bind)
 		if err != nil {
-			return nil, fmt.Errorf("activate Crane +7 datagram: %w", err)
+			return nil, fmt.Errorf("activate Crane +5 datagram: %w", err)
 		}
 	}
 	var prefix [8]byte
@@ -274,7 +274,7 @@ func (endpoint *TupleEndpoint) activate() (transport.SourceDatagram, error) {
 		if endpoint.injected == nil {
 			_ = datagram.Close()
 		}
-		return nil, fmt.Errorf("activate Crane +7 request IDs: %w", err)
+		return nil, fmt.Errorf("activate Crane +5 request IDs: %w", err)
 	}
 	endpoint.requestPrefix = binary.BigEndian.Uint64(prefix[:])
 	if endpoint.requestPrefix == 0 {
@@ -314,7 +314,7 @@ func (endpoint *TupleEndpoint) sendPayload(ctx context.Context, datagram transpo
 		return wire.ErrTooLarge
 	}
 	// The integration hook decides the fate of this exact authenticated
-	// frame; every copy it allows still leaves the node's own bound +7
+	// frame; every copy it allows still leaves the node's own bound +5
 	// socket, so the advertised source IP/port stays authentic. A held
 	// frame is re-sent later from this same socket when the hook releases it.
 	if holder, ok := endpoint.hook.(integrationhook.DatagramHolder); ok {

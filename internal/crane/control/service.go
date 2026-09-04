@@ -21,9 +21,9 @@ import (
 )
 
 const (
-	// DefaultMaxControlConnections bounds concurrently served +6 connections.
+	// DefaultMaxControlConnections bounds concurrently served +4 connections.
 	DefaultMaxControlConnections = 128
-	// DefaultMaxControlConnectionsPerPeer bounds concurrently served +6
+	// DefaultMaxControlConnectionsPerPeer bounds concurrently served +4
 	// connections from one peer source address, so a single peer cannot
 	// consume the shared global connection budget.
 	DefaultMaxControlConnectionsPerPeer = 4
@@ -59,12 +59,12 @@ type membershipAuthorizer interface {
 	AuthorizeTCP(uint16, net.Addr) error
 }
 
-// ServiceOptions fixes every caller-owned dependency of one +6 public control
+// ServiceOptions fixes every caller-owned dependency of one +4 public control
 // service. NewService retains these exact values but opens no resource.
 type ServiceOptions struct {
 	// Config is the complete validated local node configuration.
 	Config config.NodeConfig
-	// Authenticator signs and verifies every +6 frame with the cluster secret.
+	// Authenticator signs and verifies every +4 frame with the cluster secret.
 	Authenticator wire.Authenticator
 	// Clock supplies timestamps and replay-window time.
 	Clock clock.Clock
@@ -84,7 +84,7 @@ type ServiceOptions struct {
 	WakeCoordinator func()
 }
 
-// Service owns one bounded authenticated +6 TCP listener serving exactly one
+// Service owns one bounded authenticated +4 TCP listener serving exactly one
 // public control request and one correlated response per connection.
 type Service struct {
 	configuration  config.NodeConfig
@@ -114,7 +114,7 @@ type Service struct {
 	started atomic.Bool
 }
 
-// NewService validates and retains the complete +6 composition without
+// NewService validates and retains the complete +4 composition without
 // binding a listener, reading state, or starting any goroutine.
 func NewService(options ServiceOptions) (*Service, error) {
 	if options.Authenticator == nil || options.Clock == nil || options.Membership == nil || options.Machine == nil || options.Gate == nil || options.Results == nil || options.WakeCoordinator == nil {
@@ -166,10 +166,10 @@ func NewService(options ServiceOptions) (*Service, error) {
 // Name returns the stable supervisor registration name.
 func (*Service) Name() string { return "crane-control" }
 
-// Ready closes once the exact +6 listener is bound.
+// Ready closes once the exact +4 listener is bound.
 func (service *Service) Ready() <-chan struct{} { return service.ready }
 
-// Run binds the exact +6 endpoint, serves one bounded request/response per
+// Run binds the exact +4 endpoint, serves one bounded request/response per
 // authenticated connection, and joins every handler before returning.
 func (service *Service) Run(ctx context.Context) error {
 	if ctx == nil {
@@ -309,7 +309,7 @@ func (service *Service) releasePeerConnection(peer string) {
 }
 
 // serviceReplay pairs one global and bounded per-sender replay guards so no
-// authenticated +6 request identity is ever served twice.
+// authenticated +4 request identity is ever served twice.
 type serviceReplay struct {
 	mu          sync.Mutex
 	clock       clock.Clock

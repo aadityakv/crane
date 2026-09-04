@@ -44,7 +44,7 @@ func clientTestTopology(t *testing.T, name string) model.TopologySpec {
 	return topology
 }
 
-// clientHarness pairs one real +6 service fixture with a durable client store
+// clientHarness pairs one real +4 service fixture with a durable client store
 // and a recording dial seam that maps every derived endpoint to the fixture.
 type clientHarness struct {
 	t         *testing.T
@@ -162,7 +162,7 @@ func testContext(t *testing.T) context.Context {
 	return ctx
 }
 
-// scriptedControlServer serves scripted single-frame responses over real +6
+// scriptedControlServer serves scripted single-frame responses over real +4
 // framing without any service state.
 func scriptedControlServer(t *testing.T, auth wire.Authenticator, clusterID [16]byte, respond func(wire.Frame) *wire.Frame) string {
 	t.Helper()
@@ -445,7 +445,7 @@ func TestClientRedirectFollowsCheckedLeaderHint(t *testing.T) {
 	topology := clientTestTopology(t, "redirect-follow")
 	harness.fixture.raft.setLeader(false, 2)
 	harness.dialHook = func(address string, _ int) {
-		if address == "127.0.0.2:19206" {
+		if address == "127.0.0.2:19204" {
 			harness.fixture.raft.setLeader(true, 0)
 		}
 	}
@@ -458,14 +458,14 @@ func TestClientRedirectFollowsCheckedLeaderHint(t *testing.T) {
 		t.Fatalf("redirected job = %x, want %x", job, want)
 	}
 	dialed := harness.dialedAddresses()
-	if len(dialed) != 2 || dialed[0] != "127.0.0.1:19106" || dialed[1] != "127.0.0.2:19206" {
-		t.Fatalf("dialed = %v, want the hinted leader's derived +6 endpoint", dialed)
+	if len(dialed) != 2 || dialed[0] != "127.0.0.1:19104" || dialed[1] != "127.0.0.2:19204" {
+		t.Fatalf("dialed = %v, want the hinted leader's derived +4 endpoint", dialed)
 	}
 }
 
 // TestClientRedirectToUnreachableLeaderFallsBackToVoters pins the Task 24
 // leader-loss transient: a follower's checked hint names a leader that died
-// before its followers learned of a successor, so the hinted +6 endpoint
+// before its followers learned of a successor, so the hinted +4 endpoint
 // refuses connections. The client must not spend every remaining attempt on
 // that endpoint; it falls back to the remaining static voters, which answer
 // once leadership settles.
@@ -474,7 +474,7 @@ func TestClientRedirectToUnreachableLeaderFallsBackToVoters(t *testing.T) {
 	topology := clientTestTopology(t, "redirect-dead-leader")
 	harness.fixture.raft.setLeader(false, 2)
 	harness.dialErr = func(address string, _ int) error {
-		if address == "127.0.0.2:19206" {
+		if address == "127.0.0.2:19204" {
 			return &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
 		}
 		return nil
@@ -493,7 +493,7 @@ func TestClientRedirectToUnreachableLeaderFallsBackToVoters(t *testing.T) {
 		t.Fatalf("job = %x, want %x", job, want)
 	}
 	dialed := harness.dialedAddresses()
-	if len(dialed) != 3 || dialed[0] != "127.0.0.1:19106" || dialed[1] != "127.0.0.2:19206" || dialed[2] == "127.0.0.2:19206" {
+	if len(dialed) != 3 || dialed[0] != "127.0.0.1:19104" || dialed[1] != "127.0.0.2:19204" || dialed[2] == "127.0.0.2:19204" {
 		t.Fatalf("dialed = %v, want the hint tried once and then a remaining static voter", dialed)
 	}
 }
@@ -550,7 +550,7 @@ func TestClientRedirectRejectsUntrustedEndpoints(t *testing.T) {
 	topology := clientTestTopology(t, "redirect-untrusted")
 	clusterID := harness.fixture.service.clusterID
 	address := scriptedControlServer(t, harness.fixture.authenticator, clusterID, func(frame wire.Frame) *wire.Frame {
-		return scriptedResponseFrame(t, frame, clusterID, protocol.LeaderRedirect{Endpoints: []string{"127.0.0.9:19906"}})
+		return scriptedResponseFrame(t, frame, clusterID, protocol.LeaderRedirect{Endpoints: []string{"127.0.0.9:19904"}})
 	})
 	options := harness.options()
 	options.Dial = func(ctx context.Context, _ string) (net.Conn, error) {
@@ -573,7 +573,7 @@ func TestClientRetryRejectsWrongClusterResponses(t *testing.T) {
 	clusterID := harness.fixture.service.clusterID
 	foreign := [16]byte{9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9}
 	address := scriptedControlServer(t, harness.fixture.authenticator, clusterID, func(frame wire.Frame) *wire.Frame {
-		response := scriptedResponseFrame(t, frame, clusterID, protocol.LeaderRedirect{Endpoints: []string{"127.0.0.1:19106"}})
+		response := scriptedResponseFrame(t, frame, clusterID, protocol.LeaderRedirect{Endpoints: []string{"127.0.0.1:19104"}})
 		if response != nil {
 			response.Header.ClusterID = foreign
 		}
@@ -749,14 +749,14 @@ func TestClientRedirectRetriesTransientlyUnreachableLeader(t *testing.T) {
 	harness.fixture.raft.setLeader(false, 2)
 	failedOnce := false
 	harness.dialErr = func(address string, _ int) error {
-		if address == "127.0.0.2:19206" && !failedOnce {
+		if address == "127.0.0.2:19204" && !failedOnce {
 			failedOnce = true
 			return &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
 		}
 		return nil
 	}
 	harness.dialHook = func(address string, _ int) {
-		if address == "127.0.0.2:19206" && failedOnce {
+		if address == "127.0.0.2:19204" && failedOnce {
 			harness.fixture.raft.setLeader(true, 0)
 		}
 	}
@@ -769,7 +769,7 @@ func TestClientRedirectRetriesTransientlyUnreachableLeader(t *testing.T) {
 		t.Fatalf("job = %x, want %x", job, want)
 	}
 	dialed := harness.dialedAddresses()
-	if len(dialed) < 3 || dialed[len(dialed)-1] != "127.0.0.2:19206" {
+	if len(dialed) < 3 || dialed[len(dialed)-1] != "127.0.0.2:19204" {
 		t.Fatalf("dialed = %v, want the hinted leader retried after its transient failure", dialed)
 	}
 }

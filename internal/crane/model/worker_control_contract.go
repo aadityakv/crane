@@ -27,7 +27,7 @@ const (
 	ResultInventoryChainSchemaV1 = "ResultInventoryChain=SHA256(UTF8(Domain)||u8(0)||PriorDigest:sha256||RecordIndex:u64be||EntryLength:u64be||Entry:bytes(EntryLength));Entry=u32be(ResultRecordStreamLength)||ResultRecordStream"
 )
 
-// WorkerControlMessageDescriptor identifies one owned +5 message schema.
+// WorkerControlMessageDescriptor identifies one owned +3 message schema.
 type WorkerControlMessageDescriptor struct {
 	Name          string
 	MessageType   uint16
@@ -35,7 +35,7 @@ type WorkerControlMessageDescriptor struct {
 	Schema        string
 }
 
-// WorkerControlContract contains every compatibility-sensitive +5 rule.
+// WorkerControlContract contains every compatibility-sensitive +3 rule.
 // Callers receive owned slices from WorkerControlContractV1.
 type WorkerControlContract struct {
 	SchemaVersion                   uint16
@@ -140,7 +140,7 @@ var workerControlNestedSchemasV1 = []string{
 	"ResultArtifact=JobID:JobID,SinkTask:TaskID,SpecificationHash:sha256,RecordCount:u64,TotalLength:u64,Checksum:sha256",
 }
 
-// WorkerControlContractV1 returns the immutable v1 +5 worker-control contract.
+// WorkerControlContractV1 returns the immutable v1 +3 worker-control contract.
 func WorkerControlContractV1() WorkerControlContract {
 	messages := make([]WorkerControlMessageDescriptor, 19)
 	for index := range messages {

@@ -146,7 +146,7 @@ func TestServiceRunOrdersRecoveryBindWorkersOwnerAndIsolatedReady(t *testing.T) 
 		}
 		want, _ := configuration.BindEndpoint(config.ServiceRaftRPC)
 		if address != want.String() {
-			t.Fatalf("listen address = %q, want exact +8 %q", address, want)
+			t.Fatalf("listen address = %q, want exact +6 %q", address, want)
 		}
 		events.add("bind")
 		return listener, nil
@@ -735,6 +735,6 @@ func task10ServiceConfig(t *testing.T, localID, basePort uint16) (config.NodeCon
 }
 
 func task10Port(base uint16, voter uint16) string {
-	port := uint32(base) + uint32(voter-1)*10 + 8
+	port := uint32(base) + uint32(voter-1)*10 + 6
 	return strconv.FormatUint(uint64(port), 10)
 }

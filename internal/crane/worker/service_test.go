@@ -102,7 +102,7 @@ func TestWorkerServiceReadyOrdersStoreRecoveryAndComposesExactGateEndpointAndSoc
 		t.Fatalf("engine retries = %v/%v", service.engine.acceptedRetry, service.engine.completedRetry)
 	}
 	if service.endpoint.injected != fixture.datagram || service.endpoint.datagram != fixture.datagram {
-		t.Fatal("+7 send/receive owner did not retain and activate the exact injected socket")
+		t.Fatal("+5 send/receive owner did not retain and activate the exact injected socket")
 	}
 	if fixture.openCalls != 1 || fixture.listenerCalls != 1 || fixture.openPath != filepath.Join(fixture.configuration.StorageDir, WorkerStoreDirectory) || fixture.openIdentity.NodeID != fixture.configuration.NodeID || fixture.openIdentity.ClusterID != service.clusterID || fixture.openOptions.MaxBytes != fixture.configuration.Crane.MaxWorkerStoreBytes {
 		t.Fatalf("Run dependencies: opens=%d listeners=%d path=%q identity=%#v options=%#v", fixture.openCalls, fixture.listenerCalls, fixture.openPath, fixture.openIdentity, fixture.openOptions)
@@ -147,12 +147,12 @@ func TestWorkerServiceReadyOrdersStoreRecoveryAndComposesExactGateEndpointAndSoc
 	select {
 	case <-fixture.listener.closed:
 	default:
-		t.Fatal("+5 listener remained open after Run")
+		t.Fatal("+3 listener remained open after Run")
 	}
 	select {
 	case <-fixture.datagram.closed:
 	default:
-		t.Fatal("+7 socket remained open after Run")
+		t.Fatal("+5 socket remained open after Run")
 	}
 	if _, err := service.store.RecoverWork(); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("store after Run = %v, want closed", err)
@@ -185,7 +185,7 @@ func TestWorkerServiceListenerFailureBeforeReadyClosesRecoveredStoreAndSocket(t 
 		t.Fatalf("store after listener failure = %v", err)
 	}
 	if fixture.datagram.operationCount() != 0 {
-		t.Fatalf("listener failure activated +7 socket %d times", fixture.datagram.operationCount())
+		t.Fatalf("listener failure activated +5 socket %d times", fixture.datagram.operationCount())
 	}
 }
 

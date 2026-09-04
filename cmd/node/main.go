@@ -113,7 +113,7 @@ func runSupervisedNode(ctx context.Context, nodeID uint16, services []node.Servi
 // newLocalRuntime validates the strict configuration and composes the
 // complete Crane node runtime: SWIM, the membership authorizer, the shared
 // admission gate and state machine, the worker services, Raft plus the
-// coordinator on configured voters, and the +6 control service.
+// coordinator on configured voters, and the +4 control service.
 func newLocalRuntime(configuration config.NodeConfig) (*craneruntime.Runtime, error) {
 	if err := configuration.Validate(); err != nil {
 		return nil, fmt.Errorf("validate node configuration: %w", err)

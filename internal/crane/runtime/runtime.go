@@ -1,7 +1,7 @@
 // Package runtime composes one complete Crane node process: SWIM membership,
 // the owned membership authorizer, the shared admission gate and replicated
 // state machine, the durable worker services, Raft and the coordinator on
-// configured voters, and the public +6 control service. Construction is
+// configured voters, and the public +4 control service. Construction is
 // side-effect free; Run supervises every composed service and synchronously
 // closes the shared admission gate before service cancellation.
 package runtime
@@ -58,19 +58,19 @@ type Dependencies struct {
 	// SWIMDatagram optionally injects a deterministic SWIM transport; nil
 	// asks the SWIM service to bind the real +0/+1 UDP sockets during Run.
 	SWIMDatagram transport.Datagram
-	// WorkerDatagram optionally injects a deterministic +7 transport; nil
-	// binds the real bounded +7 UDP socket lazily during worker startup.
+	// WorkerDatagram optionally injects a deterministic +5 transport; nil
+	// binds the real bounded +5 UDP socket lazily during worker startup.
 	WorkerDatagram transport.SourceDatagram
 	// Dial optionally overrides outbound TCP dialing for the coordinator's
-	// +5 worker-control and result-transfer exchanges; nil uses net.Dialer.
+	// +3 worker-control and result-transfer exchanges; nil uses net.Dialer.
 	Dial func(context.Context, string, string) (net.Conn, error)
-	// SessionEpoch optionally fixes the coordinator's +5 client session
+	// SessionEpoch optionally fixes the coordinator's +3 client session
 	// epoch; the zero value draws one cryptographically random epoch.
 	SessionEpoch model.WorkerEpoch
 	// OpenStore optionally overrides the durable worker store opener; nil
 	// uses the production store.Open.
 	OpenStore func(string, store.Identity, store.Options) (*store.Store, error)
-	// Hook optionally observes worker durable boundaries and the real +7
+	// Hook optionally observes worker durable boundaries and the real +5
 	// send/receive paths. Nil asks integrationhook.LoadFromInheritedFD for
 	// the process hook: the production no-op in every ordinary build, and
 	// only under the craneintegration tag the seam activated from one
@@ -80,7 +80,7 @@ type Dependencies struct {
 
 // Runtime is one completely composed Crane node process. Exactly one
 // state.Machine and one admission.Gate are shared by Raft apply, the
-// coordinator, the worker services, and the +6 control service.
+// coordinator, the worker services, and the +4 control service.
 type Runtime struct {
 	// SWIM is the failure-detection membership service every node runs.
 	SWIM *swim.Service
@@ -90,13 +90,13 @@ type Runtime struct {
 	Gate *admission.Gate
 	// Machine is the process-wide shared replicated Crane state machine.
 	Machine *state.Machine
-	// Worker composes the durable +5/+7 worker services every node runs.
+	// Worker composes the durable +3/+5 worker services every node runs.
 	Worker *worker.Service
 	// Raft is the consensus service; it is nil on configured nonvoters.
 	Raft *raft.Service
 	// Coordinator is the fenced leader actor; it is nil on nonvoters.
 	Coordinator *coordinator.Actor
-	// Control is the public +6 control service every node runs.
+	// Control is the public +4 control service every node runs.
 	Control *control.Service
 	// Services is the exact supervised startup set in composition order.
 	Services []node.Service
@@ -118,7 +118,7 @@ type Runtime struct {
 // binding a listener or socket, or starting a goroutine. It consumes exactly
 // these NodeConfig fields: NodeID selects the voter/nonvoter role and the
 // process identity; ClusterID names the cluster; BindHost, AdvertiseHost, and
-// BasePort derive the registry's exact +0..+8 endpoints; Introducer seeds
+// BasePort derive the registry's exact +0..+6 endpoints; Introducer seeds
 // SWIM joining; StorageDir locates the SWIM incarnation state, the worker
 // store, the sealed artifact directory, and, on voters, the Raft store;
 // RaftVoters fixes consensus membership and this node's role in it; Timing,
@@ -190,7 +190,7 @@ func New(configuration config.NodeConfig, dependencies Dependencies) (*Runtime, 
 	if workerDatagram == nil {
 		tupleBind, err := owned.BindEndpoint(config.ServiceCraneTupleACK)
 		if err != nil {
-			return nil, fmt.Errorf("derive Crane +7 bind endpoint: %w", err)
+			return nil, fmt.Errorf("derive Crane +5 bind endpoint: %w", err)
 		}
 		workerDatagram = newLazyTupleDatagram(tupleBind)
 	}
@@ -385,7 +385,7 @@ func (adapter serviceRaft) SubscribeLeadership(ctx context.Context, capacity int
 	return subscription, nil
 }
 
-// resultFetchClient is the bounded +5 fetch surface the production result
+// resultFetchClient is the bounded +3 fetch surface the production result
 // fetcher consumes; *coordinator.DialWorkerClient satisfies it directly.
 type resultFetchClient interface {
 	// Fetch performs one authenticated leader result-fetch exchange.
@@ -393,7 +393,7 @@ type resultFetchClient interface {
 }
 
 // artifactFetcher is the production control.ResultFetcher: it assembles one
-// complete sealed artifact from bounded authenticated +5 fetch chunks with
+// complete sealed artifact from bounded authenticated +3 fetch chunks with
 // exact identity, contiguity, and checksum verification, then streams its
 // canonical records one at a time.
 type artifactFetcher struct {
@@ -527,7 +527,7 @@ func tupleIDLess(left, right model.TupleID) bool {
 	return string(left.PathDigest[:]) < string(right.PathDigest[:])
 }
 
-// lazyTupleDatagram binds the production bounded +7 UDP socket on first use,
+// lazyTupleDatagram binds the production bounded +5 UDP socket on first use,
 // keeping runtime construction side-effect free.
 type lazyTupleDatagram struct {
 	bind config.Endpoint
@@ -552,14 +552,14 @@ func (lazy *lazyTupleDatagram) active() (*transport.UDPDatagram, error) {
 	if lazy.datagram == nil {
 		datagram, err := transport.ListenUDPBounded(wire.MaxCraneDatagramBytesV1, lazy.bind)
 		if err != nil {
-			return nil, fmt.Errorf("bind Crane +7 datagram: %w", err)
+			return nil, fmt.Errorf("bind Crane +5 datagram: %w", err)
 		}
 		lazy.datagram = datagram
 	}
 	return lazy.datagram, nil
 }
 
-// Send transmits one datagram from the lazily bound +7 socket.
+// Send transmits one datagram from the lazily bound +5 socket.
 func (lazy *lazyTupleDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
 	datagram, err := lazy.active()
 	if err != nil {
@@ -577,7 +577,7 @@ func (lazy *lazyTupleDatagram) SendFrom(ctx context.Context, from, destination c
 	return datagram.SendFrom(ctx, from, destination, payload)
 }
 
-// Receive returns the next datagram from the lazily bound +7 socket.
+// Receive returns the next datagram from the lazily bound +5 socket.
 func (lazy *lazyTupleDatagram) Receive(ctx context.Context) (transport.Packet, error) {
 	datagram, err := lazy.active()
 	if err != nil {

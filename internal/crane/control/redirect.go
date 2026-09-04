@@ -10,12 +10,12 @@ import (
 )
 
 // ErrInvalidVoterEndpoint reports a configured Raft voter endpoint whose
-// canonical +6 control endpoint cannot be derived or validated.
+// canonical +4 control endpoint cannot be derived or validated.
 var ErrInvalidVoterEndpoint = errors.New("invalid Crane voter control endpoint")
 
-// deriveVoterControlEndpoints derives the complete sorted unique canonical +6
+// deriveVoterControlEndpoints derives the complete sorted unique canonical +4
 // control endpoint set of the configured static voters using the checked
-// +8-to-+6 helper, and proves the complete redirect encodes canonically before
+// +6-to-+4 helper, and proves the complete redirect encodes canonically before
 // any request is served.
 func deriveVoterControlEndpoints(voters []config.RaftVoter) ([]string, error) {
 	if len(voters) != 3 && len(voters) != 5 {
@@ -41,8 +41,8 @@ func deriveVoterControlEndpoints(voters []config.RaftVoter) ([]string, error) {
 	return endpoints, nil
 }
 
-// deriveVoterControlEndpoint derives one voter's canonical +6 endpoint from
-// its validated static +8 Raft endpoint with checked port arithmetic.
+// deriveVoterControlEndpoint derives one voter's canonical +4 endpoint from
+// its validated static +6 Raft endpoint with checked port arithmetic.
 func deriveVoterControlEndpoint(voter config.RaftVoter) (string, error) {
 	raftEndpoint, err := config.ParseRoutableEndpoint(voter.Endpoint)
 	if err != nil {
@@ -60,7 +60,7 @@ func (service *Service) staticRedirect() protocol.LeaderRedirect {
 	return protocol.LeaderRedirect{Endpoints: append([]string(nil), service.voterEndpoints...)}
 }
 
-// leaderRedirect returns the derived +6 endpoint of one checked known leader,
+// leaderRedirect returns the derived +4 endpoint of one checked known leader,
 // or the complete static voter redirect when the hint is zero, local, or not a
 // configured voter.
 func (service *Service) leaderRedirect(hint uint16) protocol.LeaderRedirect {

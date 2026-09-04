@@ -1,10 +1,10 @@
 // Package sim composes the complete production Crane stack — SWIM, Raft, the
 // replicated state machine, the durable worker store and engine, the
-// coordinator actor, and the +6 control service — into one deterministic
+// coordinator actor, and the +4 control service — into one deterministic
 // in-process cluster driven by a shared manual clock, a deterministic datagram
 // network, and restartable real on-disk durable stores. Every file in this
 // package is test-only: the harness injects fakes only at production seams
-// (transport.SourceDatagram, the +5 dial seam, the worker store opener, clock,
+// (transport.SourceDatagram, the +3 dial seam, the worker store opener, clock,
 // and randomness) and otherwise runs the real production objects end to end.
 package sim
 
@@ -257,7 +257,7 @@ func (cluster *simCluster) buildNodes() {
 	for index, id := range cluster.ids[:simVoterCount] {
 		voters = append(voters, config.RaftVoter{
 			NodeID:   id,
-			Endpoint: fmt.Sprintf("127.0.0.1:%d", bases[index]+8),
+			Endpoint: fmt.Sprintf("127.0.0.1:%d", bases[index]+6),
 		})
 	}
 	introducer := fmt.Sprintf("127.0.0.1:%d", bases[0]+2)
@@ -546,9 +546,9 @@ func (node *simNode) loadHandle() *store.Store {
 	return node.handle
 }
 
-// reservePortBlocks finds one bindable +0..+8 block per node. Bases stay at
-// least 16 apart so no node's +8 Raft endpoint can collide with any other
-// node's +2/+5/+6/+8 listeners across blocks.
+// reservePortBlocks finds one bindable +0..+6 block per node. Bases stay at
+// least 16 apart so no node's +6 Raft endpoint can collide with any other
+// node's +2/+3/+4/+6 listeners across blocks.
 func (cluster *simCluster) reservePortBlocks() []uint16 {
 	cluster.t.Helper()
 	blocks := make([]uint16, 0, len(cluster.ids))
@@ -576,14 +576,14 @@ func (cluster *simCluster) reservePortBlocks() []uint16 {
 
 func (cluster *simCluster) probePortBlock(base uint16) bool {
 	cluster.t.Helper()
-	for _, offset := range []uint16{2, 5, 6, 8} {
+	for _, offset := range []uint16{2, 3, 4, 6} {
 		listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+offset))
 		if err != nil {
 			return false
 		}
 		_ = listener.Close()
 	}
-	for _, offset := range []uint16{0, 1, 7} {
+	for _, offset := range []uint16{0, 1, 5} {
 		connection, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", base+offset))
 		if err != nil {
 			return false
@@ -896,7 +896,7 @@ func (cluster *simCluster) awaitSteady() {
 	cluster.record("cluster steady: leader=%d", cluster.oracle.currentLeader())
 }
 
-// simClient is one crash-safe public control client over the real +6 wire.
+// simClient is one crash-safe public control client over the real +4 wire.
 type simClient struct {
 	client *control.Client
 	store  *clientstate.ClientStore
@@ -907,7 +907,7 @@ type simClient struct {
 	readers map[uint16]*control.Client
 }
 
-// dialOption lets a scenario intercept the client's +6 dial.
+// dialOption lets a scenario intercept the client's +4 dial.
 type simClientOption func(*control.ClientOptions)
 
 // newClient builds a crash-safe public control client whose durable identity
@@ -931,7 +931,7 @@ func (cluster *simCluster) newClient(name string, options ...simClientOption) *s
 	return &simClient{client: client, store: state, name: name, options: options, readers: map[uint16]*control.Client{1: client}}
 }
 
-// buildClient constructs one public client identified as node (the +6
+// buildClient constructs one public client identified as node (the +4
 // service authorizes a public sender as an active membership record, so a
 // client speaks under the identity of the node it runs on).
 func (cluster *simCluster) buildClient(name string, state *clientstate.ClientStore, node uint16, options ...simClientOption) *control.Client {
@@ -947,7 +947,7 @@ func (cluster *simCluster) buildClient(name string, state *clientstate.ClientSto
 	for _, option := range options {
 		option(&clientOptions)
 	}
-	// Trace every +6 dial the public client makes (endpoint and outcome) so a
+	// Trace every +4 dial the public client makes (endpoint and outcome) so a
 	// failed call shows which voters answered and which refused.
 	dial := clientOptions.Dial
 	if dial == nil {
@@ -1065,7 +1065,7 @@ func (cluster *simCluster) submit(client *simClient, plan *simJobPlan) model.Job
 }
 
 // pageResult reads the complete globally ordered result of one succeeded job
-// through the real linearizable +6 result-page protocol.
+// through the real linearizable +4 result-page protocol.
 func (cluster *simCluster) pageResult(client *simClient, job model.JobID) []model.ResultRecord {
 	cluster.t.Helper()
 	var status protocol.StatusResponse

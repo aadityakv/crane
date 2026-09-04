@@ -45,13 +45,13 @@ type ServiceOptions struct {
 	// store created during Run. Empty keeps artifact receive and leader fetch
 	// fail-closed unavailable, exactly as before this seam existed.
 	ArtifactDirectory string
-	// Hook optionally observes durable store boundaries and the real +7
+	// Hook optionally observes durable store boundaries and the real +5
 	// send/receive paths; nil selects the production no-op hook.
 	Hook integrationhook.Hook
 }
 
-// Service composes one durable worker owner, one +5 listener, and exactly one
-// shared +7 sender/receiver endpoint.
+// Service composes one durable worker owner, one +3 listener, and exactly one
+// shared +5 sender/receiver endpoint.
 type Service struct {
 	configuration     config.NodeConfig
 	authenticator     wire.Authenticator
@@ -516,8 +516,8 @@ type controlResultReplicator struct {
 	timeout       time.Duration
 	dial          func(context.Context, string, string) (net.Conn, error)
 
-	// sessions caches one authenticated +5 session per destination
-	// incarnation (Task 24 defect #8, the +5 half): a session is dialed once,
+	// sessions caches one authenticated +3 session per destination
+	// incarnation (Task 24 defect #8, the +3 half): a session is dialed once,
 	// reused for every record and retry to that destination, and dropped on
 	// any failure. The repair driver's pull client shares the same cache
 	// type so repair pulls honor the same one-identity-per-record budget.

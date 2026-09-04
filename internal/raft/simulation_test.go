@@ -105,7 +105,7 @@ func newSimulationCluster(t *testing.T, voterCount int, seed uint64) *simulation
 	t.Helper()
 	configured := make([]config.RaftVoter, voterCount)
 	for index := range configured {
-		configured[index] = config.RaftVoter{NodeID: uint16(index + 1), Endpoint: fmt.Sprintf("127.0.0.1:%d", 32008+index)}
+		configured[index] = config.RaftVoter{NodeID: uint16(index + 1), Endpoint: fmt.Sprintf("127.0.0.1:%d", 32006+index)}
 	}
 	voters, err := NewVoterSet(configured)
 	if err != nil {

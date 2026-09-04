@@ -15,13 +15,13 @@ import (
 	"github.com/aadityakv/crane/internal/wire"
 )
 
-// Direction names the side of the local +7 socket a datagram crosses.
+// Direction names the side of the local +5 socket a datagram crosses.
 type Direction uint8
 
 const (
-	// Send is a datagram leaving the node's bound +7 socket.
+	// Send is a datagram leaving the node's bound +5 socket.
 	Send Direction = iota + 1
-	// Receive is an authenticated datagram accepted from the +7 socket.
+	// Receive is an authenticated datagram accepted from the +5 socket.
 	Receive
 )
 
@@ -86,7 +86,7 @@ func (Noop) DurableBoundary(string) {}
 // DatagramAction always passes.
 func (Noop) DatagramAction(Direction, wire.MessageType) Action { return Pass }
 
-// MessageName renders a +7 message type in the protocol vocabulary.
+// MessageName renders a +5 message type in the protocol vocabulary.
 func MessageName(message wire.MessageType) string {
 	switch message {
 	case wire.MessageCraneTupleDelivery:
