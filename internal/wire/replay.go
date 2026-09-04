@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"crane/internal/clock"
+	"github.com/aadityakv/crane/internal/clock"
 )
 
 var (

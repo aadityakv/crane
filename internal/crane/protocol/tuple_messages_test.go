@@ -11,8 +11,8 @@ import (
 	"runtime"
 	"testing"
 
-	"crane/internal/crane/model"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 func TestTupleTrafficGoldenVectorsAndMessageAssociation(t *testing.T) {

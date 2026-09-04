@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/config"
-	craneworker "crane/internal/crane/worker"
-	internalnode "crane/internal/node"
-	"crane/internal/raft"
+	"github.com/aadityakv/crane/internal/config"
+	craneworker "github.com/aadityakv/crane/internal/crane/worker"
+	internalnode "github.com/aadityakv/crane/internal/node"
+	"github.com/aadityakv/crane/internal/raft"
 )
 
 func TestRunSupervisedNodeEmitsSignalOnlyAfterServiceReady(t *testing.T) {

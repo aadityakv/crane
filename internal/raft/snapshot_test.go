@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 func TestSnapshotEnvelopeMatchesPinnedPortableV1BytesAndZeroedChecksumRule(t *testing.T) {

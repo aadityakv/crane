@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"testing"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 func TestStorageStoresShareExactCanonicalBatchBounds(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"math"
 	"math/bits"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const (

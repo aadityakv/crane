@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func rebindStoreForTest(t *testing.T) (*Store, string, Identity, Options) {

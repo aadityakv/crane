@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/config"
-	"crane/internal/endpointauth"
-	"crane/internal/swim"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/endpointauth"
+	"github.com/aadityakv/crane/internal/swim"
 )
 
 func TestAuthorizerRequiresExactInitialSnapshotAndPublishesOwnedMonotonicViews(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 type coreScriptedRandom struct {

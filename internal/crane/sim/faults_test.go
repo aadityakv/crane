@@ -11,13 +11,13 @@ import (
 
 	goruntime "runtime"
 
-	"crane/internal/config"
-	"crane/internal/crane/control"
-	"crane/internal/crane/model"
-	"crane/internal/crane/state"
-	"crane/internal/crane/store"
-	"crane/internal/swim"
-	"crane/internal/transport"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/crane/control"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/swim"
+	"github.com/aadityakv/crane/internal/transport"
 )
 
 func gosched() { goruntime.Gosched() }

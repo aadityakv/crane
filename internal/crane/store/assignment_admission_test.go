@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 // seedAdmissionWorkForTest fences one epoch and installs the complete

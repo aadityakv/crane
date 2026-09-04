@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 const (

@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/config"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const (

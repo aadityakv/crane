@@ -16,7 +16,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 const (

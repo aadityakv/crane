@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/config"
-	"crane/internal/raft"
-	"crane/internal/swim"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/raft"
+	"github.com/aadityakv/crane/internal/swim"
 )
 
 func TestFourProcessFixedVoterRaftLifecycle(t *testing.T) {

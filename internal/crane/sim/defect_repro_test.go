@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"crane/internal/crane/model"
-	"crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 // TestActivationRunningInstallAcceptedAtEqualJobControlRevision is the

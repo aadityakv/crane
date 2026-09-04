@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/crane/admission"
-	"crane/internal/crane/model"
-	"crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/crane/admission"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 var (

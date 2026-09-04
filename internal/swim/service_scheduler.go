@@ -4,7 +4,7 @@ import (
 	"container/heap"
 	"time"
 
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 type serviceTimerKey struct {

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/clock"
+	"github.com/aadityakv/crane/internal/clock"
 )
 
 type task8EventLog struct {

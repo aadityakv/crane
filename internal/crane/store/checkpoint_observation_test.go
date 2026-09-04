@@ -8,8 +8,8 @@ import (
 	"reflect"
 	"testing"
 
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
 )
 
 func TestCommittedCheckpointObservationIsAtomicOwnedAndSurvivesSnapshotReopen(t *testing.T) {

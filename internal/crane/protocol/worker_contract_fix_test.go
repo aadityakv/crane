@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func TestResultReplicaSetContractSchemaMatchesCanonicalEncoderOrder(t *testing.T) {

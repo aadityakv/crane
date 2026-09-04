@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"crane/internal/crane/model"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 func TestWorkerMessageTableValidInvalidGoldenTruncationAndOwnership(t *testing.T) {

@@ -8,11 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"crane/internal/config"
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/crane/state"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 // submitRequestFor builds one canonical digest-bound public submit request.

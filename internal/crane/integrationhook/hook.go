@@ -12,7 +12,7 @@ package integrationhook
 import (
 	"strconv"
 
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 // Direction names the side of the local +7 socket a datagram crosses.

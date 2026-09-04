@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const (

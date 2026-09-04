@@ -20,13 +20,13 @@ import (
 	"syscall"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/config"
-	"crane/internal/crane/clientstate"
-	"crane/internal/crane/control"
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/crane/clientstate"
+	"github.com/aadityakv/crane/internal/crane/control"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 // maxTopologyDocumentBytes bounds one topology JSON document before parsing.

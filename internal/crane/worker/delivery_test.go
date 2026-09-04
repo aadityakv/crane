@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/crane/admission"
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/crane/admission"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 func TestDeliveryReceiverStateTableAndVolatileExecutingDeduplication(t *testing.T) {

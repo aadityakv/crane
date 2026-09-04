@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 // TestDispatchStartAfterCheckpointCompactionIsBenignSkip pins the real-process

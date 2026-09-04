@@ -9,7 +9,7 @@ import (
 	"io"
 	"math"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 const walSchemaVersion uint16 = 1

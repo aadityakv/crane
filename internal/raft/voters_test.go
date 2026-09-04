@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 func TestVoterSetCanonicalOrderingMajorityAndFingerprint(t *testing.T) {

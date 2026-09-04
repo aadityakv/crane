@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"math"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 // ResultManifest seals one sink artifact and its two current durable replicas.

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func TestGateStartsClosedAndRejectsZeroOrClosedEpochs(t *testing.T) {

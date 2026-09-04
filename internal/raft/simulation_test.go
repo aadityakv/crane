@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 var (

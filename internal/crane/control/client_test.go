@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/crane/clientstate"
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/crane/state"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/crane/clientstate"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 // clientTestTopology returns one small finite valid topology.

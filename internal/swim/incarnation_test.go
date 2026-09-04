@@ -1,7 +1,7 @@
 package swim
 
 import (
-	"crane/internal/testutil"
+	"github.com/aadityakv/crane/internal/testutil"
 	"errors"
 	"math"
 	"os"

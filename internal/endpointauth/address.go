@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const (

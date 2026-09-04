@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 func TestMessageExactCanonicalLayouts(t *testing.T) {

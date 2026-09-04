@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"crane/internal/config"
-	"crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/crane/protocol"
 )
 
 // ErrInvalidVoterEndpoint reports a configured Raft voter endpoint whose

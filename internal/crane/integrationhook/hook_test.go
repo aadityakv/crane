@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 // TestNoopHookPassesEveryDatagramAndNeverBlocks pins the production

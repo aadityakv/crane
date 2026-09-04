@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/crane/clientstate"
-	"crane/internal/crane/control"
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/crane/clientstate"
+	"github.com/aadityakv/crane/internal/crane/control"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const cliTestClusterUUID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"

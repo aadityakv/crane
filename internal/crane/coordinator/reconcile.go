@@ -5,10 +5,10 @@ import (
 	"errors"
 	"sort"
 
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/crane/state"
-	"crane/internal/swim"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/swim"
 )
 
 // reconcile performs one complete full-view pass in the exact required order:

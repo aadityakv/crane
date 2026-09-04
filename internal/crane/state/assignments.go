@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"sort"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 const needsReassignmentDigestDomain = "crane/needs-reassignment/v1\x00"

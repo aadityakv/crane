@@ -3,8 +3,8 @@ package runtime
 import (
 	"testing"
 
-	"crane/internal/crane/integrationhook"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/crane/integrationhook"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 type markerHook struct{ integrationhook.Noop }

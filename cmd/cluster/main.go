@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	internalnode "crane/internal/node"
+	internalnode "github.com/aadityakv/crane/internal/node"
 )
 
 const (

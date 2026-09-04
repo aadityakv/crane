@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func TestDefaultCraneConfigPinsOperationalDefaultsAndCompiledFingerprint(t *testing.T) {

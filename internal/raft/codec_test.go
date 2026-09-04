@@ -6,8 +6,8 @@ import (
 	"math"
 	"testing"
 
-	"crane/internal/config"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 func TestCodecRejectsEveryTruncatedPrefix(t *testing.T) {

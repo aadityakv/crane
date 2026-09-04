@@ -2,7 +2,7 @@ package swim
 
 import (
 	"context"
-	"crane/internal/testutil"
+	"github.com/aadityakv/crane/internal/testutil"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/config"
-	"crane/internal/random"
-	"crane/internal/transport"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/random"
+	"github.com/aadityakv/crane/internal/transport"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const testClusterID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"

@@ -2,7 +2,7 @@ package raft
 
 import (
 	"context"
-	"crane/internal/testutil"
+	"github.com/aadityakv/crane/internal/testutil"
 	"errors"
 	"fmt"
 	"net"
@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/clock"
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/clock"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 func TestServiceConstructorIsSideEffectFreeAndRequiresLocalVoter(t *testing.T) {

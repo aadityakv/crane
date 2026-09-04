@@ -11,7 +11,7 @@ Crane daemon, no dynamic port allocation, and no plugin loading.
   records `go version`).
 - `make build` produces `bin/crane-node` (the node), `bin/crane-cluster`
   (local cluster launcher), and `bin/crane` (the client CLI).
-- Optional static analysis: `go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...`.
+- Optional static analysis: `go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...`.
 
 ## Configuration
 

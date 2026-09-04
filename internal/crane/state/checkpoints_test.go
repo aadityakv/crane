@@ -3,7 +3,7 @@ package state
 import (
 	"testing"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func TestEOFCheckpointGlobalWorkerCursorAndIndependentRevisions(t *testing.T) {

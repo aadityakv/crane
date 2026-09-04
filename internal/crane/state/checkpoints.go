@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 const failureEventDigestDomain = "crane/job-failure-event/v1\x00"

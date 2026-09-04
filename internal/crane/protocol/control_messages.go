@@ -9,8 +9,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"crane/internal/crane/model"
-	"crane/internal/wire"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/wire"
 )
 
 const (

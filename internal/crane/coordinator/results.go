@@ -14,10 +14,10 @@ import (
 	"errors"
 	"sort"
 
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/crane/state"
-	"crane/internal/crane/worker"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/worker"
 )
 
 // maxSealFetchChunks bounds one artifact fetch even against a misbehaving

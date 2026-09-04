@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sort"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const voterFingerprintDomain = "raft/voter-set/v1\x00"

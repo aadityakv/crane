@@ -3,7 +3,7 @@ package swim
 import (
 	"sort"
 
-	"crane/internal/random"
+	"github.com/aadityakv/crane/internal/random"
 )
 
 // probeSelector retains one shuffled cycle of eligible peer identities. The

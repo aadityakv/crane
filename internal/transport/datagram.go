@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"crane/internal/config"
+	"github.com/aadityakv/crane/internal/config"
 )
 
 const (

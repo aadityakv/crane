@@ -14,7 +14,7 @@ import (
 	"sync"
 	"testing"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 func TestSnapshotPersistsCompleteStateReclaimsWALAndContinuesSequence(t *testing.T) {

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"sync"
 
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/crane/state"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/state"
 )
 
 // maxStatusPagesPerPoll bounds one worker's HasMore chain so a misbehaving

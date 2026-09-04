@@ -3,9 +3,9 @@ package worker
 import (
 	"context"
 
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
-	"crane/internal/crane/store"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/store"
 )
 
 // Repository is the exact durable authority required by the slice-A worker

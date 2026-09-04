@@ -3,8 +3,8 @@ package store
 import (
 	"testing"
 
-	"crane/internal/crane/model"
-	"crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/protocol"
 )
 
 // supersedingSet derives revision+1 of prior with an unchanged placement: the

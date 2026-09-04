@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sort"
 
-	"crane/internal/crane/model"
-	"crane/internal/raft"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/raft"
 )
 
 const (

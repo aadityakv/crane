@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/crane/protocol"
+	"github.com/aadityakv/crane/internal/crane/protocol"
 )
 
 type stubFetcher struct {

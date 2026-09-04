@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"crane/internal/config"
-	"crane/internal/node"
-	"crane/internal/swim"
-	"crane/internal/testutil"
+	"github.com/aadityakv/crane/internal/config"
+	"github.com/aadityakv/crane/internal/node"
+	"github.com/aadityakv/crane/internal/swim"
+	"github.com/aadityakv/crane/internal/testutil"
 )
 
 // buildGoBinaryWithTags builds one package into a test-owned path with the

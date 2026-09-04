@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"crane/internal/crane/model"
-	"crane/internal/raft"
+	"github.com/aadityakv/crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/raft"
 )
 
 func TestMachineImplementsRaftStateMachine(t *testing.T) {

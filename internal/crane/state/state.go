@@ -7,7 +7,7 @@ import (
 	"math"
 	"sync"
 
-	"crane/internal/crane/model"
+	"github.com/aadityakv/crane/internal/crane/model"
 )
 
 const (
