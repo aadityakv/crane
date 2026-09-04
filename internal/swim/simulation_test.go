@@ -1046,6 +1046,7 @@ func (c *simulationCluster) waitSnapshot(nodeID uint16, condition func([]Member)
 			return snapshot
 		}
 		runtime.Gosched()
+		time.Sleep(time.Millisecond)
 	}
 	c.t.Fatalf("node %d snapshot condition not met: %v; last snapshot=%#v error=%v", nodeID, ctx.Err(), last, lastError)
 	return nil
