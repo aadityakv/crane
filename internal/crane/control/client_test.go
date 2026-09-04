@@ -798,3 +798,41 @@ func TestClientTreatsResultTooLargeAsConsumedRejection(t *testing.T) {
 		t.Fatalf("cancel ResultTooLarge classified as %v, want a completed exchange", err)
 	}
 }
+
+func TestClientListJobsReadsEveryRetainedJob(t *testing.T) {
+	harness := newClientHarness(t, true)
+	ctx := testContext(t)
+	job, _, err := harness.client().Submit(ctx, clientTestTopology(t, "list-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := harness.options()
+	options.Store = nil
+	reader := harness.clientFrom(options)
+	listing, err := reader.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if listing.LeaderNodeID == 0 || len(listing.Jobs) != 1 || listing.Jobs[0].JobID != job {
+		t.Fatalf("listing = %#v", listing)
+	}
+	if listing.Jobs[0].State != protocol.JobPending || listing.Jobs[0].JobControlRevision != 1 {
+		t.Fatalf("listing summary = %#v", listing.Jobs[0])
+	}
+}
+
+func TestClientListJobsRetriesThroughStarting(t *testing.T) {
+	harness := newClientHarness(t, false)
+	harness.dialHook = func(_ string, attempt int) {
+		if attempt == 2 {
+			harness.fixture.seedEpochAndOpenGate()
+		}
+	}
+	listing, err := harness.client().ListJobs(testContext(t))
+	if err != nil {
+		t.Fatalf("list jobs through Starting: %v", err)
+	}
+	if len(listing.Jobs) != 0 {
+		t.Fatalf("listing = %#v, want no jobs", listing)
+	}
+}

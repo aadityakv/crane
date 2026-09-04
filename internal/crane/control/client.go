@@ -433,6 +433,40 @@ func (client *Client) cancelAccept(request protocol.CancelRequest) func(protocol
 	}
 }
 
+// ListJobs performs one linearizable read of every retained-job summary.
+func (client *Client) ListJobs(ctx context.Context) (protocol.JobListResponse, error) {
+	request := protocol.JobListRequest{}
+	payload, err := protocol.MarshalControlMessage(request)
+	if err != nil {
+		return protocol.JobListResponse{}, fmt.Errorf("marshal job-list request: %w", err)
+	}
+	response, err := client.exchange(ctx, request.MessageType(), payload, client.listJobsAccept(request))
+	if err != nil {
+		return protocol.JobListResponse{}, err
+	}
+	return response.(protocol.JobListResponse), nil
+}
+
+// listJobsAccept classifies one response to an exact job-list request.
+func (client *Client) listJobsAccept(request protocol.JobListRequest) func(protocol.ControlMessage) error {
+	return func(response protocol.ControlMessage) error {
+		switch typed := response.(type) {
+		case protocol.JobListResponse:
+			return nil
+		case protocol.ControlError:
+			if protocol.ValidateJobListErrorCorrelation(request, typed) != nil {
+				return classifyUncorrelatedError(typed)
+			}
+			if typed.Retryable {
+				return fmt.Errorf("%w: %s", errClientRetryExchange, typed.Detail)
+			}
+			return rejectionError(typed)
+		default:
+			return fmt.Errorf("%w: unexpected %T", errClientRetryExchange, response)
+		}
+	}
+}
+
 // statusAccept classifies one response to an exact status request.
 func (client *Client) statusAccept(request protocol.StatusRequest) func(protocol.ControlMessage) error {
 	return func(response protocol.ControlMessage) error {
