@@ -36,6 +36,9 @@ type ClusterOptions struct {
 	// Dashboard is the optional loopback host:port of the read-only job
 	// dashboard; empty disables it.
 	Dashboard string
+	// ResetIncompatible wipes and re-bootstraps the data root when persisted
+	// state was written under a different consensus fingerprint.
+	ResetIncompatible bool
 }
 
 // GenerateConfigs derives one validated node configuration per node, with contiguous ports and a shared secret and cluster ID.
