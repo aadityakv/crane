@@ -523,3 +523,56 @@ func TestClientRejectionMapsResultTooLargeToTypedTerminalError(t *testing.T) {
 		t.Fatalf("ResultTooLarge is not encodable on the public matrix: %v", err)
 	}
 }
+
+func TestJobListSummarizesEveryRetainedJob(t *testing.T) {
+	seeded := seedQueryFixture(t, querySeed{sinkPartitions: 2, sealPartitions: 2, succeed: true})
+	fixture := newServiceFixture(t, seeded.machine)
+	if err := fixture.gate.Open(seeded.machine.View().CoordinatorEpoch); err != nil {
+		t.Fatal(err)
+	}
+	fixture.start()
+
+	response := fixture.exchange(protocol.JobListRequest{})
+	listing, ok := response.(protocol.JobListResponse)
+	if !ok {
+		t.Fatalf("job list response = %#v", response)
+	}
+	if fixture.raft.barrierCount() != 1 {
+		t.Fatalf("job list barriers = %d, want exactly 1 before the view", fixture.raft.barrierCount())
+	}
+	view := seeded.machine.View()
+	if listing.LeaderNodeID == 0 || listing.AppliedIndex != view.AppliedIndex || len(listing.Jobs) != 1 {
+		t.Fatalf("job list identity = %#v", listing)
+	}
+	status, ok := fixture.exchange(protocol.StatusRequest{JobID: seeded.job}).(protocol.StatusResponse)
+	if !ok {
+		t.Fatal("status comparison rejected")
+	}
+	if listing.Jobs[0] != status {
+		t.Fatalf("job list summary %#v does not equal the status response %#v", listing.Jobs[0], status)
+	}
+}
+
+func TestJobListEmptyMachineReturnsEmptyValidListing(t *testing.T) {
+	fixture := newServiceFixture(t, state.NewMachine())
+	fixture.seedEpochAndOpenGate()
+	fixture.start()
+
+	listing, ok := fixture.exchange(protocol.JobListRequest{}).(protocol.JobListResponse)
+	if !ok {
+		t.Fatal("job list rejected")
+	}
+	if len(listing.Jobs) != 0 {
+		t.Fatalf("job list = %#v, want no jobs", listing)
+	}
+}
+
+func TestJobListClosedGateReturnsRetryableStarting(t *testing.T) {
+	fixture := newServiceFixture(t, state.NewMachine())
+	fixture.start()
+
+	controlError := requireControlError(t, fixture.exchange(protocol.JobListRequest{}), protocol.ControlErrorStarting)
+	if err := protocol.ValidateJobListErrorCorrelation(protocol.JobListRequest{}, controlError); err != nil {
+		t.Fatalf("job list error correlation: %v", err)
+	}
+}

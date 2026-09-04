@@ -89,7 +89,7 @@ func validateControlRequestHeader(clusterID [16]byte, header wire.Header) error 
 		return ErrControlRequestUnauthorized
 	}
 	switch header.Message {
-	case wire.MessageCraneSubmitRequest, wire.MessageCraneCancelRequest, wire.MessageCraneStatusRequest, wire.MessageCraneResultPageRequest:
+	case wire.MessageCraneSubmitRequest, wire.MessageCraneCancelRequest, wire.MessageCraneStatusRequest, wire.MessageCraneResultPageRequest, wire.MessageCraneJobListRequest:
 		return nil
 	default:
 		return ErrControlRequestUnauthorized
@@ -153,6 +153,8 @@ func (service *Service) dispatch(ctx context.Context, message protocol.ControlMe
 		return service.handleCancel(ctx, request)
 	case protocol.StatusRequest:
 		return service.handleStatus(request, gateEpoch)
+	case protocol.JobListRequest:
+		return service.handleJobList(request, gateEpoch)
 	case protocol.ResultPageRequest:
 		return service.handleResultPage(ctx, request, gateEpoch)
 	default:
@@ -292,6 +294,25 @@ func (service *Service) clientRejection(request protocol.ControlMessage, result 
 	default:
 		return nil
 	}
+}
+
+// handleJobList performs the atomic post-barrier view read of every retained
+// job summary and aborts instead of answering when the admission gate was
+// lost during the read.
+func (service *Service) handleJobList(request protocol.JobListRequest, gateEpoch model.CoordinatorEpoch) protocol.ControlMessage {
+	view := service.machine.View()
+	jobs := make([]protocol.StatusResponse, 0, len(view.Jobs))
+	for _, record := range view.Jobs {
+		summary, err := buildStatusResponse(view, record)
+		if err != nil {
+			return nil
+		}
+		jobs = append(jobs, summary)
+	}
+	if !service.gateStillOpen(gateEpoch) {
+		return requestBoundError(request, protocol.ControlErrorStarting, true, "admission gate lost during the read")
+	}
+	return protocol.JobListResponse{LeaderNodeID: service.configuration.NodeID, AppliedIndex: view.AppliedIndex, Jobs: jobs}
 }
 
 // handleStatus performs the atomic post-barrier view read and aborts instead
@@ -480,6 +501,8 @@ func requestBoundError(message protocol.ControlMessage, code protocol.ControlErr
 		controlError.RelatedMessage = wire.MessageCraneStatusRequest
 		controlError.HasStatusRequest = true
 		controlError.StatusJobID = request.JobID
+	case protocol.JobListRequest:
+		controlError.RelatedMessage = wire.MessageCraneJobListRequest
 	case protocol.ResultPageRequest:
 		controlError.RelatedMessage = wire.MessageCraneResultPageRequest
 		controlError.HasResultPage = true
