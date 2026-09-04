@@ -16,7 +16,7 @@ rm -rf "$data_root"
 mkdir -p "$data_root"
 chmod 700 "$data_root"
 head -c 32 /dev/urandom > "$secret_file"
-trap 'kill "$cluster_pid" 2>/dev/null || true; wait "$cluster_pid" 2>/dev/null || true' EXIT HUP INT TERM
+trap 'kill "$cluster_pid" 2>/dev/null || true; wait "$cluster_pid" 2>/dev/null || true; pkill -f "$data_root/configs/" 2>/dev/null || true' EXIT HUP INT TERM
 
 ./bin/crane-cluster -nodes 3 -base-port 9000 -data-root "$data_root" -secret-file "$secret_file" -node-binary ./bin/crane-node > "$cluster_log" 2>&1 &
 cluster_pid=$!

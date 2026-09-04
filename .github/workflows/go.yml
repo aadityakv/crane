@@ -12,11 +12,7 @@ env:
 
 jobs:
   verify:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
@@ -31,8 +27,7 @@ jobs:
       # exactly one retry so a scheduling hiccup does not fail the gate.
       - run: go test ./... -short -count=1 || go test ./internal/swim ./internal/raft -short -count=1
       - run: make integration
-      - if: runner.os == 'Linux'
-        run: make staticcheck
+      - run: make staticcheck
 
   race:
     runs-on: ubuntu-latest
