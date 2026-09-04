@@ -24,7 +24,7 @@ func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch,
 
 // reconcileCluster performs the cluster phase: worker registration, worker
 // fences, status draining, and failure resolution. It reports whether the
-// phase converged.
+// phase converged and the context was not cancelled.
 func (actor *Actor) reconcileCluster(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
 	converged := true
 	session.controlFailed = make(map[uint16]bool)
@@ -37,6 +37,8 @@ func (actor *Actor) reconcileCluster(ctx context.Context, epoch model.Coordinato
 }
 
 // reconcileJobs performs every per-job convergence pass and session pruning.
+// It reports whether every per-job pass converged and the context was not
+// cancelled.
 func (actor *Actor) reconcileJobs(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
 	converged := true
 	view := actor.options.Machine.View()
@@ -530,8 +532,9 @@ func (actor *Actor) resendCheckpointNotices(ctx context.Context, job state.JobRe
 
 // repairResults verifies every assigned sink's covered result inventory on
 // both current replicas and performs record-level repair where a copy is
-// absent or differs. The admission gate never opens until every sink's two
-// current replica summaries match the expected covered set.
+// absent or differs. A sink whose two current replica summaries never match
+// the expected covered set leaves the pass unconverged so it is retried; it
+// no longer holds admission closed.
 func (actor *Actor) repairResults(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord) bool {
 	topology, err := model.DecodeTopology(job.TopologyBytes)
 	if err != nil {
@@ -573,7 +576,8 @@ func (actor *Actor) repairSink(ctx context.Context, epoch model.CoordinatorEpoch
 	secondaryHolds := secondarySummary.RecordCount > 0
 	switch {
 	case primaryHolds && secondaryHolds:
-		// Multiple disagreeing survivors leave admission closed.
+		// Multiple disagreeing survivors leave the pass unconverged so it is
+		// retried; they no longer hold admission closed.
 		return false
 	case primaryHolds:
 		return actor.repairAndVerify(ctx, epoch, job, replica, vector, query, primary, []repairEndpoint{secondary}, primarySummary)
@@ -586,8 +590,9 @@ func (actor *Actor) repairSink(ctx context.Context, epoch model.CoordinatorEpoch
 
 // scanRetainedHolders scans every replicated registered worker in NodeID
 // order for retained old-provenance inventory so actor restart needs no local
-// history. Disagreeing holders leave admission closed; an agreed empty state
-// on both current replicas stands when nobody retains records.
+// history. Disagreeing holders leave the pass unconverged so it is retried
+// rather than holding admission closed; an agreed empty state on both
+// current replicas stands when nobody retains records.
 func (actor *Actor) scanRetainedHolders(ctx context.Context, epoch model.CoordinatorEpoch, view state.View, job state.JobRecord, set model.AssignmentSet, replica model.ResultReplicaSet, vector []protocol.SourceCheckpoint, query protocol.ResultInventoryQuery, primary, secondary repairEndpoint) bool {
 	install, ok := actor.buildInstall(job, model.Closed, epoch)
 	if !ok {
