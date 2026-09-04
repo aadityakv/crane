@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -35,13 +36,12 @@ const maxTopologyDocumentBytes = 1 << 20
 // defaultResultPageBytes is the default complete-record page budget.
 const defaultResultPageBytes = 64 << 10
 
-const craneUsage = "usage: crane <submit|cancel|status|results|jobs|example-topology> [flags]\n" +
+const craneUsage = "usage: crane <submit|cancel|status|results|jobs> [flags]\n" +
 	"  submit  -config FILE -state FILE -topology FILE\n" +
 	"  cancel  -config FILE -state FILE -job HEX32 -expected-revision N\n" +
 	"  status  -config FILE -job HEX32\n" +
-	"  results -config FILE -job HEX32 [-page-bytes N]\n" +
+	"  results -config FILE -job HEX32 [-page-bytes N] [-count-by FIELD [-top N]]\n" +
 	"  jobs    -config FILE\n" +
-	"  example-topology\n" +
 	"network subcommands also accept -attempts N (1..1024), -backoff DURATION, and -timeout DURATION"
 
 func main() {
@@ -75,8 +75,6 @@ func executeCrane(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return executeResults(ctx, args[1:], stdout)
 	case "jobs":
 		return executeJobs(ctx, args[1:], stdout)
-	case "example-topology":
-		return executeExampleTopology(args[1:], stdout)
 	default:
 		return fmt.Errorf("unknown subcommand %q: %s", args[0], craneUsage)
 	}
@@ -90,6 +88,8 @@ type craneFlags struct {
 	topology   string
 	revision   uint64
 	pageBytes  uint
+	countBy    string
+	top        uint
 	attempts   uint
 	backoff    time.Duration
 	timeout    time.Duration
@@ -358,6 +358,8 @@ func executeResults(ctx context.Context, args []string, stdout io.Writer) error 
 	options, err := parseCraneFlags("results", args, func(flags *flag.FlagSet, options *craneFlags) {
 		registerJobFlag(flags, options)
 		flags.UintVar(&options.pageBytes, "page-bytes", defaultResultPageBytes, "complete-record page budget in bytes")
+		flags.StringVar(&options.countBy, "count-by", "", "aggregate at read time: print how often each value of this field occurs")
+		flags.UintVar(&options.top, "top", 0, "with -count-by, print only the N most frequent values (0 = all)")
 	})
 	if err != nil {
 		return err
@@ -383,6 +385,7 @@ func executeResults(ctx context.Context, args []string, stdout io.Writer) error 
 
 	request := protocol.ResultPageRequest{JobID: job, ManifestDigest: status.ManifestSetDigest, PageBytes: uint32(options.pageBytes)}
 	total := 0
+	counts := map[string]int{}
 	for {
 		page, err := client.ResultPage(ctx, request)
 		if err != nil {
@@ -393,7 +396,13 @@ func executeResults(ctx context.Context, args []string, stdout io.Writer) error 
 			if err != nil {
 				return err
 			}
-			if err := writeJSONLine(stdout, line); err != nil {
+			if options.countBy != "" {
+				value, ok := line["fields"].(map[string]any)[options.countBy]
+				if !ok {
+					return fmt.Errorf("result record has no field %q", options.countBy)
+				}
+				counts[fmt.Sprint(value)]++
+			} else if err := writeJSONLine(stdout, line); err != nil {
 				return err
 			}
 			total++
@@ -406,6 +415,9 @@ func executeResults(ctx context.Context, args []string, stdout io.Writer) error 
 		}
 		request.HasLastTuple = true
 		request.Last = page.NextLast
+	}
+	if options.countBy != "" {
+		writeCountTable(stdout, options.countBy, counts, total, int(options.top))
 	}
 	return writeJSONLine(stdout, map[string]any{
 		"command":  "results",
@@ -443,17 +455,6 @@ func resultRecordOutput(record model.ResultRecord) (map[string]any, error) {
 		"sink_partition":   record.SinkTask.Partition,
 		"fields":           fields,
 	}, nil
-}
-
-// executeExampleTopology emits the finite example DAG document.
-func executeExampleTopology(args []string, stdout io.Writer) error {
-	if len(args) != 0 {
-		return fmt.Errorf("example-topology accepts no arguments: %v", args)
-	}
-	if _, err := stdout.Write(exampleTopologyJSON()); err != nil {
-		return fmt.Errorf("write example topology: %w", err)
-	}
-	return nil
 }
 
 // topologyDocument is the strict JSON schema of one submitted DAG. The
@@ -568,26 +569,33 @@ func parseRoutingMode(routing string) (model.RoutingMode, error) {
 	}
 }
 
-// exampleTopologyJSON returns the finite range → multiply → collect example.
-func exampleTopologyJSON() []byte {
-	document := topologyDocument{
-		SchemaVersion: 1,
-		Name:          "example-scaled-range",
-		Stages: []stageDocument{
-			{StageID: 1, Name: "numbers", Role: "source", Parallelism: 1, Operator: operatorDocument{Name: "range", Version: 1, Settings: []settingDocument{{Key: "end_exclusive", Value: "4"}, {Key: "start", Value: "1"}}}},
-			{StageID: 2, Name: "scaled", Role: "transform", Parallelism: 1, Operator: operatorDocument{Name: "multiply", Version: 1, Settings: []settingDocument{{Key: "factor", Value: "3"}}}},
-			{StageID: 3, Name: "collected", Role: "sink", Parallelism: 1, Operator: operatorDocument{Name: "collect", Version: 1}},
-		},
-		Edges: []edgeDocument{
-			{EdgeID: 1, SourceStageID: 1, DestinationStageID: 2, Routing: "shuffle"},
-			{EdgeID: 2, SourceStageID: 2, DestinationStageID: 3, Routing: "shuffle"},
-		},
+// writeCountTable prints a read-side aggregation of the sealed result set:
+// each distinct value of one field with its occurrence count, most frequent
+// first, ties broken by value. Aggregation happens at read time over the
+// exactly-once result set, never inside the pipeline.
+func writeCountTable(stdout io.Writer, field string, counts map[string]int, total, top int) {
+	type entry struct {
+		value string
+		count int
 	}
-	encoded, err := json.MarshalIndent(document, "", "  ")
-	if err != nil {
-		panic("example topology cannot marshal: " + err.Error())
+	entries := make([]entry, 0, len(counts))
+	for value, count := range counts {
+		entries = append(entries, entry{value, count})
 	}
-	return append(encoded, '\n')
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].value < entries[j].value
+	})
+	if top > 0 && len(entries) > top {
+		entries = entries[:top]
+	}
+	fmt.Fprintf(stdout, "%8s  %s\n", "count", field)
+	for _, entry := range entries {
+		fmt.Fprintf(stdout, "%8d  %s\n", entry.count, entry.value)
+	}
+	fmt.Fprintf(stdout, "%8d  records, %d distinct %s\n", total, len(counts), field)
 }
 
 // parseJobID parses one 32-character lowercase hexadecimal job identity.

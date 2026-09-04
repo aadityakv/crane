@@ -170,10 +170,12 @@ func cliStatePath(t *testing.T) string {
 
 func writeExampleTopologyFile(t *testing.T) (string, model.TopologySpec) {
 	t.Helper()
-	var stdout, stderr bytes.Buffer
-	if err := executeCrane(context.Background(), []string{"example-topology"}, &stdout, &stderr); err != nil {
-		t.Fatalf("example-topology: %v", err)
+	document, err := os.ReadFile(filepath.Join("..", "..", "examples", "topologies", "scaled-range.json"))
+	if err != nil {
+		t.Fatalf("read example topology: %v", err)
 	}
+	var stdout bytes.Buffer
+	stdout.Write(document)
 	topology, err := parseTopologyDocument(stdout.Bytes())
 	if err != nil {
 		t.Fatalf("parse example topology: %v", err)
@@ -242,47 +244,6 @@ func TestCLIStrictFlagAndConfigValidation(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestCLIExampleTopologyIsFiniteAndStrictlyParsed(t *testing.T) {
-	_, topology := writeExampleTopologyFile(t)
-	validated, err := model.ValidateTopology(topology)
-	if err != nil {
-		t.Fatalf("example topology must validate: %v", err)
-	}
-	spec := validated.Spec()
-	if spec.Stages[0].Operator.Name != "range" {
-		t.Fatalf("example source operator = %q, want the finite range source", spec.Stages[0].Operator.Name)
-	}
-	finite := false
-	for _, setting := range spec.Stages[0].Operator.Settings {
-		if setting.Key == "end_exclusive" {
-			finite = true
-		}
-	}
-	if !finite {
-		t.Fatal("example source must be finite via end_exclusive")
-	}
-
-	t.Run("unknown fields rejected", func(t *testing.T) {
-		if _, err := parseTopologyDocument([]byte(`{"schema_version":1,"name":"x","surprise":true}`)); err == nil {
-			t.Fatal("unknown topology fields must be rejected")
-		}
-	})
-	t.Run("trailing data rejected", func(t *testing.T) {
-		var stdout, stderr bytes.Buffer
-		if err := executeCrane(context.Background(), []string{"example-topology"}, &stdout, &stderr); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := parseTopologyDocument(append(stdout.Bytes(), []byte("{}")...)); err == nil {
-			t.Fatal("trailing topology JSON must be rejected")
-		}
-	})
-	t.Run("invalid graph rejected", func(t *testing.T) {
-		if _, err := parseTopologyDocument([]byte(`{"schema_version":1,"name":"x","stages":[],"edges":[]}`)); err == nil {
-			t.Fatal("an invalid topology graph must be rejected")
-		}
-	})
 }
 
 func TestCLISubmitEmitsMachineReadableResultWithoutSecretLogs(t *testing.T) {
@@ -602,5 +563,34 @@ func TestJobsOutputRendersLeaderAndSummaries(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Fatalf("jobs output %q lacks %q", line, want)
 		}
+	}
+}
+
+func TestExampleTopologiesValidate(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "examples", "topologies", "*.json"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no example topologies found: %v", err)
+	}
+	for _, path := range paths {
+		document, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec, err := parseTopologyDocument(document)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if _, err := model.ValidateTopology(spec); err != nil {
+			t.Fatalf("%s does not validate: %v", path, err)
+		}
+	}
+}
+
+func TestWriteCountTableOrdersByCountThenValue(t *testing.T) {
+	var buffer bytes.Buffer
+	writeCountTable(&buffer, "word", map[string]int{"nation": 5, "people": 3, "dedicated": 5}, 13, 2)
+	want := "   count  word\n       5  dedicated\n       5  nation\n      13  records, 3 distinct word\n"
+	if buffer.String() != want {
+		t.Fatalf("table = %q, want %q", buffer.String(), want)
 	}
 }

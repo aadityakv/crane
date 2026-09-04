@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "name": "example-scaled-range",
+  "stages": [
+    {
+      "stage_id": 1,
+      "name": "numbers",
+      "role": "source",
+      "parallelism": 1,
+      "operator": {
+        "name": "range",
+        "version": 1,
+        "settings": [
+          {
+            "key": "end_exclusive",
+            "value": "4"
+          },
+          {
+            "key": "start",
+            "value": "1"
+          }
+        ]
+      }
+    },
+    {
+      "stage_id": 2,
+      "name": "scaled",
+      "role": "transform",
+      "parallelism": 1,
+      "operator": {
+        "name": "multiply",
+        "version": 1,
+        "settings": [
+          {
+            "key": "factor",
+            "value": "3"
+          }
+        ]
+      }
+    },
+    {
+      "stage_id": 3,
+      "name": "collected",
+      "role": "sink",
+      "parallelism": 1,
+      "operator": {
+        "name": "collect",
+        "version": 1
+      }
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": 1,
+      "source_stage_id": 1,
+      "destination_stage_id": 2,
+      "routing": "shuffle"
+    },
+    {
+      "edge_id": 2,
+      "source_stage_id": 2,
+      "destination_stage_id": 3,
+      "routing": "shuffle"
+    }
+  ]
+}

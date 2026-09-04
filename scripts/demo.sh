@@ -37,8 +37,7 @@ if [ "$ready" -ne 1 ]; then
   exit 1
 fi
 
-./bin/crane example-topology > "$data_root/topology.json"
-submit_line=$(./bin/crane submit -config "$data_root/configs/node-1.json" -state "$client_state" -topology "$data_root/topology.json")
+submit_line=$(./bin/crane submit -config "$data_root/configs/node-1.json" -state "$client_state" -topology examples/topologies/word-count.json)
 job_id=$(printf '%s\n' "$submit_line" | sed -n 's/.*"job_id":"\([0-9a-f]\{32\}\)".*/\1/p')
 if [ -z "$job_id" ]; then
   echo "crane demo: submit returned no job id: $submit_line" >&2
@@ -60,5 +59,5 @@ if [ "$state" != "succeeded" ]; then
   echo "crane demo: job $job_id ended in state '$state'" >&2
   exit 1
 fi
-./bin/crane results -config "$data_root/configs/node-1.json" -job "$job_id"
+./bin/crane results -config "$data_root/configs/node-1.json" -job "$job_id" -count-by word -top 10
 echo "crane demo: example job $job_id succeeded"

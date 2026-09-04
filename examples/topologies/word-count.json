@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "word-count",
+  "stages": [
+    {"stage_id": 1, "name": "lines", "role": "source", "parallelism": 2,
+     "operator": {"name": "lines", "version": 1, "settings": [{"key": "corpus", "value": "gettysburg"}]}},
+    {"stage_id": 2, "name": "words", "role": "transform", "parallelism": 2,
+     "operator": {"name": "split_words", "version": 1}},
+    {"stage_id": 3, "name": "long-words", "role": "transform", "parallelism": 2,
+     "operator": {"name": "min_length", "version": 1, "settings": [{"key": "length", "value": "4"}]}},
+    {"stage_id": 4, "name": "collected", "role": "sink", "parallelism": 1,
+     "operator": {"name": "collect", "version": 1}}
+  ],
+  "edges": [
+    {"edge_id": 1, "source_stage_id": 1, "destination_stage_id": 2, "routing": "shuffle"},
+    {"edge_id": 2, "source_stage_id": 2, "destination_stage_id": 3, "routing": "shuffle"},
+    {"edge_id": 3, "source_stage_id": 3, "destination_stage_id": 4, "routing": "shuffle"}
+  ]
+}

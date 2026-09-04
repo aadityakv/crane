@@ -1,9 +1,9 @@
 # Crane
 
 Crane is a small, exactly-once stream-processing system written in Go with no
-external dependencies. A job is a DAG of operators (`range` sources,
-`even`/`less_than`/`multiply` transforms, a `collect` sink) partitioned across a
-fixed cluster of nodes. Every node runs three cooperating layers in one
+external dependencies. A job is a DAG of operators (sources such as `range`
+and `lines`, transforms such as `split_words`, `min_length`, and `multiply`, a
+`collect` sink) partitioned across a fixed cluster of nodes. Every node runs three cooperating layers in one
 process:
 
 - **SWIM membership** — authenticated failure detection with incarnation
@@ -34,12 +34,16 @@ stop the whole cluster; re-running `make dev` resumes it (the cluster ID is
 persisted under the data root). Submit and inspect jobs from another shell:
 
 ```sh
-./bin/crane example-topology > topology.json
-./bin/crane submit  -config data/dev/configs/node-1.json -state data/dev/client.state -topology topology.json
+./bin/crane submit  -config data/dev/configs/node-1.json -state data/dev/client.state -topology examples/topologies/word-count.json
 ./bin/crane jobs    -config data/dev/configs/node-1.json
 ./bin/crane status  -config data/dev/configs/node-1.json -job <job id>
-./bin/crane results -config data/dev/configs/node-1.json -job <job id>
+./bin/crane results -config data/dev/configs/node-1.json -job <job id> -count-by word -top 10
 ```
+
+`examples/topologies/word-count.json` streams the Gettysburg Address through
+`lines → split_words → min_length → collect`; `-count-by` aggregates the
+sealed, exactly-once result set at read time (the pipeline itself is
+per-tuple). `scaled-range.json` is the numeric smoke job.
 
 The client keeps a durable identity file (`-state`) in an owner-only
 directory (the data root qualifies; the repository root usually does not):
@@ -47,8 +51,8 @@ request sequences are reserved before they are sent, so a crashed client
 resumes the same request and receives the replicated cached answer rather
 than submitting twice.
 
-To run the bundled example topology end-to-end without touching `./data/dev`
-(fresh cluster on port base 9000, submit, wait for success, print results,
+To run the word-count job end-to-end without touching `./data/dev` (fresh
+cluster on port base 9000, submit, wait for success, print the top words,
 tear down):
 
 ```sh

@@ -106,7 +106,7 @@ static voter set only, retries transient errors (`Starting`,
 and refuses to continue with a forfeited identity (`StaleRequest`,
 `SkippedRequest`, `IdentityReuse`) so state is never silently reused.
 
-Topology documents are validated against the immutable operator registry:
+Example documents live in `examples/topologies/` (`scaled-range.json`, `word-count.json`). Topology documents are validated against the immutable operator registry:
 
 | Operator | Role | Settings |
 | --- | --- | --- |
@@ -114,6 +114,9 @@ Topology documents are validated against the immutable operator registry:
 | `even` | transform | none; passes even values |
 | `less_than` | transform | `threshold` (int64) |
 | `multiply` | transform | `factor` (int64) |
+| `lines` | source | `corpus` (string): one of the built-in public-domain texts (`gettysburg`, `crane`); emits one tuple per line of at most 16 words, dealt across partitions |
+| `split_words` | transform | none; emits one lowercase alphabetic `word` tuple per word of a `line` |
+| `min_length` | transform | `length` (int64); drops words shorter than that |
 | `collect` | sink | none; produces the job's result records |
 
 ## Guarantees and recovery
