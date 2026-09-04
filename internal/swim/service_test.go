@@ -2336,7 +2336,13 @@ func (s *barrierServiceStore) hasStored(value uint64) bool {
 
 type observingDatagram struct {
 	transport.Datagram
-	store     *barrierServiceStore
+	store *barrierServiceStore
+	// auth and limits decode outbound frames so only gossip (membership
+	// updates such as a refutation) is counted; the service's own scheduled
+	// probes are legitimate at any time and must not trip a "no sends"
+	// premise on a slow runner.
+	auth      wire.Authenticator
+	limits    wire.Limits
 	armed     atomic.Bool
 	sendCount atomic.Int64
 	violation atomic.Bool
@@ -2384,19 +2390,22 @@ func (d *capturingSourceDatagram) snapshot() []capturedSourceDatagramSend {
 }
 
 func (d *observingDatagram) Send(ctx context.Context, destination config.Endpoint, payload []byte) error {
-	d.observeSend()
+	d.observeSend(payload)
 	return d.Datagram.Send(ctx, destination, payload)
 }
 
 func (d *observingDatagram) SendFrom(ctx context.Context, source, destination config.Endpoint, payload []byte) error {
-	d.observeSend()
+	d.observeSend(payload)
 	if datagram, ok := d.Datagram.(transport.SourceDatagram); ok {
 		return datagram.SendFrom(ctx, source, destination, payload)
 	}
 	return d.Datagram.Send(ctx, destination, payload)
 }
 
-func (d *observingDatagram) observeSend() {
+func (d *observingDatagram) observeSend(payload []byte) {
+	if frame, err := wire.Decode(payload, d.auth, d.limits); err == nil && frame.Header.Message != wire.MessageSWIMGossip {
+		return
+	}
 	if d.armed.Load() && !d.store.hasStored(d.store.blockValue) {
 		d.violation.Store(true)
 	}
@@ -2422,8 +2431,8 @@ func startPersistenceService(t *testing.T, store *barrierServiceStore) *persiste
 	configuration := serviceTestConfig(t, 1)
 	network := transport.NewMemoryNetwork()
 	baseDatagram := serviceMemoryDatagram(t, network, configuration)
-	observed := &observingDatagram{Datagram: baseDatagram, store: store}
 	authenticator := wire.NewHMACAuthenticator(testServiceKey())
+	observed := &observingDatagram{Datagram: baseDatagram, store: store, auth: authenticator, limits: serviceWireLimits(t)}
 	service, err := NewService(ServiceOptions{
 		Config:        configuration,
 		Authenticator: authenticator,

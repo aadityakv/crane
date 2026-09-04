@@ -193,6 +193,11 @@ func TestSimulationGracefulLeaveSendsOneRetransmitBudget(t *testing.T) {
 	third := startRunningServiceWithDatagram(t, thirdConfig, thirdStore, manualClock, recording, &scriptedRandom{uint64s: []uint64{1, 2, 3, 4, 5}})
 
 	waitForSnapshot(t, seed.service, func(members []Member) bool { return len(members) == 3 })
+	// The leaver announces Left only to peers its own view holds Alive or
+	// Suspect, so the premise needs the third node's view converged too, not
+	// just the seed's (a slow runner can stop it before the join snapshot
+	// is applied, in which case it legitimately sends nothing).
+	waitForSnapshot(t, third.service, func(members []Member) bool { return len(members) == 3 })
 	settleMemoryServices(network, seed.service, second.service, third.service)
 	recording.clear()
 	third.stop(t)
