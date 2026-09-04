@@ -3,8 +3,8 @@ package sim
 import (
 	"bytes"
 	"context"
-	craneruntime "github.com/aadityakv/crane/internal/crane/runtime"
 	"fmt"
+	craneruntime "github.com/aadityakv/crane/internal/crane/runtime"
 	"sort"
 	"sync"
 	"testing"
