@@ -507,6 +507,12 @@ func summarizeEvents(events []integrationhook.Event) string {
 // diagnostics renders every node's event summary for failure messages.
 func (c *craneCluster) diagnostics() string {
 	var lines []string
+	// Host-level view first: a dial timeout on loopback with live listeners
+	// points at the host (ephemeral ports, TIME_WAIT churn) rather than the
+	// nodes, so record the TCP state histogram of this test process's peers.
+	if out, err := exec.Command("sh", "-c", "netstat -an -p tcp 2>/dev/null | awk 'NR>2{print $6}' | sort | uniq -c | sort -rn | head -6 | tr '\\n' ';'").Output(); err == nil {
+		lines = append(lines, "host tcp states: "+strings.TrimSpace(string(out)))
+	}
 	// Each voter's own answer about leadership, so a redirect cycle can be
 	// read against who actually leads at the moment of failure.
 	for id := uint16(1); id <= 3; id++ {
