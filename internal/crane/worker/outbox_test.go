@@ -283,6 +283,15 @@ func TestOutboxAcceptedAndCompletedRetryIntervalsRemainDistinct(t *testing.T) {
 	if err := engine.HandleACK(ctx, accepted); err != nil {
 		t.Fatal(err)
 	}
+	// The engine applies the acceptance on its owner goroutine; advancing the
+	// clock before the outbox is durably Accepted would legitimately fire the
+	// custody retry that is still armed (observed under -race on shared
+	// runners), so wait for the durable transition first.
+	waitFor(t, func() bool {
+		repository.mu.Lock()
+		defer repository.mu.Unlock()
+		return repository.outboxes[outbox.ID].Accepted
+	})
 	acceptedAt := manual.Now()
 	manual.Advance(99 * time.Millisecond)
 	runtimeYield()
