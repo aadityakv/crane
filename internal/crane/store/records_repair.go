@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"math"
+	"sort"
 
 	"github.com/aadityakv/crane/internal/crane/model"
 	"github.com/aadityakv/crane/internal/crane/protocol"
@@ -54,6 +56,11 @@ func applyRepair(work *RecoveredWork, repair ResultRepairRecord) error {
 			return ErrCapacity
 		}
 		work.Repairs = append(work.Repairs, cloneRepair(repair))
+		// Keep the in-memory order identical to the snapshot/recovery order
+		// (ascending RepairID) so a reopen never reorders the recovered work.
+		sort.Slice(work.Repairs, func(i, j int) bool {
+			return bytes.Compare(work.Repairs[i].Instruction.RepairID[:], work.Repairs[j].Instruction.RepairID[:]) < 0
+		})
 		return nil
 	}
 	prior := work.Repairs[index]
