@@ -37,7 +37,7 @@ sim:
 	go test ./internal/crane/sim -run TestRandomized -count=1
 
 dev: build
-	./bin/crane-cluster -nodes 3 -base-port 8000 -data-root ./data/dev -secret-file ./local.secret -node-binary ./bin/crane-node -dashboard 127.0.0.1:8080
+	./bin/crane-cluster -nodes 3 -base-port 8000 -data-root ./data/dev -secret-file ./local.secret -node-binary ./bin/crane-node -dashboard 127.0.0.1:8080 -reset-incompatible
 
 demo:
 	sh scripts/demo.sh
