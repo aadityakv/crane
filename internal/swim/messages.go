@@ -127,10 +127,15 @@ type Outbound struct {
 type TimerKind uint8
 
 const (
+	// TimerDirectProbe fires when a direct ping's acknowledgement deadline passes.
 	TimerDirectProbe TimerKind = iota
+	// TimerIndirectProbe fires when an indirect ping's acknowledgement deadline passes.
 	TimerIndirectProbe
+	// TimerRelayProbe fires when a relayed ping on behalf of another member expires.
 	TimerRelayProbe
+	// TimerSuspicion fires when a suspect member's refutation window closes.
 	TimerSuspicion
+	// TimerTombstone fires when a dead or left member's record may be forgotten.
 	TimerTombstone
 	// TimerLeaveDeadline bounds graceful dissemination; it has no engine
 	// callback because the service owner uses it to close its cleanup context.

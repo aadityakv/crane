@@ -46,14 +46,21 @@ type replayExpiry struct {
 
 type replayExpiryHeap []replayExpiry
 
-func (h replayExpiryHeap) Len() int           { return len(h) }
-func (h replayExpiryHeap) Less(i, j int) bool { return h[i].expiresAt.Before(h[j].expiresAt) }
-func (h replayExpiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+// Len implements heap.Interface.
+func (h replayExpiryHeap) Len() int { return len(h) }
 
+// Less orders entries so the soonest expiry is at the heap root.
+func (h replayExpiryHeap) Less(i, j int) bool { return h[i].expiresAt.Before(h[j].expiresAt) }
+
+// Swap implements heap.Interface.
+func (h replayExpiryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+// Push implements heap.Interface.
 func (h *replayExpiryHeap) Push(value any) {
 	*h = append(*h, value.(replayExpiry))
 }
 
+// Pop implements heap.Interface.
 func (h *replayExpiryHeap) Pop() any {
 	old := *h
 	last := len(old) - 1

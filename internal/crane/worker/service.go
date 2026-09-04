@@ -25,8 +25,10 @@ import (
 	"github.com/aadityakv/crane/internal/wire"
 )
 
+// WorkerStoreDirectory is the data-directory subdirectory that holds the worker's durable store.
 const WorkerStoreDirectory = "crane-worker"
 
+// ErrServiceNotReady reports a request made before the worker finished recovery and bound its listeners.
 var ErrServiceNotReady = errors.New("crane worker service is not ready")
 
 // ServiceOptions fixes every caller-owned dependency of one worker service.
@@ -109,8 +111,10 @@ func NewService(options ServiceOptions) (*Service, error) {
 	}, nil
 }
 
+// Name reports the service name used in logs and supervision.
 func (*Service) Name() string { return "crane-worker" }
 
+// Ready returns a channel that closes once recovery is complete and both network services are bound.
 func (service *Service) Ready() <-chan struct{} { return service.ready }
 
 // Run recovers durable identity before binding either network service, then
@@ -450,6 +454,7 @@ func (repository *serviceRepository) RecoverWorkBounded() (store.RecoveredWork, 
 	return work, err
 }
 
+// RecoverWork reads the worker's durable identity and assignments, signalling a fatal error on failure.
 func (repository *serviceRepository) RecoverWork() (store.RecoveredWork, error) {
 	work, err := repository.Store.RecoverWork()
 	if err != nil {
@@ -465,10 +470,12 @@ func (repository *serviceRepository) signalFatal(err error) {
 	repository.fatalOnce.Do(func() { repository.fatal <- err })
 }
 
+// LocalIdentity reports this worker's node ID and current epoch.
 func (repository *serviceRepository) LocalIdentity() (uint16, model.WorkerEpoch) {
 	return repository.node, repository.WorkerEpoch()
 }
 
+// CurrentFence reports the coordinator epoch the store is fenced to, or zero when the store cannot be read.
 func (repository *serviceRepository) CurrentFence() model.CoordinatorEpoch {
 	work, err := repository.RecoverWork()
 	if err != nil {
@@ -477,6 +484,7 @@ func (repository *serviceRepository) CurrentFence() model.CoordinatorEpoch {
 	return work.Fence
 }
 
+// InstalledAssignment looks up the assignment currently installed for a job.
 func (repository *serviceRepository) InstalledAssignment(job model.JobID) (store.InstalledAssignment, bool) {
 	work, err := repository.RecoverWork()
 	if err != nil {
@@ -490,6 +498,7 @@ func (repository *serviceRepository) InstalledAssignment(job model.JobID) (store
 	return store.InstalledAssignment{}, false
 }
 
+// DurableTransactionID reports the last store transaction that is durable on disk.
 func (repository *serviceRepository) DurableTransactionID() (uint64, error) {
 	if _, err := repository.RecoverWork(); err != nil {
 		return 0, err
@@ -520,6 +529,7 @@ type controlResultReplicator struct {
 // multiple of the configured tuple retry interval.
 const replicationRetryCap = 32
 
+// ReplicateRecord streams one result record to the replica named by its provenance, retrying transient rejections with backoff.
 func (replicator *controlResultReplicator) ReplicateRecord(ctx context.Context, record model.ResultRecord, provenance model.ResultCopyProvenance) (ResultReplicationReceipt, error) {
 	if ctx == nil {
 		return ResultReplicationReceipt{}, errors.New("nil result replication context")

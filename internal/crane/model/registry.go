@@ -6,8 +6,11 @@ import "encoding/hex"
 type OperatorRole uint8
 
 const (
+	// OperatorRoleSource marks an operator that emits tuples without consuming any.
 	OperatorRoleSource OperatorRole = iota + 1
+	// OperatorRoleTransform marks an operator that consumes tuples and emits derived ones.
 	OperatorRoleTransform
+	// OperatorRoleSink marks an operator that consumes tuples and produces the job's results.
 	OperatorRoleSink
 )
 
@@ -15,6 +18,7 @@ const (
 type SettingType uint8
 
 const (
+	// SettingTypeInt64 is a signed 64-bit integer setting.
 	SettingTypeInt64 SettingType = iota + 1
 )
 

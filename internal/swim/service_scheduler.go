@@ -26,8 +26,10 @@ type scheduledServiceTimer struct {
 
 type serviceTimerHeap []*scheduledServiceTimer
 
+// Len implements heap.Interface.
 func (h serviceTimerHeap) Len() int { return len(h) }
 
+// Less orders timers by deadline, breaking ties by scheduling order.
 func (h serviceTimerHeap) Less(i, j int) bool {
 	if h[i].deadline.Equal(h[j].deadline) {
 		return h[i].order < h[j].order
@@ -35,18 +37,21 @@ func (h serviceTimerHeap) Less(i, j int) bool {
 	return h[i].deadline.Before(h[j].deadline)
 }
 
+// Swap implements heap.Interface and keeps each timer's index current.
 func (h serviceTimerHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 	h[i].index = i
 	h[j].index = j
 }
 
+// Push implements heap.Interface.
 func (h *serviceTimerHeap) Push(value any) {
 	timer := value.(*scheduledServiceTimer)
 	timer.index = len(*h)
 	*h = append(*h, timer)
 }
 
+// Pop implements heap.Interface.
 func (h *serviceTimerHeap) Pop() any {
 	old := *h
 	last := len(old) - 1

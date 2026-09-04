@@ -22,20 +22,31 @@ import (
 )
 
 const (
-	DefaultMaxControlSessions             = 128
-	DefaultMaxControlSessionsPerPeer      = 4
-	DefaultMaxQueuedControlWork           = 256
-	DefaultMaxControlReplayEntries        = 65536
+	// DefaultMaxControlSessions bounds the concurrent inbound control sessions a worker accepts.
+	DefaultMaxControlSessions = 128
+	// DefaultMaxControlSessionsPerPeer bounds the concurrent control sessions accepted from one peer.
+	DefaultMaxControlSessionsPerPeer = 4
+	// DefaultMaxQueuedControlWork bounds the control requests waiting for the store.
+	DefaultMaxQueuedControlWork = 256
+	// DefaultMaxControlReplayEntries bounds the replay-protection entries retained across all peers.
+	DefaultMaxControlReplayEntries = 65536
+	// DefaultMaxControlReplayEntriesPerPeer bounds the replay-protection entries retained for one peer.
 	DefaultMaxControlReplayEntriesPerPeer = 8192
 )
 
 var (
+	// ErrControlHandshakeRequired reports a control message that arrived before the session handshake.
 	ErrControlHandshakeRequired = errors.New("crane worker control handshake required")
-	ErrControlUnauthorized      = errors.New("crane worker control unauthorized")
-	ErrControlStaleEpoch        = errors.New("crane worker control stale epoch")
-	ErrControlStaleAssignment   = errors.New("crane worker control stale assignment")
-	ErrControlCapacity          = errors.New("crane worker control capacity exhausted")
-	ErrControlClosed            = errors.New("crane worker control session closed")
+	// ErrControlUnauthorized reports a control message from a peer that is not allowed to send it.
+	ErrControlUnauthorized = errors.New("crane worker control unauthorized")
+	// ErrControlStaleEpoch reports a control message fenced by a superseded coordinator or worker epoch.
+	ErrControlStaleEpoch = errors.New("crane worker control stale epoch")
+	// ErrControlStaleAssignment reports a control message bound to an assignment revision the worker no longer holds.
+	ErrControlStaleAssignment = errors.New("crane worker control stale assignment")
+	// ErrControlCapacity reports that a session or queue limit prevented accepting the request.
+	ErrControlCapacity = errors.New("crane worker control capacity exhausted")
+	// ErrControlClosed reports an operation attempted on a session that has already closed.
+	ErrControlClosed = errors.New("crane worker control session closed")
 )
 
 type controlRepository interface {

@@ -71,7 +71,10 @@ func UnmarshalWorkerMessage(messageType wire.MessageType, encoded []byte) (Worke
 	return message, nil
 }
 
+// MarshalWorkerHandshake encodes a WorkerHandshake as its canonical worker-control payload.
 func MarshalWorkerHandshake(v WorkerHandshake) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalWorkerHandshake decodes a canonical WorkerHandshake payload, rejecting any other message type.
 func UnmarshalWorkerHandshake(b []byte) (WorkerHandshake, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerHandshake, b)
 	if e != nil {
@@ -79,7 +82,11 @@ func UnmarshalWorkerHandshake(b []byte) (WorkerHandshake, error) {
 	}
 	return v.(WorkerHandshake), nil
 }
+
+// MarshalWorkerHandshakeAck encodes a WorkerHandshakeAck as its canonical worker-control payload.
 func MarshalWorkerHandshakeAck(v WorkerHandshakeAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalWorkerHandshakeAck decodes a canonical WorkerHandshakeAck payload, rejecting any other message type.
 func UnmarshalWorkerHandshakeAck(b []byte) (WorkerHandshakeAck, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerHandshakeAck, b)
 	if e != nil {
@@ -87,7 +94,11 @@ func UnmarshalWorkerHandshakeAck(b []byte) (WorkerHandshakeAck, error) {
 	}
 	return v.(WorkerHandshakeAck), nil
 }
+
+// MarshalFenceRequest encodes a FenceRequest as its canonical worker-control payload.
 func MarshalFenceRequest(v FenceRequest) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalFenceRequest decodes a canonical FenceRequest payload, rejecting any other message type.
 func UnmarshalFenceRequest(b []byte) (FenceRequest, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerFenceRequest, b)
 	if e != nil {
@@ -95,7 +106,11 @@ func UnmarshalFenceRequest(b []byte) (FenceRequest, error) {
 	}
 	return v.(FenceRequest), nil
 }
+
+// MarshalFenceResponse encodes a FenceResponse as its canonical worker-control payload.
 func MarshalFenceResponse(v FenceResponse) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalFenceResponse decodes a canonical FenceResponse payload, rejecting any other message type.
 func UnmarshalFenceResponse(b []byte) (FenceResponse, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerFenceResponse, b)
 	if e != nil {
@@ -103,9 +118,13 @@ func UnmarshalFenceResponse(b []byte) (FenceResponse, error) {
 	}
 	return v.(FenceResponse), nil
 }
+
+// MarshalWorkerRegisterRequest encodes a WorkerRegisterRequest as its canonical worker-control payload.
 func MarshalWorkerRegisterRequest(v WorkerRegisterRequest) ([]byte, error) {
 	return MarshalWorkerMessage(v)
 }
+
+// UnmarshalWorkerRegisterRequest decodes a canonical WorkerRegisterRequest payload, rejecting any other message type.
 func UnmarshalWorkerRegisterRequest(b []byte) (WorkerRegisterRequest, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerRegisterRequest, b)
 	if e != nil {
@@ -113,9 +132,13 @@ func UnmarshalWorkerRegisterRequest(b []byte) (WorkerRegisterRequest, error) {
 	}
 	return v.(WorkerRegisterRequest), nil
 }
+
+// MarshalWorkerRegisterResponse encodes a WorkerRegisterResponse as its canonical worker-control payload.
 func MarshalWorkerRegisterResponse(v WorkerRegisterResponse) ([]byte, error) {
 	return MarshalWorkerMessage(v)
 }
+
+// UnmarshalWorkerRegisterResponse decodes a canonical WorkerRegisterResponse payload, rejecting any other message type.
 func UnmarshalWorkerRegisterResponse(b []byte) (WorkerRegisterResponse, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerRegisterResponse, b)
 	if e != nil {
@@ -123,15 +146,23 @@ func UnmarshalWorkerRegisterResponse(b []byte) (WorkerRegisterResponse, error) {
 	}
 	return v.(WorkerRegisterResponse), nil
 }
+
+// MarshalAssignmentSetInstall encodes an AssignmentSetInstall as its canonical worker-control payload.
 func MarshalAssignmentSetInstall(v AssignmentSetInstall) ([]byte, error) {
 	return MarshalWorkerMessage(v)
 }
+
+// UnmarshalAssignmentSetInstall decodes a canonical AssignmentSetInstall payload, rejecting any other message type.
 func UnmarshalAssignmentSetInstall(b []byte) (AssignmentSetInstall, error) {
 	return unmarshalAssignmentSetInstallWith(b, model.DecodeTopology)
 }
+
+// MarshalAssignmentSetInstallAck encodes an AssignmentSetInstallAck as its canonical worker-control payload.
 func MarshalAssignmentSetInstallAck(v AssignmentSetInstallAck) ([]byte, error) {
 	return MarshalWorkerMessage(v)
 }
+
+// UnmarshalAssignmentSetInstallAck decodes a canonical AssignmentSetInstallAck payload, rejecting any other message type.
 func UnmarshalAssignmentSetInstallAck(b []byte) (AssignmentSetInstallAck, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneAssignmentSetInstallAck, b)
 	if e != nil {
@@ -139,9 +170,13 @@ func UnmarshalAssignmentSetInstallAck(b []byte) (AssignmentSetInstallAck, error)
 	}
 	return v.(AssignmentSetInstallAck), nil
 }
+
+// MarshalWorkerStatusRequest encodes a WorkerStatusRequest as its canonical worker-control payload.
 func MarshalWorkerStatusRequest(v WorkerStatusRequest) ([]byte, error) {
 	return MarshalWorkerMessage(v)
 }
+
+// UnmarshalWorkerStatusRequest decodes a canonical WorkerStatusRequest payload, rejecting any other message type.
 func UnmarshalWorkerStatusRequest(b []byte) (WorkerStatusRequest, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerStatusRequest, b)
 	if e != nil {
@@ -149,7 +184,11 @@ func UnmarshalWorkerStatusRequest(b []byte) (WorkerStatusRequest, error) {
 	}
 	return v.(WorkerStatusRequest), nil
 }
+
+// MarshalWorkerStatus encodes a WorkerStatus as its canonical worker-control payload.
 func MarshalWorkerStatus(v WorkerStatus) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalWorkerStatus decodes a canonical WorkerStatus payload, rejecting any other message type.
 func UnmarshalWorkerStatus(b []byte) (WorkerStatus, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerStatusReport, b)
 	if e != nil {
@@ -157,7 +196,11 @@ func UnmarshalWorkerStatus(b []byte) (WorkerStatus, error) {
 	}
 	return v.(WorkerStatus), nil
 }
+
+// MarshalCheckpointNotice encodes a CheckpointNotice as its canonical worker-control payload.
 func MarshalCheckpointNotice(v CheckpointNotice) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalCheckpointNotice decodes a canonical CheckpointNotice payload, rejecting any other message type.
 func UnmarshalCheckpointNotice(b []byte) (CheckpointNotice, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneCheckpointNotice, b)
 	if e != nil {
@@ -165,7 +208,11 @@ func UnmarshalCheckpointNotice(b []byte) (CheckpointNotice, error) {
 	}
 	return v.(CheckpointNotice), nil
 }
+
+// MarshalCheckpointAck encodes a CheckpointAck as its canonical worker-control payload.
 func MarshalCheckpointAck(v CheckpointAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalCheckpointAck decodes a canonical CheckpointAck payload, rejecting any other message type.
 func UnmarshalCheckpointAck(b []byte) (CheckpointAck, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneCheckpointAck, b)
 	if e != nil {
@@ -173,7 +220,11 @@ func UnmarshalCheckpointAck(b []byte) (CheckpointAck, error) {
 	}
 	return v.(CheckpointAck), nil
 }
+
+// MarshalResultRecordChunk encodes a ResultRecordChunk as its canonical worker-control payload.
 func MarshalResultRecordChunk(v ResultRecordChunk) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalResultRecordChunk decodes a canonical ResultRecordChunk payload, rejecting any other message type.
 func UnmarshalResultRecordChunk(b []byte) (ResultRecordChunk, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultRecordChunk, b)
 	if e != nil {
@@ -181,7 +232,11 @@ func UnmarshalResultRecordChunk(b []byte) (ResultRecordChunk, error) {
 	}
 	return v.(ResultRecordChunk), nil
 }
+
+// MarshalResultRecordAck encodes a ResultRecordAck as its canonical worker-control payload.
 func MarshalResultRecordAck(v ResultRecordAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalResultRecordAck decodes a canonical ResultRecordAck payload, rejecting any other message type.
 func UnmarshalResultRecordAck(b []byte) (ResultRecordAck, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultRecordAck, b)
 	if e != nil {
@@ -189,9 +244,13 @@ func UnmarshalResultRecordAck(b []byte) (ResultRecordAck, error) {
 	}
 	return v.(ResultRecordAck), nil
 }
+
+// MarshalResultArtifactChunk encodes a ResultArtifactChunk as its canonical worker-control payload.
 func MarshalResultArtifactChunk(v ResultArtifactChunk) ([]byte, error) {
 	return MarshalWorkerMessage(v)
 }
+
+// UnmarshalResultArtifactChunk decodes a canonical ResultArtifactChunk payload, rejecting any other message type.
 func UnmarshalResultArtifactChunk(b []byte) (ResultArtifactChunk, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultArtifactChunk, b)
 	if e != nil {
@@ -199,7 +258,11 @@ func UnmarshalResultArtifactChunk(b []byte) (ResultArtifactChunk, error) {
 	}
 	return v.(ResultArtifactChunk), nil
 }
+
+// MarshalResultArtifactAck encodes a ResultArtifactAck as its canonical worker-control payload.
 func MarshalResultArtifactAck(v ResultArtifactAck) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalResultArtifactAck decodes a canonical ResultArtifactAck payload, rejecting any other message type.
 func UnmarshalResultArtifactAck(b []byte) (ResultArtifactAck, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultArtifactAck, b)
 	if e != nil {
@@ -207,7 +270,11 @@ func UnmarshalResultArtifactAck(b []byte) (ResultArtifactAck, error) {
 	}
 	return v.(ResultArtifactAck), nil
 }
+
+// MarshalResultFetchRequest encodes a ResultFetchRequest as its canonical worker-control payload.
 func MarshalResultFetchRequest(v ResultFetchRequest) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalResultFetchRequest decodes a canonical ResultFetchRequest payload, rejecting any other message type.
 func UnmarshalResultFetchRequest(b []byte) (ResultFetchRequest, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultFetchRequest, b)
 	if e != nil {
@@ -215,7 +282,11 @@ func UnmarshalResultFetchRequest(b []byte) (ResultFetchRequest, error) {
 	}
 	return v.(ResultFetchRequest), nil
 }
+
+// MarshalResultFetchChunk encodes a ResultFetchChunk as its canonical worker-control payload.
 func MarshalResultFetchChunk(v ResultFetchChunk) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalResultFetchChunk decodes a canonical ResultFetchChunk payload, rejecting any other message type.
 func UnmarshalResultFetchChunk(b []byte) (ResultFetchChunk, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneResultFetchChunk, b)
 	if e != nil {
@@ -223,7 +294,11 @@ func UnmarshalResultFetchChunk(b []byte) (ResultFetchChunk, error) {
 	}
 	return v.(ResultFetchChunk), nil
 }
+
+// MarshalWorkerError encodes a WorkerError as its canonical worker-control payload.
 func MarshalWorkerError(v WorkerError) ([]byte, error) { return MarshalWorkerMessage(v) }
+
+// UnmarshalWorkerError decodes a canonical WorkerError payload, rejecting any other message type.
 func UnmarshalWorkerError(b []byte) (WorkerError, error) {
 	v, e := UnmarshalWorkerMessage(wire.MessageCraneWorkerError, b)
 	if e != nil {

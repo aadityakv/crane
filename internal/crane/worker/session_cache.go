@@ -65,6 +65,7 @@ type controlPeerRejection struct {
 	retryable bool
 }
 
+// Error describes the rejected message type and the peer's error code.
 func (rejection *controlPeerRejection) Error() string {
 	return fmt.Sprintf("remote worker rejected %d with code %d", rejection.related, rejection.code)
 }

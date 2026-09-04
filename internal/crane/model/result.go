@@ -22,7 +22,9 @@ const (
 type ResultReplicaRole uint8
 
 const (
+	// PrimaryReplica selects the replica set's primary copy.
 	PrimaryReplica ResultReplicaRole = iota + 1
+	// SecondaryReplica selects the replica set's secondary copy.
 	SecondaryReplica
 )
 

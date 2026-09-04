@@ -38,14 +38,17 @@ type realTimer struct {
 	timer *time.Timer
 }
 
+// C returns the channel the underlying time.Timer fires on.
 func (t realTimer) C() <-chan time.Time {
 	return t.timer.C
 }
 
+// Stop cancels the underlying time.Timer and reports whether it was still pending.
 func (t realTimer) Stop() bool {
 	return t.timer.Stop()
 }
 
+// Reset re-arms the underlying time.Timer and reports whether it was still pending.
 func (t realTimer) Reset(duration time.Duration) bool {
 	return t.timer.Reset(duration)
 }

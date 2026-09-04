@@ -398,6 +398,7 @@ func parseRaftClusterID(value string) ([16]byte, error) {
 
 type cryptoTransferIDSource struct{}
 
+// NextTransferID draws a fresh non-zero transfer ID from the operating system's random source.
 func (cryptoTransferIDSource) NextTransferID(uint16) (TransferID, error) {
 	var id TransferID
 	if _, err := cryptorand.Read(id[:]); err != nil || id.IsZero() {

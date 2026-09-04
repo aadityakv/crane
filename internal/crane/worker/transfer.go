@@ -25,12 +25,18 @@ const (
 )
 
 var (
-	ErrTransferUnauthorized      = errors.New("crane transfer unauthorized")
-	ErrTransferStaleAuthority    = errors.New("crane transfer stale authority")
-	ErrTransferIdentityReuse     = errors.New("crane transfer identity reuse")
-	ErrTransferCapacity          = errors.New("crane transfer capacity exhausted")
+	// ErrTransferUnauthorized reports a transfer from a peer that holds no authority for it.
+	ErrTransferUnauthorized = errors.New("crane transfer unauthorized")
+	// ErrTransferStaleAuthority reports a transfer whose authority was superseded by a newer epoch or assignment.
+	ErrTransferStaleAuthority = errors.New("crane transfer stale authority")
+	// ErrTransferIdentityReuse reports a transfer ID reused with different content.
+	ErrTransferIdentityReuse = errors.New("crane transfer identity reuse")
+	// ErrTransferCapacity reports that the worker cannot accept another transfer right now.
+	ErrTransferCapacity = errors.New("crane transfer capacity exhausted")
+	// ErrResultArtifactUnavailable reports an artifact write attempted before the sink's manifest was sealed.
 	ErrResultArtifactUnavailable = errors.New("crane result artifact storage unavailable until sealing")
-	ErrResultFetchUnavailable    = errors.New("crane result fetch unavailable until artifacts are sealed")
+	// ErrResultFetchUnavailable reports a fetch attempted before the sink's artifacts were sealed.
+	ErrResultFetchUnavailable = errors.New("crane result fetch unavailable until artifacts are sealed")
 )
 
 // TransferRole keeps coordinator commands, current replication, bilateral
@@ -38,9 +44,13 @@ var (
 type TransferRole uint8
 
 const (
+	// TransferCoordinatorCommand authorizes a transfer instructed by the fenced coordinator.
 	TransferCoordinatorCommand TransferRole = iota + 1
+	// TransferNormalReplication authorizes replication under the current assignment set.
 	TransferNormalReplication
+	// TransferHistoricalRepair authorizes a bilateral repair of an older partition.
 	TransferHistoricalRepair
+	// TransferLeaderFetch authorizes the leader to fetch a sealed artifact from a replica.
 	TransferLeaderFetch
 )
 

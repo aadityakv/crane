@@ -16,6 +16,7 @@ import (
 
 const localNodePortStride = 100
 
+// ClusterOptions describes the local cluster to generate node configurations for.
 type ClusterOptions struct {
 	Nodes            int
 	Voters           int
@@ -31,6 +32,7 @@ type ClusterOptions struct {
 	Dashboard string
 }
 
+// GenerateConfigs derives one validated node configuration per node, with contiguous ports and a shared secret and cluster ID.
 func GenerateConfigs(options ClusterOptions) ([]config.NodeConfig, error) {
 	if options.Nodes < 3 {
 		return nil, fmt.Errorf("local cluster requires at least three nodes")

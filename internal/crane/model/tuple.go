@@ -10,8 +10,11 @@ import (
 type ValueType uint8
 
 const (
+	// ValueInt64 tags a signed 64-bit integer value.
 	ValueInt64 ValueType = iota + 1
+	// ValueString tags a UTF-8 string value.
 	ValueString
+	// ValueBytes tags an opaque byte-slice value.
 	ValueBytes
 )
 

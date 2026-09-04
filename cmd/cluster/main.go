@@ -367,6 +367,7 @@ type synchronizedWriter struct {
 	output io.Writer
 }
 
+// Write forwards to the wrapped writer under a mutex so concurrent child output does not interleave.
 func (w *synchronizedWriter) Write(content []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -389,6 +390,7 @@ func newObservedPrefixWriter(output io.Writer, prefix string, observe func(strin
 	return &prefixWriter{output: output, prefix: []byte(prefix), observe: observe}
 }
 
+// Write buffers partial lines and emits each complete line with the prefix, observing it first when configured.
 func (w *prefixWriter) Write(content []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -414,6 +416,7 @@ func (w *prefixWriter) Write(content []byte) (int, error) {
 	return len(content), nil
 }
 
+// Flush emits any buffered partial line with the prefix.
 func (w *prefixWriter) Flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

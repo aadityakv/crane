@@ -11,8 +11,11 @@ const completionReportDigestDomain = "crane/completion-report/v1\x00"
 type SchedulingState uint8
 
 const (
+	// SchedulingClosed admits no tuples; the job is installed but not yet processing.
 	SchedulingClosed SchedulingState = iota + 1
+	// SchedulingRunning admits source tuples and worker progress.
 	SchedulingRunning
+	// SchedulingDraining admits only in-flight work so the job can finish after every source EOF.
 	SchedulingDraining
 )
 
@@ -50,8 +53,11 @@ type CheckpointNotice struct {
 type FailureCode uint16
 
 const (
+	// FailureOperator reports an operator that returned an error while processing a tuple.
 	FailureOperator FailureCode = iota + 1
+	// FailureTupleInvalid reports a tuple that violated the operator's declared schema.
 	FailureTupleInvalid
+	// FailureStorage reports a worker whose durable store refused or lost a write.
 	FailureStorage
 )
 
@@ -71,7 +77,9 @@ type JobFailureReport struct {
 type WorkerEventKind uint8
 
 const (
+	// WorkerEventCompletion carries a completion report for one source task.
 	WorkerEventCompletion WorkerEventKind = iota + 1
+	// WorkerEventFailure carries a deterministic job failure report.
 	WorkerEventFailure
 )
 

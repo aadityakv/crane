@@ -62,6 +62,7 @@ func NewAdvanceCheckpoint(id InternalCommandID, expectedRevision uint64, report 
 	return command, command.Validate()
 }
 
+// Validate reports whether the command's envelope, source subject, and digest all agree.
 func (command RecordSourceEOF) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err
@@ -79,6 +80,7 @@ func (command RecordSourceEOF) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command's envelope, checkpoint subject, report, and digest all agree.
 func (command AdvanceCheckpoint) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err

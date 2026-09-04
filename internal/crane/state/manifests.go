@@ -20,6 +20,7 @@ type ResultManifest struct {
 	Replicas          model.ResultReplicaSet // Replicas are the exact two current copies.
 }
 
+// Validate reports whether the manifest names a real sink task with a consistent artifact and replica set.
 func (manifest ResultManifest) Validate() error {
 	if err := manifest.JobID.Validate(); err != nil {
 		return err
@@ -92,6 +93,7 @@ func NewFailJob(id InternalCommandID, expectedRevision uint64, report model.JobF
 	return command, command.Validate()
 }
 
+// Validate reports whether the command's envelope, manifest subject and revision, and digest all agree.
 func (command SealManifest) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err
@@ -109,6 +111,7 @@ func (command SealManifest) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command names a real job and two distinct lifecycle states with a matching digest.
 func (command TransitionJob) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err
@@ -122,6 +125,7 @@ func (command TransitionJob) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command's envelope, job subject, failure report, and digest all agree.
 func (command FailJob) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err

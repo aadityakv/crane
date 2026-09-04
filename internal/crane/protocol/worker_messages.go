@@ -11,26 +11,42 @@ import (
 )
 
 const (
-	WorkerControlSchemaVersion   uint16 = model.WorkerControlSchemaVersionV1
-	MaxWorkerControlPayloadBytes        = model.WorkerControlMaxFrameBytesV1 - wire.FixedHeaderSize - wire.MACSize
-	MaxWorkerStatusEvents               = model.WorkerControlMaxStatusEventsV1
-	MaxInventoryCheckpoints             = model.WorkerControlMaxCheckpointsV1
-	MaxTransferChunkBytes               = model.WorkerControlMaxTransferChunkV1
-	MaxTransferTotalBytes               = model.WorkerControlMaxTransferTotalV1
-	MaxWorkerErrorDetailBytes           = model.WorkerControlMaxErrorDetailV1
+	// WorkerControlSchemaVersion is the schema version stamped on every worker-control payload.
+	WorkerControlSchemaVersion uint16 = model.WorkerControlSchemaVersionV1
+	// MaxWorkerControlPayloadBytes bounds a worker-control payload so the framed message fits one wire frame.
+	MaxWorkerControlPayloadBytes = model.WorkerControlMaxFrameBytesV1 - wire.FixedHeaderSize - wire.MACSize
+	// MaxWorkerStatusEvents caps the events carried by one WorkerStatus page.
+	MaxWorkerStatusEvents = model.WorkerControlMaxStatusEventsV1
+	// MaxInventoryCheckpoints caps the checkpoint vector carried by inventory queries and repair instructions.
+	MaxInventoryCheckpoints = model.WorkerControlMaxCheckpointsV1
+	// MaxTransferChunkBytes caps the data carried by one TransferChunk.
+	MaxTransferChunkBytes = model.WorkerControlMaxTransferChunkV1
+	// MaxTransferTotalBytes caps the total length of any single result transfer.
+	MaxTransferTotalBytes = model.WorkerControlMaxTransferTotalV1
+	// MaxWorkerErrorDetailBytes caps the free-form detail attached to a WorkerError.
+	MaxWorkerErrorDetailBytes = model.WorkerControlMaxErrorDetailV1
 )
 
 var (
-	ErrMalformedWorkerMessage  = errors.New("malformed Crane worker-control message")
+	// ErrMalformedWorkerMessage reports a payload that is not the canonical encoding of any message.
+	ErrMalformedWorkerMessage = errors.New("malformed Crane worker-control message")
+	// ErrUnsupportedWorkerSchema reports a payload stamped with a schema version this build does not speak.
 	ErrUnsupportedWorkerSchema = errors.New("unsupported Crane worker-control schema")
+	// ErrUnexpectedWorkerMessage reports a message type outside the worker-control range or different from the one expected.
 	ErrUnexpectedWorkerMessage = errors.New("unexpected Crane worker-control message type")
-	ErrInvalidWorkerMessage    = errors.New("invalid Crane worker-control message")
-	ErrWorkerMessageTooLarge   = errors.New("crane worker-control message too large")
+	// ErrInvalidWorkerMessage reports a well-formed message whose fields violate the worker-control contract.
+	ErrInvalidWorkerMessage = errors.New("invalid Crane worker-control message")
+	// ErrWorkerMessageTooLarge reports a payload larger than MaxWorkerControlPayloadBytes.
+	ErrWorkerMessageTooLarge = errors.New("crane worker-control message too large")
 )
 
+// WorkerMessage is implemented by every message that travels over a worker-control session.
 type WorkerMessage interface{ MessageType() wire.MessageType }
+
+// TransferID identifies one result transfer across the chunks and acknowledgements that make it up.
 type TransferID [16]byte
 
+// WorkerHandshake opens a worker-control session by declaring the worker's identity and build fingerprints.
 type WorkerHandshake struct {
 	NodeID               uint16
 	WorkerEpoch          model.WorkerEpoch
@@ -38,8 +54,10 @@ type WorkerHandshake struct {
 	RegistryFingerprint  [32]byte
 }
 
+// MessageType reports the wire type that carries a WorkerHandshake.
 func (WorkerHandshake) MessageType() wire.MessageType { return wire.MessageCraneWorkerHandshake }
 
+// WorkerHandshakeAck answers a WorkerHandshake with the accepting side's identity, capacity, and fingerprints.
 type WorkerHandshakeAck struct {
 	NodeID               uint16
 	WorkerEpoch          model.WorkerEpoch
@@ -48,20 +66,26 @@ type WorkerHandshakeAck struct {
 	RegistryFingerprint  [32]byte
 }
 
+// MessageType reports the wire type that carries a WorkerHandshakeAck.
 func (WorkerHandshakeAck) MessageType() wire.MessageType { return wire.MessageCraneWorkerHandshakeAck }
 
+// FenceRequest asks a worker to fence itself to the named coordinator epoch and reject older ones.
 type FenceRequest struct{ CoordinatorEpoch model.CoordinatorEpoch }
 
+// MessageType reports the wire type that carries a FenceRequest.
 func (FenceRequest) MessageType() wire.MessageType { return wire.MessageCraneWorkerFenceRequest }
 
+// FenceResponse confirms the coordinator epoch a worker is now fenced to.
 type FenceResponse struct {
 	NodeID           uint16
 	WorkerEpoch      model.WorkerEpoch
 	CoordinatorEpoch model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries a FenceResponse.
 func (FenceResponse) MessageType() wire.MessageType { return wire.MessageCraneWorkerFenceResponse }
 
+// WorkerRegisterRequest asks the coordinator to register a worker epoch with the given slot capacity.
 type WorkerRegisterRequest struct {
 	NodeID               uint16
 	WorkerEpoch          model.WorkerEpoch
@@ -71,10 +95,12 @@ type WorkerRegisterRequest struct {
 	RegistryFingerprint  [32]byte
 }
 
+// MessageType reports the wire type that carries a WorkerRegisterRequest.
 func (WorkerRegisterRequest) MessageType() wire.MessageType {
 	return wire.MessageCraneWorkerRegisterRequest
 }
 
+// WorkerRegisterResponse reports whether a registration was accepted and the worker revision it produced.
 type WorkerRegisterResponse struct {
 	NodeID           uint16
 	WorkerEpoch      model.WorkerEpoch
@@ -83,10 +109,12 @@ type WorkerRegisterResponse struct {
 	Accepted         bool
 }
 
+// MessageType reports the wire type that carries a WorkerRegisterResponse.
 func (WorkerRegisterResponse) MessageType() wire.MessageType {
 	return wire.MessageCraneWorkerRegisterResponse
 }
 
+// AssignmentSetInstall delivers a job's topology and assignment set to a worker together with the scheduling state to run it under.
 type AssignmentSetInstall struct {
 	Assignment          model.AssignmentSet
 	Specification       model.TopologySpec
@@ -96,10 +124,12 @@ type AssignmentSetInstall struct {
 	CoordinatorEpoch    model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries an AssignmentSetInstall.
 func (AssignmentSetInstall) MessageType() wire.MessageType {
 	return wire.MessageCraneAssignmentSetInstall
 }
 
+// AssignmentSetInstallAck confirms which assignment revision and scheduling state a worker has installed for a job.
 type AssignmentSetInstallAck struct {
 	NodeID             uint16
 	WorkerEpoch        model.WorkerEpoch
@@ -111,11 +141,15 @@ type AssignmentSetInstallAck struct {
 	CoordinatorEpoch   model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries an AssignmentSetInstallAck.
 func (AssignmentSetInstallAck) MessageType() wire.MessageType {
 	return wire.MessageCraneAssignmentSetInstallAck
 }
 
+// SourceCheckpoint is the per-source watermark entry carried by inventory queries and repair instructions.
 type SourceCheckpoint = model.SourceCheckpoint
+
+// ResultInventoryQuery asks a worker to summarize the result records it holds for a sink task at a checkpoint vector.
 type ResultInventoryQuery struct {
 	JobID              model.JobID
 	SinkTask           model.TaskID
@@ -126,19 +160,26 @@ type ResultInventoryQuery struct {
 	CheckpointDigest   [32]byte
 	QueryDigest        [32]byte
 }
+
+// ResultInventorySummary answers a ResultInventoryQuery with the count, size, and content digest of the matching records.
 type ResultInventorySummary struct {
 	QueryDigest   [32]byte
 	RecordCount   uint64
 	TotalBytes    uint64
 	ContentDigest [32]byte
 }
+
+// RepairEndpointRole names which end of a result repair a worker plays.
 type RepairEndpointRole uint8
 
 const (
+	// RepairSource streams the repaired records to the destination.
 	RepairSource RepairEndpointRole = iota + 1
+	// RepairDestination receives and persists the repaired records.
 	RepairDestination
 )
 
+// RepairResultPartition instructs one worker to copy a sink task's result partition to another, bound to the inventory that justified it.
 type RepairResultPartition struct {
 	RepairID               [16]byte
 	CoordinatorEpoch       model.CoordinatorEpoch
@@ -159,19 +200,28 @@ type RepairResultPartition struct {
 	ExpectedContentDigest  [32]byte
 	InstructionDigest      [32]byte
 }
+
+// RepairGrant hands a worker a repair instruction together with the role it must play in it.
 type RepairGrant struct {
 	Instruction RepairResultPartition
 	Role        RepairEndpointRole
 }
+
+// ResultRepairState tracks how far a granted repair has progressed on a worker.
 type ResultRepairState uint8
 
 const (
+	// RepairPending means the repair was accepted but no records have moved yet.
 	RepairPending ResultRepairState = iota + 1
+	// RepairStreaming means records are in flight between the endpoints.
 	RepairStreaming
+	// RepairComplete means the destination holds the full expected partition.
 	RepairComplete
+	// RepairFailed means the repair stopped with the reported error code.
 	RepairFailed
 )
 
+// ResultRepairStatus reports a worker's progress on a granted repair together with the aggregate it has seen so far.
 type ResultRepairStatus struct {
 	Instruction       RepairResultPartition
 	RepairID          [16]byte
@@ -184,6 +234,7 @@ type ResultRepairStatus struct {
 	ErrorCode         WorkerErrorCode
 }
 
+// WorkerStatusRequest polls a worker for its status page after a transaction cursor, optionally attaching an inventory query or repair grant.
 type WorkerStatusRequest struct {
 	CoordinatorEpoch   model.CoordinatorEpoch
 	AfterTransactionID uint64
@@ -192,10 +243,12 @@ type WorkerStatusRequest struct {
 	Repair             *RepairGrant
 }
 
+// MessageType reports the wire type that carries a WorkerStatusRequest.
 func (WorkerStatusRequest) MessageType() wire.MessageType {
 	return wire.MessageCraneWorkerStatusRequest
 }
 
+// InstalledAssignmentStatus summarizes the revision and scheduling state a worker currently holds for one job.
 type InstalledAssignmentStatus struct {
 	JobID               model.JobID
 	JobControlRevision  uint64
@@ -204,6 +257,8 @@ type InstalledAssignmentStatus struct {
 	SpecificationDigest [32]byte
 	SchedulingState     model.SchedulingState
 }
+
+// WorkerStatus is one page of a worker's installed assignments and ordered events, plus any inventory or repair answer.
 type WorkerStatus struct {
 	NodeID             uint16
 	WorkerEpoch        model.WorkerEpoch
@@ -222,8 +277,10 @@ type WorkerStatus struct {
 	Repair         *ResultRepairStatus
 }
 
+// MessageType reports the wire type that carries a WorkerStatus.
 func (WorkerStatus) MessageType() wire.MessageType { return wire.MessageCraneWorkerStatusReport }
 
+// CheckpointNotice tells a worker that a source checkpoint was committed under a specific assignment revision.
 type CheckpointNotice struct {
 	Notice             model.CheckpointNotice
 	JobControlRevision uint64
@@ -231,8 +288,10 @@ type CheckpointNotice struct {
 	AssignmentDigest   [32]byte
 }
 
+// MessageType reports the wire type that carries a CheckpointNotice.
 func (CheckpointNotice) MessageType() wire.MessageType { return wire.MessageCraneCheckpointNotice }
 
+// CheckpointAck confirms that a worker applied a checkpoint notice for one source task.
 type CheckpointAck struct {
 	NodeID             uint16
 	WorkerEpoch        model.WorkerEpoch
@@ -246,8 +305,10 @@ type CheckpointAck struct {
 	CoordinatorEpoch   model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries a CheckpointAck.
 func (CheckpointAck) MessageType() wire.MessageType { return wire.MessageCraneCheckpointAck }
 
+// TransferChunk is one contiguous slice of a checksummed byte stream being transferred between workers.
 type TransferChunk struct {
 	TransferID  TransferID
 	JobID       model.JobID
@@ -257,6 +318,8 @@ type TransferChunk struct {
 	Data        []byte
 	Final       bool
 }
+
+// ResultRecordChunk carries part of a canonical result record stream to a replica, with the provenance that authorizes the copy.
 type ResultRecordChunk struct {
 	Transfer                TransferChunk
 	Record                  model.ResultRecord
@@ -267,8 +330,10 @@ type ResultRecordChunk struct {
 	RepairInstructionDigest [32]byte
 }
 
+// MessageType reports the wire type that carries a ResultRecordChunk.
 func (ResultRecordChunk) MessageType() wire.MessageType { return wire.MessageCraneResultRecordChunk }
 
+// ResultRecordAck acknowledges a ResultRecordChunk and reports the next offset the receiver expects.
 type ResultRecordAck struct {
 	TransferID              TransferID
 	NodeID                  uint16
@@ -282,8 +347,10 @@ type ResultRecordAck struct {
 	CoordinatorEpoch        model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries a ResultRecordAck.
 func (ResultRecordAck) MessageType() wire.MessageType { return wire.MessageCraneResultRecordAck }
 
+// ResultArtifact identifies a sink task's sealed result stream by its size and checksum.
 type ResultArtifact struct {
 	JobID             model.JobID
 	SinkTask          model.TaskID
@@ -292,6 +359,8 @@ type ResultArtifact struct {
 	TotalLength       uint64
 	Checksum          [32]byte
 }
+
+// ResultArtifactChunk carries part of a sealed result artifact to a replica.
 type ResultArtifactChunk struct {
 	Transfer               TransferChunk
 	Artifact               ResultArtifact
@@ -300,10 +369,12 @@ type ResultArtifactChunk struct {
 	CoordinatorEpoch       model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries a ResultArtifactChunk.
 func (ResultArtifactChunk) MessageType() wire.MessageType {
 	return wire.MessageCraneResultArtifactChunk
 }
 
+// ResultArtifactAck acknowledges a ResultArtifactChunk and reports the next offset the receiver expects.
 type ResultArtifactAck struct {
 	TransferID       TransferID
 	NodeID           uint16
@@ -314,8 +385,10 @@ type ResultArtifactAck struct {
 	CoordinatorEpoch model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries a ResultArtifactAck.
 func (ResultArtifactAck) MessageType() wire.MessageType { return wire.MessageCraneResultArtifactAck }
 
+// ResultFetchRequest asks a replica to stream a sealed result artifact from the given offset.
 type ResultFetchRequest struct {
 	Artifact           ResultArtifact
 	ReplicaNodeID      uint16
@@ -324,8 +397,10 @@ type ResultFetchRequest struct {
 	CoordinatorEpoch   model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries a ResultFetchRequest.
 func (ResultFetchRequest) MessageType() wire.MessageType { return wire.MessageCraneResultFetchRequest }
 
+// ResultFetchChunk carries part of a sealed result artifact in answer to a ResultFetchRequest.
 type ResultFetchChunk struct {
 	Transfer          TransferChunk
 	Artifact          ResultArtifact
@@ -334,20 +409,30 @@ type ResultFetchChunk struct {
 	CoordinatorEpoch  model.CoordinatorEpoch
 }
 
+// MessageType reports the wire type that carries a ResultFetchChunk.
 func (ResultFetchChunk) MessageType() wire.MessageType { return wire.MessageCraneResultFetchChunk }
 
+// WorkerErrorCode classifies why a worker rejected or failed a worker-control message.
 type WorkerErrorCode uint16
 
 const (
+	// WorkerErrorMalformed reports a message that could not be decoded or validated.
 	WorkerErrorMalformed WorkerErrorCode = iota + 1
+	// WorkerErrorUnauthorized reports a peer that is not allowed to send the message.
 	WorkerErrorUnauthorized
+	// WorkerErrorStaleEpoch reports a message from a coordinator or worker epoch that has been superseded.
 	WorkerErrorStaleEpoch
+	// WorkerErrorStaleAssignment reports a message bound to an assignment revision the worker no longer holds.
 	WorkerErrorStaleAssignment
+	// WorkerErrorCapacity reports that the worker has no room to accept the request right now.
 	WorkerErrorCapacity
+	// WorkerErrorUnavailable reports that the requested data or service is not present on the worker.
 	WorkerErrorUnavailable
+	// WorkerErrorCorrupt reports that the worker found its local copy of the requested data damaged.
 	WorkerErrorCorrupt
 )
 
+// WorkerError tells a peer that a related message was rejected, with a code and whether a retry may succeed.
 type WorkerError struct {
 	NodeID           uint16
 	WorkerEpoch      model.WorkerEpoch
@@ -358,11 +443,15 @@ type WorkerError struct {
 	Detail           []byte
 }
 
+// MessageType reports the wire type that carries a WorkerError.
 func (WorkerError) MessageType() wire.MessageType { return wire.MessageCraneWorkerError }
 
+// CheckpointVectorDigest computes the digest that binds a checkpoint vector into inventory queries and repairs.
 func CheckpointVectorDigest(entries []SourceCheckpoint) [32]byte {
 	return model.CheckpointVectorDigest(entries)
 }
+
+// InventoryQueryDigest computes the digest that identifies an inventory query independent of who asked it.
 func InventoryQueryDigest(query ResultInventoryQuery) [32]byte {
 	return model.ResultInventoryQueryDigest(model.ResultInventoryQueryDefinition{
 		JobID: query.JobID, SinkTask: query.SinkTask, SpecificationHash: query.SpecificationHash,
@@ -370,9 +459,13 @@ func InventoryQueryDigest(query ResultInventoryQuery) [32]byte {
 		Checkpoints: query.Checkpoints, CheckpointDigest: query.CheckpointDigest,
 	})
 }
+
+// DeriveRepairID derives the deterministic repair identifier for an instruction from its identity fields.
 func DeriveRepairID(instruction RepairResultPartition) [16]byte {
 	return model.DeriveRepairID(repairDefinition(instruction))
 }
+
+// RepairInstructionDigest computes the digest that a worker must echo to prove it acted on exactly this instruction.
 func RepairInstructionDigest(instruction RepairResultPartition) [32]byte {
 	return model.RepairInstructionDigest(repairDefinition(instruction))
 }

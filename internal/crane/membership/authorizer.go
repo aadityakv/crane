@@ -72,7 +72,10 @@ type membershipSource interface {
 
 type swimSource struct{ service *swim.Service }
 
+// Ready returns the SWIM service's readiness channel.
 func (source swimSource) Ready() <-chan struct{} { return source.service.Ready() }
+
+// Subscribe opens a membership subscription on the SWIM service with the given event buffer.
 func (source swimSource) Subscribe(ctx context.Context, capacity int) (membershipSubscription, error) {
 	return source.service.Subscribe(ctx, capacity)
 }

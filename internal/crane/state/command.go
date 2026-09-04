@@ -65,6 +65,7 @@ type SubjectKey struct {
 	WorkerID uint16       // WorkerID identifies worker-scoped subjects.
 }
 
+// Validate reports whether exactly the identity fields required by Kind are set.
 func (key SubjectKey) Validate() error {
 	zeroJob := model.JobID{}
 	zeroTask := model.TaskID{}
@@ -115,6 +116,7 @@ type Envelope struct {
 	Internal             *InternalEnvelope      // Internal is set only for coordinator operations.
 }
 
+// Validate reports whether the envelope carries a supported schema, the current consensus fingerprint, a known kind, and exactly one identity.
 func (envelope Envelope) Validate() error {
 	if envelope.SchemaVersion != CommandSchemaVersion {
 		return fmt.Errorf("%w: %d", ErrUnsupportedCommandSchema, envelope.SchemaVersion)
@@ -164,6 +166,7 @@ type BeginCoordinatorEpoch struct {
 	Nonce       [16]byte // Nonce distinguishes leadership at the same node.
 }
 
+// Validate reports whether the command is the well-formed coordinator-subject fence constructor with a matching digest.
 func (command BeginCoordinatorEpoch) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err
@@ -217,11 +220,15 @@ const (
 	ResultStaleEpoch        ResultCode = 7 // ResultStaleEpoch reports the current coordinator fence.
 	ResultResultTooLarge    ResultCode = 8 // ResultResultTooLarge reports an uncacheable outcome.
 	// State-specific names map onto the stable v1 result categories.
-	ResultNotFound          ResultCode = ResultRevisionMismatch
+	ResultNotFound ResultCode = ResultRevisionMismatch
+	// ResultInvalidTransition reports a lifecycle transition the current job state does not permit.
 	ResultInvalidTransition ResultCode = ResultRevisionMismatch
+	// ResultIdentityCollision reports an identity already committed with different content.
 	ResultIdentityCollision ResultCode = ResultIdentityReuse
-	ResultInvalidTarget     ResultCode = ResultRevisionMismatch
-	ResultStaleWorkerEvent  ResultCode = ResultRevisionMismatch
+	// ResultInvalidTarget reports a target that does not exist or no longer matches the command.
+	ResultInvalidTarget ResultCode = ResultRevisionMismatch
+	// ResultStaleWorkerEvent reports a worker event at or behind the committed cursor.
+	ResultStaleWorkerEvent ResultCode = ResultRevisionMismatch
 )
 
 // CommandResult is the canonical cached outcome of one accepted operation.
@@ -234,6 +241,7 @@ type CommandResult struct {
 	Epoch    model.CoordinatorEpoch // Epoch reports coordinator success or the current stale fence.
 }
 
+// Validate reports whether the result's code, subject, revision, identity, and epoch satisfy the v1 result rules.
 func (result CommandResult) Validate() error {
 	if result.Code < ResultSuccess || result.Code > ResultResultTooLarge {
 		return errors.New("unknown result code")

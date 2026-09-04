@@ -5,13 +5,20 @@ import "crypto/sha256"
 const workerControlContractFingerprintDomain = "crane/worker-control-contract/v1\x00"
 
 const (
-	WorkerControlSchemaVersionV1    uint16 = 1
-	WorkerControlMaxStatusEventsV1         = 256
-	WorkerControlMaxCheckpointsV1          = 256
-	WorkerControlMaxTransferChunkV1        = 256 << 10
-	WorkerControlMaxTransferTotalV1        = 64 << 20
-	WorkerControlMaxErrorDetailV1          = 256
-	WorkerControlMaxFrameBytesV1           = 1 << 20
+	// WorkerControlSchemaVersionV1 is the schema version of the v1 worker-control contract.
+	WorkerControlSchemaVersionV1 uint16 = 1
+	// WorkerControlMaxStatusEventsV1 caps the events in one v1 worker status page.
+	WorkerControlMaxStatusEventsV1 = 256
+	// WorkerControlMaxCheckpointsV1 caps the checkpoint vector in v1 inventory and repair messages.
+	WorkerControlMaxCheckpointsV1 = 256
+	// WorkerControlMaxTransferChunkV1 caps the bytes in one v1 transfer chunk.
+	WorkerControlMaxTransferChunkV1 = 256 << 10
+	// WorkerControlMaxTransferTotalV1 caps the total bytes of one v1 result transfer.
+	WorkerControlMaxTransferTotalV1 = 64 << 20
+	// WorkerControlMaxErrorDetailV1 caps the detail bytes in one v1 worker error.
+	WorkerControlMaxErrorDetailV1 = 256
+	// WorkerControlMaxFrameBytesV1 caps a complete v1 worker-control frame including header and MAC.
+	WorkerControlMaxFrameBytesV1 = 1 << 20
 	// ResultInventoryChainDomainV1 separates the ordered inventory digest
 	// chain from every other Crane identity.
 	ResultInventoryChainDomainV1 = "crane-result-inventory-chain-v1"

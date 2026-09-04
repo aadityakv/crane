@@ -21,8 +21,10 @@ type immutableSnapshot struct {
 	encoded []byte
 }
 
+// SchemaVersion reports the snapshot schema this capture was encoded under.
 func (snapshot immutableSnapshot) SchemaVersion() uint32 { return SnapshotSchemaVersion }
 
+// MarshalBinary returns a fresh copy of the frozen canonical snapshot bytes.
 func (snapshot immutableSnapshot) MarshalBinary() ([]byte, error) {
 	return append([]byte(nil), snapshot.encoded...), nil
 }

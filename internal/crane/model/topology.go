@@ -14,8 +14,11 @@ import (
 type StageRole uint8
 
 const (
+	// StageSource marks a stage that produces tuples from outside the topology.
 	StageSource StageRole = iota + 1
+	// StageTransform marks a stage that consumes upstream tuples and emits downstream ones.
 	StageTransform
+	// StageSink marks a stage that consumes tuples and writes the job's results.
 	StageSink
 )
 
@@ -30,8 +33,11 @@ const (
 type RoutingMode uint8
 
 const (
+	// RoutingShuffle spreads tuples over downstream partitions deterministically without keying.
 	RoutingShuffle RoutingMode = iota + 1
+	// RoutingFieldHash sends each tuple to the partition selected by hashing its key field.
 	RoutingFieldHash
+	// RoutingBroadcast delivers every tuple to every downstream partition.
 	RoutingBroadcast
 )
 

@@ -30,6 +30,7 @@ type WorkerRecord struct {
 	RegistryFingerprint  [32]byte          // RegistryFingerprint proves protocol compatibility.
 }
 
+// Validate reports whether the record has a real identity, revision, slot count, epoch, and fingerprints.
 func (record WorkerRecord) Validate() error {
 	if record.NodeID == 0 || record.Revision == 0 || record.Slots == 0 || uint64(record.Slots) > model.LimitsV1().MaxWorkerSlots {
 		return errors.New("invalid worker identity, revision, or slots")
@@ -199,6 +200,7 @@ func validateWorkerCommandEnvelope(envelope Envelope, kind CommandKind, workerID
 	return nil
 }
 
+// Validate reports whether the command registers an Eligible worker at the expected successor revision with a matching digest.
 func (command RegisterWorker) Validate() error {
 	if err := validateWorkerCommandEnvelope(command.Envelope, CommandRegisterWorker, command.Worker.NodeID); err != nil {
 		return err
@@ -218,6 +220,7 @@ func (command RegisterWorker) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command's worker envelope, epoch, and digest all agree.
 func (command DrainWorker) Validate() error {
 	if err := validateWorkerCommandEnvelope(command.Envelope, CommandDrainWorker, command.WorkerID); err != nil {
 		return err
@@ -231,6 +234,7 @@ func (command DrainWorker) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command's worker envelope, epoch, affected targets, and digest all agree.
 func (command DeactivateWorker) Validate() error {
 	if err := validateWorkerCommandEnvelope(command.Envelope, CommandDeactivateWorker, command.WorkerID); err != nil {
 		return err
@@ -247,6 +251,7 @@ func (command DeactivateWorker) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command's worker envelope, old and new epochs, and digest all agree.
 func (command ReplaceWorkerEpoch) Validate() error {
 	if err := validateWorkerCommandEnvelope(command.Envelope, CommandReplaceWorkerEpoch, command.WorkerID); err != nil {
 		return err

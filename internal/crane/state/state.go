@@ -61,6 +61,7 @@ type Machine struct {
 	estimatedSnapshotBytes uint64
 }
 
+// NewMachine returns an empty replicated state machine ready to apply commands from index one.
 func NewMachine() *Machine {
 	return &Machine{
 		clients: make(map[model.ClientID]clientHistory), subjects: make(map[SubjectKey]subjectHistory),

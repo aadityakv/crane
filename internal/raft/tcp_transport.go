@@ -667,16 +667,25 @@ type outgoingRequestExpiry struct {
 
 type outgoingRequestExpiryHeap []outgoingRequestExpiry
 
+// Len implements heap.Interface.
 func (expirations outgoingRequestExpiryHeap) Len() int { return len(expirations) }
+
+// Less orders expiries so the soonest deadline is at the heap root.
 func (expirations outgoingRequestExpiryHeap) Less(left, right int) bool {
 	return expirations[left].expiresAt.Before(expirations[right].expiresAt)
 }
+
+// Swap implements heap.Interface.
 func (expirations outgoingRequestExpiryHeap) Swap(left, right int) {
 	expirations[left], expirations[right] = expirations[right], expirations[left]
 }
+
+// Push implements heap.Interface.
 func (expirations *outgoingRequestExpiryHeap) Push(value any) {
 	*expirations = append(*expirations, value.(outgoingRequestExpiry))
 }
+
+// Pop implements heap.Interface.
 func (expirations *outgoingRequestExpiryHeap) Pop() any {
 	old := *expirations
 	last := len(old) - 1
@@ -756,6 +765,7 @@ func waitTransportBackoff(ctx context.Context, delay time.Duration) error {
 
 type cryptoRequestIDSource struct{}
 
+// NextRequestID draws a fresh request ID from the operating system's random source.
 func (cryptoRequestIDSource) NextRequestID() (wire.RequestID, error) {
 	var id wire.RequestID
 	_, err := cryptorand.Read(id[:])

@@ -103,6 +103,7 @@ type manualTimer struct {
 	resetMu    sync.Mutex
 }
 
+// C returns the channel the manual clock delivers on when the deadline is reached.
 func (t *manualTimer) C() <-chan time.Time {
 	return t.channel
 }

@@ -31,6 +31,7 @@ type NeedsReassignment struct {
 	OldWorkerEpoch model.WorkerEpoch       // OldWorkerEpoch binds its exact incarnation.
 }
 
+// Validate reports whether the marker names exactly one well-formed target bound to a real worker incarnation.
 func (marker NeedsReassignment) Validate() error {
 	if marker.OldWorkerID == 0 {
 		return errors.New("zero old worker ID")
@@ -162,6 +163,7 @@ func validateAssignmentStructure(set model.AssignmentSet) error {
 	return nil
 }
 
+// Validate reports whether the command's envelope, subject, assignment structure, and digest all agree.
 func (command InstallAssignments) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err
@@ -178,6 +180,7 @@ func (command InstallAssignments) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command's envelope, subject, replacement set, and digest all agree.
 func (command ReplaceAssignments) Validate() error {
 	if err := command.Envelope.Validate(); err != nil {
 		return err

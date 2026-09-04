@@ -106,28 +106,38 @@ type StateCommandEnumDescriptor struct {
 type StateCommandRevisionPolicy uint8
 
 const (
-	StateCommandRevisionZero    StateCommandRevisionPolicy = 1
+	// StateCommandRevisionZero requires the result revision to be zero.
+	StateCommandRevisionZero StateCommandRevisionPolicy = 1
+	// StateCommandRevisionNonZero requires a committed, non-zero result revision.
 	StateCommandRevisionNonZero StateCommandRevisionPolicy = 2
-	StateCommandRevisionAny     StateCommandRevisionPolicy = 3
+	// StateCommandRevisionAny accepts any result revision.
+	StateCommandRevisionAny StateCommandRevisionPolicy = 3
 )
 
 // StateCommandIdentityPolicy pins the legal JobID/WorkerID correlation fields.
 type StateCommandIdentityPolicy uint8
 
 const (
-	StateCommandIdentityUnbound     StateCommandIdentityPolicy = 1
+	// StateCommandIdentityUnbound requires both JobID and WorkerID to be zero.
+	StateCommandIdentityUnbound StateCommandIdentityPolicy = 1
+	// StateCommandIdentityCoordinator requires a coordinator-scoped result with no job or worker correlation.
 	StateCommandIdentityCoordinator StateCommandIdentityPolicy = 2
-	StateCommandIdentityWorker      StateCommandIdentityPolicy = 3
-	StateCommandIdentityJob         StateCommandIdentityPolicy = 4
+	// StateCommandIdentityWorker requires a non-zero WorkerID and a zero JobID.
+	StateCommandIdentityWorker StateCommandIdentityPolicy = 3
+	// StateCommandIdentityJob requires a non-zero JobID and a zero WorkerID.
+	StateCommandIdentityJob StateCommandIdentityPolicy = 4
 )
 
 // StateCommandEpochPolicy pins whether a result may carry a coordinator epoch.
 type StateCommandEpochPolicy uint8
 
 const (
-	StateCommandEpochZero                StateCommandEpochPolicy = 1
+	// StateCommandEpochZero forbids a coordinator epoch on the result.
+	StateCommandEpochZero StateCommandEpochPolicy = 1
+	// StateCommandEpochCoordinatorRevision requires the epoch to match the result's coordinator revision.
 	StateCommandEpochCoordinatorRevision StateCommandEpochPolicy = 2
-	StateCommandEpochCurrentFence        StateCommandEpochPolicy = 3
+	// StateCommandEpochCurrentFence requires the epoch to be the current coordinator fence.
+	StateCommandEpochCurrentFence StateCommandEpochPolicy = 3
 )
 
 // StateCommandResultRule pins one accepted ResultCode/SubjectKind combination.

@@ -71,6 +71,7 @@ func NewSubmitJob(request model.ClientRequestID, topology model.TopologySpec, fe
 	return command, command.Validate()
 }
 
+// JobID derives the job identity from the client request and topology digest, or returns zero when either is invalid.
 func (command SubmitJob) JobID() model.JobID {
 	validated, err := model.ValidateTopology(command.Topology)
 	if err != nil || command.Envelope.Client == nil {
@@ -101,6 +102,7 @@ func validateClientCommandEnvelope(envelope Envelope, kind CommandKind) error {
 	return nil
 }
 
+// Validate reports whether the command's client envelope, topology, size bound, and digest all agree.
 func (command SubmitJob) Validate() error {
 	if err := validateClientCommandEnvelope(command.Envelope, CommandSubmitJob); err != nil {
 		return err
@@ -119,6 +121,7 @@ func (command SubmitJob) Validate() error {
 	return nil
 }
 
+// Validate reports whether the command's client envelope, job identity, and digest all agree.
 func (command CancelJob) Validate() error {
 	if err := validateClientCommandEnvelope(command.Envelope, CommandCancelJob); err != nil {
 		return err

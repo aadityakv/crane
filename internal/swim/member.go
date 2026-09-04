@@ -6,9 +6,13 @@ package swim
 type Status uint8
 
 const (
+	// Alive means the member is believed healthy.
 	Alive Status = iota
+	// Suspect means a probe failed and the member has until the suspicion timeout to refute it.
 	Suspect
+	// Dead means the suspicion timeout elapsed without refutation.
 	Dead
+	// Left means the member announced a graceful departure.
 	Left
 )
 
