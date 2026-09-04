@@ -1,6 +1,7 @@
 package swim
 
 import (
+	"github.com/aadityakv/crane/internal/testutil"
 	"sync"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ func TestSubscriptionOverflowSignalsResyncWithoutBlocking(t *testing.T) {
 	}()
 	select {
 	case <-published:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("publisher blocked behind a full subscriber")
 	}
 
@@ -168,7 +169,7 @@ func receiveEvent(t *testing.T, events <-chan MembershipEvent) MembershipEvent {
 			t.Fatal("event channel closed unexpectedly")
 		}
 		return event
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for membership event")
 		return MembershipEvent{}
 	}

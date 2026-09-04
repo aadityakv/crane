@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"os"
@@ -373,7 +374,7 @@ func startTask10ClusterNodeWithFingerprint(t *testing.T, configuration config.No
 		return node
 	case err := <-node.done:
 		t.Fatalf("node %d failed before Ready: %v", configuration.NodeID, err)
-	case <-time.After(3 * time.Second):
+	case <-time.After(testutil.Scale(3 * time.Second)):
 		t.Fatalf("node %d did not become lifecycle-ready", configuration.NodeID)
 	}
 	return nil
@@ -391,7 +392,7 @@ func (node *task10ClusterNode) stop(t *testing.T) {
 			if err != nil {
 				t.Errorf("stop node %d: %v", node.configuration.NodeID, err)
 			}
-		case <-time.After(3 * time.Second):
+		case <-time.After(testutil.Scale(3 * time.Second)):
 			t.Errorf("node %d did not stop", node.configuration.NodeID)
 		}
 	})

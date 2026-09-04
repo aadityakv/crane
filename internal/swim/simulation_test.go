@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"net"
 	"runtime"
 	"sync"
@@ -49,7 +50,7 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 		if event.Cause != EventResyncRequired {
 			t.Fatalf("slow subscriber event = %#v, want resync marker", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for slow-subscriber resync marker")
 	}
 	snapshot, err := subscription.Snapshot(testContext(t))
@@ -71,7 +72,7 @@ func TestSimulationSlowSubscriberResynchronizesAfterSnapshot(t *testing.T) {
 		if event.Current != third || event.Cause != EventMemberChanged {
 			t.Fatalf("post-resync event = %#v, want third member", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("snapshot did not resume slow-subscriber delta delivery")
 	}
 	running.stop(t)
@@ -121,7 +122,7 @@ func TestSimulationSubscriptionSnapshotResumesOnlyItsCaller(t *testing.T) {
 			if event.Cause != EventResyncRequired {
 				t.Fatalf("%s overflow event = %#v, want resync marker", name, event)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(testutil.Scale(time.Second)):
 			t.Fatalf("timed out waiting for %s resync marker", name)
 		}
 	}
@@ -137,7 +138,7 @@ func TestSimulationSubscriptionSnapshotResumesOnlyItsCaller(t *testing.T) {
 		if event.Current != fourthMember {
 			t.Fatalf("resynchronized first event = %#v, want %#v", event, fourthMember)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("first subscription did not resume after its snapshot")
 	}
 	select {
@@ -168,7 +169,7 @@ func TestSimulationSubscriptionSnapshotResumesOnlyItsCaller(t *testing.T) {
 		if event.Current != sixthMember {
 			t.Fatalf("resynchronized second event = %#v, want %#v", event, sixthMember)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("second subscription did not resume after its snapshot")
 	}
 	running.stop(t)
@@ -339,7 +340,7 @@ func TestGracefulLeaveRetriesAfterNoProgressUntilClockBackoff(t *testing.T) {
 			if got != call {
 				t.Fatalf("leave send call = %d, want %d", got, call)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(testutil.Scale(time.Second)):
 			t.Fatalf("timed out waiting for leave send %d", call)
 		}
 	}
@@ -366,7 +367,7 @@ func TestGracefulLeaveRetriesAfterNoProgressUntilClockBackoff(t *testing.T) {
 		if err != nil {
 			t.Fatalf("graceful leave retry error = %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("graceful leave did not resume after injected-clock backoff")
 	}
 	if got, want := delivery.count(), 2+RetransmitBudget(serviceRetransmitFactor, 2); got != want {
@@ -479,7 +480,7 @@ func TestSimulationSuspicionRefutationStaleAndDuplicateUpdates(t *testing.T) {
 		if event.Current != newMember {
 			t.Fatalf("duplicate-delivery event = %#v, want new member", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for duplicated packet's single event")
 	}
 	select {
@@ -1363,7 +1364,7 @@ func receiveBlockingSendCall(t *testing.T, calls <-chan int) int {
 	select {
 	case call := <-calls:
 		return call
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for blocked datagram send transition")
 		return 0
 	}

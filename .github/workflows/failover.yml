@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CRANE_TEST_TIME_SCALE: '3'
+
 jobs:
   crane-integration:
     runs-on: ubuntu-latest

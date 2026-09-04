@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"net/netip"
@@ -1080,7 +1081,7 @@ func TestServicePersistsSelfRefutationBeforePublishingOrSending(t *testing.T) {
 
 	select {
 	case <-store.started:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("self-refutation persistence did not start")
 	}
 	select {
@@ -1101,7 +1102,7 @@ func TestServicePersistsSelfRefutationBeforePublishingOrSending(t *testing.T) {
 		if !store.hasStored(3) {
 			t.Fatal("refutation event arrived before incarnation 3 was durable")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for persisted refutation event")
 	}
 	if harness.datagram.violation.Load() {
@@ -1158,7 +1159,7 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 		if event.Cause != EventResyncRequired {
 			t.Fatalf("overflow event = %#v, want resync marker", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for resync marker")
 	}
 
@@ -1166,7 +1167,7 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 	harness.enqueuePeerGossip([]Update{{Member: self, ReporterID: 2}})
 	select {
 	case <-store.started:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("self-refutation persistence did not block")
 	}
 
@@ -1213,7 +1214,7 @@ func TestServiceCanceledSnapshotDoesNotResumeSlowSubscriber(t *testing.T) {
 		if event.Current != sixth {
 			t.Fatalf("post-snapshot delta = %#v, want %#v", event, sixth)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("successful Snapshot did not resume delta delivery")
 	}
 	harness.stop(t)
@@ -1387,7 +1388,7 @@ func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testi
 		if event.Cause != EventResyncRequired {
 			t.Fatalf("overflow event = %#v, want resync marker", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for resync marker")
 	}
 
@@ -1440,7 +1441,7 @@ func TestServiceSnapshotAcknowledgmentRequiresCurrentMembershipRevision(t *testi
 		if event.Current != seventh {
 			t.Fatalf("fresh snapshot post-delta = %#v, want %#v", event, seventh)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("fresh current-revision snapshot did not resume subscriber")
 	}
 	harness.stop(t)
@@ -1453,7 +1454,7 @@ func TestServiceCanceledSubscribeRequestsDoNotLeakOwnerState(t *testing.T) {
 	harness.enqueuePeerGossip([]Update{{Member: self, ReporterID: 2}})
 	select {
 	case <-store.started:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("self-refutation persistence did not block")
 	}
 
@@ -1642,7 +1643,7 @@ func TestServiceWrittenSnapshotWithoutApplicationAckKeepsRepairPending(t *testin
 		default:
 			t.Fatal("snapshot handler completed without waiting for application ack")
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(testutil.Scale(100 * time.Millisecond)):
 		// The handler remains the stream owner while awaiting application.
 	}
 	if err := clientStream.Close(); err != nil {
@@ -1651,7 +1652,7 @@ func TestServiceWrittenSnapshotWithoutApplicationAckKeepsRepairPending(t *testin
 	<-snapshotRequested
 	select {
 	case <-handled:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("snapshot handler did not exit after requester closed without application ack")
 	}
 }
@@ -1706,7 +1707,7 @@ func TestServiceSnapshotApplicationAckRevalidatesRequesterGeneration(t *testing.
 	}
 	select {
 	case <-handled:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("snapshot handler did not accept correlated application ack")
 	}
 	event := (<-service.events).(snapshotServedServiceEvent)
@@ -2518,13 +2519,13 @@ func serviceSubscriptionCount(t *testing.T, service *Service) int {
 	response := make(chan int, 1)
 	select {
 	case service.events <- subscriptionCountServiceEvent{response: response}:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out enqueueing subscription-count query")
 	}
 	select {
 	case count := <-response:
 		return count
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for subscription-count query")
 		return -1
 	}
@@ -2760,7 +2761,7 @@ func waitServiceReady(t *testing.T, service *Service) {
 	t.Helper()
 	select {
 	case <-service.Ready():
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for service readiness")
 	}
 }
@@ -2845,7 +2846,7 @@ func waitServiceResult(t *testing.T, result <-chan error) error {
 	select {
 	case err := <-result:
 		return err
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for service Run result")
 		return nil
 	}

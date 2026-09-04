@@ -2,6 +2,7 @@ package swim
 
 import (
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -82,7 +83,7 @@ func TestFileIncarnationLoadRejectsFIFOWithoutBlocking(t *testing.T) {
 		if !errors.Is(err, ErrInvalidIncarnationState) {
 			t.Fatalf("Load() error = %v, want ErrInvalidIncarnationState", err)
 		}
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(testutil.Scale(250 * time.Millisecond)):
 		// Release an implementation that incorrectly performs a blocking FIFO
 		// read so the failed test does not strand a syscall during cleanup.
 		writer, _ := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)

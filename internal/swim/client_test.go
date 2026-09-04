@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/aadityakv/crane/internal/testutil"
 	"math"
 	"net"
 	"net/netip"
@@ -226,7 +227,7 @@ func receiveSnapshotResyncEvent(t *testing.T, events <-chan serviceEvent) snapsh
 			t.Fatalf("snapshot resync event type = %T", event)
 		}
 		return result
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("timed out waiting for snapshot resync event")
 		return snapshotResyncServiceEvent{}
 	}

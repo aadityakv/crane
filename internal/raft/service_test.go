@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/aadityakv/crane/internal/testutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -174,7 +175,7 @@ func TestServiceRunOrdersRecoveryBindWorkersOwnerAndIsolatedReady(t *testing.T) 
 		if err != nil {
 			t.Fatalf("Run cancellation: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("Service did not join children")
 	}
 	if _, err := service.Propose(context.Background(), []byte("after")); !errors.Is(err, ErrStopped) {
@@ -327,7 +328,7 @@ func TestServiceRuntimeListenerFailureIsFatalAndStopsNode(t *testing.T) {
 		if err == nil || !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("runtime listener failure = %v, want fatal net.ErrClosed", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("runtime listener failure did not stop Service")
 	}
 	if _, err := service.Barrier(context.Background()); !errors.Is(err, ErrStopped) {
@@ -358,7 +359,7 @@ func TestServiceReadyDoesNotBeatAlreadyReportedNodeStartupFailure(t *testing.T) 
 		if !errors.Is(err, ErrTickRegression) {
 			t.Fatalf("Run error = %v, want startup ErrTickRegression", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("startup owner failure did not terminate Service")
 	}
 	select {
@@ -394,7 +395,7 @@ func TestServiceReportedFatalWinsConcurrentCancellation(t *testing.T) {
 		if !errors.Is(err, failure) {
 			t.Fatalf("Run error = %v, want already-reported fatal over cancellation", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("fatal/cancellation race did not join children")
 	}
 }
@@ -456,13 +457,13 @@ func TestServiceReturnsStateMachineContextCancellationAsFatalAfterReady(t *testi
 					if !errors.Is(runErr, context.Canceled) || !strings.Contains(runErr.Error(), test.wantText) || !strings.Contains(runErr.Error(), "Raft Node failed: apply committed entry 1") {
 						t.Fatalf("attempt %d Service Run error = %v, want first application fatal wrapping context.Canceled", attempt, runErr)
 					}
-				case <-time.After(time.Second):
+				case <-time.After(testutil.Scale(time.Second)):
 					t.Fatalf("attempt %d Service did not join after application fatal", attempt)
 				}
 				awaitClosed(t, transport.done)
 				select {
 				case <-submitDone:
-				case <-time.After(time.Second):
+				case <-time.After(testutil.Scale(time.Second)):
 					t.Fatalf("attempt %d SubmitRPC caller did not unblock", attempt)
 				}
 			}

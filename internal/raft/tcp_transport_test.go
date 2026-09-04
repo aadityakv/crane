@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"io"
 	"net"
 	"reflect"
@@ -54,7 +55,7 @@ func TestTCPHandshakeBindsConfiguredHeaderAndPayloadSender(t *testing.T) {
 		if got.(AppendEntriesRequest).LeaderID != 2 {
 			t.Fatalf("submitted RPC = %#v", got)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("valid bound RPC was not submitted")
 	}
 	_ = stream.Close()
@@ -334,7 +335,7 @@ func TestTCPBoundStreamRejectsSenderChangeAndGob(t *testing.T) {
 			select {
 			case rpc := <-called:
 				t.Fatalf("rejected stream submitted %#v", rpc)
-			case <-time.After(20 * time.Millisecond):
+			case <-time.After(testutil.Scale(20 * time.Millisecond)):
 			}
 			awaitClosed(t, done)
 			expectClosedStream(t, stream)
@@ -520,7 +521,7 @@ func TestTCPOutboundHandshakeRejectsEveryUncorrelatedAck(t *testing.T) {
 			}
 			select {
 			case <-serverDone:
-			case <-time.After(time.Second):
+			case <-time.After(testutil.Scale(time.Second)):
 				t.Fatal("outbound peer did not exit")
 			}
 		})
@@ -572,7 +573,7 @@ func TestTCPDialAndHandshakeShareOneAggregateRPCTimeout(t *testing.T) {
 	}
 	select {
 	case <-serverDone:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("delayed peer did not exit")
 	}
 }
@@ -617,7 +618,7 @@ func TestTCPRetryUsesFreshWireRequestIDForSameSemanticRPC(t *testing.T) {
 		if frame.Header.RequestID != (wire.RequestID{4}) {
 			t.Fatalf("retry request ID = %x, want fourth fresh ID", frame.Header.RequestID)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("semantic RPC was not delivered after reconnect")
 	}
 	activeConnections := 0
@@ -929,7 +930,7 @@ func TestTCPRequestIDCapacityWaitsAndRecoversAfterSafeExpiry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("post-expiry allocation: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("capacity waiter did not resume after safe expiry")
 	}
 	if got := task10TrackedRequestCount(transport, 2); got != 1 {

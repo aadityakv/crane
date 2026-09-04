@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"github.com/aadityakv/crane/internal/testutil"
 	"net"
 	"runtime"
 	"sync"
@@ -263,7 +264,7 @@ func TestTransportHandoffUnavailableUntilEveryOwnerAcknowledgesStartup(t *testin
 	for owner := 0; owner < 3; owner++ {
 		select {
 		case <-ownersEntered:
-		case <-time.After(time.Second):
+		case <-time.After(testutil.Scale(time.Second)):
 			t.Fatal("owner did not enter startup gate")
 		}
 	}
@@ -416,7 +417,7 @@ func TestTransportCancellationDrainsTrulyFullQueueAndJoins(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("cancellation did not join full-queue worker")
 	}
 	if got := transport.queues[2].length(); got != 0 {
@@ -460,7 +461,7 @@ func TestTransportCapsInboundHandlersAndJoinsThemOnCancellation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("transport did not join maximum inbound handlers")
 	}
 	awaitTask10ConnectionCount(t, transport, 0)
@@ -507,7 +508,7 @@ func TestTransportRunKeepsSlowPeerFromDelayingAnotherAndJoins(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run after cancellation: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("Run did not join peer workers and accept loop")
 	}
 	if got, err := transport.Handoff(PeerMessage{To: 2, RPC: RequestVoteRequest{CandidateID: 1, Term: 1}}); err != nil || got != TransportUnavailable {
@@ -529,7 +530,7 @@ func TestTransportRunTreatsRuntimeListenerCloseAsFatal(t *testing.T) {
 		if err == nil {
 			t.Fatal("runtime listener close returned nil, want fatal accept error")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("runtime listener close did not terminate transport")
 	}
 }
@@ -711,7 +712,7 @@ func awaitClosed(t *testing.T, channel <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-channel:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("channel did not close")
 	}
 }

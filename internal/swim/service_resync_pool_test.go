@@ -2,6 +2,7 @@ package swim
 
 import (
 	"context"
+	"github.com/aadityakv/crane/internal/testutil"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,7 +48,7 @@ func TestSnapshotResyncUsesBoundedWorkerPool(t *testing.T) {
 	for worker := 0; worker < serviceResyncWorkers; worker++ {
 		select {
 		case <-entered:
-		case <-time.After(time.Second):
+		case <-time.After(testutil.Scale(time.Second)):
 			t.Fatalf("resync worker %d did not start", worker+1)
 		}
 	}
@@ -69,7 +70,7 @@ func TestSnapshotResyncUsesBoundedWorkerPool(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(testutil.Scale(time.Second)):
 		t.Fatal("resync workers did not stop after cancellation")
 	}
 }

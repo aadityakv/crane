@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CRANE_TEST_TIME_SCALE: '3'
+
 jobs:
   verify:
     strategy:
