@@ -35,11 +35,12 @@ const maxTopologyDocumentBytes = 1 << 20
 // defaultResultPageBytes is the default complete-record page budget.
 const defaultResultPageBytes = 64 << 10
 
-const craneUsage = "usage: crane <submit|cancel|status|results|example-topology> [flags]\n" +
+const craneUsage = "usage: crane <submit|cancel|status|results|jobs|example-topology> [flags]\n" +
 	"  submit  -config FILE -state FILE -topology FILE\n" +
 	"  cancel  -config FILE -state FILE -job HEX32 -expected-revision N\n" +
 	"  status  -config FILE -job HEX32\n" +
 	"  results -config FILE -job HEX32 [-page-bytes N]\n" +
+	"  jobs    -config FILE\n" +
 	"  example-topology\n" +
 	"network subcommands also accept -attempts N (1..1024), -backoff DURATION, and -timeout DURATION"
 
@@ -72,6 +73,8 @@ func executeCrane(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return executeStatus(ctx, args[1:], stdout)
 	case "results":
 		return executeResults(ctx, args[1:], stdout)
+	case "jobs":
+		return executeJobs(ctx, args[1:], stdout)
 	case "example-topology":
 		return executeExampleTopology(args[1:], stdout)
 	default:
@@ -103,7 +106,9 @@ func parseCraneFlags(name string, args []string, register func(*flag.FlagSet, *c
 	flags.DurationVar(&options.backoff, "backoff", control.DefaultClientRetryBackoff, "retry backoff between attempts")
 	flags.DurationVar(&options.timeout, "timeout", 0, "per-exchange timeout override")
 	if register != nil {
-		register(flags, &options)
+		if register != nil {
+			register(flags, &options)
+		}
 	}
 	if err := flags.Parse(args); err != nil {
 		return craneFlags{}, fmt.Errorf("parse %s flags: %w", name, err)
@@ -261,9 +266,10 @@ func executeStatus(ctx context.Context, args []string, stdout io.Writer) error {
 }
 
 // statusOutput renders one stable machine-readable status line.
-func statusOutput(status protocol.StatusResponse) map[string]any {
+// jobSummaryOutput renders one stable machine-readable job summary shared by
+// the status and jobs subcommands.
+func jobSummaryOutput(status protocol.StatusResponse) map[string]any {
 	output := map[string]any{
-		"command":                "status",
 		"job_id":                 hex.EncodeToString(status.JobID[:]),
 		"state":                  jobStateName(status.State),
 		"job_control_revision":   status.JobControlRevision,
@@ -284,6 +290,44 @@ func statusOutput(status protocol.StatusResponse) map[string]any {
 		output["failure_code"] = uint16(status.FailureCode)
 	}
 	return output
+}
+
+// statusOutput renders one stable machine-readable status line.
+func statusOutput(status protocol.StatusResponse) map[string]any {
+	output := jobSummaryOutput(status)
+	output["command"] = "status"
+	return output
+}
+
+// jobsOutput renders one stable machine-readable job-listing line.
+func jobsOutput(listing protocol.JobListResponse) map[string]any {
+	jobs := make([]map[string]any, 0, len(listing.Jobs))
+	for _, status := range listing.Jobs {
+		jobs = append(jobs, jobSummaryOutput(status))
+	}
+	return map[string]any{
+		"command":        "jobs",
+		"leader_node_id": listing.LeaderNodeID,
+		"applied_index":  listing.AppliedIndex,
+		"jobs":           jobs,
+	}
+}
+
+// executeJobs reads one linearizable summary of every retained job.
+func executeJobs(ctx context.Context, args []string, stdout io.Writer) error {
+	options, err := parseCraneFlags("jobs", args, nil)
+	if err != nil {
+		return err
+	}
+	client, _, err := craneClient(options, false)
+	if err != nil {
+		return err
+	}
+	listing, err := client.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	return writeJSONLine(stdout, jobsOutput(listing))
 }
 
 // jobStateName renders the stable lowercase public lifecycle name.

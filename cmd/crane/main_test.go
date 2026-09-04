@@ -590,3 +590,17 @@ func TestCLISubmitResolvesResultTooLargeAsTerminalRejection(t *testing.T) {
 		t.Fatalf("state after consumed rejection = sequence %d pending %d bytes, want sequence 2 and nothing pending", state.NextSequence, len(state.Pending))
 	}
 }
+
+func TestJobsOutputRendersLeaderAndSummaries(t *testing.T) {
+	status := protocol.StatusResponse{JobID: model.JobID{0x01}, AppliedIndex: 5, TopologyDigest: [32]byte{0x02}, JobControlRevision: 2, State: protocol.JobRunning, SourceTaskCount: 2, CompletedSourceTasks: 1, AssignmentRevision: 1}
+	var buffer bytes.Buffer
+	if err := writeJSONLine(&buffer, jobsOutput(protocol.JobListResponse{LeaderNodeID: 3, AppliedIndex: 5, Jobs: []protocol.StatusResponse{status}})); err != nil {
+		t.Fatal(err)
+	}
+	line := buffer.String()
+	for _, want := range []string{`"command":"jobs"`, `"leader_node_id":3`, `"state":"running"`, `"completed_source_tasks":1`} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("jobs output %q lacks %q", line, want)
+		}
+	}
+}
