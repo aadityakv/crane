@@ -144,6 +144,25 @@ func TestJobListSummaryBytesMatchStatusResponseEncoding(t *testing.T) {
 	if !bytes.HasPrefix(summary, statusBytes[4:]) {
 		t.Fatalf("list summary %x does not embed the canonical status encoding %x", summary, statusBytes[4:])
 	}
+	if golden := goldenStatusResponse(fixture); len(golden) != 4+minStatusSummaryBytes {
+		t.Fatalf("independent status summary = %d bytes, want %d", len(golden), 4+minStatusSummaryBytes)
+	}
+}
+
+func TestJobListRejectsHostileDeclaredCount(t *testing.T) {
+	fixture := controlFixture(t)
+	encoded, err := MarshalJobListResponse(fixture.jobListResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prefix, leader ID, and applied index precede the declared job count.
+	const jobListCountOffset = 4 + 2 + 8
+	hostile := append([]byte(nil), encoded[:jobListCountOffset+2]...)
+	binary.BigEndian.PutUint16(hostile[jobListCountOffset:], 2)
+	hostile = append(hostile, encoded[jobListCountOffset+2:]...)
+	if _, err := UnmarshalControlMessage(wire.MessageCraneJobListResponse, hostile); !errors.Is(err, ErrMalformedControlMessage) {
+		t.Fatalf("hostile declared job count error = %v", err)
+	}
 }
 
 func TestTypedControlCodecWrappersUseExactMessageAssociations(t *testing.T) {

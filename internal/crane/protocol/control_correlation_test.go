@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"errors"
 	"math"
 	"reflect"
 	"testing"
@@ -54,6 +55,7 @@ func TestExactControlErrorCorrelationRejectsDifferentRequests(t *testing.T) {
 	pageError := ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: ControlErrorResultUnavailable, HasResultPage: true, ResultPage: fixture.pageRequest}
 	submitError := ControlError{RelatedMessage: wire.MessageCraneSubmitRequest, Code: ControlErrorCapacityExhausted, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.submitDigest}
 	cancelError := ControlError{RelatedMessage: wire.MessageCraneCancelRequest, Code: ControlErrorRevisionMismatch, HasClientRequest: true, ClientRequest: fixture.request, ClientDigest: fixture.cancelDigest}
+	jobListError := ControlError{RelatedMessage: wire.MessageCraneJobListRequest, Code: ControlErrorNotLeader, Retryable: true}
 	checks := []struct {
 		name      string
 		valid     func() error
@@ -80,6 +82,21 @@ func TestExactControlErrorCorrelationRejectsDifferentRequests(t *testing.T) {
 			changed := fixture.pageRequest
 			changed.PageBytes++
 			return ValidateResultPageErrorCorrelation(changed, pageError)
+		}},
+		{"job list", func() error { return ValidateJobListErrorCorrelation(fixture.jobListRequest, jobListError) }, func() error {
+			incompatible := jobListError
+			incompatible.Code = ControlErrorNotFound
+			bound := jobListError
+			bound.HasStatusRequest = true
+			bound.StatusJobID = fixture.job
+			foreign := jobListError
+			foreign.RelatedMessage = wire.MessageCraneStatusRequest
+			for _, hostile := range []ControlError{incompatible, bound, foreign} {
+				if err := ValidateJobListErrorCorrelation(fixture.jobListRequest, hostile); err == nil {
+					return nil
+				}
+			}
+			return errors.New("rejected every job-list binding other than the stateless one")
 		}},
 	}
 	for _, check := range checks {
@@ -129,6 +146,13 @@ func TestControlErrorRequestCodeCompatibilityMatrix(t *testing.T) {
 			if (err == nil) != want {
 				t.Fatalf("unbound message=%d code=%d allowed=%v error=%v", message, code, want, err)
 			}
+		}
+	}
+	for code := ControlErrorMalformed; code <= ControlErrorResultTooLarge; code++ {
+		_, err := MarshalControlError(ControlError{RelatedMessage: wire.MessageCraneJobListRequest, Code: code})
+		want := code == ControlErrorStarting || code == ControlErrorNotLeader
+		if (err == nil) != want {
+			t.Fatalf("unbound job-list code=%d allowed=%v error=%v", code, want, err)
 		}
 	}
 }
