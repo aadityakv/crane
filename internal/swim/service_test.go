@@ -2818,6 +2818,7 @@ func waitForSnapshot(t *testing.T, service *Service, condition func([]Member) bo
 			return snapshot
 		}
 		runtime.Gosched()
+		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("snapshot condition not met: %v", ctx.Err())
 	return nil
