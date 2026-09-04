@@ -586,8 +586,15 @@ func assertConnectionClosedWithoutResponse(t *testing.T, connection net.Conn) {
 func TestControlServiceAnswersStartingWhileDependenciesOrGateClosed(t *testing.T) {
 	t.Run("GateClosed", func(t *testing.T) {
 		fixture := newServiceFixture(t, state.NewMachine())
+		fixture.seedEpochAndOpenGate()
+		if err := fixture.gate.CloseAndWait(context.Background()); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
 		fixture.start()
-		response := fixture.exchange(statusRequest(model.JobID{0x33}))
+		// gate decoupling: reads now succeed through the closed gate (pinned by
+		// TestDispatchServesReadsWithClosedGate), so the Starting answer is
+		// asserted on a mutation, which still enters the gate.
+		response := fixture.exchange(submitRequestFor(t, 0x68, 1, queryTopology(1)))
 		controlError := requireControlError(t, response, protocol.ControlErrorStarting)
 		if !controlError.Retryable {
 			t.Fatal("Starting must be retryable")
@@ -941,5 +948,42 @@ func TestControlServicePerPeerReplayBudgetAdmitsConfiguredCountThenDropsWithoutR
 	fixture.clock.Advance(production.window + time.Second)
 	if _, err := fixture.exchangeFrame(2, testRequestID(t), request); err != nil {
 		t.Fatalf("peer budget did not free after the replay window elapsed: %v", err)
+	}
+}
+
+// TestDispatchServesReadsWithClosedGate pins that reads are served from the
+// post-barrier applied view even while the admission gate is closed, while
+// mutations still receive the retryable starting error.
+func TestDispatchServesReadsWithClosedGate(t *testing.T) {
+	seeded := seedQueryFixture(t, querySeed{sinkPartitions: 2, sealPartitions: 2, succeed: true})
+	fixture := newServiceFixture(t, seeded.machine)
+	fixture.start()
+
+	statusResponse := fixture.exchange(statusRequest(seeded.job))
+	status, ok := statusResponse.(protocol.StatusResponse)
+	if !ok {
+		t.Fatalf("status read through the closed gate = %#v, want StatusResponse", statusResponse)
+	}
+	if status.JobID != seeded.job || status.State != protocol.JobSucceeded {
+		t.Fatalf("closed-gate status = %#v", status)
+	}
+	if fixture.raft.barrierCount() == 0 {
+		t.Fatal("status read skipped the leader barrier")
+	}
+
+	listingResponse := fixture.exchange(protocol.JobListRequest{})
+	listing, ok := listingResponse.(protocol.JobListResponse)
+	if !ok {
+		t.Fatalf("job list read through the closed gate = %#v, want JobListResponse", listingResponse)
+	}
+	view := seeded.machine.View()
+	if listing.LeaderNodeID != fixture.configuration.NodeID || listing.AppliedIndex != view.AppliedIndex || len(listing.Jobs) != 1 || listing.Jobs[0].JobID != seeded.job {
+		t.Fatalf("closed-gate job list = %#v", listing)
+	}
+
+	submit := submitRequestFor(t, 0x67, 1, queryTopology(1))
+	controlError := requireControlError(t, fixture.exchange(submit), protocol.ControlErrorStarting)
+	if !controlError.Retryable || string(controlError.Detail) != "admission gate is closed" {
+		t.Fatalf("closed-gate mutation = %#v, want retryable gate-closed Starting", controlError)
 	}
 }
