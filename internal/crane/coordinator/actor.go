@@ -1,8 +1,9 @@
 // Package coordinator implements Crane's fenced leader actor. The actor is an
 // idle follower until Raft leadership arrives, then owns exactly one
 // epoch-scoped reconciliation loop that registers workers, fences the +3
-// control plane, converges replicated assignments, repairs result replicas,
-// and only then opens the caller-owned admission gate.
+// control plane, opens the caller-owned admission gate once the cluster phase
+// has run, and then converges replicated assignments and repairs result
+// replicas with the gate held open for the rest of the epoch.
 package coordinator
 
 import (
@@ -308,21 +309,107 @@ type sessionState struct {
 	// one unreachable or rejecting worker never forces the converged workers
 	// to re-commit the identical terminal install on every pass.
 	terminal map[model.JobID]terminalProgress
+	// lostManifests retains the manifest subjects whose terminal
+	// MarkManifestLost this session has already proposed, so the terminal
+	// loss declaration is proposed exactly once per leadership session and a
+	// later session re-derives it from the replicated view.
+	lostManifests map[lostManifestKey]bool
 	// admission retains each worker's last observed process admission epoch
 	// from the durable status exchange. A missing or non-current entry means
 	// the worker's gate was not observed open under this leadership epoch —
 	// for example after a same-epoch process restart.
 	admission map[uint16]model.CoordinatorEpoch
-	members   MembershipSubscription
+	// handshakes retains, per member, the membership view values and the
+	// verified identity this session's last completed handshake observed. A
+	// later pass skips the network dial only while the member's incarnation
+	// and status are unchanged and the replicated worker record still
+	// carries the recorded identity's worker epoch.
+	handshakes map[uint16]handshakeMemory
+	// fences retains, per worker, the coordinator epoch and exact worker
+	// incarnation of this session's last acknowledged fence, so later passes
+	// fence only workers whose durable fence at this epoch is unproven.
+	fences map[uint16]fenceMemory
+	// fenceFailed retains workers whose last fence attempt this session
+	// failed; they are retried on every later pass.
+	fenceFailed map[uint16]bool
+	members     MembershipSubscription
+}
+
+// handshakeMemory records one member's completed this-session handshake: the
+// membership incarnation and status the dial was validated against and the
+// authenticated identity it returned. The skip's safety relies on a replaced
+// worker process always arriving with a new SWIM incarnation, enforced by the
+// runtime's single-process composition and swim.PrepareJoin's durable
+// incarnation advance (swim/join.go).
+type handshakeMemory struct {
+	incarnation uint64
+	status      swim.Status
+	identity    WorkerIdentity
+}
+
+// fenceMemory records one exact worker incarnation's acknowledged fence at
+// one coordinator epoch within this session.
+type fenceMemory struct {
+	epoch       model.CoordinatorEpoch
+	workerEpoch model.WorkerEpoch
 }
 
 func newSessionState() *sessionState {
 	return &sessionState{
-		observations: make(map[uint16]time.Time),
-		reconciled:   make(map[model.JobID]jobFence),
-		terminal:     make(map[model.JobID]terminalProgress),
-		admission:    make(map[uint16]model.CoordinatorEpoch),
+		observations:  make(map[uint16]time.Time),
+		reconciled:    make(map[model.JobID]jobFence),
+		terminal:      make(map[model.JobID]terminalProgress),
+		lostManifests: make(map[lostManifestKey]bool),
+		admission:     make(map[uint16]model.CoordinatorEpoch),
+		handshakes:    make(map[uint16]handshakeMemory),
+		fences:        make(map[uint16]fenceMemory),
+		fenceFailed:   make(map[uint16]bool),
 	}
+}
+
+// lostManifestKey identifies one sink manifest subject proposed lost.
+type lostManifestKey struct {
+	job  model.JobID
+	sink model.TaskID
+}
+
+// settledHandshake reports the recorded handshake result for one member when
+// this pass may skip the network dial: an entry exists, the member's current
+// membership entry is unchanged (same incarnation and status), and the
+// replicated worker record still carries the recorded identity's worker
+// epoch. Any membership mismatch clears the entry so the member is
+// re-handshaken; a pending registration (no replicated record yet) never
+// skips the dial.
+func (session *sessionState) settledHandshake(member swim.Member, members membership.View, workers state.View) (WorkerIdentity, bool) {
+	memory, ok := session.handshakes[member.NodeID]
+	if !ok {
+		return WorkerIdentity{}, false
+	}
+	current, present := findMember(members, member.NodeID)
+	if !present || current.Incarnation != memory.incarnation || current.Status != memory.status {
+		delete(session.handshakes, member.NodeID)
+		return WorkerIdentity{}, false
+	}
+	record, exists := findWorker(workers, member.NodeID)
+	if !exists || record.Epoch != memory.identity.WorkerEpoch {
+		return WorkerIdentity{}, false
+	}
+	return memory.identity, true
+}
+
+// needsFence reports whether one non-Offline worker must be fenced this
+// pass: no fence was acknowledged this session for the exact incarnation at
+// this epoch, the worker was last observed admitting under a different
+// nonzero coordinator epoch, or the previous fence attempt failed.
+func (session *sessionState) needsFence(worker state.WorkerRecord, epoch model.CoordinatorEpoch) bool {
+	if session.fenceFailed[worker.NodeID] {
+		return true
+	}
+	if admitted, observed := session.admission[worker.NodeID]; observed && admitted != (model.CoordinatorEpoch{}) && admitted != epoch {
+		return true
+	}
+	acknowledged, ok := session.fences[worker.NodeID]
+	return !ok || acknowledged.epoch != epoch || acknowledged.workerEpoch != worker.Epoch
 }
 
 // pruneJobs drops the per-job reconciliation and terminal-install memory of
@@ -342,6 +429,11 @@ func (session *sessionState) pruneJobs(view state.View) {
 	for jobID := range session.terminal {
 		if !retained[jobID] {
 			delete(session.terminal, jobID)
+		}
+	}
+	for key := range session.lostManifests {
+		if !retained[key.job] {
+			delete(session.lostManifests, key)
 		}
 	}
 }
@@ -379,10 +471,21 @@ func (actor *Actor) runLeader(ctx context.Context) error {
 		}
 		return fmt.Errorf("%w: coordinator epoch not established within %d attempts", errLeaderSessionAborted, establishAttemptLimit)
 	}
+	// The admission gate opens exactly once per epoch, unconditionally after
+	// the first cluster phase completes: a failing worker-control exchange in
+	// any later phase must never lock the control plane out of admission.
+	// A session context that died mid-pass never opens the gate, because the
+	// owning loop is ending and the fencing close may already have happened.
+	// The cluster phase itself keeps running every pass so registration,
+	// event draining, and failure resolution stay live for the whole epoch.
+	gateOpened := false
 	for {
-		if actor.reconcile(ctx, epoch, session) {
+		actor.reconcileCluster(ctx, epoch, session)
+		if !gateOpened && ctx.Err() == nil {
 			_ = actor.options.Gate.Open(epoch)
+			gateOpened = true
 		}
+		actor.reconcileJobs(ctx, epoch, session)
 		actor.driveTerminalResults(ctx, epoch)
 		if !actor.awaitTrigger(ctx, session) {
 			return nil

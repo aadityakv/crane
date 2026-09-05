@@ -403,7 +403,11 @@ type workReducer struct {
 	current, transaction RecoveredWork
 	inTransaction        bool
 	allowLegacy          bool
-	prepared             [recordCheckpointObservation + 1]bool
+	// proven carries the owning store's validatedOutboxes set so outbox
+	// creation proofs are executed (and recorded) at most once per record
+	// even across retries of the same transaction.
+	proven   map[model.DeliveryID]struct{}
+	prepared [recordCheckpointObservation + 1]bool
 }
 
 func newRecoveredWork() RecoveredWork {
@@ -431,7 +435,7 @@ func (r *workReducer) ConsumeRecord(record Record) error {
 		return errors.New("record outside transaction")
 	}
 	r.prepare(record.Type)
-	return applyDomainRecord(&r.transaction, record, r.allowLegacy)
+	return applyDomainRecord(&r.transaction, record, r.allowLegacy, r.proven)
 }
 
 func (r *workReducer) prepare(recordType RecordType) {
@@ -512,7 +516,7 @@ func (r *workReducer) CommitTransaction() error {
 	return nil
 }
 
-func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) error {
+func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool, proven map[model.DeliveryID]struct{}) error {
 	switch record.Type {
 	case recordFence:
 		epoch, err := decodeFence(record.Payload)
@@ -531,7 +535,7 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) err
 		if err != nil {
 			return err
 		}
-		return applyDelivery(work, delivery, outboxes, record.Type == recordDeliveryProcessed)
+		return applyDelivery(work, delivery, outboxes, record.Type == recordDeliveryProcessed, proven)
 	case recordDeliveryCompleted:
 		id, err := decodeDeliveryIDPayload(record.Payload)
 		if err != nil {
@@ -549,11 +553,11 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) err
 				return errors.New("legacy checkpoint schema is recovery-only")
 			}
 			if exactLegacyCheckpointProofAvailable(work, notice) {
-				return applyCheckpoint(work, notice)
+				return applyCheckpoint(work, notice, proven)
 			}
-			return applyLegacyCheckpoint(work, notice)
+			return applyLegacyCheckpoint(work, notice, proven)
 		}
-		return applyCheckpoint(work, notice)
+		return applyCheckpoint(work, notice, proven)
 	case recordResult:
 		result, err := decodeStoredResult(record.Payload)
 		if err != nil {
@@ -590,7 +594,7 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) err
 		if err != nil {
 			return err
 		}
-		return applySource(work, cursor, outboxes)
+		return applySource(work, cursor, outboxes, proven)
 	case recordOutboxAck:
 		id, err := decodeDeliveryIDPayload(record.Payload)
 		if err != nil {
@@ -614,6 +618,13 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) err
 	}
 }
 
+// recoveredWorkCloneObserver, when non-nil, is invoked once for every
+// full-store recovered-work clone served to a caller (RecoverWork and
+// RecoverWorkWithin). Production leaves it nil; it exists as the test seam
+// that pins the borrowed-view zero-clone contract. Package tests are
+// sequential: do not add t.Parallel tests that swap this seam.
+var recoveredWorkCloneObserver func()
+
 // RecoverWork returns a complete independently owned validated worker view.
 func (store *Store) RecoverWork() (RecoveredWork, error) {
 	store.mu.Lock()
@@ -624,7 +635,31 @@ func (store *Store) RecoverWork() (RecoveredWork, error) {
 	if store.failed {
 		return RecoveredWork{}, ErrUnavailable
 	}
+	if recoveredWorkCloneObserver != nil {
+		recoveredWorkCloneObserver()
+	}
 	return store.work.Clone(), nil
+}
+
+// boundedLock takes the store mutex under the bounded control-read
+// discipline shared by RecoverWorkWithin, RecoverWorkViewWithin, and
+// DurableSequenceWithin: TryLock plus a deadline loop sleeping 1ms between
+// attempts, failing with ErrBusy (wrapped with the wait) once the deadline
+// passes; a non-positive wait blocks uninterruptedly instead. The caller
+// must invoke the returned release function exactly once.
+func (store *Store) boundedLock(wait time.Duration) (func(), error) {
+	if wait <= 0 {
+		store.mu.Lock()
+		return store.mu.Unlock, nil
+	}
+	deadline := time.Now().Add(wait)
+	for !store.mu.TryLock() {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("%w: %s", ErrBusy, wait)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return store.mu.Unlock, nil
 }
 
 // RecoverWorkWithin behaves like RecoverWork but gives up with ErrBusy when
@@ -633,24 +668,67 @@ func (store *Store) RecoverWork() (RecoveredWork, error) {
 // control requests fast instead of piling blocked handlers up to the node's
 // connection budget; recovery and execution paths keep the unbounded read.
 func (store *Store) RecoverWorkWithin(wait time.Duration) (RecoveredWork, error) {
-	if wait <= 0 {
-		return store.RecoverWork()
+	release, err := store.boundedLock(wait)
+	if err != nil {
+		return RecoveredWork{}, err
 	}
-	deadline := time.Now().Add(wait)
-	for !store.mu.TryLock() {
-		if time.Now().After(deadline) {
-			return RecoveredWork{}, fmt.Errorf("%w: %s", ErrBusy, wait)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	defer store.mu.Unlock()
+	defer release()
 	if store.closed {
 		return RecoveredWork{}, ErrClosed
 	}
 	if store.failed {
 		return RecoveredWork{}, ErrUnavailable
 	}
+	if recoveredWorkCloneObserver != nil {
+		recoveredWorkCloneObserver()
+	}
 	return store.work.Clone(), nil
+}
+
+// RecoverWorkViewWithin lends the callback the internal recovered work
+// WITHOUT cloning, under the same bounded-lock discipline as
+// RecoverWorkWithin. The callback must not mutate, must not block, and
+// must not retain the borrowed pointer or any aliasing reference after it
+// returns; callers copy out the values they keep. The callback runs with
+// the store lock held; it must not call any store method (self-deadlock).
+// The store is copy-on-write, so values copied out stay immune to later
+// commits, and the borrowed view keeps every cloned-view field except
+// Results — logical records stay solely in the search indexes there, so
+// borrowed readers must not read Results.
+func (store *Store) RecoverWorkViewWithin(wait time.Duration, borrow func(*RecoveredWork) error) error {
+	if borrow == nil {
+		return errors.New("nil borrowed recovered-work callback")
+	}
+	release, err := store.boundedLock(wait)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if store.closed {
+		return ErrClosed
+	}
+	if store.failed {
+		return ErrUnavailable
+	}
+	return borrow(&store.work)
+}
+
+// DurableSequenceWithin reports the last durable transaction sequence under
+// the same bounded-lock discipline, without cloning recovered work. The
+// sequence lives on the recovered WAL metadata (RecoveredState.LastSequence).
+func (store *Store) DurableSequenceWithin(wait time.Duration) (uint64, error) {
+	release, err := store.boundedLock(wait)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	if store.closed {
+		return 0, ErrClosed
+	}
+	if store.failed {
+		return 0, ErrUnavailable
+	}
+	return store.state.LastSequence, nil
 }
 
 // applyWorkTransaction commits one registered transaction and, only after its
@@ -678,7 +756,7 @@ func (store *Store) applyWorkTransaction(tx Transaction, boundary string) error 
 }
 
 func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
-	reducer := &workReducer{current: store.work}
+	reducer := &workReducer{current: store.work, proven: store.validatedOutboxes}
 	if err := reducer.BeginTransaction(uint32(len(tx.Records))); err != nil {
 		return RecoveredWork{}, err
 	}
@@ -694,7 +772,7 @@ func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
 }
 
 func (store *Store) commitWorkLocked(tx Transaction, prospective RecoveredWork) error {
-	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
+	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch, store.validatedOutboxes); err != nil {
 		return err
 	}
 	encodedBytes, err := transactionEncodedSize(tx)
@@ -746,7 +824,12 @@ func reservedBytes(work RecoveredWork) (uint64, error) {
 	return total, nil
 }
 
-func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch model.WorkerEpoch) error {
+// validateRecoveredWorkLocal enforces the per-commit invariants of the whole
+// recovered set. The outbox walk passes proven so already-proven outboxes pay
+// only the cheap structural checks; a nil set (recovery-time validation)
+// forces the full proof of every outbox, exactly as before the proof cache
+// existed.
+func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch model.WorkerEpoch, proven map[model.DeliveryID]struct{}) error {
 	for _, cursor := range work.Sources {
 		assignment, ok := findAssignment(&work, cursor.Source.JobID)
 		token, tokenOK := findToken(assignment.Assignment, cursor.Source)
@@ -771,7 +854,7 @@ func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch m
 		if !ok || outbox.Producer.WorkerID != nodeID || outbox.Producer.WorkerEpoch != workerEpoch {
 			return errors.New("recovered outbox producer is not this worker incarnation")
 		}
-		if err := validateSnapshotOutbox(outbox, assignment, work.Fence); err != nil {
+		if err := validateSnapshotOutbox(outbox, assignment, work.Fence, proven); err != nil {
 			return fmt.Errorf("recovered outbox cross-reference: %w", err)
 		}
 	}

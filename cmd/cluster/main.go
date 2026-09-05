@@ -53,6 +53,9 @@ func executeCluster(ctx context.Context, args []string, signals <-chan os.Signal
 	if err := ensureClusterSecret(options.SecretFile); err != nil {
 		return err
 	}
+	if err := reconcileDataRoot(options.DataRoot, options.ResetIncompatible, stdout); err != nil {
+		return err
+	}
 	clusterID, err := resolveClusterID(options.DataRoot)
 	if err != nil {
 		return err
@@ -90,6 +93,7 @@ func parseClusterFlags(args []string) (ClusterOptions, string, error) {
 	secretFile := flags.String("secret-file", "./local.secret", "permission-restricted cluster secret file")
 	nodeBinary := flags.String("node-binary", "./bin/crane-node", "node executable")
 	dashboard := flags.String("dashboard", "", "read-only loopback job dashboard address")
+	resetIncompatible := flags.Bool("reset-incompatible", false, "wipe and re-bootstrap the data root when persisted state is incompatible with this binary")
 	if err := flags.Parse(args); err != nil {
 		return ClusterOptions{}, "", fmt.Errorf("parse cluster flags: %w", err)
 	}
@@ -109,13 +113,14 @@ func parseClusterFlags(args []string) (ClusterOptions, string, error) {
 		}
 	}
 	return ClusterOptions{
-		Dashboard:        *dashboard,
-		Nodes:            *nodes,
-		Voters:           voters,
-		Host:             "127.0.0.1",
-		StartingBasePort: uint16(*basePort),
-		DataRoot:         *dataRoot,
-		SecretFile:       *secretFile,
+		Dashboard:         *dashboard,
+		ResetIncompatible: *resetIncompatible,
+		Nodes:             *nodes,
+		Voters:            voters,
+		Host:              "127.0.0.1",
+		StartingBasePort:  uint16(*basePort),
+		DataRoot:          *dataRoot,
+		SecretFile:        *secretFile,
 	}, *nodeBinary, nil
 }
 

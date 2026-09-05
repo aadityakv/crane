@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"testing"
+	"time"
 
 	"github.com/aadityakv/crane/internal/crane/admission"
 	"github.com/aadityakv/crane/internal/crane/model"
@@ -968,5 +969,214 @@ func TestFinalCheckpointVectorAcceptsHistoricalCheckpointProof(t *testing.T) {
 	}
 	if len(vector) != 1 || vector[0].Source != fixture.source.Task || vector[0].Watermark != eof {
 		t.Fatalf("final vector = %+v", vector)
+	}
+}
+
+// TestReconcileResultsSkipsMaterializedDeliveries pins that a second pass
+// over an unchanged processed sink delivery performs no tuple marshaling
+// and no result-record construction while still rebuilding parents, and
+// that an assignment revision change re-derives the result under the new
+// provenance.
+func TestReconcileResultsSkipsMaterializedDeliveries(t *testing.T) {
+	fixture, sink, replica := workerFixtureWithLocalPrimarySink(t)
+	repository := newFakeRepository(fixture)
+	delivery := fixture.sinkDelivery(t, sink, 1)
+	delivery.State = store.Processed
+	delivery.Outputs = []model.Tuple{cloneTuple(delivery.Tuple)}
+	repository.work.Deliveries = []store.DeliveryRecord{delivery}
+	repository.deliveries[delivery.ID] = delivery
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := repository.RecoverWork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.consumeRecovery(work); err != nil {
+		t.Fatal(err)
+	}
+	marshals, records := 0, 0
+	marshalTuple = func(tuple model.Tuple) ([]byte, error) {
+		marshals++
+		return model.MarshalTuple(tuple)
+	}
+	newResultRecord = func(tupleID model.TupleID, sinkTask model.TaskID, specificationHash [32]byte, value []byte) (model.ResultRecord, error) {
+		records++
+		return model.NewResultRecord(tupleID, sinkTask, specificationHash, value)
+	}
+	defer func() { marshalTuple, newResultRecord = model.MarshalTuple, model.NewResultRecord }()
+	key := resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
+
+	// (a) The first pass materializes the owned sink result and links the
+	// processed delivery as its parent.
+	if err = engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	owned, exists := engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("first pass owned=%t parents=%+v", exists, owned.parents)
+	}
+	if marshals != 1 || records != 1 {
+		t.Fatalf("first pass derivations marshals=%d records=%d, want 1 and 1", marshals, records)
+	}
+
+	// (b) A second pass over unchanged state derives nothing for the
+	// already-materialized delivery.
+	if err = engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if marshals != 1 || records != 1 {
+		t.Fatalf("second pass re-derived the materialized delivery: marshals=%d records=%d, want no new derivations", marshals, records)
+	}
+	// (c) Parents are still rebuilt on the skipped pass.
+	owned, exists = engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("second pass rebuilt owned=%t parents=%+v", exists, owned.parents)
+	}
+
+	// (d) A durable replacement install (revision 2) reaches the engine's
+	// serialized view like Task 3's tests drive it; the next pass
+	// re-derives and re-upserts the result under the new provenance.
+	job := fixture.assignment.Assignment.JobID
+	tokens := append([]model.AssignmentToken(nil), fixture.assignment.Assignment.Tasks...)
+	for index := range tokens {
+		tokens[index].AssignmentRevision++
+	}
+	replacement, replaceErr := model.NewAssignmentSet(job, fixture.assignment.Assignment.Revision+1, tokens, fixture.assignment.Assignment.ResultReplicas, fixture.topology)
+	if replaceErr != nil {
+		t.Fatal(replaceErr)
+	}
+	replaced := fixture.assignment
+	replaced.Assignment = replacement
+	repository.mu.Lock()
+	repository.assignments[job] = replaced
+	repository.mu.Unlock()
+	engine.refreshInstalledAssignment(job)
+	if err = engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if marshals <= 1 || records <= 1 {
+		t.Fatalf("replacement revision did not re-derive: marshals=%d records=%d", marshals, records)
+	}
+	wantProvenance := model.ResultCopyProvenance{AssignmentRevision: replacement.Revision, AssignmentDigest: replacement.Digest, ReplicaSet: replica, DestinationRole: model.PrimaryReplica, CoordinatorEpoch: fixture.epoch}
+	if recorded := engine.materialized[delivery.ID]; recorded != wantProvenance {
+		t.Fatalf("re-derived provenance=%+v want=%+v", recorded, wantProvenance)
+	}
+	owned, exists = engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("replacement pass rebuilt owned=%t parents=%+v", exists, owned.parents)
+	}
+
+	// The re-derived entry skips again under the recorded revision-2
+	// provenance.
+	if err = engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if marshals != 2 || records != 2 {
+		t.Fatalf("fourth pass re-derived under the new provenance: marshals=%d records=%d, want 2 and 2", marshals, records)
+	}
+	owned, exists = engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("fourth pass rebuilt owned=%t parents=%+v", exists, owned.parents)
+	}
+}
+
+// TestReconcileResultsFenceAdvanceInvalidatesMaterializedDeliveries pins the
+// fence invalidation path of the materialized-skip index: a coordinator
+// fence advance that reaches the engine through the durable fence command
+// republishes the assignment view and clears the index, so a previously
+// skipping processed sink delivery is re-derived under the new epoch and
+// then skips again once re-recorded.
+func TestReconcileResultsFenceAdvanceInvalidatesMaterializedDeliveries(t *testing.T) {
+	fixture, sink, replica := workerFixtureWithLocalPrimarySink(t)
+	repository := newFakeRepository(fixture)
+	delivery := fixture.sinkDelivery(t, sink, 1)
+	delivery.State = store.Processed
+	delivery.Outputs = []model.Tuple{cloneTuple(delivery.Tuple)}
+	repository.work.Deliveries = []store.DeliveryRecord{delivery}
+	repository.deliveries[delivery.ID] = delivery
+	replicator := &fakeResultReplicator{calls: make(chan resultReplicationCall, 1)}
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	options := testEngineOptions(repository, gate, &fakeSender{})
+	options.Replicator = replicator
+	engine, err := NewEngine(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marshals, records := 0, 0
+	marshalTuple = func(tuple model.Tuple) ([]byte, error) {
+		marshals++
+		return model.MarshalTuple(tuple)
+	}
+	newResultRecord = func(tupleID model.TupleID, sinkTask model.TaskID, specificationHash [32]byte, value []byte) (model.ResultRecord, error) {
+		records++
+		return model.NewResultRecord(tupleID, sinkTask, specificationHash, value)
+	}
+	defer func() { marshalTuple, newResultRecord = model.MarshalTuple, model.NewResultRecord }()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	if marshals != 1 || records != 1 {
+		t.Fatalf("initial reconcile derivations marshals=%d records=%d, want 1 and 1", marshals, records)
+	}
+	// The dispatched replication stays blocked in the fake replicator, so the
+	// delivery remains Processed and owned by the derivation path.
+	call := <-replicator.calls
+	defer func() { call.response <- resultReplicationResponse{} }()
+
+	// A durable fence advance rebinds the installation at a strictly newer
+	// epoch; the fence command drives the same republish the service sees.
+	newer := fixture.epoch
+	newer.Term++
+	newer.BeginIndex++
+	newer.Nonce[0]++
+	rebound := fixture.assignment
+	rebound.CoordinatorEpoch = newer
+	repository.mu.Lock()
+	repository.assignments[fixture.assignment.Assignment.JobID] = rebound
+	repository.work.Assignments = []store.InstalledAssignment{rebound}
+	repository.work.Fence = newer
+	repository.mu.Unlock()
+	if err := engine.ObserveFence(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-done
+
+	// The cleared index re-derives the delivery under the new epoch.
+	if err := engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if marshals != 2 || records != 2 {
+		t.Fatalf("fence advance did not re-derive: marshals=%d records=%d, want 2 and 2", marshals, records)
+	}
+	wantProvenance := model.ResultCopyProvenance{AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, ReplicaSet: replica, DestinationRole: model.PrimaryReplica, CoordinatorEpoch: newer}
+	if recorded := engine.materialized[delivery.ID]; recorded != wantProvenance {
+		t.Fatalf("re-derived provenance=%+v want=%+v", recorded, wantProvenance)
+	}
+	key := resultIdentity{sink: delivery.Destination.Task, tuple: delivery.ID.Tuple}
+	owned, exists := engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("fence pass rebuilt owned=%t parents=%+v", exists, owned.parents)
+	}
+
+	// The re-recorded entry skips again at the new fence.
+	if err := engine.reconcile(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if marshals != 2 || records != 2 {
+		t.Fatalf("post-fence skip failed: marshals=%d records=%d, want 2 and 2", marshals, records)
+	}
+	owned, exists = engine.results[key]
+	if !exists || len(owned.parents) != 1 || owned.parents[0] != delivery.ID {
+		t.Fatalf("post-fence pass rebuilt owned=%t parents=%+v", exists, owned.parents)
 	}
 }

@@ -460,8 +460,8 @@ func TestResultPageMapsTypedErrors(t *testing.T) {
 	})
 }
 
-// gateClosingFetcher closes the shared admission gate before streaming, so the
-// read observes leadership/gate loss mid-request.
+// gateClosingFetcher closes the shared admission gate before streaming, so
+// the read observes the gate closing mid-request.
 type gateClosingFetcher struct {
 	inner ResultFetcher
 	close func()
@@ -472,7 +472,10 @@ func (fetcher *gateClosingFetcher) OpenPartition(ctx context.Context, request pr
 	return fetcher.inner.OpenPartition(ctx, request)
 }
 
-func TestResultReadsAbortOnGateLossInsteadOfServingStale(t *testing.T) {
+// gate decoupling: the page read is served from the post-barrier applied view
+// with no admission-gate dependency, so a gate closed mid-read no longer
+// aborts with Starting; the sealed page is served.
+func TestResultReadsServeThroughGateLossMidRead(t *testing.T) {
 	seeded := seedQueryFixture(t, querySeed{sinkPartitions: 1, sealPartitions: 1, succeed: true})
 	fixture := newServiceFixture(t, seeded.machine)
 	gate := fixture.gate
@@ -488,9 +491,15 @@ func TestResultReadsAbortOnGateLossInsteadOfServingStale(t *testing.T) {
 	fixture.start()
 
 	request := pageRequest(seeded, protocol.MaxResultPageBytes)
-	controlError := requireControlError(t, fixture.exchange(request), protocol.ControlErrorStarting)
-	if !controlError.Retryable {
-		t.Fatal("gate-loss abort must be retryable")
+	page, ok := fixture.exchange(request).(protocol.ResultPageResponse)
+	if !ok {
+		t.Fatalf("result page through gate loss mid-read = %#v, want ResultPageResponse", page)
+	}
+	if err := protocol.ValidateResultPageResponseCorrelation(request, page); err != nil {
+		t.Fatalf("result page correlation: %v", err)
+	}
+	if !page.End || len(page.Records) == 0 {
+		t.Fatalf("result page shape = end %v records %d", page.End, len(page.Records))
 	}
 }
 
@@ -567,12 +576,18 @@ func TestJobListEmptyMachineReturnsEmptyValidListing(t *testing.T) {
 	}
 }
 
-func TestJobListClosedGateReturnsRetryableStarting(t *testing.T) {
+// gate decoupling: reads are served from the post-barrier applied view with
+// no admission-gate dependency, so a closed gate no longer answers a job list
+// with Starting; the empty listing is served directly.
+func TestJobListClosedGateServesEmptyListing(t *testing.T) {
 	fixture := newServiceFixture(t, state.NewMachine())
 	fixture.start()
 
-	controlError := requireControlError(t, fixture.exchange(protocol.JobListRequest{}), protocol.ControlErrorStarting)
-	if err := protocol.ValidateJobListErrorCorrelation(protocol.JobListRequest{}, controlError); err != nil {
-		t.Fatalf("job list error correlation: %v", err)
+	listing, ok := fixture.exchange(protocol.JobListRequest{}).(protocol.JobListResponse)
+	if !ok {
+		t.Fatal("job list read through the closed gate rejected")
+	}
+	if len(listing.Jobs) != 0 {
+		t.Fatalf("job list = %#v, want no jobs", listing)
 	}
 }

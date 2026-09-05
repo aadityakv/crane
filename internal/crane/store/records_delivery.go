@@ -12,7 +12,7 @@ import (
 	"github.com/aadityakv/crane/internal/crane/protocol"
 )
 
-func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []OutboxRecord, processed bool) error {
+func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []OutboxRecord, processed bool, proven map[model.DeliveryID]struct{}) error {
 	if uint64(len(delivery.Outputs)) > model.LimitsV1().MaxOperatorOutputs || uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
 		return errors.New("processed output/outbox count exceeds v1 bounds")
 	}
@@ -88,7 +88,7 @@ func applyDelivery(work *RecoveredWork, delivery DeliveryRecord, outboxes []Outb
 		if outbox.Completed || outbox.Accepted || outbox.RetryDeadlineUnixNano != 0 {
 			return errors.New("new processed outbox has retry or completion state")
 		}
-		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
+		if err := validateOutbox(outbox, assignment, work.Fence, proven); err != nil {
 			return err
 		}
 		if outbox.Producer != currentProducerToken(delivery, assignment) {
@@ -343,14 +343,33 @@ func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fen
 	return nil
 }
 
-func validateOutbox(record OutboxRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch) error {
-	delivery := DeliveryRecord{ID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, AssignmentRevision: record.AssignmentRevision, AssignmentDigest: record.AssignmentDigest, CoordinatorEpoch: record.CoordinatorEpoch, State: Received}
+// outboxProofObserver, when non-nil, is invoked once for every executed
+// expensive outbox proof (TupleDelivery construction + marshal + assignment
+// containment + deterministic route validation). Production leaves it nil; it
+// exists as the test seam that pins the once-per-record proof contract.
+// Package tests are sequential: do not add t.Parallel tests that swap this seam.
+var outboxProofObserver func(record OutboxRecord)
+
+// validateOutbox enforces the per-commit structural invariants of one outbox
+// (fence branding and retry-state consistency) and, unless the record's
+// immutable definition is already in the proven set, the expensive proof:
+// TupleDelivery construction + MarshalTupleDelivery, assignment containment,
+// and the deterministic route. A successful proof is recorded in proven; a nil
+// set forces the proof (recovery-time validation and Snapshot full checks).
+func validateOutbox(record OutboxRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch, proven map[model.DeliveryID]struct{}) error {
 	if record.CoordinatorEpoch != fence {
 		return errors.New("outbox fence mismatch")
 	}
 	if record.Accepted && record.RetryDeadlineUnixNano == 0 {
 		return errors.New("accepted outbox has no retry deadline")
 	}
+	if _, ok := proven[record.ID]; ok {
+		return nil
+	}
+	if outboxProofObserver != nil {
+		outboxProofObserver(record)
+	}
+	delivery := DeliveryRecord{ID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, AssignmentRevision: record.AssignmentRevision, AssignmentDigest: record.AssignmentDigest, CoordinatorEpoch: record.CoordinatorEpoch, State: Received}
 	message := protocol.TupleDelivery{DeliveryID: delivery.ID, Tuple: delivery.Tuple, Producer: delivery.Producer, Destination: delivery.Destination, Assignment: protocol.AssignmentSetIdentity{JobID: delivery.ID.Tuple.JobID, Revision: delivery.AssignmentRevision, Digest: delivery.AssignmentDigest}, Coordinator: delivery.CoordinatorEpoch}
 	if _, err := protocol.MarshalTupleDelivery(message); err != nil {
 		return err
@@ -360,6 +379,9 @@ func validateOutbox(record OutboxRecord, assignment InstalledAssignment, fence m
 	}
 	if err := validateRoute(assignment.Topology, record.ID, record.Tuple, record.Producer.Task); err != nil {
 		return err
+	}
+	if proven != nil {
+		proven[record.ID] = struct{}{}
 	}
 	return nil
 }

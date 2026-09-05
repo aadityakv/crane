@@ -208,7 +208,7 @@ func (engine *Engine) completeSatisfiedParents() error {
 		if !complete {
 			continue
 		}
-		assignment, present := engine.repository.InstalledAssignment(parent.ID.Tuple.JobID)
+		assignment, present := engine.installedAssignment(parent.ID.Tuple.JobID)
 		if !present {
 			return errors.New("completed outbox parent has no installed assignment")
 		}
@@ -451,8 +451,10 @@ func findAssignmentToken(set model.AssignmentSet, task model.TaskID) (model.Assi
 // the stale ones.
 func (engine *Engine) emissionForOutbox(record store.OutboxRecord) protocol.TupleDelivery {
 	message := deliveryMessageForOutbox(record)
-	fence := engine.repository.CurrentFence()
-	assignment, ok := engine.repository.InstalledAssignment(record.ID.Tuple.JobID)
+	// The sender worker and the owner's ACK fallback both derive from the
+	// published immutable snapshot; no store recovery happens per send.
+	assignments, fence := engine.currentSnapshot()
+	assignment, ok := assignments[record.ID.Tuple.JobID]
 	if !ok || assignment.CoordinatorEpoch != fence || assignment.SchedulingState != model.Running {
 		return message
 	}

@@ -23,6 +23,105 @@ import (
 	"github.com/aadityakv/crane/internal/wire"
 )
 
+// TestServiceRepositoryBorrowedViewDoesNotSignalFatalOnCallbackErrors pins
+// the fatal classification of the borrowed read: only store failures poison
+// the worker. Control-domain errors the callback returns (stale epoch, stale
+// assignment) propagate to the caller — the cloned reads never signaled
+// fatal for those, and neither may the borrowed view.
+func TestServiceRepositoryBorrowedViewDoesNotSignalFatalOnCallbackErrors(t *testing.T) {
+	fixture := newControlFixture(t)
+	path := filepath.Join(t.TempDir(), "worker")
+	durable, err := store.Open(path, store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}
+	if err := repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error { return ErrControlStaleEpoch }); !errors.Is(err, ErrControlStaleEpoch) {
+		t.Fatalf("callback error = %v, want ErrControlStaleEpoch", err)
+	}
+	select {
+	case fatalErr := <-repository.fatal:
+		t.Fatalf("callback error signaled fatal: %v", fatalErr)
+	default:
+	}
+	if err := repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case fatalErr := <-repository.fatal:
+		t.Fatalf("clean borrow signaled fatal: %v", fatalErr)
+	default:
+	}
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error { return nil }); !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("closed store borrow err = %v, want ErrClosed", err)
+	}
+	select {
+	case fatalErr := <-repository.fatal:
+		if !errors.Is(fatalErr, store.ErrClosed) {
+			t.Fatalf("closed store fatal = %v, want ErrClosed", fatalErr)
+		}
+	default:
+		t.Fatal("closed store borrow did not signal fatal")
+	}
+}
+
+// TestServiceRepositoryDurableTransactionIDSplitsBusyFromFatal pins the
+// fatal classification of the bounded durable-sequence read through the real
+// store path: ErrBusy from a held lock is a transient retryable rejection
+// that never poisons the worker, while a closed store stays fatal.
+func TestServiceRepositoryDurableTransactionIDSplitsBusyFromFatal(t *testing.T) {
+	fixture := newControlFixture(t)
+	path := filepath.Join(t.TempDir(), "worker")
+	durable, err := store.Open(path, store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1), controlWait: 30 * time.Millisecond}
+	held := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	var releaseOnce sync.Once
+	free := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	go func() {
+		defer close(done)
+		_ = durable.RecoverWorkViewWithin(time.Minute, func(work *store.RecoveredWork) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	_, busyErr := repository.DurableTransactionID()
+	if !errors.Is(busyErr, store.ErrBusy) {
+		t.Fatalf("held store durable sequence err = %v, want ErrBusy", busyErr)
+	}
+	select {
+	case fatalErr := <-repository.fatal:
+		t.Fatalf("ErrBusy durable sequence signaled fatal: %v", fatalErr)
+	default:
+	}
+	free()
+	<-done
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.DurableTransactionID(); !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("closed store durable sequence err = %v, want ErrClosed", err)
+	}
+	select {
+	case fatalErr := <-repository.fatal:
+		if !errors.Is(fatalErr, store.ErrClosed) {
+			t.Fatalf("closed store fatal = %v, want ErrClosed", fatalErr)
+		}
+	default:
+		t.Fatal("closed store durable sequence did not signal fatal")
+	}
+}
+
 func TestWorkerServiceConstructorIsSideEffectFreeAndRequiresExactDependencies(t *testing.T) {
 	fixture := newWorkerServiceFixture(t, false)
 	service, err := NewService(fixture.options())

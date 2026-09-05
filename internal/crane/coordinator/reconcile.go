@@ -12,20 +12,36 @@ import (
 )
 
 // reconcile performs one complete full-view pass in the exact required order:
-// worker registration, worker fences, status draining, failure resolution,
-// then per-job convergence (reassignment, distribution, checkpoint notices,
-// result repair, replay activation). It reports whether the pass converged
-// completely, which is the only state that may open the admission gate.
+// the cluster phase (worker registration, worker fences, status draining,
+// failure resolution) followed by per-job convergence (reassignment,
+// distribution, checkpoint notices, result repair, replay activation). The
+// cluster phase gates admission-opening; job convergence does not.
 func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
+	clusterConverged := actor.reconcileCluster(ctx, epoch, session)
+	jobsConverged := actor.reconcileJobs(ctx, epoch, session)
+	return clusterConverged && jobsConverged
+}
+
+// reconcileCluster performs the cluster phase: worker registration, worker
+// fences, status draining, and failure resolution. It reports whether the
+// phase converged and the context was not cancelled.
+func (actor *Actor) reconcileCluster(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
 	converged := true
 	session.controlFailed = make(map[uint16]bool)
-	actor.registerWorkers(ctx, epoch, &converged)
+	actor.registerWorkers(ctx, epoch, session, &converged)
 	view := actor.options.Machine.View()
 	reachable := actor.fenceWorkers(ctx, epoch, view, session, &converged)
 	actor.drainWorkerEvents(ctx, reachable, session, &converged)
 	actor.resolveWorkerFailures(ctx, epoch, session, &converged)
+	return converged && ctx.Err() == nil
+}
 
-	view = actor.options.Machine.View()
+// reconcileJobs performs every per-job convergence pass and session pruning.
+// It reports whether every per-job pass converged and the context was not
+// cancelled.
+func (actor *Actor) reconcileJobs(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
+	converged := true
+	view := actor.options.Machine.View()
 	jobs := make([]model.JobID, 0, len(view.Jobs))
 	for _, job := range view.Jobs {
 		jobs = append(jobs, job.JobID)
@@ -39,8 +55,11 @@ func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch,
 
 // registerWorkers scans the complete owned Alive/Suspect view in NodeID order
 // and converges every replicated worker record through authenticated
-// handshakes. An absent or failed handshake never creates a record.
-func (actor *Actor) registerWorkers(ctx context.Context, epoch model.CoordinatorEpoch, converged *bool) {
+// handshakes. An absent or failed handshake never creates a record. A member
+// whose this-session handshake settled and whose membership entry and
+// replicated record are unchanged skips the network dial; only the idempotent
+// registration convergence keeps running.
+func (actor *Actor) registerWorkers(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState, converged *bool) {
 	members := actor.options.Membership.View()
 	for _, member := range members.Members {
 		if ctx.Err() != nil {
@@ -49,20 +68,25 @@ func (actor *Actor) registerWorkers(ctx context.Context, epoch model.Coordinator
 		if !activeMemberStatus(member.Status) {
 			continue
 		}
-		actor.registerWorker(ctx, epoch, member, converged)
+		actor.registerWorker(ctx, epoch, member, session, converged)
 	}
 }
 
-func (actor *Actor) registerWorker(ctx context.Context, epoch model.CoordinatorEpoch, member swim.Member, converged *bool) {
-	identity, err := actor.options.Workers.Handshake(ctx, member)
-	if err != nil {
-		return
-	}
-	if verifyWorkerIdentity(member, identity) != nil {
-		return
-	}
-	if !memberActive(actor.options.Membership.View(), member.NodeID) {
-		return
+func (actor *Actor) registerWorker(ctx context.Context, epoch model.CoordinatorEpoch, member swim.Member, session *sessionState, converged *bool) {
+	identity, settled := session.settledHandshake(member, actor.options.Membership.View(), actor.options.Machine.View())
+	if !settled {
+		var err error
+		identity, err = actor.options.Workers.Handshake(ctx, member)
+		if err != nil {
+			return
+		}
+		if verifyWorkerIdentity(member, identity) != nil {
+			return
+		}
+		if !memberActive(actor.options.Membership.View(), member.NodeID) {
+			return
+		}
+		session.handshakes[member.NodeID] = handshakeMemory{incarnation: member.Incarnation, status: member.Status, identity: identity}
 	}
 	view := actor.options.Machine.View()
 	record, exists := findWorker(view, member.NodeID)
@@ -143,10 +167,14 @@ func (actor *Actor) proposeReplaceWorkerEpoch(ctx context.Context, epoch model.C
 	}
 }
 
-// fenceWorkers installs the leadership fence on every current non-Offline
-// worker before any status, install, or repair command. Ambiguous fence
-// outcomes are resolved by one idempotent retry; persistent failure marks the
-// worker control-unreachable for the failure tracker.
+// fenceWorkers installs the leadership fence before any status, install, or
+// repair command: the session's first pass sweeps every non-Offline worker,
+// and later passes fence only workers whose durable fence at this epoch is
+// unproven — no acknowledged fence for the exact incarnation this session, a
+// last observed admission epoch from a different nonzero coordinator, or a
+// previously failed attempt. Ambiguous fence outcomes are resolved by one
+// idempotent retry; persistent failure marks the worker control-unreachable
+// for the failure tracker.
 func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpoch, view state.View, session *sessionState, converged *bool) map[uint16]bool {
 	reachable := make(map[uint16]bool)
 	for _, worker := range view.Workers {
@@ -154,6 +182,14 @@ func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpo
 			return reachable
 		}
 		if worker.State == state.WorkerOffline {
+			continue
+		}
+		if !session.needsFence(worker, epoch) {
+			// The exact incarnation acknowledged this session's fence, so
+			// the durable worker-side fence still stands and the worker is
+			// treated as reachable until the drain proves otherwise (drain
+			// failures feed the failure tracker).
+			reachable[worker.NodeID] = true
 			continue
 		}
 		err := actor.options.Workers.Fence(ctx, worker.NodeID, epoch)
@@ -164,8 +200,11 @@ func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpo
 			// Convergence for control-unreachable workers is decided by the
 			// failure tracker, which may deactivate them this very pass.
 			session.controlFailed[worker.NodeID] = true
+			session.fenceFailed[worker.NodeID] = true
 			continue
 		}
+		session.fences[worker.NodeID] = fenceMemory{epoch: epoch, workerEpoch: worker.Epoch}
+		delete(session.fenceFailed, worker.NodeID)
 		reachable[worker.NodeID] = true
 	}
 	return reachable
@@ -215,7 +254,16 @@ func (actor *Actor) reconcileJob(ctx context.Context, epoch model.CoordinatorEpo
 		return
 	}
 	if terminalLifecycle(job.Lifecycle) {
-		actor.propagateTerminal(ctx, epoch, job, session)
+		if job.Lifecycle == state.JobSucceeded && !actor.maintainTerminalResults(ctx, epoch, job, session) {
+			*converged = false
+			return
+		}
+		view := actor.options.Machine.View()
+		terminal, ok := findJob(view, jobID)
+		if !ok {
+			return
+		}
+		actor.propagateTerminal(ctx, epoch, terminal, session)
 		return
 	}
 	if job.Lifecycle == state.JobPending && job.Assignment == nil {
@@ -516,8 +564,9 @@ func (actor *Actor) resendCheckpointNotices(ctx context.Context, job state.JobRe
 
 // repairResults verifies every assigned sink's covered result inventory on
 // both current replicas and performs record-level repair where a copy is
-// absent or differs. The admission gate never opens until every sink's two
-// current replica summaries match the expected covered set.
+// absent or differs. A sink whose two current replica summaries never match
+// the expected covered set leaves the pass unconverged so it is retried; it
+// no longer holds admission closed.
 func (actor *Actor) repairResults(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord) bool {
 	topology, err := model.DecodeTopology(job.TopologyBytes)
 	if err != nil {
@@ -559,7 +608,8 @@ func (actor *Actor) repairSink(ctx context.Context, epoch model.CoordinatorEpoch
 	secondaryHolds := secondarySummary.RecordCount > 0
 	switch {
 	case primaryHolds && secondaryHolds:
-		// Multiple disagreeing survivors leave admission closed.
+		// Multiple disagreeing survivors leave the pass unconverged so it is
+		// retried; they no longer hold admission closed.
 		return false
 	case primaryHolds:
 		return actor.repairAndVerify(ctx, epoch, job, replica, vector, query, primary, []repairEndpoint{secondary}, primarySummary)
@@ -572,8 +622,9 @@ func (actor *Actor) repairSink(ctx context.Context, epoch model.CoordinatorEpoch
 
 // scanRetainedHolders scans every replicated registered worker in NodeID
 // order for retained old-provenance inventory so actor restart needs no local
-// history. Disagreeing holders leave admission closed; an agreed empty state
-// on both current replicas stands when nobody retains records.
+// history. Disagreeing holders leave the pass unconverged so it is retried
+// rather than holding admission closed; an agreed empty state on both
+// current replicas stands when nobody retains records.
 func (actor *Actor) scanRetainedHolders(ctx context.Context, epoch model.CoordinatorEpoch, view state.View, job state.JobRecord, set model.AssignmentSet, replica model.ResultReplicaSet, vector []protocol.SourceCheckpoint, query protocol.ResultInventoryQuery, primary, secondary repairEndpoint) bool {
 	install, ok := actor.buildInstall(job, model.Closed, epoch)
 	if !ok {

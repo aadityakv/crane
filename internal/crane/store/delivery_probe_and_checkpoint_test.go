@@ -423,7 +423,7 @@ func TestDeliveryCheckpointRequiresDurableCompletionAndAdvancesRevisionOnce(t *t
 		legacy := beforeDuplicate.Clone()
 		legacy.Sources[0].CheckpointRevision = 0
 		legacy.Sources[0].CheckpointAuthority = CheckpointAuthority{}
-		if err := applyCheckpoint(&legacy, notice); err != nil {
+		if err := applyCheckpoint(&legacy, notice, nil); err != nil {
 			t.Fatalf("legacy checkpoint did not migrate from pending proof: %v", err)
 		}
 		if legacy.Sources[0].CheckpointRevision != 1 || legacy.Sources[0].CheckpointAuthority != wantAuthority {
@@ -433,7 +433,7 @@ func TestDeliveryCheckpointRequiresDurableCompletionAndAdvancesRevisionOnce(t *t
 		legacy.Sources[0].CheckpointRevision = 0
 		legacy.Sources[0].CheckpointAuthority = CheckpointAuthority{}
 		legacy.PendingEvents = nil
-		if err := applyCheckpoint(&legacy, notice); !errors.Is(err, ErrCheckpointAuthorityUnavailable) {
+		if err := applyCheckpoint(&legacy, notice, nil); !errors.Is(err, ErrCheckpointAuthorityUnavailable) {
 			t.Fatalf("legacy checkpoint without proof=%v", err)
 		}
 

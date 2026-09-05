@@ -48,8 +48,12 @@ func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 	transition, _ := NewTransitionJob(InternalCommandID{0xdb}, machine.jobs[job].JobControlRevision, job, JobRunning, JobDraining, machine.coordinatorEpoch)
 	failure := model.JobFailureReport{JobID: job, JobControlRevision: machine.jobs[job].JobControlRevision, AssignmentRevision: assignment.Revision, Task: source, Epoch: machine.coordinatorEpoch, TransactionID: 2, Code: model.FailureStorage, DetailDigest: [32]byte{0xdc}}
 	fail, _ := NewFailJob(InternalCommandID{0xdc}, machine.jobs[job].JobControlRevision, failure, machine.coordinatorEpoch)
+	lostManifest := manifest
+	lostManifest.ManifestRevision = manifest.ManifestRevision + 1
+	lostManifest.Lost, lostManifest.LostRevision, lostManifest.LostEpoch = true, lostManifest.ManifestRevision, machine.coordinatorEpoch
+	markLost, _ := NewMarkManifestLost(InternalCommandID{0xdd}, manifest.ManifestRevision, lostManifest, machine.coordinatorEpoch)
 
-	commands := []any{register, drain, deactivate, replaceWorker, submit, cancel, recordEOF, install, replaceAssignments, advance, seal, transition, fail}
+	commands := []any{register, drain, deactivate, replaceWorker, submit, cancel, recordEOF, install, replaceAssignments, advance, seal, transition, fail, markLost}
 	bundle := make([]byte, 0)
 	for _, command := range commands {
 		encoded, err := MarshalCommand(command)
@@ -62,7 +66,7 @@ func TestTask10ConcreteCommandCanonicalGoldenBundle(t *testing.T) {
 		bundle = append(bundle, encoded...)
 	}
 	digest := sha256.Sum256(bundle)
-	const want = "4bc90ca37b46415bc79459860e6e94c950b9d0e236ce352539ea732ceb0ba70c"
+	const want = "ec2f86f380e232d1b0e18bd2afb53178c622ad86f770009e1e9f5c247e185f40"
 	if got := hex.EncodeToString(digest[:]); got != want {
 		t.Fatalf("Task 10 canonical command bundle SHA-256 = %s, want %s", got, want)
 	}

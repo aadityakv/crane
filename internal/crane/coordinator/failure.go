@@ -71,6 +71,14 @@ func (actor *Actor) deactivateWorker(ctx context.Context, epoch model.Coordinato
 		if !ok {
 			return false
 		}
+		if terminalLifecycle(job.Lifecycle) {
+			// The pre-install fences live producers of nonterminal work so
+			// healthy receivers durably reject the returning stale worker
+			// before authority advances. A terminal job has no live producer
+			// to fence — its invalidation only reassigns retained result
+			// custody — so it must not multiply this retry loop's installs.
+			continue
+		}
 		// Healthy receivers must durably reject a returning stale producer
 		// before durable authority advances.
 		if !actor.installAssignment(ctx, epoch, job, model.Closed, false, worker.NodeID) {
@@ -272,12 +280,14 @@ func pickSecondaryWorker(view state.View, marker state.NeedsReassignment, primar
 }
 
 // affectedForWorker mirrors the replicated invalidation computation: the
-// sorted complete list of nonterminal assigned jobs on which the exact worker
-// incarnation would gain new reassignment markers.
+// sorted complete list of invalidation-eligible assigned jobs on which the
+// exact worker incarnation would gain new reassignment markers. A Succeeded
+// job is eligible exactly like a nonterminal one — its committed manifests
+// stay servable only while current workers hold the sealed artifacts.
 func affectedForWorker(view state.View, workerID uint16, epoch model.WorkerEpoch) []state.AffectedAssignment {
 	var affected []state.AffectedAssignment
 	for _, job := range view.Jobs {
-		if job.Assignment == nil || terminalLifecycle(job.Lifecycle) {
+		if job.Assignment == nil || (terminalLifecycle(job.Lifecycle) && job.Lifecycle != state.JobSucceeded) {
 			continue
 		}
 		markers := markersForWorkerSet(*job.Assignment, workerID, epoch)

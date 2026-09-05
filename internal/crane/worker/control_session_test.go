@@ -162,6 +162,9 @@ func TestControlFenceDrainsGatePersistsThenClosesOlderSessions(t *testing.T) {
 	if fixture.repository.log[0] != "fence" {
 		t.Fatalf("durable order = %v", fixture.repository.log)
 	}
+	if len(fixture.repository.log) < 2 || fixture.repository.log[1] != "engine-fence" {
+		t.Fatalf("fence did not reach the serialized engine owner: %v", fixture.repository.log)
+	}
 	select {
 	case <-oldClosed:
 	default:
@@ -614,6 +617,158 @@ func TestControlAssignmentCapacityIsAtomicAndExactReplacementRetriesWithRealStor
 	after, _ := durable.RecoverWork()
 	if !reflect.DeepEqual(after, before) || len(after.Assignments) != 1 {
 		t.Fatal("capacity rejection mutated durable Store")
+	}
+}
+
+// countingControlRepository decorates the store-backed service repository so
+// tests can count every full recovered-work clone the control path would pay:
+// RecoverWork and RecoverWorkBounded are the two clone-bearing reads; the
+// borrowed view and the durable-sequence read clone nothing.
+type countingControlRepository struct {
+	*serviceRepository
+	clones int
+}
+
+func (repository *countingControlRepository) RecoverWork() (store.RecoveredWork, error) {
+	repository.clones++
+	return repository.serviceRepository.RecoverWork()
+}
+
+func (repository *countingControlRepository) RecoverWorkBounded() (store.RecoveredWork, error) {
+	repository.clones++
+	return repository.serviceRepository.RecoverWorkBounded()
+}
+
+// TestControlExchangesPerformZeroFullStoreClones pins the borrowed-read
+// contract against a real store: an authenticated handshake, an idempotent
+// fence redelivery, a first fence through the gate drain, and a plain status
+// sweep exchange each perform ZERO full recovered-work clones. The final
+// direct bounded read proves the counter observes clones when they occur.
+func TestControlExchangesPerformZeroFullStoreClones(t *testing.T) {
+	fixture := newControlFixture(t)
+	path := filepath.Join(t.TempDir(), "worker")
+	durable, err := store.Open(path, store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	if err := durable.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.InstallAssignment(fixture.assignment.Assignment, fixture.assignment.Topology.Spec(), fixture.assignment.JobControlRevision, model.Running, fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	repository := &countingControlRepository{serviceRepository: &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}}
+	owner, err := NewControlOwner(ControlOptions{Config: fixture.configuration, ClusterID: fixture.cluster, Repository: repository, Engine: &controlNoopEngine{}, Transfer: fixture.transfer, Gate: fixture.gate, Membership: fixture.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner = owner
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	if repository.clones != 0 {
+		t.Fatalf("handshake paid %d full-store clones, want 0", repository.clones)
+	}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, protocol.FenceRequest{CoordinatorEpoch: fixture.epoch})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 8})); err != nil {
+		t.Fatal(err)
+	}
+	response, err := session.Handle(context.Background(), fixture.frame(t, 2, 4, protocol.WorkerStatusRequest{CoordinatorEpoch: fixture.epoch, MaxEvents: 8}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, ok := response.(protocol.WorkerStatus)
+	if !ok || status.CoordinatorEpoch != fixture.epoch || status.StoreTransactionID == 0 || len(status.Assignments) != 1 {
+		t.Fatalf("status response = %#v", response)
+	}
+	var source model.AssignmentToken
+	for _, token := range fixture.assignment.Assignment.Tasks {
+		if token.WorkerID == fixture.repository.localNode && token.Task.StageID == 1 {
+			source = token
+			break
+		}
+	}
+	if source == (model.AssignmentToken{}) {
+		t.Fatal("fixture has no locally owned source task")
+	}
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: fixture.assignment.Assignment.JobID, Source: source.Task, Watermark: 1, RaftIndex: 5, Epoch: fixture.epoch}, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 5, notice)); err != nil {
+		t.Fatal(err)
+	}
+	newer := fixture.epoch
+	newer.Term++
+	newer.Nonce[0]++
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 6, protocol.FenceRequest{CoordinatorEpoch: newer})); err != nil {
+		t.Fatal(err)
+	}
+	if repository.clones != 0 {
+		t.Fatalf("handshake+idempotent-fence+status+checkpoint+first-fence paid %d full-store clones, want 0 (borrowed reads: fence checks, status summary, checkpoint validation, durable sequence)", repository.clones)
+	}
+	if _, err := repository.RecoverWorkBounded(); err != nil {
+		t.Fatal(err)
+	}
+	if repository.clones != 1 {
+		t.Fatalf("clone counter observed %d bounded reads, want 1", repository.clones)
+	}
+}
+
+// TestControlAssignmentInstallCloneCounts pins the install exchange's
+// borrowed-read split: an assignment targeting this worker validates under
+// the borrowed view with ZERO full-store clones, and the historical-holder
+// fallback (a non-targeted Closed install) performs exactly ONE bounded
+// cloned read for its Results check.
+func TestControlAssignmentInstallCloneCounts(t *testing.T) {
+	fixture := newControlFixture(t)
+	path := filepath.Join(t.TempDir(), "worker")
+	durable, err := store.Open(path, store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	if err := durable.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.InstallAssignment(fixture.assignment.Assignment, fixture.assignment.Topology.Spec(), fixture.assignment.JobControlRevision, model.Running, fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	repository := &countingControlRepository{serviceRepository: &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}}
+	owner, err := NewControlOwner(ControlOptions{Config: fixture.configuration, ClusterID: fixture.cluster, Repository: repository, Engine: &controlNoopEngine{}, Transfer: fixture.transfer, Gate: fixture.gate, Membership: fixture.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner = owner
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	replacement := protocol.AssignmentSetInstall{Assignment: fixture.assignment.Assignment, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: fixture.assignment.JobControlRevision, SchedulingState: model.Running, CoordinatorEpoch: fixture.epoch}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, replacement)); err != nil {
+		t.Fatal(err)
+	}
+	if repository.clones != 0 {
+		t.Fatalf("targeted install paid %d full-store clones, want 0 (borrowed reads: revision/slot admission)", repository.clones)
+	}
+	workers := []model.WorkerPlacement{{NodeID: 1, WorkerEpoch: fixture.repository.localEpoch, SlotCapacity: 8}, {NodeID: 2, WorkerEpoch: model.WorkerEpoch{2}, SlotCapacity: 8}, {NodeID: 3, WorkerEpoch: model.WorkerEpoch{3}, SlotCapacity: 8}}
+	var candidate model.AssignmentSet
+	for value := uint16(2); value < 512; value++ {
+		job := model.JobID{byte(value), byte(value >> 8)}
+		candidate, err = model.BuildAssignmentSet(job, fixture.assignment.Topology.Digest(), 1, fixture.assignment.Topology, workers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !assignmentTargetsWorker(candidate, fixture.repository.localNode, fixture.repository.localEpoch) {
+			break
+		}
+	}
+	if assignmentTargetsWorker(candidate, fixture.repository.localNode, fixture.repository.localEpoch) {
+		t.Fatal("could not build a non-targeted candidate assignment")
+	}
+	historical := protocol.AssignmentSetInstall{Assignment: candidate, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: 1, SchedulingState: model.Closed, CoordinatorEpoch: fixture.epoch}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, historical)); !errors.Is(err, ErrControlStaleAssignment) {
+		t.Fatalf("non-targeted Closed install without retained results error = %v, want ErrControlStaleAssignment", err)
+	}
+	if repository.clones != 1 {
+		t.Fatalf("historical fallback paid %d full-store clones, want exactly 1 (the Results read)", repository.clones)
 	}
 }
 
@@ -1295,6 +1450,14 @@ func (repository *controlTestRepository) RecoverWorkBounded() (store.RecoveredWo
 	return repository.RecoverWork()
 }
 
+// RecoverWorkViewWithin lends the fake's live work; the test fake keeps
+// Results materialized, so callers may read them here.
+func (repository *controlTestRepository) RecoverWorkViewWithin(borrow func(*store.RecoveredWork) error) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	return borrow(&repository.work)
+}
+
 func (repository *controlTestRepository) RecoverWork() (store.RecoveredWork, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
@@ -1387,6 +1550,9 @@ type controlTestEngine struct{ repository *controlTestRepository }
 type controlNoopEngine struct{}
 
 func (*controlNoopEngine) ReconcileAssignment(context.Context, model.JobID) error { return nil }
+func (*controlNoopEngine) ObserveFence(context.Context) error {
+	return nil
+}
 func (*controlNoopEngine) ApplyCheckpoint(context.Context, protocol.CheckpointNotice) error {
 	return nil
 }
@@ -1396,6 +1562,12 @@ func (engine *controlTestEngine) ReconcileAssignment(_ context.Context, _ model.
 	engine.repository.mu.Lock()
 	defer engine.repository.mu.Unlock()
 	engine.repository.log = append(engine.repository.log, "reconcile")
+	return nil
+}
+func (engine *controlTestEngine) ObserveFence(_ context.Context) error {
+	engine.repository.mu.Lock()
+	defer engine.repository.mu.Unlock()
+	engine.repository.log = append(engine.repository.log, "engine-fence")
 	return nil
 }
 func (engine *controlTestEngine) ApplyCheckpoint(_ context.Context, _ protocol.CheckpointNotice) error {

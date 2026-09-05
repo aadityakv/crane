@@ -164,6 +164,10 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	service.engine = engine
+	// The repository publishes the engine's immutable installed view to the
+	// transfer owner; wired here, before any owner goroutine starts, so no
+	// transfer path can observe a partially constructed composition.
+	repository.engine = engine
 	tuple, err := NewTupleService(TupleServiceOptions{Endpoint: endpoint, Engine: engine})
 	if err != nil {
 		return err
@@ -440,8 +444,13 @@ type serviceRepository struct {
 	node      uint16
 	fatal     chan error
 	fatalOnce sync.Once
-	// controlWait bounds control-path store reads (RecoverWorkBounded).
+	// controlWait bounds control-path store reads (RecoverWorkBounded,
+	// RecoverWorkViewWithin, and DurableTransactionID's sequence read).
 	controlWait time.Duration
+	// engine is wired by Service.Run immediately after engine construction,
+	// before any owner goroutine starts; it publishes the immutable
+	// installed view the transfer owner validates against.
+	engine *Engine
 }
 
 // RecoverWorkBounded reads the recovered work with the control wait bound; a
@@ -452,6 +461,36 @@ func (repository *serviceRepository) RecoverWorkBounded() (store.RecoveredWork, 
 		repository.signalFatal(err)
 	}
 	return work, err
+}
+
+// borrowedCallbackError marks errors raised by the borrowed-read callback —
+// control-domain refusals (stale epoch, stale assignment) — so the service
+// repository signals fatal only for store failures, exactly like the cloned
+// bounded read did.
+type borrowedCallbackError struct{ err error }
+
+func (failure borrowedCallbackError) Error() string { return failure.err.Error() }
+func (failure borrowedCallbackError) Unwrap() error { return failure.err }
+
+// RecoverWorkViewWithin lends the callback the borrowed recovered-work view
+// with the control wait bound, without cloning it; a store.ErrBusy result is
+// a retryable control rejection, never a poison. Only store failures signal
+// fatal: errors the callback itself returns belong to the caller.
+func (repository *serviceRepository) RecoverWorkViewWithin(borrow func(*store.RecoveredWork) error) error {
+	err := repository.Store.RecoverWorkViewWithin(repository.controlWait, func(work *store.RecoveredWork) error {
+		if err := borrow(work); err != nil {
+			return borrowedCallbackError{err}
+		}
+		return nil
+	})
+	var callback borrowedCallbackError
+	if errors.As(err, &callback) {
+		return callback.err
+	}
+	if err != nil && !errors.Is(err, store.ErrBusy) {
+		repository.signalFatal(err)
+	}
+	return err
 }
 
 // RecoverWork reads the worker's durable identity and assignments, signalling a fatal error on failure.
@@ -498,12 +537,34 @@ func (repository *serviceRepository) InstalledAssignment(job model.JobID) (store
 	return store.InstalledAssignment{}, false
 }
 
+// InstalledView serves the engine's immutable installed-assignment/fence
+// snapshot for transfer-path authority validation. A wired engine that has
+// not yet published a view fails closed with a nil map, exactly like a
+// repository read failure. Without a wired engine (the composition tests'
+// store-backed repositories) it falls back to one durable read and serves the
+// same authority the store would.
+func (repository *serviceRepository) InstalledView() (map[model.JobID]store.InstalledAssignment, model.CoordinatorEpoch) {
+	if repository.engine == nil {
+		work, err := repository.RecoverWork()
+		if err != nil {
+			return nil, model.CoordinatorEpoch{}
+		}
+		view := make(map[model.JobID]store.InstalledAssignment, len(work.Assignments))
+		for _, assignment := range work.Assignments {
+			view[assignment.Assignment.JobID] = assignment
+		}
+		return view, work.Fence
+	}
+	return repository.engine.InstalledView()
+}
+
 // DurableTransactionID reports the last store transaction that is durable on disk.
 func (repository *serviceRepository) DurableTransactionID() (uint64, error) {
-	if _, err := repository.RecoverWork(); err != nil {
-		return 0, err
+	transaction, err := repository.Store.DurableSequenceWithin(repository.controlWait)
+	if err != nil && !errors.Is(err, store.ErrBusy) {
+		repository.signalFatal(err)
 	}
-	return repository.Recovered().LastSequence, nil
+	return transaction, err
 }
 
 type controlResultReplicator struct {
@@ -675,6 +736,9 @@ func (owner *ControlOwner) localStatus(ctx context.Context) (protocol.WorkerStat
 	if err != nil {
 		return protocol.WorkerStatus{}, err
 	}
+	// borrowed reads: the durable-sequence read is now bounded, so a held
+	// store surfaces ErrBusy here transiently; the wire maps it to a
+	// retryable WorkerErrorUnavailable and the peer retries.
 	transaction, err := owner.repository.DurableTransactionID()
 	if err != nil {
 		return protocol.WorkerStatus{}, err

@@ -20,7 +20,9 @@ package sim
 //     job was live and the report's token was still current, so the rejection
 //     was classified "transiently false" and stayed a retryable error; every
 //     reconciliation pass re-proposed the same AdvanceCheckpoint and never
-//     converged, so the leader's admission gate never reopened.
+//     converged, so the leader's admission gate never reopened. gate
+//     decoupling: the gate now opens once per epoch, so this failure mode no
+//     longer locks the control plane.
 //  3. worker/checkpoint.go publishContiguousCompletions refused to supersede
 //     the pending report (pendingCompletion), so the worker never re-published
 //     under the current fence.

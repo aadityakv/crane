@@ -2298,7 +2298,7 @@ func ControlNestedEncodingLayouts() []model.PublicControlNestedDescriptor {
 func ControlEnumDomains() []model.PublicControlEnumDescriptor {
 	return []model.PublicControlEnumDescriptor{
 		{Name: "JobState", Values: []string{fmt.Sprintf("Pending=%d", JobPending), fmt.Sprintf("Deploying=%d", JobDeploying), fmt.Sprintf("Running=%d", JobRunning), fmt.Sprintf("Draining=%d", JobDraining), fmt.Sprintf("Succeeded=%d", JobSucceeded), fmt.Sprintf("Failed=%d", JobFailed), fmt.Sprintf("Canceled=%d", JobCanceled)}},
-		{Name: "ControlErrorCode", Values: []string{fmt.Sprintf("Malformed=%d", ControlErrorMalformed), fmt.Sprintf("UnsupportedSchema=%d", ControlErrorUnsupportedSchema), fmt.Sprintf("InvalidRequest=%d", ControlErrorInvalidRequest), fmt.Sprintf("Starting=%d", ControlErrorStarting), fmt.Sprintf("NotLeader=%d", ControlErrorNotLeader), fmt.Sprintf("StaleRequest=%d", ControlErrorStaleRequest), fmt.Sprintf("SkippedRequest=%d", ControlErrorSkippedRequest), fmt.Sprintf("IdentityReuse=%d", ControlErrorIdentityReuse), fmt.Sprintf("NotFound=%d", ControlErrorNotFound), fmt.Sprintf("RevisionMismatch=%d", ControlErrorRevisionMismatch), fmt.Sprintf("CapacityExhausted=%d", ControlErrorCapacityExhausted), fmt.Sprintf("PageLimitTooSmall=%d", ControlErrorPageLimitTooSmall), fmt.Sprintf("ResultUnavailable=%d", ControlErrorResultUnavailable), fmt.Sprintf("CorruptResult=%d", ControlErrorCorruptResult), fmt.Sprintf("ResultTooLarge=%d", ControlErrorResultTooLarge)}},
+		{Name: "ControlErrorCode", Values: []string{fmt.Sprintf("Malformed=%d", ControlErrorMalformed), fmt.Sprintf("UnsupportedSchema=%d", ControlErrorUnsupportedSchema), fmt.Sprintf("InvalidRequest=%d", ControlErrorInvalidRequest), fmt.Sprintf("Starting=%d", ControlErrorStarting), fmt.Sprintf("NotLeader=%d", ControlErrorNotLeader), fmt.Sprintf("StaleRequest=%d", ControlErrorStaleRequest), fmt.Sprintf("SkippedRequest=%d", ControlErrorSkippedRequest), fmt.Sprintf("IdentityReuse=%d", ControlErrorIdentityReuse), fmt.Sprintf("NotFound=%d", ControlErrorNotFound), fmt.Sprintf("RevisionMismatch=%d", ControlErrorRevisionMismatch), fmt.Sprintf("CapacityExhausted=%d", ControlErrorCapacityExhausted), fmt.Sprintf("PageLimitTooSmall=%d", ControlErrorPageLimitTooSmall), fmt.Sprintf("ResultUnavailable=%d", ControlErrorResultUnavailable), fmt.Sprintf("CorruptResult=%d", ControlErrorCorruptResult), fmt.Sprintf("ResultTooLarge=%d", ControlErrorResultTooLarge), fmt.Sprintf("ResultsNoLongerRetained=%d", ControlErrorResultsNoLongerRetained)}},
 		{Name: "FailureCode", Values: []string{fmt.Sprintf("Operator=%d", model.FailureOperator), fmt.Sprintf("TupleInvalid=%d", model.FailureTupleInvalid), fmt.Sprintf("Storage=%d", model.FailureStorage)}},
 	}
 }
@@ -2318,8 +2318,8 @@ func ControlErrorCodeMatrix() []string {
 	}
 	result := make([]string, len(rows))
 	for index, row := range rows {
-		values := make([]string, 0, int(ControlErrorResultTooLarge))
-		for code := ControlErrorMalformed; code <= ControlErrorResultTooLarge; code++ {
+		values := make([]string, 0, int(ControlErrorResultsNoLongerRetained))
+		for code := ControlErrorMalformed; code <= ControlErrorResultsNoLongerRetained; code++ {
 			allowed := predecodeControlError(code)
 			if row.message != 0 {
 				allowed = controlErrorCodeCompatible(row.message, code)
@@ -2365,6 +2365,8 @@ func controlErrorCodeName(code ControlErrorCode) string {
 		return "CorruptResult"
 	case ControlErrorResultTooLarge:
 		return "ResultTooLarge"
+	case ControlErrorResultsNoLongerRetained:
+		return "ResultsNoLongerRetained"
 	default:
 		return ""
 	}

@@ -37,6 +37,25 @@ func TestParseClusterFlagsUsesSpecifiedLocalLayout(t *testing.T) {
 	}
 }
 
+// TestParseClusterFlagsDefaultsAndParsesResetIncompatible pins the opt-in
+// default and the flag spelling the Makefile dev target relies on.
+func TestParseClusterFlagsDefaultsAndParsesResetIncompatible(t *testing.T) {
+	options, _, err := parseClusterFlags([]string{"-reset-incompatible"})
+	if err != nil {
+		t.Fatalf("parseClusterFlags: %v", err)
+	}
+	if !options.ResetIncompatible {
+		t.Fatal("ResetIncompatible = false, want true")
+	}
+	options, _, err = parseClusterFlags(nil)
+	if err != nil {
+		t.Fatalf("parseClusterFlags: %v", err)
+	}
+	if options.ResetIncompatible {
+		t.Fatal("ResetIncompatible defaulted to true, want false")
+	}
+}
+
 func TestRunClusterProcessesCancelsPeersAfterChildFailure(t *testing.T) {
 	nodeBinary := writeClusterHelperWrapper(t)
 	configDirectory := t.TempDir()

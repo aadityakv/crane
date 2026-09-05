@@ -549,3 +549,61 @@ func allGlobalRecords(t *testing.T, fixture queryFixture) []model.ResultRecord {
 	}
 	return records
 }
+
+// TestResultPageReportsLostManifestAsNoLongerRetained pins the terminal
+// result-serving path: once a Succeeded job's sealed artifact is declared
+// lost, every result-page request — whatever cursor or manifest digest it
+// carries — answers with the explicit typed unavailable error instead of an
+// empty silent page or a generic transient refusal, and the public handler
+// maps it onto the non-retryable results-no-longer-retained code.
+func TestResultPageReportsLostManifestAsNoLongerRetained(t *testing.T) {
+	seeded := seedQueryFixture(t, querySeed{sinkPartitions: 2, sealPartitions: 2, succeed: true})
+	view := seeded.machine.View()
+	job := view.Jobs[0]
+	sink := job.Assignment.ResultReplicas[0].SinkTask
+	committed := job.Manifests[sink]
+	epoch := view.CoordinatorEpoch
+
+	// Before the loss the page still serves records.
+	fixture := newServiceFixture(t, seeded.machine)
+	fixture.fetcher = newFakeFetcher(seeded)
+	fixture.buildService()
+	if err := fixture.gate.Open(epoch); err != nil {
+		t.Fatal(err)
+	}
+	fixture.start()
+	request := pageRequest(seeded, protocol.MaxResultPageBytes)
+	if _, ok := fixture.exchange(request).(protocol.ResultPageResponse); !ok {
+		t.Fatalf("pre-loss page rejected: %v", fixture.exchange(request))
+	}
+
+	// The committed artifact is terminally declared lost.
+	lost := committed
+	lost.ManifestRevision = committed.ManifestRevision + 1
+	lost.Lost, lost.LostRevision, lost.LostEpoch = true, lost.ManifestRevision, epoch
+	markLost, err := state.NewMarkManifestLost(queryCommandID("mark-lost", sink.JobID[:]), committed.ManifestRevision, lost, epoch)
+	if err != nil {
+		t.Fatalf("mark lost: %v", err)
+	}
+	seedMachine(t, seeded.machine, 40, markLost)
+
+	// The engine answers with the typed terminal error for every binding.
+	engine := &QueryEngine{Machine: seeded.machine, Fetcher: fixture.fetcher}
+	if _, err := engine.Page(context.Background(), request); !errors.Is(err, ErrResultsNoLongerRetained) {
+		t.Fatalf("page after loss = %v want %v", err, ErrResultsNoLongerRetained)
+	}
+	foreign := request
+	foreign.ManifestDigest = [32]byte{0x5C}
+	if _, err := engine.Page(context.Background(), foreign); !errors.Is(err, ErrResultsNoLongerRetained) {
+		t.Fatalf("page with foreign digest after loss = %v want %v", err, ErrResultsNoLongerRetained)
+	}
+
+	// The public handler maps it onto the explicit non-retryable code.
+	controlError := requireControlError(t, fixture.exchange(request), protocol.ControlErrorResultsNoLongerRetained)
+	if controlError.Retryable {
+		t.Fatal("lost results must not be retryable")
+	}
+	if err := protocol.ValidateResultPageErrorCorrelation(request, controlError); err != nil {
+		t.Fatalf("page error correlation: %v", err)
+	}
+}

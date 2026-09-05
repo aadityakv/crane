@@ -40,7 +40,10 @@ func TestSuspectAloneNeverStartsReassignment(t *testing.T) {
 	h.waitGateOpen()
 	h.clk.Advance(time.Second)
 	h.actor.Wake()
-	h.waitFor(func() bool { return h.log.count("fence:3") >= 2 }, "second pass over suspect worker")
+	// pass-exchange elimination: settled workers are no longer re-fenced
+	// each pass, so the second pass over the suspect member is pinned by
+	// its event drain instead of its fence dial.
+	h.waitFor(func() bool { return h.log.count("status:3") >= 2 }, "second pass over suspect worker")
 	if h.log.contains("propose:deactivate") || h.log.contains("propose:replace-assignments") {
 		t.Fatalf("suspicion alone drove reassignment: %v", h.log.snapshot())
 	}
@@ -282,7 +285,15 @@ func TestNextLeaderCompletesReplacementAfterReplaceWorkerEpochCrash(t *testing.T
 	h.start()
 	h.markReady()
 	h.lead(2)
-	h.waitGateOpen()
+	// gate decoupling: the gate opens before the replacement converges, so
+	// wait for the pass's final artifact — the completed replacement and the
+	// Running installs that follow it.
+	h.waitFor(func() bool {
+		record, ok := h.job(job)
+		return ok && len(record.NeedsReassignment) == 0 && record.Assignment != nil &&
+			record.Assignment.Revision == assignment.Revision+1 &&
+			len(h.workers.installsFor(2, model.Running)) > 0 && len(h.workers.installsFor(3, model.Running)) > 0
+	}, "markers cleared by conditional replacement")
 	record, _ := h.job(job)
 	if len(record.NeedsReassignment) != 0 || record.Assignment.Revision != assignment.Revision+1 {
 		t.Fatalf("markers not cleared by conditional replacement: %#v", record)
@@ -353,7 +364,12 @@ func TestReRegistrationNeverOverridesDraining(t *testing.T) {
 	}
 
 	// A restarted incarnation replaces the epoch but preserves Draining.
+	// pass-exchange elimination: a fresh worker store means a fresh storage
+	// directory and therefore a fresh durable SWIM incarnation, so the
+	// restart is modeled with the incarnation bump the membership view
+	// observes; the settled-identity handshake skip relies on that delta.
 	h.addWorkerMember(2, model.WorkerEpoch{2, 0xB}, 4)
+	h.members.setMember(swim.Member{NodeID: 2, Host: "127.0.0.1", BasePort: 9000, Incarnation: 2, Status: swim.Alive})
 	h.actor.Wake()
 	h.waitFor(func() bool {
 		record, ok := h.workerRecord(2)

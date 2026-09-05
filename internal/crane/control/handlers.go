@@ -125,8 +125,11 @@ func activeViewMember(view membership.View, node uint16) (swim.Member, bool) {
 	return swim.Member{}, false
 }
 
-// dispatch performs the leader, gate, and per-request handling for one
-// decoded request, redirecting non-leaders with checked endpoints.
+// dispatch performs the leader check, the linearizing barrier, and the
+// per-request handling for one decoded request, redirecting non-leaders with
+// checked endpoints. Reads are served from the post-barrier applied view
+// regardless of the admission gate; mutations gate themselves in
+// proposeClientCommand.
 func (service *Service) dispatch(ctx context.Context, message protocol.ControlMessage) protocol.ControlMessage {
 	if !service.voter {
 		return service.staticRedirect()
@@ -142,21 +145,17 @@ func (service *Service) dispatch(ctx context.Context, message protocol.ControlMe
 		}
 		return requestBoundError(message, protocol.ControlErrorStarting, true, "leader barrier failed")
 	}
-	gateEpoch, open := service.gate.AdmissionEpoch()
-	if !open {
-		return requestBoundError(message, protocol.ControlErrorStarting, true, "admission gate is closed")
-	}
 	switch request := message.(type) {
 	case protocol.SubmitRequest:
 		return service.handleSubmit(ctx, request)
 	case protocol.CancelRequest:
 		return service.handleCancel(ctx, request)
 	case protocol.StatusRequest:
-		return service.handleStatus(request, gateEpoch)
+		return service.handleStatus(request)
 	case protocol.JobListRequest:
-		return service.handleJobList(request, gateEpoch)
+		return service.handleJobList(request)
 	case protocol.ResultPageRequest:
-		return service.handleResultPage(ctx, request, gateEpoch)
+		return service.handleResultPage(ctx, request)
 	default:
 		return nil
 	}
@@ -297,9 +296,9 @@ func (service *Service) clientRejection(request protocol.ControlMessage, result 
 }
 
 // handleJobList performs the atomic post-barrier view read of every retained
-// job summary and aborts instead of answering when the admission gate was
-// lost during the read.
-func (service *Service) handleJobList(request protocol.JobListRequest, gateEpoch model.CoordinatorEpoch) protocol.ControlMessage {
+// job summary; it is served from the applied view without any admission-gate
+// dependency.
+func (service *Service) handleJobList(request protocol.JobListRequest) protocol.ControlMessage {
 	view := service.machine.View()
 	jobs := make([]protocol.StatusResponse, 0, len(view.Jobs))
 	for _, record := range view.Jobs {
@@ -309,15 +308,12 @@ func (service *Service) handleJobList(request protocol.JobListRequest, gateEpoch
 		}
 		jobs = append(jobs, summary)
 	}
-	if !service.gateStillOpen(gateEpoch) {
-		return requestBoundError(request, protocol.ControlErrorStarting, true, "admission gate lost during the read")
-	}
 	return protocol.JobListResponse{LeaderNodeID: service.configuration.NodeID, AppliedIndex: view.AppliedIndex, Jobs: jobs}
 }
 
-// handleStatus performs the atomic post-barrier view read and aborts instead
-// of answering when the admission gate was lost during the read.
-func (service *Service) handleStatus(request protocol.StatusRequest, gateEpoch model.CoordinatorEpoch) protocol.ControlMessage {
+// handleStatus performs the atomic post-barrier view read; it is served from
+// the applied view without any admission-gate dependency.
+func (service *Service) handleStatus(request protocol.StatusRequest) protocol.ControlMessage {
 	view := service.machine.View()
 	record, ok := viewJob(view, request.JobID)
 	if !ok {
@@ -327,24 +323,18 @@ func (service *Service) handleStatus(request protocol.StatusRequest, gateEpoch m
 	if err != nil {
 		return nil
 	}
-	if !service.gateStillOpen(gateEpoch) {
-		return requestBoundError(request, protocol.ControlErrorStarting, true, "admission gate lost during the read")
-	}
 	return response
 }
 
 // handleResultPage serves one linearizable manifest-bound global result page
-// and aborts instead of answering when the admission gate was lost.
-func (service *Service) handleResultPage(ctx context.Context, request protocol.ResultPageRequest, gateEpoch model.CoordinatorEpoch) protocol.ControlMessage {
+// from the post-barrier applied view without any admission-gate dependency.
+func (service *Service) handleResultPage(ctx context.Context, request protocol.ResultPageRequest) protocol.ControlMessage {
 	if service.results.Fetcher == nil {
 		return requestBoundError(request, protocol.ControlErrorResultUnavailable, true, "result transfer is not composed")
 	}
 	page, err := service.results.Page(ctx, request)
 	if err != nil {
 		return service.resultPageRejection(request, err)
-	}
-	if !service.gateStillOpen(gateEpoch) {
-		return requestBoundError(request, protocol.ControlErrorStarting, true, "admission gate lost during the read")
 	}
 	return page
 }
@@ -362,6 +352,8 @@ func (service *Service) resultPageRejection(request protocol.ResultPageRequest, 
 		return response
 	case errors.Is(err, ErrInvalidResultPage):
 		return protocol.ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: protocol.ControlErrorInvalidRequest, Detail: []byte("invalid result page binding")}
+	case errors.Is(err, ErrResultsNoLongerRetained):
+		return requestBoundError(request, protocol.ControlErrorResultsNoLongerRetained, false, "results no longer retained")
 	case errors.Is(err, ErrCorruptResultSet):
 		return requestBoundError(request, protocol.ControlErrorCorruptResult, false, "committed result set is corrupt")
 	case errors.Is(err, ErrResultQueryUnavailable):
@@ -376,13 +368,6 @@ func (service *Service) resultPageRejection(request protocol.ResultPageRequest, 
 		}
 		return requestBoundError(request, protocol.ControlErrorResultUnavailable, true, detail)
 	}
-}
-
-// gateStillOpen reports whether the shared gate still admits the exact epoch
-// observed when the request began.
-func (service *Service) gateStillOpen(epoch model.CoordinatorEpoch) bool {
-	current, open := service.gate.AdmissionEpoch()
-	return open && current == epoch
 }
 
 // buildStatusResponse derives the complete bounded public summary from one

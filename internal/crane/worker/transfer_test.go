@@ -580,6 +580,13 @@ type transferRepository struct {
 	repairErrOnce error
 	beforeResult  func(model.ResultRecord)
 	beforeRepair  func(store.ResultRepairRecord)
+	// recoverCalls counts RecoverWork invocations and viewCalls counts
+	// InstalledView invocations, pinning that transfer validation reads the
+	// immutable installed view instead of full recoveries. viewOverride, when
+	// set, replaces the served view (tests simulate an unpublished snapshot).
+	recoverCalls int
+	viewCalls    int
+	viewOverride func() (map[model.JobID]store.InstalledAssignment, model.CoordinatorEpoch)
 }
 
 type realTransferRepository struct {
@@ -628,6 +635,17 @@ func (r *realTransferRepository) InstalledAssignment(job model.JobID) (store.Ins
 	}
 	return store.InstalledAssignment{}, false
 }
+func (r *realTransferRepository) InstalledView() (map[model.JobID]store.InstalledAssignment, model.CoordinatorEpoch) {
+	work, err := r.workerStore.RecoverWork()
+	if err != nil {
+		return nil, model.CoordinatorEpoch{}
+	}
+	view := make(map[model.JobID]store.InstalledAssignment, len(work.Assignments))
+	for _, assignment := range work.Assignments {
+		view[assignment.Assignment.JobID] = assignment
+	}
+	return view, work.Fence
+}
 func (r *realTransferRepository) UpsertResult(record model.ResultRecord, provenance model.ResultCopyProvenance) error {
 	return r.workerStore.UpsertResult(record, provenance)
 }
@@ -644,6 +662,7 @@ func (r *transferRepository) clone() *transferRepository {
 func (r *transferRepository) RecoverWork() (store.RecoveredWork, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.recoverCalls++
 	if r.recoverErr != nil {
 		return store.RecoveredWork{}, r.recoverErr
 	}
@@ -662,6 +681,23 @@ func (r *transferRepository) InstalledAssignment(job model.JobID) (store.Install
 	defer r.mu.Unlock()
 	v, ok := r.assignments[job]
 	return v, ok
+}
+
+// InstalledView serves the same durable authority the repository would
+// recover: one immutable map derived from the retained assignments plus the
+// durable fence. It is the test double of the engine's published snapshot.
+func (r *transferRepository) InstalledView() (map[model.JobID]store.InstalledAssignment, model.CoordinatorEpoch) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.viewCalls++
+	if r.viewOverride != nil {
+		return r.viewOverride()
+	}
+	view := make(map[model.JobID]store.InstalledAssignment, len(r.work.Assignments))
+	for _, assignment := range r.work.Assignments {
+		view[assignment.Assignment.JobID] = assignment
+	}
+	return view, r.work.Fence
 }
 func (r *transferRepository) UpsertResult(record model.ResultRecord, provenance model.ResultCopyProvenance) error {
 	if r.beforeResult != nil {

@@ -1700,7 +1700,12 @@ func validateSnapshotJob(machine *Machine, key model.JobID, job JobRecord, usedS
 			return errors.New("manifest cross-reference mismatch")
 		}
 		replica, ok := resultReplica(job.Assignment, sink)
-		if !ok || replica != manifest.Replicas {
+		// A manifest↔assignment divergence is legal exactly when the
+		// manifest carries the durable lost marker: the marker is the
+		// terminal honest record that the sealed bytes are gone, after
+		// which no re-seal can ever re-bind the placement. Without the
+		// marker the divergence stays a rejection as before.
+		if !ok || (replica != manifest.Replicas && !manifest.Lost) {
 			return errors.New("manifest assignment mismatch")
 		}
 		if manifest.TotalBytes > model.LimitsV1().MaxResultRecordsBytesPerJob-artifactBytes {

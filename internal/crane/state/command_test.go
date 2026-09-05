@@ -19,7 +19,7 @@ func TestCommandBeginCoordinatorEpochCanonicalGoldenAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBeginCoordinatorEpoch: %v", err)
 	}
-	const wantHex = "000180586b11b13c86be8ec0578a802c6d0f31b5126083e2fd4bcedbc3b8a8776950000100000000000000000000000000000000000000000000000000000000000000000000021100000000000000000000000000000000000000000000000000000000000000fdf7205a8198bbd43e5b4534220948e05c17b1c6cf799c96fd56c3a540ee5de50100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
+	const wantHex = "00013643617380aac22794af1b823d7da6beddbca7cc620e469928c4d3f3c533c116000100000000000000000000000000000000000000000000000000000000000000000000021100000000000000000000000000000000000000000000000000000000000000b0c130d7926613f3c0c35dd78ab24656b7cf2dfb22638b94d512940612958a060100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000231000000000000000000000000000000"
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("golden = %s, want %s", got, wantHex)
 	}
@@ -397,6 +397,7 @@ func TestCommandContractDescriptorMechanicallyMatchesCodecConstantsAndEnums(t *t
 		fmt.Sprintf("SealManifest=%d", CommandSealManifest),
 		fmt.Sprintf("TransitionJob=%d", CommandTransitionJob),
 		fmt.Sprintf("FailJob=%d", CommandFailJob),
+		fmt.Sprintf("MarkManifestLost=%d", CommandMarkManifestLost),
 	}
 	if !reflect.DeepEqual(commandValues, wantCommandValues) {
 		t.Fatalf("fingerprinted CommandKind domain = %v, want actual complete domain %v", commandValues, wantCommandValues)

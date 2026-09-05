@@ -65,7 +65,7 @@ const (
 	// StateCommandCheckpointEntryBytesV1 counts a source key and checkpoint record.
 	StateCommandCheckpointEntryBytesV1 uint64 = 36
 	// StateCommandManifestEntryBytesV1 counts a sink key and manifest record.
-	StateCommandManifestEntryBytesV1 uint64 = 200
+	StateCommandManifestEntryBytesV1 uint64 = 243
 	// StateCommandFailureBytesV1 counts one present failure report.
 	StateCommandFailureBytesV1 uint64 = 194
 	// StateCommandWorkerEventBytesV1 counts one worker-event key and cursor.
@@ -225,6 +225,7 @@ var stateCommandLayoutsV1 = []StateCommandLayoutDescriptor{
 	{Name: "ReplaceAssignments", Fields: []string{"Envelope:Envelope(internal-job-control)", "JobID:JobID", "ExpectedAssignmentRevision:u64(nonzero)", "ExpectedDigest:sha256(nonzero)", "ExpectedMarkersDigest:sha256(nonzero)", "Target:AssignmentSet(successor)"}},
 	{Name: "AdvanceCheckpoint", Fields: []string{"Envelope:Envelope(internal-source-checkpoint)", "Report:CompletionReport"}},
 	{Name: "SealManifest", Fields: []string{"Envelope:Envelope(internal-result-manifest)", "Manifest:ResultManifest"}},
+	{Name: "MarkManifestLost", Fields: []string{"Envelope:Envelope(internal-result-manifest)", "Manifest:ResultManifest"}},
 	{Name: "TransitionJob", Fields: []string{"Envelope:Envelope(internal-job-control)", "JobID:JobID", "From:JobLifecycle", "To:JobLifecycle"}},
 	{Name: "FailJob", Fields: []string{"Envelope:Envelope(internal-job-control)", "Report:JobFailureReport"}},
 	{Name: "WorkerRecord", Fields: []string{"NodeID:u16(nonzero)", "Epoch:bytes16(nonzero)", "State:u8", "Revision:u64(nonzero)", "Slots:u16", "ConsensusFingerprint:sha256", "RegistryFingerprint:sha256"}},
@@ -239,7 +240,7 @@ var stateCommandLayoutsV1 = []StateCommandLayoutDescriptor{
 	{Name: "InvalidationProvenance", Fields: []string{"Kind:WorkerInvalidationKind(zero-iff-worker-anchor-forgotten)", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "WorkerRevision:u64(zero-iff-worker-anchor-forgotten)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)", "Markers:u16-count+sorted(NeedsReassignment)", "RepairState:InvalidationRepairState", "RepairJobControlRevision:u64(nonzero-iff-anchored)", "RepairAssignmentRevision:u64(successor-iff-anchored)", "RepairAssignmentDigest:sha256(nonzero-iff-anchored)", "RepairMarkersDigest:sha256(nonzero-iff-anchored)"}},
 	{Name: "CompletionReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Source:TaskID", "Token:AssignmentToken", "Epoch:CoordinatorEpoch", "ExpectedCheckpointRevision:u64", "Prior:u64", "New:u64", "EOF:u64", "WorkerTransactionID:u64(nonzero)", "Digest:sha256(nonzero)"}},
 	{Name: "JobFailureReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Task:AssignmentToken", "Epoch:CoordinatorEpoch", "TransactionID:u64(nonzero)", "Code:FailureCode", "DetailDigest:sha256(nonzero)"}},
-	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet"}},
+	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet", "Lost:u8(bool)", "LostEpoch:CoordinatorEpoch(zero-iff-not-lost)", "LostRevision:u64(nonzero-iff-lost)"}},
 	{Name: "SourceEOFRecord", Fields: []string{"EOF:u64", "Revision:u64(exactly-one)"}},
 	{Name: "CheckpointRecord", Fields: []string{"Watermark:u64", "Revision:u64(nonzero)"}},
 	{Name: "WorkerEventCursor", Fields: []string{"WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "TransactionID:u64(nonzero)", "Digest:sha256(nonzero)"}},
@@ -268,7 +269,7 @@ var stateSnapshotLayoutsV2 = []StateCommandLayoutDescriptor{
 	{Name: "ResultReplicaSet", Fields: []string{"SinkTask:TaskID", "PrimaryNodeID:u16(nonzero)", "SecondaryNodeID:u16(nonzero-distinct)", "PrimaryEpoch:bytes16(nonzero)", "SecondaryEpoch:bytes16(nonzero)"}},
 	{Name: "NeedsReassignment", Fields: []string{"Kind:ReassignmentTargetKind", "Task:TaskID", "SinkTask:TaskID", "ReplicaRole:ResultReplicaRole", "OldWorkerID:u16(nonzero)", "OldWorkerEpoch:bytes16(nonzero)"}},
 	{Name: "InvalidationProvenance", Fields: []string{"Kind:WorkerInvalidationKind(zero-iff-worker-anchor-forgotten)", "WorkerID:u16(nonzero)", "WorkerEpoch:bytes16(nonzero)", "WorkerRevision:u64(zero-iff-worker-anchor-forgotten)", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "AssignmentDigest:sha256(nonzero)", "Markers:u16-count+sorted(NeedsReassignment)", "RepairState:InvalidationRepairState", "RepairJobControlRevision:u64(nonzero-iff-anchored)", "RepairAssignmentRevision:u64(successor-iff-anchored)", "RepairAssignmentDigest:sha256(nonzero-iff-anchored)", "RepairMarkersDigest:sha256(nonzero-iff-anchored)"}},
-	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet"}},
+	{Name: "ResultManifest", Fields: []string{"JobID:JobID", "SinkTask:TaskID", "ManifestRevision:u64(nonzero)", "SpecificationHash:sha256(nonzero)", "RecordCount:u64", "TotalBytes:u64(bounded)", "Checksum:sha256(nonzero)", "Replicas:ResultReplicaSet", "Lost:u8(bool)", "LostEpoch:CoordinatorEpoch(zero-iff-not-lost)", "LostRevision:u64(nonzero-iff-lost)"}},
 	{Name: "JobFailureReport", Fields: []string{"JobID:JobID", "JobControlRevision:u64(nonzero)", "AssignmentRevision:u64(nonzero)", "Task:AssignmentToken", "Epoch:CoordinatorEpoch", "TransactionID:u64(nonzero)", "Code:FailureCode", "DetailDigest:sha256(nonzero)"}},
 }
 
@@ -333,7 +334,7 @@ var stateSnapshotEstimatorConstantsV2 = []StateCommandConstantDescriptor{
 
 var stateCommandEnumsV1 = []StateCommandEnumDescriptor{
 	{Name: "IdentitySelector", Values: []string{"Client=1", "Internal=2"}},
-	{Name: "CommandKind", Values: []string{"BeginCoordinatorEpoch=1", "RegisterWorker=2", "DrainWorker=3", "DeactivateWorker=4", "ReplaceWorkerEpoch=5", "SubmitJob=6", "CancelJob=7", "RecordSourceEOF=8", "InstallAssignments=9", "ReplaceAssignments=10", "AdvanceCheckpoint=11", "SealManifest=12", "TransitionJob=13", "FailJob=14"}},
+	{Name: "CommandKind", Values: []string{"BeginCoordinatorEpoch=1", "RegisterWorker=2", "DrainWorker=3", "DeactivateWorker=4", "ReplaceWorkerEpoch=5", "SubmitJob=6", "CancelJob=7", "RecordSourceEOF=8", "InstallAssignments=9", "ReplaceAssignments=10", "AdvanceCheckpoint=11", "SealManifest=12", "TransitionJob=13", "FailJob=14", "MarkManifestLost=15"}},
 	{Name: "WorkerState", Values: []string{"Eligible=1", "Draining=2", "Offline=3"}},
 	{Name: "JobLifecycle", Values: []string{"Pending=1", "Deploying=2", "Running=3", "Draining=4", "Succeeded=5", "Failed=6", "Canceled=7"}},
 	{Name: "SubjectKind", Values: []string{"None=0", "Coordinator=1", "Worker=2", "JobControl=3", "SourceEOF=4", "SourceCheckpoint=5", "ResultManifest=6"}},
@@ -436,6 +437,7 @@ var stateCommandRulesV1 = []string{
 	"completion-and-failure-events-bind-the-current-coordinator-epoch-job-control-revision-assignment-revision-and-exact-current-token",
 	"checkpoints-never-exceed-immutable-source-eof-and-job-draining-requires-every-source-at-eof",
 	"sealed-manifests-bind-the-current-two-node-result-replica-set-and-succeeded-requires-every-current-manifest-and-final-checkpoint",
+	"mark-manifest-lost-declares-exactly-one-succeeded-jobs-committed-artifact-identity-lost-under-the-declaring-fence-keeps-the-placement-binding-advances-the-manifest-revision-once-and-forbids-every-later-seal-while-snapshot-validation-accepts-the-manifest-assignment-divergence-only-for-carried-lost-markers",
 	"result-manifest-count-is-zero-iff-total-bytes-is-zero-and-nonzero-count-times-canonical-record-minimum-and-maximum-brackets-total-bytes-with-checked-arithmetic",
 	"snapshot-accounting-includes-every-root-and-job-collection-count-map-key-entry-and-optional-selector-before-mutation",
 	"only-deploying-to-running-running-to-draining-and-draining-to-succeeded-are-normal-internal-lifecycle-transitions",

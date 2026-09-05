@@ -55,6 +55,13 @@ type controlRepository interface {
 	// RecoverWorkBounded is RecoverWork bounded by the control wait: a stalled
 	// store answers store.ErrBusy (retryable) instead of blocking the handler.
 	RecoverWorkBounded() (store.RecoveredWork, error)
+	// RecoverWorkViewWithin lends the callback the borrowed recovered-work
+	// view under the control wait bound, without cloning it: the callback
+	// must not mutate, block, or retain the borrowed view, and must not read
+	// Results (the borrowed view keeps logical records solely in the store's
+	// search indexes). The callback runs with the store lock held; it must
+	// not call any store method (self-deadlock).
+	RecoverWorkViewWithin(borrow func(*store.RecoveredWork) error) error
 	DurableTransactionID() (uint64, error)
 	Fence(model.CoordinatorEpoch) error
 	InstallAssignment(model.AssignmentSet, model.TopologySpec, uint64, model.SchedulingState, model.CoordinatorEpoch) error
@@ -65,6 +72,7 @@ type controlRepository interface {
 
 type controlEngine interface {
 	ReconcileAssignment(context.Context, model.JobID) error
+	ObserveFence(context.Context) error
 	ApplyCheckpoint(context.Context, protocol.CheckpointNotice) error
 	AcknowledgeEvents(context.Context, uint64) error
 }
@@ -561,24 +569,33 @@ func (owner *ControlOwner) handleRepairPull(ctx context.Context, session *Contro
 	if !complete {
 		return chunk, nil
 	}
-	work, err := owner.repository.RecoverWorkBounded()
-	if err != nil {
+	// borrowed reads: the completed-repair status needs only the durable
+	// repairs and fence; repairStatus copies its protocol values out.
+	var completed *protocol.ResultRepairStatus
+	var fence model.CoordinatorEpoch
+	found := false
+	if err := owner.repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error {
+		for _, repair := range work.Repairs {
+			if repair.Instruction.RepairID == request.Repair.RepairID && repair.Role == store.RepairSource {
+				status := repairStatus(repair)
+				completed = &status
+				fence = work.Fence
+				found = true
+				break
+			}
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	transaction, err := owner.repository.DurableTransactionID()
 	if err != nil {
 		return nil, err
 	}
-	for _, repair := range work.Repairs {
-		if repair.Instruction.RepairID == request.Repair.RepairID && repair.Role == store.RepairSource {
-			if transaction == 0 {
-				return nil, ErrControlStaleAssignment
-			}
-			status := repairStatus(repair)
-			return protocol.WorkerStatus{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, CoordinatorEpoch: work.Fence, StoreTransactionID: transaction, Repair: &status}, nil
-		}
+	if !found || transaction == 0 {
+		return nil, ErrControlStaleAssignment
 	}
-	return nil, ErrControlStaleAssignment
+	return protocol.WorkerStatus{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, CoordinatorEpoch: fence, StoreTransactionID: transaction, Repair: completed}, nil
 }
 
 func (owner *ControlOwner) finalCurrentSession(ctx context.Context, session *ControlSession, peer controlPeer, kind string, epoch model.CoordinatorEpoch) error {
@@ -594,14 +611,13 @@ func (owner *ControlOwner) finalCurrentSession(ctx context.Context, session *Con
 	if err := session.revalidate(peer.node); err != nil {
 		return err
 	}
-	work, err := owner.repository.RecoverWorkBounded()
-	if err != nil {
-		return err
-	}
-	if work.Fence == (model.CoordinatorEpoch{}) || epoch != work.Fence {
-		return ErrControlStaleEpoch
-	}
-	return nil
+	// borrowed reads: the current-fence equality check needs no owned copy.
+	return owner.repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error {
+		if work.Fence == (model.CoordinatorEpoch{}) || epoch != work.Fence {
+			return ErrControlStaleEpoch
+		}
+		return nil
+	})
 }
 
 func (owner *ControlOwner) finalMutation(ctx context.Context, session *ControlSession, peer controlPeer, kind string, epoch model.CoordinatorEpoch, exact bool) error {
@@ -624,31 +640,44 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, false); err != nil {
 		return nil, err
 	}
-	work, err := owner.repository.RecoverWorkBounded()
+	// borrowed reads: the fence checks compare the durable fence only.
+	durableFence := func() (model.CoordinatorEpoch, error) {
+		var fence model.CoordinatorEpoch
+		err := owner.repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error {
+			fence = work.Fence
+			return nil
+		})
+		return fence, err
+	}
+	fence, err := durableFence()
 	if err != nil {
 		return nil, err
 	}
-	if work.Fence != (model.CoordinatorEpoch{}) {
-		comparison := compareControlEpoch(request.CoordinatorEpoch, work.Fence)
-		if comparison < 0 || comparison == 0 && request.CoordinatorEpoch != work.Fence {
+	if fence != (model.CoordinatorEpoch{}) {
+		comparison := compareControlEpoch(request.CoordinatorEpoch, fence)
+		if comparison < 0 || comparison == 0 && request.CoordinatorEpoch != fence {
 			return nil, ErrControlStaleEpoch
 		}
 		if comparison == 0 {
-			return owner.fenceResponse(work.Fence), nil
+			// Idempotent redelivery of the already-durable fence skips
+			// ObserveFence safely: the original request observed this exact
+			// transition, or this process recovered the fence at startup.
+			return owner.fenceResponse(fence), nil
 		}
 	}
 	if err := owner.gate.CloseAndWait(ctx); err != nil {
 		return nil, err
 	}
-	work, err = owner.repository.RecoverWorkBounded()
+	fence, err = durableFence()
 	if err != nil {
 		return nil, err
 	}
-	if work.Fence != (model.CoordinatorEpoch{}) {
-		comparison := compareControlEpoch(request.CoordinatorEpoch, work.Fence)
+	if fence != (model.CoordinatorEpoch{}) {
+		comparison := compareControlEpoch(request.CoordinatorEpoch, fence)
 		if comparison <= 0 {
-			if comparison == 0 && request.CoordinatorEpoch == work.Fence {
-				return owner.fenceResponse(work.Fence), nil
+			if comparison == 0 && request.CoordinatorEpoch == fence {
+				// Same-fence retry after the gate drain: already observed above.
+				return owner.fenceResponse(fence), nil
 			}
 			return nil, ErrControlStaleEpoch
 		}
@@ -657,6 +686,12 @@ func (owner *ControlOwner) handleFence(ctx context.Context, session *ControlSess
 		return nil, err
 	}
 	if err := owner.repository.Fence(request.CoordinatorEpoch); err != nil {
+		return nil, err
+	}
+	// The durable fence changed: the serialized engine owner re-establishes
+	// its installed view at this exact transition, exactly as an install
+	// command does, so it never keeps serving the superseded fence.
+	if err := owner.engine.ObserveFence(ctx); err != nil {
 		return nil, err
 	}
 	owner.closeOlderCoordinatorSessions(session, request.CoordinatorEpoch)
@@ -668,12 +703,14 @@ func (owner *ControlOwner) authorizeCoordinator(peer controlPeer, epoch model.Co
 		return ErrControlUnauthorized
 	}
 	if exact {
-		work, err := owner.repository.RecoverWorkBounded()
-		if err != nil {
+		// borrowed reads: exact coordinator authority needs only the fence.
+		if err := owner.repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error {
+			if work.Fence == (model.CoordinatorEpoch{}) || epoch != work.Fence {
+				return ErrControlStaleEpoch
+			}
+			return nil
+		}); err != nil {
 			return err
-		}
-		if work.Fence == (model.CoordinatorEpoch{}) || epoch != work.Fence {
-			return ErrControlStaleEpoch
 		}
 	}
 	return nil
@@ -726,20 +763,42 @@ func (owner *ControlOwner) handleAssignment(ctx context.Context, session *Contro
 	if err := owner.authorizeCoordinator(peer, request.CoordinatorEpoch, true); err != nil {
 		return nil, err
 	}
-	work, err := owner.repository.RecoverWorkBounded()
-	if err != nil {
-		return nil, err
-	}
-	if prior, ok := controlAssignment(work, request.Assignment.JobID); ok && request.Assignment.Revision > prior.Assignment.Revision && request.Assignment.Revision-prior.Assignment.Revision > 1 {
-		return nil, ErrControlStaleAssignment
-	}
-	if !assignmentTargetsWorker(request.Assignment, owner.localNode, owner.localEpoch) {
-		if request.SchedulingState == model.Running || !owner.historicalResultsAuthorizeAssignment(work, request.Assignment, request.SpecificationDigest) {
-			return nil, ErrControlStaleAssignment
+	// planAssignment validates the install against recovered work. The
+	// historical-holder branch reads retained Results, which the borrowed
+	// view does not carry (the store keeps them solely in its search
+	// indexes), so that branch falls back to one bounded cloned read.
+	planAssignment := func(work *store.RecoveredWork, borrowed bool) (needsClone bool, err error) {
+		if prior, ok := controlAssignment(*work, request.Assignment.JobID); ok && request.Assignment.Revision > prior.Assignment.Revision && request.Assignment.Revision-prior.Assignment.Revision > 1 {
+			return false, ErrControlStaleAssignment
 		}
+		if !assignmentTargetsWorker(request.Assignment, owner.localNode, owner.localEpoch) {
+			if borrowed && request.SchedulingState != model.Running {
+				return true, nil
+			}
+			if request.SchedulingState == model.Running || !owner.historicalResultsAuthorizeAssignment(*work, request.Assignment, request.SpecificationDigest) {
+				return false, ErrControlStaleAssignment
+			}
+		}
+		return false, owner.validateLocalSlots(*work, request.Assignment, request.SchedulingState)
 	}
-	if err := owner.validateLocalSlots(work, request.Assignment, request.SchedulingState); err != nil {
+	needsClone := false
+	// borrowed reads: the revision-gap and local-slot admission checks copy
+	// nothing out of the durable work.
+	if err := owner.repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error {
+		var err error
+		needsClone, err = planAssignment(work, true)
+		return err
+	}); err != nil {
 		return nil, err
+	}
+	if needsClone {
+		work, err := owner.repository.RecoverWorkBounded()
+		if err != nil {
+			return nil, err
+		}
+		if _, err = planAssignment(&work, false); err != nil {
+			return nil, err
+		}
 	}
 	if err := owner.finalMutation(ctx, session, peer, "assignment", request.CoordinatorEpoch, true); err != nil {
 		return nil, err
@@ -842,6 +901,22 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSes
 			return nil, err
 		}
 	}
+	if request.Repair == nil && request.Inventory == nil {
+		// borrowed reads: the plain status sweep copies out only the fence
+		// and the installed assignment summary, all protocol values.
+		var fence model.CoordinatorEpoch
+		var installed []protocol.InstalledAssignmentStatus
+		if err := owner.repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error {
+			fence = work.Fence
+			installed = assignmentStatusSummary(work.Assignments)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return owner.statusResponse(request, fence, installed, nil)
+	}
+	// The repair and inventory paths read retained Results, which the
+	// borrowed view does not carry; they keep the bounded cloned read.
 	work, err := owner.repository.RecoverWorkBounded()
 	if err != nil {
 		return nil, err
@@ -857,42 +932,57 @@ func (owner *ControlOwner) handleStatus(ctx context.Context, session *ControlSes
 			return nil, err
 		}
 	}
-	transaction, err := owner.repository.DurableTransactionID()
+	response, err := owner.statusResponse(request, work.Fence, assignmentStatusSummary(work.Assignments), repair)
 	if err != nil {
 		return nil, err
+	}
+	if request.Inventory != nil {
+		summary, inventoryErr := owner.controlInventory(work, *request.Inventory)
+		if inventoryErr != nil {
+			return nil, inventoryErr
+		}
+		response.Inventory = &summary
+	}
+	return response, nil
+}
+
+// statusResponse assembles the worker status from copied-out fence and
+// assignment values plus the durable event/transaction cursors.
+func (owner *ControlOwner) statusResponse(request protocol.WorkerStatusRequest, fence model.CoordinatorEpoch, installed []protocol.InstalledAssignmentStatus, repair *protocol.ResultRepairStatus) (protocol.WorkerStatus, error) {
+	transaction, err := owner.repository.DurableTransactionID()
+	if err != nil {
+		return protocol.WorkerStatus{}, err
 	}
 	events, last, more, err := owner.repository.PendingEvents(request.AfterTransactionID, request.MaxEvents)
 	if err != nil {
-		return nil, err
+		return protocol.WorkerStatus{}, err
 	}
 	if transaction == 0 || transaction < last || transaction < request.AfterTransactionID {
-		return nil, ErrControlStaleAssignment
+		return protocol.WorkerStatus{}, ErrControlStaleAssignment
 	}
-	status := protocol.WorkerStatus{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, CoordinatorEpoch: work.Fence, StoreTransactionID: transaction, AfterTransactionID: request.AfterTransactionID, Events: cloneControlEvents(events), LastTransactionID: last, HasMore: more, Repair: repair}
+	status := protocol.WorkerStatus{NodeID: owner.localNode, WorkerEpoch: owner.localEpoch, CoordinatorEpoch: fence, StoreTransactionID: transaction, AfterTransactionID: request.AfterTransactionID, Events: cloneControlEvents(events), LastTransactionID: last, HasMore: more, Repair: repair}
 	if admission, open := owner.gate.AdmissionEpoch(); open {
 		// The process admission gate opens only on a Running install, so the
 		// reported epoch distinguishes a restarted (closed-gate) process from
 		// an admitted one for the leader's convergence decisions.
 		status.AdmissionEpoch = admission
 	}
-	status.Assignments = make([]protocol.InstalledAssignmentStatus, len(work.Assignments))
-	for index, assignment := range work.Assignments {
-		status.Assignments[index] = protocol.InstalledAssignmentStatus{JobID: assignment.Assignment.JobID, JobControlRevision: assignment.JobControlRevision, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, SpecificationDigest: assignment.Topology.Digest(), SchedulingState: assignment.SchedulingState}
-	}
-	sort.Slice(status.Assignments, func(i, j int) bool {
-		return bytes.Compare(status.Assignments[i].JobID[:], status.Assignments[j].JobID[:]) < 0
-	})
-	if request.Inventory != nil {
-		summary, inventoryErr := owner.controlInventory(work, *request.Inventory)
-		if inventoryErr != nil {
-			return nil, inventoryErr
-		}
-		status.Inventory = &summary
-	}
+	status.Assignments = installed
 	if request.Repair == nil && repair == nil {
 		status.Repair = nil
 	}
 	return status, nil
+}
+
+func assignmentStatusSummary(assignments []store.InstalledAssignment) []protocol.InstalledAssignmentStatus {
+	installed := make([]protocol.InstalledAssignmentStatus, len(assignments))
+	for index, assignment := range assignments {
+		installed[index] = protocol.InstalledAssignmentStatus{JobID: assignment.Assignment.JobID, JobControlRevision: assignment.JobControlRevision, AssignmentRevision: assignment.Assignment.Revision, AssignmentDigest: assignment.Assignment.Digest, SpecificationDigest: assignment.Topology.Digest(), SchedulingState: assignment.SchedulingState}
+	}
+	sort.Slice(installed, func(i, j int) bool {
+		return bytes.Compare(installed[i].JobID[:], installed[j].JobID[:]) < 0
+	})
+	return installed
 }
 
 func cloneControlEvents(events []model.WorkerEvent) []model.WorkerEvent {
@@ -1151,49 +1241,81 @@ func (owner *ControlOwner) handleCheckpoint(ctx context.Context, session *Contro
 	if err := owner.authorizeCoordinator(peer, request.Notice.Epoch, true); err != nil {
 		return nil, err
 	}
-	work, err := owner.repository.RecoverWorkBounded()
-	if err != nil {
+	// planCheckpoint validates the notice against recovered work and reports
+	// whether the locally owned source already durably covers it. The
+	// historical-holder branch reads retained Results, which the borrowed
+	// view does not carry, so that branch falls back to one bounded clone.
+	planCheckpoint := func(work *store.RecoveredWork, borrowed bool) (local, confirmed, needsClone bool, err error) {
+		assignment, ok := controlAssignment(*work, request.Notice.JobID)
+		if !ok || assignment.CoordinatorEpoch != work.Fence || request.Notice.Epoch != work.Fence || request.JobControlRevision != assignment.JobControlRevision || request.AssignmentRevision != assignment.Assignment.Revision || request.AssignmentDigest != assignment.Assignment.Digest {
+			return false, false, false, ErrControlStaleAssignment
+		}
+		if !assignmentTargetsWorker(assignment.Assignment, owner.localNode, owner.localEpoch) {
+			if borrowed {
+				return false, false, true, nil
+			}
+			if !owner.historicalResultHolder(*work, assignment) {
+				return false, false, false, ErrControlStaleAssignment
+			}
+		}
+		var source model.AssignmentToken
+		for _, token := range assignment.Assignment.Tasks {
+			if token.Task == request.Notice.Source {
+				source = token
+				break
+			}
+		}
+		stage, stageOK := controlStage(assignment.Topology.Spec(), request.Notice.Source.StageID)
+		if source == (model.AssignmentToken{}) || !stageOK || stage.Role != model.StageSource {
+			return false, false, false, ErrControlStaleAssignment
+		}
+		if source.WorkerID == owner.localNode && source.WorkerEpoch == owner.localEpoch {
+			return true, owner.checkpointAlreadyDurable(*work, request), false, nil
+		}
+		return false, false, false, nil
+	}
+	local, confirmed, needsClone := false, false, false
+	// borrowed reads: the notice's assignment/fence/source checks copy
+	// nothing out of the durable work.
+	if err := owner.repository.RecoverWorkViewWithin(func(work *store.RecoveredWork) error {
+		var err error
+		local, confirmed, needsClone, err = planCheckpoint(work, true)
+		return err
+	}); err != nil {
 		return nil, err
 	}
-	assignment, ok := controlAssignment(work, request.Notice.JobID)
-	if !ok || assignment.CoordinatorEpoch != work.Fence || request.Notice.Epoch != work.Fence || request.JobControlRevision != assignment.JobControlRevision || request.AssignmentRevision != assignment.Assignment.Revision || request.AssignmentDigest != assignment.Assignment.Digest || !assignmentTargetsWorker(assignment.Assignment, owner.localNode, owner.localEpoch) && !owner.historicalResultHolder(work, assignment) {
-		return nil, ErrControlStaleAssignment
-	}
-	var source model.AssignmentToken
-	for _, token := range assignment.Assignment.Tasks {
-		if token.Task == request.Notice.Source {
-			source = token
-			break
+	if needsClone {
+		work, err := owner.repository.RecoverWorkBounded()
+		if err != nil {
+			return nil, err
+		}
+		if local, confirmed, _, err = planCheckpoint(&work, false); err != nil {
+			return nil, err
 		}
 	}
-	stage, stageOK := controlStage(assignment.Topology.Spec(), request.Notice.Source.StageID)
-	if source == (model.AssignmentToken{}) || !stageOK || stage.Role != model.StageSource {
-		return nil, ErrControlStaleAssignment
-	}
-	if source.WorkerID == owner.localNode && source.WorkerEpoch == owner.localEpoch {
-		if confirmed := owner.checkpointAlreadyDurable(work, request); confirmed {
-			// The committed checkpoint is already durable here; a redelivered
-			// notice (a later leadership pass carries a higher Raft index, and
-			// the trivially committed zero watermark carries nothing) is
-			// confirmed without any engine or store mutation. Byte-exact
-			// duplicates still flow through the serialized engine so the
-			// durable store answers them.
-			if err := owner.finalCurrentSession(ctx, session, peer, "checkpoint", request.Notice.Epoch); err != nil {
-				return nil, err
-			}
-			return owner.checkpointAck(request), nil
+	if local && confirmed {
+		// The committed checkpoint is already durable here; a redelivered
+		// notice (a later leadership pass carries a higher Raft index, and
+		// the trivially committed zero watermark carries nothing) is
+		// confirmed without any engine or store mutation. Byte-exact
+		// duplicates still flow through the serialized engine so the
+		// durable store answers them.
+		if err := owner.finalCurrentSession(ctx, session, peer, "checkpoint", request.Notice.Epoch); err != nil {
+			return nil, err
 		}
+		return owner.checkpointAck(request), nil
 	}
 	if err := owner.finalMutation(ctx, session, peer, "checkpoint", request.Notice.Epoch, true); err != nil {
 		return nil, err
 	}
-	if source.WorkerID == owner.localNode && source.WorkerEpoch == owner.localEpoch {
-		err = owner.engine.ApplyCheckpoint(ctx, request)
+	var applyErr error
+	if local {
+		applyErr = owner.engine.ApplyCheckpoint(ctx, request)
 	} else {
-		err = owner.repository.ObserveCheckpoint(request)
+		applyErr = owner.repository.ObserveCheckpoint(request)
 	}
-	if err != nil {
-		return nil, err
+	if applyErr != nil {
+		return nil, applyErr
 	}
 	return owner.checkpointAck(request), nil
 }

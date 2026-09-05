@@ -31,7 +31,10 @@ This builds the binaries, creates `./local.secret` with owner-only permissions
 on first run, starts a three-node cluster with data under `./data/dev`, and
 serves a read-only job dashboard at `http://127.0.0.1:8080`. Press Ctrl-C to
 stop the whole cluster; re-running `make dev` resumes it (the cluster ID is
-persisted under the data root). Submit and inspect jobs from another shell:
+persisted under the data root). Rebuilding after an operator change moves
+the consensus fingerprint, so incompatible dev state is reset automatically
+and the cluster re-bootstraps fresh. Submit and inspect jobs from another
+shell:
 
 ```sh
 ./bin/crane submit  -config data/dev/configs/node-1.json -state data/dev/client.state -topology examples/topologies/word-count.json

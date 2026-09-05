@@ -6,7 +6,7 @@ import (
 	"github.com/aadityakv/crane/internal/crane/model"
 )
 
-func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxRecord) error {
+func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxRecord, proven map[model.DeliveryID]struct{}) error {
 	if uint64(len(outboxes)) > model.LimitsV1().MaxDerivedDeliveries {
 		return errors.New("source outbox count exceeds v1 bounds")
 	}
@@ -59,7 +59,7 @@ func applySource(work *RecoveredWork, cursor SourceCursor, outboxes []OutboxReco
 			}
 			return errors.New("source outbox does not match immutable source route")
 		}
-		if err := validateOutbox(outbox, assignment, work.Fence); err != nil {
+		if err := validateOutbox(outbox, assignment, work.Fence, proven); err != nil {
 			return err
 		}
 	}

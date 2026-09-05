@@ -9,7 +9,7 @@ import (
 	"github.com/aadityakv/crane/internal/crane/protocol"
 )
 
-func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
+func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice, proven map[model.DeliveryID]struct{}) error {
 	if err := notice.Validate(); err != nil {
 		return err
 	}
@@ -120,7 +120,13 @@ func applyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
 	for _, outbox := range work.Outboxes {
 		if outbox.ID.Tuple.SourceTask != notice.Source || outbox.ID.Tuple.SourceSequence > notice.Watermark {
 			kept = append(kept, outbox)
+			continue
 		}
+		// A compacted outbox can never be recreated — the source cursor's
+		// watermark/next-sequence monotonicity forbids re-emitting its
+		// sequence and both creation funnels reject an already-present
+		// identity — so its cached proof is dead weight: prune it.
+		delete(proven, outbox.ID)
 	}
 	work.Outboxes = kept
 	return nil
@@ -177,7 +183,7 @@ func validateCheckpointObservation(observation CommittedCheckpoint) error {
 
 // applyLegacyCheckpoint replays only an already-durable schema-v1 Task14
 // checkpoint. New writes use schema v2 and always enter applyCheckpoint.
-func applyLegacyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) error {
+func applyLegacyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice, proven map[model.DeliveryID]struct{}) error {
 	if err := notice.Validate(); err != nil {
 		return err
 	}
@@ -225,7 +231,11 @@ func applyLegacyCheckpoint(work *RecoveredWork, notice model.CheckpointNotice) e
 	for _, outbox := range work.Outboxes {
 		if outbox.ID.Tuple.SourceTask != notice.Source || outbox.ID.Tuple.SourceSequence > notice.Watermark {
 			keptOutboxes = append(keptOutboxes, outbox)
+			continue
 		}
+		// Compacted identities never return (see applyCheckpoint); prune the
+		// dead proof alongside the dropped record.
+		delete(proven, outbox.ID)
 	}
 	work.Outboxes = keptOutboxes
 	return nil

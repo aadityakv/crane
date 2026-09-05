@@ -18,6 +18,9 @@ type ResultManifest struct {
 	TotalBytes        uint64                 // TotalBytes is the complete artifact byte count.
 	Checksum          [32]byte               // Checksum authenticates the artifact stream.
 	Replicas          model.ResultReplicaSet // Replicas are the exact two current copies.
+	Lost              bool                   // Lost records that no servable copy of the sealed bytes remains.
+	LostEpoch         model.CoordinatorEpoch // LostEpoch names the fence that declared the loss.
+	LostRevision      uint64                 // LostRevision is the manifest revision recording the loss.
 }
 
 // Validate reports whether the manifest names a real sink task with a consistent artifact and replica set.
@@ -30,6 +33,15 @@ func (manifest ResultManifest) Validate() error {
 	}
 	if err := manifest.Replicas.Validate(); err != nil || manifest.Replicas.SinkTask != manifest.SinkTask {
 		return errors.New("manifest replica set mismatch")
+	}
+	if manifest.Lost {
+		// The lost marker is the honest terminal record of the sealed bytes:
+		// it must name the declaring fence and the revision that recorded it.
+		if err := manifest.LostEpoch.Validate(); err != nil || manifest.LostRevision != manifest.ManifestRevision {
+			return errors.New("lost result manifest carries an inconsistent loss marker")
+		}
+	} else if manifest.LostEpoch != (model.CoordinatorEpoch{}) || manifest.LostRevision != 0 {
+		return errors.New("retained result manifest carries a loss marker")
 	}
 	if manifest.RecordCount == 0 {
 		if manifest.TotalBytes != 0 {
@@ -55,6 +67,14 @@ type SealManifest struct {
 	Manifest ResultManifest // Manifest is the complete successor record.
 }
 
+// MarkManifestLost records the terminal loss of one Succeeded job's sealed
+// artifact: the exact committed identity stays, the placement binding stays,
+// and the successor carries the durable lost marker.
+type MarkManifestLost struct {
+	Envelope Envelope       // Envelope carries manifest and coordinator fences.
+	Manifest ResultManifest // Manifest is the complete successor record.
+}
+
 // TransitionJob conditionally applies one legal nonterminal lifecycle edge.
 type TransitionJob struct {
 	Envelope Envelope     // Envelope carries job-control and coordinator fences.
@@ -74,6 +94,16 @@ func NewSealManifest(id InternalCommandID, expectedRevision uint64, manifest Res
 	command := SealManifest{Manifest: manifest}
 	command.Envelope = newInternalEnvelope(CommandSealManifest, SubjectKey{Kind: SubjectResultManifest, JobID: manifest.JobID, TaskID: manifest.SinkTask}, id, expectedRevision, fence...)
 	command.Envelope.Internal.Digest = internalDigest(command.Envelope, sealManifestTarget(command))
+	return command, command.Validate()
+}
+
+// NewMarkManifestLost builds one digest-bound terminal loss declaration for a
+// committed sink manifest. The successor manifest must already carry the lost
+// marker bound to the declaring fence.
+func NewMarkManifestLost(id InternalCommandID, expectedRevision uint64, manifest ResultManifest, fence ...model.CoordinatorEpoch) (MarkManifestLost, error) {
+	command := MarkManifestLost{Manifest: manifest}
+	command.Envelope = newInternalEnvelope(CommandMarkManifestLost, SubjectKey{Kind: SubjectResultManifest, JobID: manifest.JobID, TaskID: manifest.SinkTask}, id, expectedRevision, fence...)
+	command.Envelope.Internal.Digest = internalDigest(command.Envelope, markManifestLostTarget(command))
 	return command, command.Validate()
 }
 
@@ -105,7 +135,31 @@ func (command SealManifest) Validate() error {
 	if err := command.Manifest.Validate(); err != nil {
 		return err
 	}
+	if command.Manifest.Lost {
+		return fmt.Errorf("%w: seal cannot declare a lost manifest", ErrInvalidCommandSubject)
+	}
 	if command.Envelope.Internal.Digest != internalDigest(command.Envelope, sealManifestTarget(command)) {
+		return ErrCommandDigestMismatch
+	}
+	return nil
+}
+
+// Validate reports whether the command's envelope, manifest subject and revision, lost marker, and digest all agree.
+func (command MarkManifestLost) Validate() error {
+	if err := command.Envelope.Validate(); err != nil {
+		return err
+	}
+	key := SubjectKey{Kind: SubjectResultManifest, JobID: command.Manifest.JobID, TaskID: command.Manifest.SinkTask}
+	if command.Envelope.Kind != CommandMarkManifestLost || command.Envelope.Internal == nil || command.Envelope.Internal.Subject != key || command.Manifest.ManifestRevision != command.Envelope.Internal.ExpectedRevision+1 {
+		return fmt.Errorf("%w: lost-manifest subject/revision mismatch", ErrInvalidCommandSubject)
+	}
+	if err := command.Manifest.Validate(); err != nil {
+		return err
+	}
+	if !command.Manifest.Lost || command.Manifest.LostEpoch != command.Envelope.CoordinatorEpoch {
+		return fmt.Errorf("%w: lost-manifest marker does not bind the declaring fence", ErrInvalidCommandSubject)
+	}
+	if command.Envelope.Internal.Digest != internalDigest(command.Envelope, markManifestLostTarget(command)) {
 		return ErrCommandDigestMismatch
 	}
 	return nil
@@ -159,7 +213,15 @@ func (machine *Machine) applySealManifestLocked(command SealManifest) ([]byte, e
 			return mutationPlan{result: result, reject: true}, err
 		}
 		currentReplica, replicaExists := resultReplica(record.Assignment, manifest.SinkTask)
-		valid := record.Lifecycle == JobDraining && record.Assignment != nil && len(record.NeedsReassignment) == 0 && allCheckpointsFinal(record) && manifest.ManifestRevision == nextRevision && manifest.SpecificationHash == record.TopologyDigest && replicaExists && currentReplica == manifest.Replicas && machine.replicaWorkersCurrent(currentReplica) && manifestTotalWithinLimit(record.Manifests, manifest)
+		// A Succeeded job seals exactly like a Draining one: after a replica
+		// reassignment re-established the artifact on current workers, the
+		// manifest must re-bind to the live placement for result pages to
+		// stay servable. The identical guards (final checkpoints, no pending
+		// markers, current replica workers) keep the terminal re-seal honest.
+		// A manifest already declared lost stays lost: its sealed bytes are
+		// gone forever, so no later seal may resurrect the identity.
+		valid := (record.Lifecycle == JobDraining || record.Lifecycle == JobSucceeded) && record.Assignment != nil && len(record.NeedsReassignment) == 0 && allCheckpointsFinal(record) && manifest.ManifestRevision == nextRevision && manifest.SpecificationHash == record.TopologyDigest && replicaExists && currentReplica == manifest.Replicas && machine.replicaWorkersCurrent(currentReplica) && manifestTotalWithinLimit(record.Manifests, manifest) &&
+			!(manifestExists && record.Manifests[manifest.SinkTask].Lost)
 		if !valid {
 			result, err := marshalBusinessResult(ResultInvalidTarget, key, currentRevision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err
@@ -172,6 +234,45 @@ func (machine *Machine) applySealManifestLocked(command SealManifest) ([]byte, e
 			delta = int64(resultManifestEntryEstimatedBytes)
 		}
 		return mutationPlan{result: result, stateDelta: delta, commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
+	})
+}
+
+// applyMarkManifestLostLocked commits the terminal loss declaration of one
+// Succeeded job's committed manifest. The successor must repeat the committed
+// artifact identity and placement exactly — the marker is only the honest
+// record that the sealed bytes are gone — and only a Succeeded job with no
+// pending reassignment may declare it. Failed, Canceled, and nonterminal jobs
+// are rejected: they retain no availability duty the marker could discharge.
+func (machine *Machine) applyMarkManifestLostLocked(command MarkManifestLost) ([]byte, error) {
+	manifest := command.Manifest
+	record, exists := machine.jobs[manifest.JobID]
+	currentRevision := uint64(0)
+	if exists {
+		currentRevision = record.Manifests[manifest.SinkTask].ManifestRevision
+	}
+	key := command.Envelope.Internal.Subject
+	target := markManifestLostTarget(command)
+	return machine.applyInternalAtRevisionLocked(command.Envelope, target, currentRevision, func(nextRevision uint64) (mutationPlan, error) {
+		if !exists {
+			result, err := marshalBusinessResult(ResultNotFound, key, currentRevision, model.CoordinatorEpoch{})
+			return mutationPlan{result: result, reject: true}, err
+		}
+		committed, sealed := record.Manifests[manifest.SinkTask]
+		valid := record.Lifecycle == JobSucceeded && record.Assignment != nil && len(record.NeedsReassignment) == 0 && sealed &&
+			committed.ManifestRevision == currentRevision && !committed.Lost &&
+			committed.SpecificationHash == record.TopologyDigest &&
+			manifest.ManifestRevision == nextRevision && manifest.SpecificationHash == record.TopologyDigest &&
+			manifest.Lost && manifest.LostRevision == nextRevision && manifest.LostEpoch == command.Envelope.CoordinatorEpoch &&
+			committed.RecordCount == manifest.RecordCount && committed.TotalBytes == manifest.TotalBytes && committed.Checksum == manifest.Checksum &&
+			committed.Replicas == manifest.Replicas && committed.SinkTask == manifest.SinkTask && committed.JobID == manifest.JobID
+		if !valid {
+			result, err := marshalBusinessResult(ResultInvalidTarget, key, currentRevision, model.CoordinatorEpoch{})
+			return mutationPlan{result: result, reject: true}, err
+		}
+		candidate := cloneJobRecord(record)
+		candidate.Manifests[manifest.SinkTask] = manifest
+		result, err := marshalBusinessResult(ResultSuccess, key, nextRevision, model.CoordinatorEpoch{})
+		return mutationPlan{result: result, commit: func() { machine.jobs[candidate.JobID] = candidate }}, err
 	})
 }
 
@@ -336,7 +437,16 @@ func allManifestsCurrent(record JobRecord) bool {
 	}
 	for _, replica := range record.Assignment.ResultReplicas {
 		manifest, ok := record.Manifests[replica.SinkTask]
-		if !ok || manifest.SpecificationHash != record.TopologyDigest || manifest.Replicas != replica || !machineReplicaCurrent(record, manifest) {
+		if !ok || manifest.SpecificationHash != record.TopologyDigest {
+			return false
+		}
+		if manifest.Lost {
+			// A lost manifest's placement binding is terminal: the honest
+			// record that the sealed bytes are gone forever is exactly as
+			// current as the job's result availability can ever become.
+			continue
+		}
+		if manifest.Replicas != replica || !machineReplicaCurrent(record, manifest) {
 			return false
 		}
 	}

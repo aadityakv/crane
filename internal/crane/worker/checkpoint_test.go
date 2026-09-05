@@ -478,11 +478,14 @@ func TestCheckpointSupersededUnappliedReportCanBeAcknowledgedAndRepublished(t *t
 	repository.mu.Lock()
 	repository.assignments[replacement.JobID] = installed
 	repository.mu.Unlock()
-	if err := engine.AcknowledgeEvents(ctx, 1); err != nil {
-		t.Fatalf("strict successor did not prove stale report: %v", err)
-	}
+	// engine cache: the replacement reaches the serialized owner as an
+	// assignment command before any later status exchange, exactly as the
+	// control session persists and reconciles it.
 	if err := engine.ReconcileAssignment(ctx, replacement.JobID); err != nil {
 		t.Fatal(err)
+	}
+	if err := engine.AcknowledgeEvents(ctx, 1); err != nil {
+		t.Fatalf("strict successor did not prove stale report: %v", err)
 	}
 	waitFor(t, func() bool {
 		repository.mu.Lock()
@@ -507,6 +510,15 @@ func TestCheckpointCompactionNeverCollectsAboveWatermarkOrResults(t *testing.T) 
 		t.Fatal(err)
 	}
 	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	// engine cache: the serialized view is seeded by recovery before any
+	// direct-drive checkpoint application.
+	recovered, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err := engine.consumeRecovery(recovered); err != nil {
+		t.Fatal(err)
+	}
 	source := fixture.source.Task
 	cursor := store.SourceCursor{Source: source, NextSequence: 3, EOF: 2}
 	engine.sources[source] = cursor
@@ -551,6 +563,63 @@ func TestCheckpointCompactionNeverCollectsAboveWatermarkOrResults(t *testing.T) 
 	}
 	if _, retained := engine.results[resultID(result)]; !retained {
 		t.Fatal("compaction collected a result record")
+	}
+}
+
+// TestCheckpointCompactionEvictsMaterializedDeliveries pins that compacting
+// a checkpoint-covered source stream also evicts the covered deliveries'
+// materialized-skip index entries, so the index cannot grow without bound
+// on long-running jobs at a stable assignment revision, while entries above
+// the watermark survive.
+func TestCheckpointCompactionEvictsMaterializedDeliveries(t *testing.T) {
+	fixture := workerFixtureWithRange(t, "1", "3")
+	repository := newFakeRepository(fixture)
+	engine, err := NewEngine(testEngineOptions(repository, admission.NewGate(), &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	recovered, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err := engine.consumeRecovery(recovered); err != nil {
+		t.Fatal(err)
+	}
+	source := fixture.source.Task
+	cursor := store.SourceCursor{Source: source, NextSequence: 3, EOF: 2}
+	engine.sources[source] = cursor
+	repository.mu.Lock()
+	repository.sources[source] = cursor
+	repository.mu.Unlock()
+
+	report := model.CompletionReport{JobID: fixture.assignment.Assignment.JobID, JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, Source: source, Token: fixture.source, Epoch: fixture.epoch, Prior: 0, New: 1, EOF: 2, WorkerTransactionID: 1}
+	report.Digest = model.CompletionReportDigest(report)
+	event := model.WorkerEvent{WorkerID: fixture.localNode, WorkerEpoch: fixture.localEpoch, TransactionID: 1, Kind: model.WorkerEventCompletion, Completion: &report}
+	engine.completionReports[source] = event
+	repository.mu.Lock()
+	repository.work.PendingEvents = []model.WorkerEvent{event}
+	repository.work.NextTransactionID = 2
+	repository.mu.Unlock()
+
+	makeID := func(sequence uint64) model.DeliveryID {
+		return model.DeliveryID{Tuple: model.TupleID{JobID: source.JobID, SourceTask: source, SourceSequence: sequence}, EdgeID: 1, DestinationTask: fixture.transform.Task}
+	}
+	engine.deliveries[makeID(1)] = store.DeliveryRecord{ID: makeID(1), State: store.Processed}
+	engine.deliveries[makeID(2)] = store.DeliveryRecord{ID: makeID(2), State: store.Processed}
+	provenance := model.ResultCopyProvenance{AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, CoordinatorEpoch: fixture.epoch, DestinationRole: model.PrimaryReplica}
+	engine.materialized[makeID(1)] = provenance
+	engine.materialized[makeID(2)] = provenance
+
+	notice := protocol.CheckpointNotice{Notice: model.CheckpointNotice{JobID: report.JobID, Source: source, Watermark: 1, RaftIndex: 9, Epoch: fixture.epoch}, JobControlRevision: report.JobControlRevision, AssignmentRevision: report.AssignmentRevision, AssignmentDigest: fixture.assignment.Assignment.Digest}
+	if err := engine.applyCheckpoint(notice); err != nil {
+		t.Fatalf("apply checkpoint: %v", err)
+	}
+	if _, retained := engine.materialized[makeID(1)]; retained {
+		t.Fatal("covered delivery's materialized entry survived compaction")
+	}
+	if _, retained := engine.materialized[makeID(2)]; !retained {
+		t.Fatal("compaction collected a materialized entry above the watermark")
 	}
 }
 
@@ -717,6 +786,15 @@ func TestCheckpointNoticeAboveCursorAdoptsCommittedWatermarkWithoutPendingReport
 		t.Fatal(err)
 	}
 	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	// engine cache: the serialized view is seeded by recovery before any
+	// direct-drive checkpoint application.
+	recovered, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err := engine.consumeRecovery(recovered); err != nil {
+		t.Fatal(err)
+	}
 	source := fixture.source.Task
 	proof := store.CheckpointAuthority{JobControlRevision: fixture.assignment.JobControlRevision, AssignmentRevision: fixture.assignment.Assignment.Revision, AssignmentDigest: fixture.assignment.Assignment.Digest, SourceToken: fixture.source, CoordinatorEpoch: fixture.epoch}
 	cursor := store.SourceCursor{Source: source, NextSequence: 2, EOF: 2, Watermark: 1, RaftIndex: 9, CheckpointRevision: 1, CheckpointAuthority: proof}
@@ -788,6 +866,15 @@ func TestCheckpointNoticeAdoptsCommittedWatermarkForReassignedOwnerWithoutCursor
 		t.Fatal(err)
 	}
 	engine.localNode, engine.localEpoch = fixture.localNode, fixture.localEpoch
+	// engine cache: the serialized view is seeded by recovery before any
+	// direct-drive checkpoint application.
+	recovered, recoverErr := repository.RecoverWork()
+	if recoverErr != nil {
+		t.Fatal(recoverErr)
+	}
+	if err := engine.consumeRecovery(recovered); err != nil {
+		t.Fatal(err)
+	}
 	source := fixture.source.Task
 	if _, exists := engine.sources[source]; exists {
 		t.Fatal("reassigned-owner fixture must start without a local cursor")

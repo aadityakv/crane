@@ -963,13 +963,13 @@ func TestTransactionRound2CheckpointRetiresEveryCoveredTombstone(t *testing.T) {
 		if err := applyEvent(&work, completionEventForCheckpoint(t, work, notice)); err != nil {
 			t.Fatal(err)
 		}
-		if err := applyCheckpoint(&work, notice); err != nil {
+		if err := applyCheckpoint(&work, notice, nil); err != nil {
 			t.Fatal(err)
 		}
 		if len(work.Deliveries) != 0 {
 			t.Fatalf("covered tombstones retained at admission cap: %d", len(work.Deliveries))
 		}
-		if err := applyDelivery(&work, domainDeliverySequence(t, topology, assignment, epoch, MaxTransactionRecords+1), nil, false); err != nil {
+		if err := applyDelivery(&work, domainDeliverySequence(t, topology, assignment, epoch, MaxTransactionRecords+1), nil, false, nil); err != nil {
 			t.Fatalf("post-checkpoint admission = %v", err)
 		}
 	})

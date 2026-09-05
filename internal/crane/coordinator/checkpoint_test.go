@@ -78,8 +78,12 @@ func TestScheduleCommitsEveryPartitionEOFBeforeAssignmentAndEmission(t *testing.
 	h.start()
 	h.markReady()
 	h.lead(2)
-	h.waitGateOpen()
-
+	// gate decoupling: gate-open no longer implies job scheduling converged;
+	// wait for the scheduling artifacts themselves.
+	h.waitFor(func() bool {
+		record, ok := h.job(job)
+		return ok && record.Lifecycle == state.JobRunning
+	}, "job scheduled and running")
 	record, ok := h.job(job)
 	if !ok || record.Lifecycle != state.JobRunning {
 		t.Fatalf("job = %#v", record)

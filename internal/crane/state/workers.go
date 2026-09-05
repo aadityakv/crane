@@ -417,7 +417,13 @@ func (machine *Machine) prepareWorkerInvalidation(kind workerInvalidationKind, w
 	for jobID, record := range machine.jobs {
 		candidate := cloneJobRecord(record)
 		candidate.invalidationHistory = machine.pruneConsumedInvalidationHistory(jobID, candidate.invalidationHistory, workerID)
-		if record.Assignment != nil && !record.Lifecycle.terminal() {
+		if record.Assignment != nil && (!record.Lifecycle.terminal() || record.Lifecycle == JobSucceeded) {
+			// A Succeeded job stays invalidation-eligible like a nonterminal
+			// one: its committed manifest set remains servable only while a
+			// current worker holds each sealed artifact, so a worker
+			// incarnation that held a task or result replica must reassign
+			// it before the surviving copy is lost. Failed and Canceled jobs
+			// retain no availability duty and stay frozen.
 			markers := markersForWorker(*record.Assignment, workerID, epoch)
 			union := sortedMarkerUnion(record.NeedsReassignment, markers)
 			if len(union) != len(record.NeedsReassignment) {

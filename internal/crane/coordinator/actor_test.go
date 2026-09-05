@@ -258,6 +258,8 @@ func commandName(command any) string {
 		return "transition"
 	case state.FailJob:
 		return "fail"
+	case state.MarkManifestLost:
+		return "mark-lost"
 	default:
 		return "unknown"
 	}
@@ -414,6 +416,15 @@ func (w *fakeWorkers) restartGate(node uint16) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.gates, node)
+}
+
+// admitUnderEpoch models one worker whose process admission gate stands open
+// under an older coordinator epoch, as a prior leadership's Running install
+// left it.
+func (w *fakeWorkers) admitUnderEpoch(node uint16, epoch model.CoordinatorEpoch) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.gates[node] = epoch
 }
 
 // admissionEpoch reports one node's modeled process admission epoch.
@@ -1312,14 +1323,11 @@ func TestActorRetriesAmbiguousWorkerInstallIdempotently(t *testing.T) {
 	h.markReady()
 	h.lead(2)
 	h.waitFor(func() bool { return h.log.count("install:2:closed") >= 1 }, "first install attempt")
-	if h.gateOpen() {
-		t.Fatal("gate opened despite failed install")
-	}
-	h.actor.Wake()
+	// gate decoupling: the admission gate opens after the cluster phase even
+	// while a per-job install keeps failing, and stays open across the retry.
 	h.waitGateOpen()
-	if len(h.workers.installsFor(2, model.Running)) == 0 {
-		t.Fatal("worker 2 never accepted the running install")
-	}
+	h.actor.Wake()
+	h.waitFor(func() bool { return len(h.workers.installsFor(2, model.Running)) > 0 }, "running install after idempotent retry")
 }
 
 // TestReconcilePrunesSessionStateForEvictedJobs pins that per-job session
@@ -1384,5 +1392,38 @@ func TestLeaderSessionRestartsAfterPersistentBarrierFailure(t *testing.T) {
 	}, "gate open after the leader session restarted under the same term")
 	if view := h.view(); view.CoordinatorEpoch.Term != 1 {
 		t.Fatalf("restarted session established epoch under term %d, want the unchanged term 1", view.CoordinatorEpoch.Term)
+	}
+}
+
+// TestRunLeaderOpensGateAfterClusterPhaseOncePerEpoch pins the decoupled
+// admission policy: the gate opens after the epoch is established and one
+// cluster-registration pass ran, exactly once per epoch, regardless of
+// per-job convergence afterwards.
+func TestRunLeaderOpensGateAfterClusterPhaseOncePerEpoch(t *testing.T) {
+	h, _, _, _ := runningHarness(t)
+	// Worker 3 stays Alive in membership yet fails every worker-control
+	// exchange, so the per-job phase (repair verification through its status
+	// exchange) can never converge.
+	h.failWorker(3)
+
+	h.start()
+	h.markReady()
+	h.lead(2)
+	h.waitFor(func() bool {
+		_, open := h.gate.AdmissionEpoch()
+		return open
+	}, "gate open after the cluster phase")
+	epoch, open := h.gate.AdmissionEpoch()
+	if !open || epoch != h.view().CoordinatorEpoch {
+		t.Fatalf("admission epoch = %#v open=%v, want the established epoch open", epoch, open)
+	}
+
+	// Later rescan triggers keep reconciling the unconverged job, but the
+	// once-per-epoch gate must stay open under the same epoch.
+	h.rescan()
+	h.rescan()
+	again, stillOpen := h.gate.AdmissionEpoch()
+	if !stillOpen || again != epoch {
+		t.Fatalf("admission epoch = %#v open=%v, want the same epoch still open", again, stillOpen)
 	}
 }

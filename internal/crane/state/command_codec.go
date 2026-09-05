@@ -46,6 +46,8 @@ func MarshalCommand(command any) ([]byte, error) {
 		return marshalConcreteCommand(value.Envelope, advanceCheckpointTarget(value), value.Validate())
 	case SealManifest:
 		return marshalConcreteCommand(value.Envelope, sealManifestTarget(value), value.Validate())
+	case MarkManifestLost:
+		return marshalConcreteCommand(value.Envelope, markManifestLostTarget(value), value.Validate())
 	case TransitionJob:
 		return marshalConcreteCommand(value.Envelope, transitionJobTarget(value), value.Validate())
 	case FailJob:
@@ -188,6 +190,12 @@ func UnmarshalCommand(encoded []byte) (any, error) {
 			return nil, err
 		}
 		command = SealManifest{Envelope: envelope, Manifest: manifest}
+	case CommandMarkManifestLost:
+		manifest, err := decoder.manifest()
+		if err != nil {
+			return nil, err
+		}
+		command = MarkManifestLost{Envelope: envelope, Manifest: manifest}
 	case CommandTransitionJob:
 		job, err := decoder.jobID()
 		if err != nil {
@@ -517,6 +525,14 @@ func appendManifestTraced(encoded []byte, manifest ResultManifest, trace *[]stri
 	appendCodecField(&encoded, trace, "TotalBytes:u64(bounded)", func(out []byte) []byte { return appendU64(out, manifest.TotalBytes) })
 	appendCodecField(&encoded, trace, "Checksum:sha256(nonzero)", func(out []byte) []byte { return append(out, manifest.Checksum[:]...) })
 	appendCodecField(&encoded, trace, "Replicas:ResultReplicaSet", func(out []byte) []byte { return appendReplica(out, manifest.Replicas) })
+	appendCodecField(&encoded, trace, "Lost:u8(bool)", func(out []byte) []byte {
+		if manifest.Lost {
+			return append(out, 1)
+		}
+		return append(out, 0)
+	})
+	appendCodecField(&encoded, trace, "LostEpoch:CoordinatorEpoch(zero-iff-not-lost)", func(out []byte) []byte { return appendEpoch(out, manifest.LostEpoch) })
+	appendCodecField(&encoded, trace, "LostRevision:u64(nonzero-iff-lost)", func(out []byte) []byte { return appendU64(out, manifest.LostRevision) })
 	return encoded
 }
 
@@ -563,6 +579,15 @@ func advanceCheckpointTargetTraced(command AdvanceCheckpoint, trace *[]string) [
 }
 func sealManifestTarget(command SealManifest) []byte { return sealManifestTargetTraced(command, nil) }
 func sealManifestTargetTraced(command SealManifest, trace *[]string) []byte {
+	recordCodecDescriptor(trace, "Envelope:Envelope(internal-result-manifest)")
+	encoded := []byte(nil)
+	appendCodecField(&encoded, trace, "Manifest:ResultManifest", func(out []byte) []byte { return appendManifest(out, command.Manifest) })
+	return encoded
+}
+func markManifestLostTarget(command MarkManifestLost) []byte {
+	return markManifestLostTargetTraced(command, nil)
+}
+func markManifestLostTargetTraced(command MarkManifestLost, trace *[]string) []byte {
 	recordCodecDescriptor(trace, "Envelope:Envelope(internal-result-manifest)")
 	encoded := []byte(nil)
 	appendCodecField(&encoded, trace, "Manifest:ResultManifest", func(out []byte) []byte { return appendManifest(out, command.Manifest) })
@@ -1268,5 +1293,20 @@ func (decoder *commandDecoder) manifest() (ResultManifest, error) {
 		return ResultManifest{}, err
 	}
 	replica, err := decoder.replica()
-	return ResultManifest{JobID: job, SinkTask: sink, ManifestRevision: revision, SpecificationHash: specification, RecordCount: records, TotalBytes: total, Checksum: checksum, Replicas: replica}, err
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	lost, err := decoder.byte()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	lostEpoch, err := decoder.epoch()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	lostRevision, err := decoder.u64()
+	if err != nil {
+		return ResultManifest{}, err
+	}
+	return ResultManifest{JobID: job, SinkTask: sink, ManifestRevision: revision, SpecificationHash: specification, RecordCount: records, TotalBytes: total, Checksum: checksum, Replicas: replica, Lost: lost == 1, LostEpoch: lostEpoch, LostRevision: lostRevision}, nil
 }

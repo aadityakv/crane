@@ -444,6 +444,9 @@ func (client *dialRepairSourceClient) PullRepair(ctx context.Context, sourceNode
 	if _, ok := activeControlMember(client.options.Membership.View(), sourceNode); !ok {
 		return nil, fmt.Errorf("%w: repair source %d is not an active member", ErrRepairSourceUnavailable, sourceNode)
 	}
+	// borrowed reads: the durable-sequence read is now bounded, so a held
+	// store surfaces ErrBusy here transiently; the pull loop below backs off
+	// and retries it like any other transient failure.
 	transaction, err := client.options.Repository.DurableTransactionID()
 	if err != nil {
 		return nil, err

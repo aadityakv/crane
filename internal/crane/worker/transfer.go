@@ -70,6 +70,12 @@ type TransferRepository interface {
 	LocalIdentity() (uint16, model.WorkerEpoch)
 	CurrentFence() model.CoordinatorEpoch
 	InstalledAssignment(model.JobID) (store.InstalledAssignment, bool)
+	// InstalledView returns the immutable installed-assignment/fence view the
+	// engine publishes at recovery and every assignment or fence transition.
+	// The map is immutable-by-construction and must only be read; a nil map
+	// means no view is published yet and authority validation fails closed
+	// exactly like a repository read failure.
+	InstalledView() (map[model.JobID]store.InstalledAssignment, model.CoordinatorEpoch)
 	UpsertResult(model.ResultRecord, model.ResultCopyProvenance) error
 	UpsertRepair(store.ResultRepairRecord) error
 }
@@ -424,11 +430,14 @@ func (owner *TransferOwner) ReceiveResultArtifact(ctx context.Context, peer Tran
 		chunk.Transfer.TotalLength != chunk.Artifact.TotalLength || chunk.Transfer.Checksum != chunk.Artifact.Checksum {
 		return protocol.ResultArtifactAck{}, errors.New("artifact chunk does not bind its artifact")
 	}
-	fence := owner.repository.CurrentFence()
+	viewAssignments, fence := owner.repository.InstalledView()
+	if viewAssignments == nil {
+		return protocol.ResultArtifactAck{}, ErrTransferStaleAuthority
+	}
 	if chunk.CoordinatorEpoch != fence {
 		return protocol.ResultArtifactAck{}, ErrTransferStaleAuthority
 	}
-	assignment, ok := owner.repository.InstalledAssignment(chunk.Artifact.JobID)
+	assignment, ok := viewAssignments[chunk.Artifact.JobID]
 	if !ok || assignment.CoordinatorEpoch != fence {
 		return protocol.ResultArtifactAck{}, ErrTransferStaleAuthority
 	}
@@ -494,11 +503,14 @@ func (owner *TransferOwner) OpenResultFetch(ctx context.Context, peer TransferPe
 	if request.Offset > request.Artifact.TotalLength || request.Artifact.TotalLength > 0 && request.Offset == request.Artifact.TotalLength {
 		return protocol.ResultFetchChunk{}, ErrTransferIdentityReuse
 	}
-	fence := owner.repository.CurrentFence()
+	viewAssignments, fence := owner.repository.InstalledView()
+	if viewAssignments == nil {
+		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
+	}
 	if request.CoordinatorEpoch != fence || peer.NodeID != request.CoordinatorEpoch.Coordinator {
 		return protocol.ResultFetchChunk{}, ErrTransferUnauthorized
 	}
-	assignment, ok := owner.repository.InstalledAssignment(request.Artifact.JobID)
+	assignment, ok := viewAssignments[request.Artifact.JobID]
 	if !ok || assignment.CoordinatorEpoch != fence {
 		return protocol.ResultFetchChunk{}, ErrTransferStaleAuthority
 	}
@@ -642,8 +654,12 @@ func (owner *TransferOwner) persistResult(chunk protocol.ResultRecordChunk) erro
 }
 
 func (owner *TransferOwner) validateCurrentReplication(peer TransferPeer, chunk protocol.ResultRecordChunk) error {
-	assignment, ok := owner.repository.InstalledAssignment(chunk.Transfer.JobID)
-	if !ok || assignment.CoordinatorEpoch != owner.repository.CurrentFence() || chunk.Provenance.CoordinatorEpoch != assignment.CoordinatorEpoch {
+	assignments, fence := owner.repository.InstalledView()
+	if assignments == nil {
+		return ErrTransferStaleAuthority
+	}
+	assignment, ok := assignments[chunk.Transfer.JobID]
+	if !ok || assignment.CoordinatorEpoch != fence || chunk.Provenance.CoordinatorEpoch != assignment.CoordinatorEpoch {
 		return ErrTransferStaleAuthority
 	}
 	if !replicationAdmitted(assignment.SchedulingState) || chunk.Provenance.AssignmentRevision != assignment.Assignment.Revision || chunk.Provenance.AssignmentDigest != assignment.Assignment.Digest || chunk.Record.SpecificationHash != assignment.Topology.Digest() {
@@ -680,8 +696,12 @@ func (owner *TransferOwner) validateRepairDestination(repair store.ResultRepairR
 }
 
 func (owner *TransferOwner) repairDestinationProvenance(repair store.ResultRepairRecord, record model.ResultRecord) (model.ResultCopyProvenance, error) {
-	assignment, ok := owner.repository.InstalledAssignment(repair.Instruction.JobID)
-	if !ok || assignment.CoordinatorEpoch != owner.repository.CurrentFence() || repair.Instruction.CoordinatorEpoch != assignment.CoordinatorEpoch {
+	assignments, fence := owner.repository.InstalledView()
+	if assignments == nil {
+		return model.ResultCopyProvenance{}, ErrTransferStaleAuthority
+	}
+	assignment, ok := assignments[repair.Instruction.JobID]
+	if !ok || assignment.CoordinatorEpoch != fence || repair.Instruction.CoordinatorEpoch != assignment.CoordinatorEpoch {
 		return model.ResultCopyProvenance{}, ErrTransferStaleAuthority
 	}
 	if assignment.Assignment.Revision != repair.Instruction.AssignmentRevision || assignment.Assignment.Digest != repair.Instruction.AssignmentDigest || assignment.Topology.Digest() != repair.Instruction.SpecificationHash {
@@ -716,7 +736,8 @@ func (owner *TransferOwner) currentRepair(id [16]byte, role store.RepairEndpoint
 		if repair.Role != role || repair.State == store.RepairFailed {
 			return store.RecoveredWork{}, store.ResultRepairRecord{}, ErrTransferUnauthorized
 		}
-		if repair.Instruction.CoordinatorEpoch != work.Fence || repair.Instruction.CoordinatorEpoch != owner.repository.CurrentFence() {
+		viewAssignments, fence := owner.repository.InstalledView()
+		if repair.Instruction.CoordinatorEpoch != work.Fence || viewAssignments == nil || repair.Instruction.CoordinatorEpoch != fence {
 			return store.RecoveredWork{}, store.ResultRepairRecord{}, ErrTransferStaleAuthority
 		}
 		if role == store.RepairSource && (repair.Instruction.SourceNodeID != owner.localNode || repair.Instruction.SourceWorkerEpoch != owner.localEpoch) || role == store.RepairDestination && (repair.Instruction.DestinationNodeID != owner.localNode || repair.Instruction.DestinationWorkerEpoch != owner.localEpoch) {

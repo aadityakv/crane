@@ -112,7 +112,12 @@ func (engine *Engine) probeDelivery(message protocol.TupleDelivery) (protocol.Tu
 	if message.Destination.WorkerID != engine.localNode || message.Destination.WorkerEpoch != engine.localEpoch {
 		return protocol.TupleACK{}, true, errors.New("delivery destination is not the durable local worker")
 	}
-	assignment, ok := engine.repository.InstalledAssignment(message.DeliveryID.Tuple.JobID)
+	// The probe is a best-effort admission bypass on the session goroutine:
+	// it reads the published immutable snapshot and stays fail-closed — a
+	// missing or unpublished view defers to the serialized owner's enqueue
+	// revalidation, exactly as a repository miss did.
+	assignments, _ := engine.currentSnapshot()
+	assignment, ok := assignments[message.DeliveryID.Tuple.JobID]
 	if !ok {
 		return protocol.TupleACK{}, false, nil
 	}
@@ -142,7 +147,7 @@ func (engine *Engine) receiveDelivery(ctx context.Context, message protocol.Tupl
 	if !ok {
 		return protocol.TupleACK{}, ErrNotRunning
 	}
-	if err := validateDeliveryAuthority(assignment, engine.repository.CurrentFence(), message); err != nil {
+	if err := validateDeliveryAuthority(assignment, engine.installedFence(), message); err != nil {
 		return protocol.TupleACK{}, err
 	}
 	reservation, err := assignment.Topology.WorstCaseCustodyBytes(message.Destination.Task)
@@ -353,10 +358,11 @@ func (engine *Engine) scheduleExecution(ctx context.Context, record store.Delive
 		release()
 		return
 	}
-	if retainedEnvelope(assignment, engine.repository.CurrentFence(), record.AssignmentRevision, record.AssignmentDigest, record.CoordinatorEpoch) {
+	fence := engine.installedFence()
+	if retainedEnvelope(assignment, fence, record.AssignmentRevision, record.AssignmentDigest, record.CoordinatorEpoch) {
 		// Retained custody published under a superseded envelope re-enters
 		// execution only through the byte-exact readoption above.
-		readopted, readoptedOK := engine.readoptRetainedRecord(assignment, engine.repository.CurrentFence(), record)
+		readopted, readoptedOK := engine.readoptRetainedRecord(assignment, fence, record)
 		if !readoptedOK {
 			release()
 			return
@@ -407,7 +413,7 @@ func (engine *Engine) handleExecutionResult(result executionResult) error {
 	if result.err != nil {
 		return engine.persistFailure(result.job.record, model.FailureOperator, result.err)
 	}
-	assignment, ok := engine.repository.InstalledAssignment(result.job.record.ID.Tuple.JobID)
+	assignment, ok := engine.installedAssignment(result.job.record.ID.Tuple.JobID)
 	if !ok {
 		return errors.New("execution result lost installed assignment")
 	}
@@ -463,7 +469,7 @@ func (engine *Engine) persistFailure(record store.DeliveryRecord, code model.Fai
 		Epoch: record.CoordinatorEpoch, TransactionID: engine.nextTransactionID, Code: code,
 		DetailDigest: sha256.Sum256([]byte(cause.Error())),
 	}
-	assignment, ok := engine.repository.InstalledAssignment(report.JobID)
+	assignment, ok := engine.installedAssignment(report.JobID)
 	if !ok {
 		return errors.New("failure references missing assignment")
 	}
