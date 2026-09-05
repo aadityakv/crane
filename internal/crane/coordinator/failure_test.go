@@ -40,7 +40,10 @@ func TestSuspectAloneNeverStartsReassignment(t *testing.T) {
 	h.waitGateOpen()
 	h.clk.Advance(time.Second)
 	h.actor.Wake()
-	h.waitFor(func() bool { return h.log.count("fence:3") >= 2 }, "second pass over suspect worker")
+	// pass-exchange elimination: settled workers are no longer re-fenced
+	// each pass, so the second pass over the suspect member is pinned by
+	// its event drain instead of its fence dial.
+	h.waitFor(func() bool { return h.log.count("status:3") >= 2 }, "second pass over suspect worker")
 	if h.log.contains("propose:deactivate") || h.log.contains("propose:replace-assignments") {
 		t.Fatalf("suspicion alone drove reassignment: %v", h.log.snapshot())
 	}
@@ -361,7 +364,12 @@ func TestReRegistrationNeverOverridesDraining(t *testing.T) {
 	}
 
 	// A restarted incarnation replaces the epoch but preserves Draining.
+	// pass-exchange elimination: a fresh worker store means a fresh storage
+	// directory and therefore a fresh durable SWIM incarnation, so the
+	// restart is modeled with the incarnation bump the membership view
+	// observes; the settled-identity handshake skip relies on that delta.
 	h.addWorkerMember(2, model.WorkerEpoch{2, 0xB}, 4)
+	h.members.setMember(swim.Member{NodeID: 2, Host: "127.0.0.1", BasePort: 9000, Incarnation: 2, Status: swim.Alive})
 	h.actor.Wake()
 	h.waitFor(func() bool {
 		record, ok := h.workerRecord(2)

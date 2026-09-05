@@ -28,7 +28,7 @@ func (actor *Actor) reconcile(ctx context.Context, epoch model.CoordinatorEpoch,
 func (actor *Actor) reconcileCluster(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState) bool {
 	converged := true
 	session.controlFailed = make(map[uint16]bool)
-	actor.registerWorkers(ctx, epoch, &converged)
+	actor.registerWorkers(ctx, epoch, session, &converged)
 	view := actor.options.Machine.View()
 	reachable := actor.fenceWorkers(ctx, epoch, view, session, &converged)
 	actor.drainWorkerEvents(ctx, reachable, session, &converged)
@@ -55,8 +55,11 @@ func (actor *Actor) reconcileJobs(ctx context.Context, epoch model.CoordinatorEp
 
 // registerWorkers scans the complete owned Alive/Suspect view in NodeID order
 // and converges every replicated worker record through authenticated
-// handshakes. An absent or failed handshake never creates a record.
-func (actor *Actor) registerWorkers(ctx context.Context, epoch model.CoordinatorEpoch, converged *bool) {
+// handshakes. An absent or failed handshake never creates a record. A member
+// whose this-session handshake settled and whose membership entry and
+// replicated record are unchanged skips the network dial; only the idempotent
+// registration convergence keeps running.
+func (actor *Actor) registerWorkers(ctx context.Context, epoch model.CoordinatorEpoch, session *sessionState, converged *bool) {
 	members := actor.options.Membership.View()
 	for _, member := range members.Members {
 		if ctx.Err() != nil {
@@ -65,20 +68,25 @@ func (actor *Actor) registerWorkers(ctx context.Context, epoch model.Coordinator
 		if !activeMemberStatus(member.Status) {
 			continue
 		}
-		actor.registerWorker(ctx, epoch, member, converged)
+		actor.registerWorker(ctx, epoch, member, session, converged)
 	}
 }
 
-func (actor *Actor) registerWorker(ctx context.Context, epoch model.CoordinatorEpoch, member swim.Member, converged *bool) {
-	identity, err := actor.options.Workers.Handshake(ctx, member)
-	if err != nil {
-		return
-	}
-	if verifyWorkerIdentity(member, identity) != nil {
-		return
-	}
-	if !memberActive(actor.options.Membership.View(), member.NodeID) {
-		return
+func (actor *Actor) registerWorker(ctx context.Context, epoch model.CoordinatorEpoch, member swim.Member, session *sessionState, converged *bool) {
+	identity, settled := session.settledHandshake(member, actor.options.Membership.View(), actor.options.Machine.View())
+	if !settled {
+		var err error
+		identity, err = actor.options.Workers.Handshake(ctx, member)
+		if err != nil {
+			return
+		}
+		if verifyWorkerIdentity(member, identity) != nil {
+			return
+		}
+		if !memberActive(actor.options.Membership.View(), member.NodeID) {
+			return
+		}
+		session.handshakes[member.NodeID] = handshakeMemory{incarnation: member.Incarnation, status: member.Status, identity: identity}
 	}
 	view := actor.options.Machine.View()
 	record, exists := findWorker(view, member.NodeID)
@@ -159,10 +167,14 @@ func (actor *Actor) proposeReplaceWorkerEpoch(ctx context.Context, epoch model.C
 	}
 }
 
-// fenceWorkers installs the leadership fence on every current non-Offline
-// worker before any status, install, or repair command. Ambiguous fence
-// outcomes are resolved by one idempotent retry; persistent failure marks the
-// worker control-unreachable for the failure tracker.
+// fenceWorkers installs the leadership fence before any status, install, or
+// repair command: the session's first pass sweeps every non-Offline worker,
+// and later passes fence only workers whose durable fence at this epoch is
+// unproven — no acknowledged fence for the exact incarnation this session, a
+// last observed admission epoch from a different nonzero coordinator, or a
+// previously failed attempt. Ambiguous fence outcomes are resolved by one
+// idempotent retry; persistent failure marks the worker control-unreachable
+// for the failure tracker.
 func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpoch, view state.View, session *sessionState, converged *bool) map[uint16]bool {
 	reachable := make(map[uint16]bool)
 	for _, worker := range view.Workers {
@@ -170,6 +182,13 @@ func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpo
 			return reachable
 		}
 		if worker.State == state.WorkerOffline {
+			continue
+		}
+		if !session.needsFence(worker, epoch) {
+			// The exact incarnation acknowledged this session's fence, so
+			// the durable worker-side fence still stands and the worker
+			// remains control-reachable for the event drain.
+			reachable[worker.NodeID] = true
 			continue
 		}
 		err := actor.options.Workers.Fence(ctx, worker.NodeID, epoch)
@@ -180,8 +199,11 @@ func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpo
 			// Convergence for control-unreachable workers is decided by the
 			// failure tracker, which may deactivate them this very pass.
 			session.controlFailed[worker.NodeID] = true
+			session.fenceFailed[worker.NodeID] = true
 			continue
 		}
+		session.fences[worker.NodeID] = fenceMemory{epoch: epoch, workerEpoch: worker.Epoch}
+		delete(session.fenceFailed, worker.NodeID)
 		reachable[worker.NodeID] = true
 	}
 	return reachable

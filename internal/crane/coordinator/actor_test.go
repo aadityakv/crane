@@ -416,6 +416,15 @@ func (w *fakeWorkers) restartGate(node uint16) {
 	delete(w.gates, node)
 }
 
+// admitUnderEpoch models one worker whose process admission gate stands open
+// under an older coordinator epoch, as a prior leadership's Running install
+// left it.
+func (w *fakeWorkers) admitUnderEpoch(node uint16, epoch model.CoordinatorEpoch) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.gates[node] = epoch
+}
+
 // admissionEpoch reports one node's modeled process admission epoch.
 func (w *fakeWorkers) admissionEpoch(node uint16) model.CoordinatorEpoch {
 	w.mu.Lock()

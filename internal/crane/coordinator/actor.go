@@ -314,7 +314,36 @@ type sessionState struct {
 	// the worker's gate was not observed open under this leadership epoch —
 	// for example after a same-epoch process restart.
 	admission map[uint16]model.CoordinatorEpoch
-	members   MembershipSubscription
+	// handshakes retains, per member, the membership view values and the
+	// verified identity this session's last completed handshake observed. A
+	// later pass skips the network dial only while the member's incarnation
+	// and status are unchanged and the replicated worker record still
+	// carries the recorded identity's worker epoch.
+	handshakes map[uint16]handshakeMemory
+	// fences retains, per worker, the coordinator epoch and exact worker
+	// incarnation of this session's last acknowledged fence, so later passes
+	// fence only workers whose durable fence at this epoch is unproven.
+	fences map[uint16]fenceMemory
+	// fenceFailed retains workers whose last fence attempt this session
+	// failed; they are retried on every later pass.
+	fenceFailed map[uint16]bool
+	members     MembershipSubscription
+}
+
+// handshakeMemory records one member's completed this-session handshake: the
+// membership incarnation and status the dial was validated against and the
+// authenticated identity it returned.
+type handshakeMemory struct {
+	incarnation uint64
+	status      swim.Status
+	identity    WorkerIdentity
+}
+
+// fenceMemory records one exact worker incarnation's acknowledged fence at
+// one coordinator epoch within this session.
+type fenceMemory struct {
+	epoch       model.CoordinatorEpoch
+	workerEpoch model.WorkerEpoch
 }
 
 func newSessionState() *sessionState {
@@ -323,7 +352,49 @@ func newSessionState() *sessionState {
 		reconciled:   make(map[model.JobID]jobFence),
 		terminal:     make(map[model.JobID]terminalProgress),
 		admission:    make(map[uint16]model.CoordinatorEpoch),
+		handshakes:   make(map[uint16]handshakeMemory),
+		fences:       make(map[uint16]fenceMemory),
+		fenceFailed:  make(map[uint16]bool),
 	}
+}
+
+// settledHandshake reports the recorded handshake result for one member when
+// this pass may skip the network dial: an entry exists, the member's current
+// membership entry is unchanged (same incarnation and status), and the
+// replicated worker record still carries the recorded identity's worker
+// epoch. Any membership mismatch clears the entry so the member is
+// re-handshaken; a pending registration (no replicated record yet) never
+// skips the dial.
+func (session *sessionState) settledHandshake(member swim.Member, members membership.View, workers state.View) (WorkerIdentity, bool) {
+	memory, ok := session.handshakes[member.NodeID]
+	if !ok {
+		return WorkerIdentity{}, false
+	}
+	current, present := findMember(members, member.NodeID)
+	if !present || current.Incarnation != memory.incarnation || current.Status != memory.status {
+		delete(session.handshakes, member.NodeID)
+		return WorkerIdentity{}, false
+	}
+	record, exists := findWorker(workers, member.NodeID)
+	if !exists || record.Epoch != memory.identity.WorkerEpoch {
+		return WorkerIdentity{}, false
+	}
+	return memory.identity, true
+}
+
+// needsFence reports whether one non-Offline worker must be fenced this
+// pass: no fence was acknowledged this session for the exact incarnation at
+// this epoch, the worker was last observed admitting under a different
+// nonzero coordinator epoch, or the previous fence attempt failed.
+func (session *sessionState) needsFence(worker state.WorkerRecord, epoch model.CoordinatorEpoch) bool {
+	if session.fenceFailed[worker.NodeID] {
+		return true
+	}
+	if admitted, observed := session.admission[worker.NodeID]; observed && admitted != (model.CoordinatorEpoch{}) && admitted != epoch {
+		return true
+	}
+	acknowledged, ok := session.fences[worker.NodeID]
+	return !ok || acknowledged.epoch != epoch || acknowledged.workerEpoch != worker.Epoch
 }
 
 // pruneJobs drops the per-job reconciliation and terminal-install memory of
