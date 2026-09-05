@@ -736,6 +736,9 @@ func (owner *ControlOwner) localStatus(ctx context.Context) (protocol.WorkerStat
 	if err != nil {
 		return protocol.WorkerStatus{}, err
 	}
+	// borrowed reads: the durable-sequence read is now bounded, so a held
+	// store surfaces ErrBusy here transiently; the wire maps it to a
+	// retryable WorkerErrorUnavailable and the peer retries.
 	transaction, err := owner.repository.DurableTransactionID()
 	if err != nil {
 		return protocol.WorkerStatus{}, err

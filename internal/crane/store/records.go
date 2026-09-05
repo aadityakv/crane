@@ -641,23 +641,38 @@ func (store *Store) RecoverWork() (RecoveredWork, error) {
 	return store.work.Clone(), nil
 }
 
+// boundedLock takes the store mutex under the bounded control-read
+// discipline shared by RecoverWorkWithin, RecoverWorkViewWithin, and
+// DurableSequenceWithin: TryLock plus a deadline loop sleeping 1ms between
+// attempts, failing with ErrBusy (wrapped with the wait) once the deadline
+// passes; a non-positive wait blocks uninterruptedly instead. The caller
+// must invoke the returned release function exactly once.
+func (store *Store) boundedLock(wait time.Duration) (func(), error) {
+	if wait <= 0 {
+		store.mu.Lock()
+		return store.mu.Unlock, nil
+	}
+	deadline := time.Now().Add(wait)
+	for !store.mu.TryLock() {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("%w: %s", ErrBusy, wait)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return store.mu.Unlock, nil
+}
+
 // RecoverWorkWithin behaves like RecoverWork but gives up with ErrBusy when
 // the store lock cannot be taken within wait. The control path uses it so a
 // stalled store (a hung disk, or a durable write held at a boundary) fails
 // control requests fast instead of piling blocked handlers up to the node's
 // connection budget; recovery and execution paths keep the unbounded read.
 func (store *Store) RecoverWorkWithin(wait time.Duration) (RecoveredWork, error) {
-	if wait <= 0 {
-		return store.RecoverWork()
+	release, err := store.boundedLock(wait)
+	if err != nil {
+		return RecoveredWork{}, err
 	}
-	deadline := time.Now().Add(wait)
-	for !store.mu.TryLock() {
-		if time.Now().After(deadline) {
-			return RecoveredWork{}, fmt.Errorf("%w: %s", ErrBusy, wait)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	defer store.mu.Unlock()
+	defer release()
 	if store.closed {
 		return RecoveredWork{}, ErrClosed
 	}
@@ -674,34 +689,21 @@ func (store *Store) RecoverWorkWithin(wait time.Duration) (RecoveredWork, error)
 // WITHOUT cloning, under the same bounded-lock discipline as
 // RecoverWorkWithin. The callback must not mutate, must not block, and
 // must not retain the borrowed pointer or any aliasing reference after it
-// returns; callers copy out the values they keep. The store is
-// copy-on-write, so values copied out stay immune to later commits, and the
-// borrowed view keeps every cloned-view field except Results — logical
-// records stay solely in the search indexes there, so borrowed readers must
-// not read Results.
+// returns; callers copy out the values they keep. The callback runs with
+// the store lock held; it must not call any store method (self-deadlock).
+// The store is copy-on-write, so values copied out stay immune to later
+// commits, and the borrowed view keeps every cloned-view field except
+// Results — logical records stay solely in the search indexes there, so
+// borrowed readers must not read Results.
 func (store *Store) RecoverWorkViewWithin(wait time.Duration, borrow func(*RecoveredWork) error) error {
 	if borrow == nil {
 		return errors.New("nil borrowed recovered-work callback")
 	}
-	if wait <= 0 {
-		store.mu.Lock()
-		defer store.mu.Unlock()
-		if store.closed {
-			return ErrClosed
-		}
-		if store.failed {
-			return ErrUnavailable
-		}
-		return borrow(&store.work)
+	release, err := store.boundedLock(wait)
+	if err != nil {
+		return err
 	}
-	deadline := time.Now().Add(wait)
-	for !store.mu.TryLock() {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%w: %s", ErrBusy, wait)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	defer store.mu.Unlock()
+	defer release()
 	if store.closed {
 		return ErrClosed
 	}
@@ -715,25 +717,11 @@ func (store *Store) RecoverWorkViewWithin(wait time.Duration, borrow func(*Recov
 // the same bounded-lock discipline, without cloning recovered work. The
 // sequence lives on the recovered WAL metadata (RecoveredState.LastSequence).
 func (store *Store) DurableSequenceWithin(wait time.Duration) (uint64, error) {
-	if wait <= 0 {
-		store.mu.Lock()
-		defer store.mu.Unlock()
-		if store.closed {
-			return 0, ErrClosed
-		}
-		if store.failed {
-			return 0, ErrUnavailable
-		}
-		return store.state.LastSequence, nil
+	release, err := store.boundedLock(wait)
+	if err != nil {
+		return 0, err
 	}
-	deadline := time.Now().Add(wait)
-	for !store.mu.TryLock() {
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("%w: %s", ErrBusy, wait)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	defer store.mu.Unlock()
+	defer release()
 	if store.closed {
 		return 0, ErrClosed
 	}

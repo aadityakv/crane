@@ -714,6 +714,64 @@ func TestControlExchangesPerformZeroFullStoreClones(t *testing.T) {
 	}
 }
 
+// TestControlAssignmentInstallCloneCounts pins the install exchange's
+// borrowed-read split: an assignment targeting this worker validates under
+// the borrowed view with ZERO full-store clones, and the historical-holder
+// fallback (a non-targeted Closed install) performs exactly ONE bounded
+// cloned read for its Results check.
+func TestControlAssignmentInstallCloneCounts(t *testing.T) {
+	fixture := newControlFixture(t)
+	path := filepath.Join(t.TempDir(), "worker")
+	durable, err := store.Open(path, store.Identity{ClusterID: fixture.cluster, NodeID: fixture.repository.localNode}, store.Options{MaxBytes: 8 << 20, NewWorkerEpoch: func() (model.WorkerEpoch, error) { return fixture.repository.localEpoch, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	if err := durable.Fence(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.InstallAssignment(fixture.assignment.Assignment, fixture.assignment.Topology.Spec(), fixture.assignment.JobControlRevision, model.Running, fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	repository := &countingControlRepository{serviceRepository: &serviceRepository{Store: durable, node: fixture.repository.localNode, fatal: make(chan error, 1)}}
+	owner, err := NewControlOwner(ControlOptions{Config: fixture.configuration, ClusterID: fixture.cluster, Repository: repository, Engine: &controlNoopEngine{}, Transfer: fixture.transfer, Gate: fixture.gate, Membership: fixture.members, Clock: clock.NewManual(time.Unix(100, 0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner = owner
+	session := fixture.session(t, 2)
+	fixture.authenticate(t, session, 2, 1)
+	replacement := protocol.AssignmentSetInstall{Assignment: fixture.assignment.Assignment, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: fixture.assignment.JobControlRevision, SchedulingState: model.Running, CoordinatorEpoch: fixture.epoch}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 2, replacement)); err != nil {
+		t.Fatal(err)
+	}
+	if repository.clones != 0 {
+		t.Fatalf("targeted install paid %d full-store clones, want 0 (borrowed reads: revision/slot admission)", repository.clones)
+	}
+	workers := []model.WorkerPlacement{{NodeID: 1, WorkerEpoch: fixture.repository.localEpoch, SlotCapacity: 8}, {NodeID: 2, WorkerEpoch: model.WorkerEpoch{2}, SlotCapacity: 8}, {NodeID: 3, WorkerEpoch: model.WorkerEpoch{3}, SlotCapacity: 8}}
+	var candidate model.AssignmentSet
+	for value := uint16(2); value < 512; value++ {
+		job := model.JobID{byte(value), byte(value >> 8)}
+		candidate, err = model.BuildAssignmentSet(job, fixture.assignment.Topology.Digest(), 1, fixture.assignment.Topology, workers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !assignmentTargetsWorker(candidate, fixture.repository.localNode, fixture.repository.localEpoch) {
+			break
+		}
+	}
+	if assignmentTargetsWorker(candidate, fixture.repository.localNode, fixture.repository.localEpoch) {
+		t.Fatal("could not build a non-targeted candidate assignment")
+	}
+	historical := protocol.AssignmentSetInstall{Assignment: candidate, Specification: fixture.assignment.Topology.Spec(), SpecificationDigest: fixture.assignment.Topology.Digest(), JobControlRevision: 1, SchedulingState: model.Closed, CoordinatorEpoch: fixture.epoch}
+	if _, err := session.Handle(context.Background(), fixture.frame(t, 2, 3, historical)); !errors.Is(err, ErrControlStaleAssignment) {
+		t.Fatalf("non-targeted Closed install without retained results error = %v, want ErrControlStaleAssignment", err)
+	}
+	if repository.clones != 1 {
+		t.Fatalf("historical fallback paid %d full-store clones, want exactly 1 (the Results read)", repository.clones)
+	}
+}
+
 func TestControlAssignmentAdmitsOnlyClosedHistoricalHolderAndRejectsRevisionGap(t *testing.T) {
 	fixture := newControlFixture(t)
 	base := workerFixture(t)

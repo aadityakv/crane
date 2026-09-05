@@ -59,7 +59,8 @@ type controlRepository interface {
 	// view under the control wait bound, without cloning it: the callback
 	// must not mutate, block, or retain the borrowed view, and must not read
 	// Results (the borrowed view keeps logical records solely in the store's
-	// search indexes).
+	// search indexes). The callback runs with the store lock held; it must
+	// not call any store method (self-deadlock).
 	RecoverWorkViewWithin(borrow func(*store.RecoveredWork) error) error
 	DurableTransactionID() (uint64, error)
 	Fence(model.CoordinatorEpoch) error
