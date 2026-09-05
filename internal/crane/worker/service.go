@@ -164,6 +164,10 @@ func (service *Service) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	service.engine = engine
+	// The repository publishes the engine's immutable installed view to the
+	// transfer owner; wired here, before any owner goroutine starts, so no
+	// transfer path can observe a partially constructed composition.
+	repository.engine = engine
 	tuple, err := NewTupleService(TupleServiceOptions{Endpoint: endpoint, Engine: engine})
 	if err != nil {
 		return err
@@ -442,6 +446,10 @@ type serviceRepository struct {
 	fatalOnce sync.Once
 	// controlWait bounds control-path store reads (RecoverWorkBounded).
 	controlWait time.Duration
+	// engine is wired by Service.Run immediately after engine construction,
+	// before any owner goroutine starts; it publishes the immutable
+	// installed view the transfer owner validates against.
+	engine *Engine
 }
 
 // RecoverWorkBounded reads the recovered work with the control wait bound; a
@@ -496,6 +504,27 @@ func (repository *serviceRepository) InstalledAssignment(job model.JobID) (store
 		}
 	}
 	return store.InstalledAssignment{}, false
+}
+
+// InstalledView serves the engine's immutable installed-assignment/fence
+// snapshot for transfer-path authority validation. A wired engine that has
+// not yet published a view fails closed with a nil map, exactly like a
+// repository read failure. Without a wired engine (the composition tests'
+// store-backed repositories) it falls back to one durable read and serves the
+// same authority the store would.
+func (repository *serviceRepository) InstalledView() (map[model.JobID]store.InstalledAssignment, model.CoordinatorEpoch) {
+	if repository.engine == nil {
+		work, err := repository.RecoverWork()
+		if err != nil {
+			return nil, model.CoordinatorEpoch{}
+		}
+		view := make(map[model.JobID]store.InstalledAssignment, len(work.Assignments))
+		for _, assignment := range work.Assignments {
+			view[assignment.Assignment.JobID] = assignment
+		}
+		return view, work.Fence
+	}
+	return repository.engine.InstalledView()
 }
 
 // DurableTransactionID reports the last store transaction that is durable on disk.

@@ -1196,7 +1196,7 @@ func validateSnapshotWork(work RecoveredWork, nodeID uint16, workerEpoch model.W
 		}
 		seenOutboxes[outbox.ID] = outbox
 		assignment, ok := findAssignment(&work, outbox.ID.Tuple.JobID)
-		if !ok || validateSnapshotOutbox(outbox, assignment, work.Fence) != nil {
+		if !ok || validateSnapshotOutbox(outbox, assignment, work.Fence, nil) != nil {
 			return errors.New("invalid snapshot outbox")
 		}
 		if _, owned := referencedOutboxes[outbox.ID]; owned {
@@ -1391,21 +1391,39 @@ func validateSnapshotDelivery(record DeliveryRecord, assignment InstalledAssignm
 	return nil
 }
 
-func validateSnapshotOutbox(record OutboxRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch) error {
+// validateSnapshotOutbox enforces the per-commit authority and token checks of
+// one outbox against the installed assignment, and — unless the record's
+// immutable definition is already in the proven set — the expensive proof of
+// whichever branch applies: the current-revision TupleDelivery/route proof via
+// validateOutbox, or the historical delivery-digest + route proof. A
+// successful proof is recorded in proven; a nil set forces full proofs.
+func validateSnapshotOutbox(record OutboxRecord, assignment InstalledAssignment, fence model.CoordinatorEpoch, proven map[model.DeliveryID]struct{}) error {
 	if record.AssignmentRevision == 0 || record.AssignmentRevision > assignment.Assignment.Revision || record.AssignmentDigest == ([32]byte{}) || !snapshotEpochAtOrBefore(record.CoordinatorEpoch, fence) || record.Accepted && record.RetryDeadlineUnixNano == 0 {
 		return errors.New("invalid snapshot outbox authority")
 	}
 	if record.AssignmentRevision == assignment.Assignment.Revision {
-		return validateOutbox(record, assignment, record.CoordinatorEpoch)
+		return validateOutbox(record, assignment, record.CoordinatorEpoch, proven)
 	}
 	if record.Producer.Validate() != nil || record.Destination.Validate() != nil || record.Producer.AssignmentRevision != record.AssignmentRevision || record.Destination.AssignmentRevision != record.AssignmentRevision || record.Producer.SpecificationHash != assignment.Topology.Digest() || record.Destination.SpecificationHash != assignment.Topology.Digest() || record.Destination.Task != record.ID.DestinationTask {
 		return errors.New("invalid historical snapshot outbox")
+	}
+	if _, ok := proven[record.ID]; ok {
+		return nil
+	}
+	if outboxProofObserver != nil {
+		outboxProofObserver(record)
 	}
 	delivery := DeliveryRecord{ID: record.ID, Tuple: record.Tuple, Producer: record.Producer, Destination: record.Destination, AssignmentRevision: record.AssignmentRevision, AssignmentDigest: record.AssignmentDigest, CoordinatorEpoch: record.CoordinatorEpoch, State: Received}
 	if _, err := deliveryDefinitionDigest(delivery); err != nil {
 		return err
 	}
-	return validateRoute(assignment.Topology, record.ID, record.Tuple, record.Producer.Task)
+	if err := validateRoute(assignment.Topology, record.ID, record.Tuple, record.Producer.Task); err != nil {
+		return err
+	}
+	if proven != nil {
+		proven[record.ID] = struct{}{}
+	}
+	return nil
 }
 
 func expectedSnapshotProcessedOutboxes(delivery DeliveryRecord, assignment InstalledAssignment) (map[model.DeliveryID]OutboxRecord, error) {
@@ -1587,7 +1605,12 @@ func (store *Store) recoverExisting(identity Identity) error {
 		return fmt.Errorf("%w: active generation WAL size", ErrCorrupt)
 	}
 	anchor := walSnapshotAnchor{Identity: identity, WorkerEpoch: current.WorkerEpoch, Generation: current.Generation, BaseSequence: current.BaseSequence, TransactionCount: current.TransactionCount, SnapshotDigest: current.SnapshotDigest}
-	reducer := &workReducer{current: work, allowLegacy: true}
+	// Recovery rebuilds the durable view, so every cached outbox proof is
+	// discarded; the replay below re-proves each WAL-created outbox once and
+	// repopulates the set for them while the full validation walks below
+	// re-prove the complete recovered set exactly as before the cache.
+	store.validatedOutboxes = make(map[model.DeliveryID]struct{})
+	reducer := &workReducer{current: work, allowLegacy: true, proven: store.validatedOutboxes}
 	state, truncateAt, err := recoverSnapshotWALReader(wal, walInfo.Size(), identity, anchor, reducer)
 	if err != nil {
 		if errors.Is(err, ErrIdentityMismatch) {
@@ -1635,7 +1658,12 @@ func (store *Store) recoverLegacy(identity Identity) error {
 	if info.Size() <= 0 || uint64(info.Size()) > store.options.MaxBytes || uint64(info.Size()) > uint64(math.MaxInt) {
 		return fmt.Errorf("%w: WAL size %d", ErrCorrupt, info.Size())
 	}
+	// Legacy recovery replays the whole WAL: discard every cached proof and
+	// let the replay re-prove (and repopulate) each outbox once while the
+	// final full validation below re-proves the complete set, unchanged.
+	store.validatedOutboxes = make(map[model.DeliveryID]struct{})
 	reducer := newRecoveryWorkReducer()
+	reducer.proven = store.validatedOutboxes
 	state, truncateAt, err := recoverWALReader(wal, info.Size(), identity, reducer)
 	if err != nil {
 		if !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrIdentityMismatch) {
@@ -1654,7 +1682,7 @@ func (store *Store) recoverLegacy(identity Identity) error {
 	if _, err := wal.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
-	if err := validateRecoveredWorkLocal(reducer.current, state.Identity.NodeID, state.WorkerEpoch); err != nil {
+	if err := validateRecoveredWorkLocal(reducer.current, state.Identity.NodeID, state.WorkerEpoch, nil); err != nil {
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	if err := validateRecoveredCapacity(state, reducer.current, store.options.MaxBytes); err != nil {

@@ -558,6 +558,16 @@ func (engine *Engine) currentSnapshot() (map[model.JobID]store.InstalledAssignme
 	return nil, model.CoordinatorEpoch{}
 }
 
+// InstalledView publishes the latest immutable assignment/fence snapshot for
+// readers outside the engine (the transfer owner's authority validation). The
+// returned map is immutable-by-construction and must only be read; a nil map
+// reports that no view has been published yet (the engine has not completed
+// its one-time recovery), which callers treat exactly like a repository read
+// failure.
+func (engine *Engine) InstalledView() (map[model.JobID]store.InstalledAssignment, model.CoordinatorEpoch) {
+	return engine.currentSnapshot()
+}
+
 // refreshInstalledFence re-establishes the serialized fence view at one
 // durable fence transition. A fence change republishes the complete
 // assignment view from the same recovery read. On a repository read

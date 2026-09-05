@@ -1259,3 +1259,38 @@ func TestEngineRefreshKeepsPriorViewOnReadFailureAndCorrectsLater(t *testing.T) 
 	cancel()
 	<-done
 }
+
+// TestEngineInstalledViewPublishesNilUntilRecovery pins the exported
+// installed-view accessor's fail-closed contract for transfer-path readers:
+// before the engine's one-time recovery publishes a view it reports nil, and
+// once published it serves exactly the immutable snapshot the owner maintains.
+func TestEngineInstalledViewPublishesNilUntilRecovery(t *testing.T) {
+	fixture := workerFixture(t)
+	repository := newFakeRepository(fixture)
+	gate := admission.NewGate()
+	if err := gate.Open(fixture.epoch); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(testEngineOptions(repository, gate, &fakeSender{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignments, fence := engine.InstalledView(); assignments != nil || fence != (model.CoordinatorEpoch{}) {
+		t.Fatalf("unpublished installed view = %t, %+v; want nil/zero", assignments != nil, fence)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runEngine(t, ctx, engine)
+	<-engine.Ready()
+	assignments, fence := engine.InstalledView()
+	if assignments == nil || fence != fixture.epoch {
+		t.Fatalf("published installed view = %t, %+v; want live view at the durable fence", assignments != nil, fence)
+	}
+	published, ok := assignments[fixture.assignment.Assignment.JobID]
+	if !ok || published.Assignment.Digest != fixture.assignment.Assignment.Digest {
+		t.Fatalf("published installed view lost the assignment: %+v, %t", published, ok)
+	}
+	cancel()
+	<-done
+}

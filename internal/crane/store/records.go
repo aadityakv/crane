@@ -403,7 +403,11 @@ type workReducer struct {
 	current, transaction RecoveredWork
 	inTransaction        bool
 	allowLegacy          bool
-	prepared             [recordCheckpointObservation + 1]bool
+	// proven carries the owning store's validatedOutboxes set so outbox
+	// creation proofs are executed (and recorded) at most once per record
+	// even across retries of the same transaction.
+	proven   map[model.DeliveryID]struct{}
+	prepared [recordCheckpointObservation + 1]bool
 }
 
 func newRecoveredWork() RecoveredWork {
@@ -431,7 +435,7 @@ func (r *workReducer) ConsumeRecord(record Record) error {
 		return errors.New("record outside transaction")
 	}
 	r.prepare(record.Type)
-	return applyDomainRecord(&r.transaction, record, r.allowLegacy)
+	return applyDomainRecord(&r.transaction, record, r.allowLegacy, r.proven)
 }
 
 func (r *workReducer) prepare(recordType RecordType) {
@@ -512,7 +516,7 @@ func (r *workReducer) CommitTransaction() error {
 	return nil
 }
 
-func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) error {
+func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool, proven map[model.DeliveryID]struct{}) error {
 	switch record.Type {
 	case recordFence:
 		epoch, err := decodeFence(record.Payload)
@@ -531,7 +535,7 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) err
 		if err != nil {
 			return err
 		}
-		return applyDelivery(work, delivery, outboxes, record.Type == recordDeliveryProcessed)
+		return applyDelivery(work, delivery, outboxes, record.Type == recordDeliveryProcessed, proven)
 	case recordDeliveryCompleted:
 		id, err := decodeDeliveryIDPayload(record.Payload)
 		if err != nil {
@@ -590,7 +594,7 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool) err
 		if err != nil {
 			return err
 		}
-		return applySource(work, cursor, outboxes)
+		return applySource(work, cursor, outboxes, proven)
 	case recordOutboxAck:
 		id, err := decodeDeliveryIDPayload(record.Payload)
 		if err != nil {
@@ -678,7 +682,7 @@ func (store *Store) applyWorkTransaction(tx Transaction, boundary string) error 
 }
 
 func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
-	reducer := &workReducer{current: store.work}
+	reducer := &workReducer{current: store.work, proven: store.validatedOutboxes}
 	if err := reducer.BeginTransaction(uint32(len(tx.Records))); err != nil {
 		return RecoveredWork{}, err
 	}
@@ -694,7 +698,7 @@ func (store *Store) reduceWorkLocked(tx Transaction) (RecoveredWork, error) {
 }
 
 func (store *Store) commitWorkLocked(tx Transaction, prospective RecoveredWork) error {
-	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
+	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch, store.validatedOutboxes); err != nil {
 		return err
 	}
 	encodedBytes, err := transactionEncodedSize(tx)
@@ -746,7 +750,12 @@ func reservedBytes(work RecoveredWork) (uint64, error) {
 	return total, nil
 }
 
-func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch model.WorkerEpoch) error {
+// validateRecoveredWorkLocal enforces the per-commit invariants of the whole
+// recovered set. The outbox walk passes proven so already-proven outboxes pay
+// only the cheap structural checks; a nil set (recovery-time validation)
+// forces the full proof of every outbox, exactly as before the proof cache
+// existed.
+func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch model.WorkerEpoch, proven map[model.DeliveryID]struct{}) error {
 	for _, cursor := range work.Sources {
 		assignment, ok := findAssignment(&work, cursor.Source.JobID)
 		token, tokenOK := findToken(assignment.Assignment, cursor.Source)
@@ -771,7 +780,7 @@ func validateRecoveredWorkLocal(work RecoveredWork, nodeID uint16, workerEpoch m
 		if !ok || outbox.Producer.WorkerID != nodeID || outbox.Producer.WorkerEpoch != workerEpoch {
 			return errors.New("recovered outbox producer is not this worker incarnation")
 		}
-		if err := validateSnapshotOutbox(outbox, assignment, work.Fence); err != nil {
+		if err := validateSnapshotOutbox(outbox, assignment, work.Fence, proven); err != nil {
 			return fmt.Errorf("recovered outbox cross-reference: %w", err)
 		}
 	}

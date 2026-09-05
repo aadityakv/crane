@@ -26,8 +26,17 @@ type Store struct {
 	root            *os.Root
 	state           RecoveredState
 	work            RecoveredWork
-	closed          bool
-	failed          bool
+	// validatedOutboxes caches, under mu, the DeliveryIDs whose expensive
+	// outbox proof (TupleDelivery marshal + assignment containment +
+	// deterministic route) already succeeded for their immutable definition.
+	// Outbox definitions never change after creation and the assignment
+	// context of a proof is pinned by revision monotonicity, so each proof is
+	// executed at most once per recovery generation: at creation, and again
+	// only after recovery rebuilds the state and clears this set. Cheap
+	// structural, fence, and retry-state checks remain per-commit.
+	validatedOutboxes map[model.DeliveryID]struct{}
+	closed            bool
+	failed            bool
 }
 
 type storeOperations struct {
@@ -74,7 +83,7 @@ func openWithOperations(path string, identity Identity, options Options, operati
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{options: options, operations: operations, directory: directory}
+	store := &Store{options: options, operations: operations, directory: directory, validatedOutboxes: make(map[model.DeliveryID]struct{})}
 	defer func() {
 		if resultErr != nil {
 			resultErr = errors.Join(resultErr, store.release())
@@ -191,7 +200,7 @@ func (store *Store) Commit(transaction Transaction) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTransaction, err)
 	}
-	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch); err != nil {
+	if err := validateRecoveredWorkLocal(prospective, store.state.Identity.NodeID, store.state.WorkerEpoch, store.validatedOutboxes); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTransaction, err)
 	}
 	return store.commitWorkLocked(transaction, prospective)
@@ -260,6 +269,7 @@ func (store *Store) Close() error {
 		return nil
 	}
 	store.closed = true
+	store.validatedOutboxes = nil
 	return store.release()
 }
 
