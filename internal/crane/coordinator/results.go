@@ -126,6 +126,101 @@ func manifestPartitionBound(partitions int) bool {
 	return uint64(partitions) > model.LimitsV1().MaxResultManifestsPerJob
 }
 
+// maintainTerminalResults preserves one Succeeded job's result availability
+// across worker incarnation loss. A committed manifest stays servable only
+// while a current worker holds its sealed artifact, so whenever a reassignment
+// marker names the job — the invalidation of an incarnation that held a task
+// or result replica — the marker is resolved with one replacement set, the
+// assignment is installed at the current epoch so the new holders may accept
+// artifacts, and every manifest the replacement invalidated is restored: the
+// sealed artifact is fetched from a live endpoint under its committed
+// identity, re-installed on both current endpoints, and the manifest
+// re-committed bound to the live placement. The restoration never depends on
+// the record-level inventory or repair exchanges, whose store-transaction
+// cursors a freshly created store cannot yet answer.
+func (actor *Actor) maintainTerminalResults(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord) bool {
+	if job.Assignment == nil {
+		return false
+	}
+	if len(job.NeedsReassignment) == 0 && terminalManifestsSatisfied(job) {
+		return true
+	}
+	if len(job.NeedsReassignment) > 0 {
+		if !actor.replaceAssignments(ctx, epoch, actor.options.Machine.View(), job) {
+			return false
+		}
+		view := actor.options.Machine.View()
+		replaced, ok := findJob(view, job.JobID)
+		if !ok || replaced.Assignment == nil || len(replaced.NeedsReassignment) > 0 {
+			return false
+		}
+		job = replaced
+	}
+	if !actor.installAssignment(ctx, epoch, job, model.Closed, false, 0) {
+		return false
+	}
+	view := actor.options.Machine.View()
+	current, ok := findJob(view, job.JobID)
+	if !ok || current.Assignment == nil || len(current.NeedsReassignment) > 0 || current.Lifecycle != state.JobSucceeded {
+		return false
+	}
+	return actor.restoreTerminalManifests(ctx, epoch, current)
+}
+
+// terminalManifestsSatisfied reports whether every expected partition of one
+// terminal job carries a committed manifest bound to the current placement.
+func terminalManifestsSatisfied(job state.JobRecord) bool {
+	for _, replica := range job.Assignment.ResultReplicas {
+		if !manifestSatisfied(job, replica, job.TopologyDigest) {
+			return false
+		}
+	}
+	return true
+}
+
+// restoreTerminalManifests re-establishes each invalidated manifest's sealed
+// artifact on the live placement and re-commits it. The committed manifest is
+// the discovery identity: the fetched stream must match its exact count,
+// length, and checksum, and the committed revision advances only over an
+// identical artifact, so a lost sole copy can never silently shrink the
+// result set.
+func (actor *Actor) restoreTerminalManifests(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord) bool {
+	if manifestPartitionBound(len(job.Assignment.ResultReplicas)) {
+		return false
+	}
+	record := job
+	for _, replica := range job.Assignment.ResultReplicas {
+		if manifestSatisfied(record, replica, record.TopologyDigest) {
+			continue
+		}
+		committed, ok := record.Manifests[replica.SinkTask]
+		if !ok || committed.ManifestRevision == 0 || committed.SpecificationHash != record.TopologyDigest {
+			return false
+		}
+		summary := protocol.ResultInventorySummary{RecordCount: committed.RecordCount, TotalBytes: committed.TotalBytes, ContentDigest: committed.Checksum}
+		artifact, stream, fetched := actor.fetchPartitionArtifact(ctx, epoch, replica, replica.SinkTask, record.TopologyDigest, summary)
+		if !fetched ||
+			artifact.RecordCount != committed.RecordCount || artifact.TotalLength != committed.TotalBytes || artifact.Checksum != committed.Checksum {
+			return false
+		}
+		for _, endpoint := range []repairEndpoint{
+			{node: replica.PrimaryNodeID, epoch: replica.PrimaryEpoch},
+			{node: replica.SecondaryNodeID, epoch: replica.SecondaryEpoch},
+		} {
+			if !actor.installPartitionArtifact(ctx, epoch, endpoint, artifact, stream) {
+				return false
+			}
+		}
+		if !actor.commitResultManifest(ctx, epoch, job.JobID, replica, artifact) {
+			return false
+		}
+		if updated, ok := findJob(actor.options.Machine.View(), job.JobID); ok {
+			record = updated
+		}
+	}
+	return true
+}
+
 // sealJobResults seals every expected sink partition of one Draining job,
 // commits each idempotent manifest, and — only once every expected partition
 // carries a committed current manifest — transitions to Succeeded and installs
@@ -474,6 +569,15 @@ func (actor *Actor) commitResultManifest(ctx context.Context, epoch model.Coordi
 		return false
 	}
 	currentRevision := record.Manifests[replica.SinkTask].ManifestRevision
+	if existing := record.Manifests[replica.SinkTask]; existing.ManifestRevision != 0 &&
+		(existing.RecordCount != artifact.RecordCount || existing.TotalBytes != artifact.TotalLength || existing.Checksum != artifact.Checksum) {
+		// A re-seal must reproduce the committed artifact exactly: the
+		// covered record set derives from immutable checkpoints, so any
+		// disagreement means the surviving copies no longer prove the
+		// sealed bytes (for example both durable copies were lost) and
+		// committing would silently regress the result set.
+		return false
+	}
 	manifest := state.ResultManifest{
 		JobID: jobID, SinkTask: replica.SinkTask, ManifestRevision: currentRevision + 1,
 		SpecificationHash: record.TopologyDigest, RecordCount: artifact.RecordCount,

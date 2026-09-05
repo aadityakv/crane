@@ -254,7 +254,16 @@ func (actor *Actor) reconcileJob(ctx context.Context, epoch model.CoordinatorEpo
 		return
 	}
 	if terminalLifecycle(job.Lifecycle) {
-		actor.propagateTerminal(ctx, epoch, job, session)
+		if job.Lifecycle == state.JobSucceeded && !actor.maintainTerminalResults(ctx, epoch, job) {
+			*converged = false
+			return
+		}
+		view := actor.options.Machine.View()
+		terminal, ok := findJob(view, jobID)
+		if !ok {
+			return
+		}
+		actor.propagateTerminal(ctx, epoch, terminal, session)
 		return
 	}
 	if job.Lifecycle == state.JobPending && job.Assignment == nil {

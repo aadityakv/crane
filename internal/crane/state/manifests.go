@@ -159,7 +159,12 @@ func (machine *Machine) applySealManifestLocked(command SealManifest) ([]byte, e
 			return mutationPlan{result: result, reject: true}, err
 		}
 		currentReplica, replicaExists := resultReplica(record.Assignment, manifest.SinkTask)
-		valid := record.Lifecycle == JobDraining && record.Assignment != nil && len(record.NeedsReassignment) == 0 && allCheckpointsFinal(record) && manifest.ManifestRevision == nextRevision && manifest.SpecificationHash == record.TopologyDigest && replicaExists && currentReplica == manifest.Replicas && machine.replicaWorkersCurrent(currentReplica) && manifestTotalWithinLimit(record.Manifests, manifest)
+		// A Succeeded job seals exactly like a Draining one: after a replica
+		// reassignment re-established the artifact on current workers, the
+		// manifest must re-bind to the live placement for result pages to
+		// stay servable. The identical guards (final checkpoints, no pending
+		// markers, current replica workers) keep the terminal re-seal honest.
+		valid := (record.Lifecycle == JobDraining || record.Lifecycle == JobSucceeded) && record.Assignment != nil && len(record.NeedsReassignment) == 0 && allCheckpointsFinal(record) && manifest.ManifestRevision == nextRevision && manifest.SpecificationHash == record.TopologyDigest && replicaExists && currentReplica == manifest.Replicas && machine.replicaWorkersCurrent(currentReplica) && manifestTotalWithinLimit(record.Manifests, manifest)
 		if !valid {
 			result, err := marshalBusinessResult(ResultInvalidTarget, key, currentRevision, model.CoordinatorEpoch{})
 			return mutationPlan{result: result, reject: true}, err

@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/aadityakv/crane/internal/crane/model"
@@ -285,6 +286,24 @@ func TestSnapshotErrorsPreserveTopLevelAndNestedSentinels(t *testing.T) {
 	}
 }
 
+// affectedDutiesForWorker mirrors the machine's invalidation computation for
+// test fixtures: the sorted affected list of every invalidation-eligible job
+// whose complete assignment the exact worker incarnation holds duties in.
+func affectedDutiesForWorker(machine *Machine, workerID uint16, epoch model.WorkerEpoch) []AffectedAssignment {
+	var affected []AffectedAssignment
+	for jobID, record := range machine.jobs {
+		if record.Assignment == nil || (record.Lifecycle.terminal() && record.Lifecycle != JobSucceeded) {
+			continue
+		}
+		if len(markersForWorker(*record.Assignment, workerID, epoch)) == 0 {
+			continue
+		}
+		affected = append(affected, AffectedAssignment{JobID: jobID, JobControlRevision: record.JobControlRevision, AssignmentRevision: record.Assignment.Revision, AssignmentDigest: record.Assignment.Digest})
+	}
+	sort.Slice(affected, func(i, j int) bool { return bytes.Compare(affected[i].JobID[:], affected[j].JobID[:]) < 0 })
+	return affected
+}
+
 func TestSnapshotCaptureRejectsIncrementalEstimatorDriftBeforeAndAfterCursorDeletion(t *testing.T) {
 	machine := completeSnapshotMachine(t, false)
 	if _, err := machine.Capture(1000, 1000); err != nil {
@@ -300,7 +319,10 @@ func TestSnapshotCaptureRejectsIncrementalEstimatorDriftBeforeAndAfterCursorDele
 	target := worker
 	target.Epoch[15]++
 	target.Revision++
-	replace, err := NewReplaceWorkerEpoch(InternalCommandID{0xf1}, worker.Revision, worker.NodeID, worker.Epoch, target, nil, machine.coordinatorEpoch)
+	// The succeeded job retains its invalidation eligibility, so the
+	// replacement must present the affected list the machine computes.
+	affected := affectedDutiesForWorker(machine, worker.NodeID, worker.Epoch)
+	replace, err := NewReplaceWorkerEpoch(InternalCommandID{0xf1}, worker.Revision, worker.NodeID, worker.Epoch, target, affected, machine.coordinatorEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}

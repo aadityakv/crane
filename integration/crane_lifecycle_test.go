@@ -1270,6 +1270,12 @@ func TestCraneLifecycle(t *testing.T) {
 	epochs := map[uint16]model.WorkerEpoch{}
 	var storeLossVictim, storeLossPreEpoch = uint16(0), model.WorkerEpoch{}
 	var sinkLossVictim uint16
+	// suspectOnlyRevision records the suspect-only job's assignment revision
+	// proven unchanged across the Suspect window, so the offline audit can
+	// separate "never reassigned" (attempts must all be one) from "legitimately
+	// reassigned after a later genuine worker loss" (attempts may advance, but
+	// only onto live worker incarnations).
+	suspectOnlyRevision, suspectOnlyTracked := uint64(0), false
 
 	shape := func(name string, end int64) model.TopologySpec {
 		return craneTopology(craneTopologyShape{name: name, start: 0, end: end, factor: 3, threshold: 10_000, sourceParallelism: 3, multiplyParallelism: 3, evenParallelism: 2, lessThanParallelism: 2, includeEvenAndLess: true})
@@ -1661,6 +1667,7 @@ func TestCraneLifecycle(t *testing.T) {
 		finish("suspect-only", job, 120*time.Second)
 		if premise {
 			jobs["suspect-only-attempts-one"] = job
+			suspectOnlyRevision, suspectOnlyTracked = revision, true
 		}
 	})
 
@@ -1783,9 +1790,11 @@ func TestCraneLifecycle(t *testing.T) {
 			cluster.terminate(id)
 		}
 		works := map[uint16]store.RecoveredWork{}
+		finalEpochs := map[uint16]model.WorkerEpoch{}
 		for id := uint16(1); id <= 4; id++ {
 			epoch, work := cluster.inspectStore(id)
 			works[id] = work
+			finalEpochs[id] = epoch
 			if previous, seen := epochs[id]; seen && id != storeLossVictim && id != sinkLossVictim && previous != epoch {
 				cluster.fatalf("node %d epoch changed across store-preserving restarts: %x -> %x", id, previous[:4], epoch[:4])
 			}
@@ -1793,12 +1802,26 @@ func TestCraneLifecycle(t *testing.T) {
 				cluster.fatalf("node %d kept epoch %x across store loss", id, epoch[:4])
 			}
 		}
-		if job, ok := jobs["suspect-only-attempts-one"]; ok {
+		if job, ok := jobs["suspect-only-attempts-one"]; ok && suspectOnlyTracked {
 			for id := uint16(1); id <= 4; id++ {
 				if assignment, found := installedAssignment(works[id], job.id); found {
+					if assignment.Assignment.Revision == suspectOnlyRevision {
+						// The Suspect window's assignment survived untouched:
+						// every attempt must still be the first.
+						for _, token := range assignment.Assignment.Tasks {
+							if token.Attempt != 1 {
+								cluster.fatalf("Suspect-only job task %+v has attempt %d on node %d", token.Task, token.Attempt, id)
+							}
+						}
+						continue
+					}
+					// A later genuine worker loss legitimately reassigns a
+					// succeeded job's retained custody; every reassigned
+					// token must name the live incarnation of its holder.
 					for _, token := range assignment.Assignment.Tasks {
-						if token.Attempt != 1 {
-							cluster.fatalf("Suspect-only job task %+v has attempt %d on node %d", token.Task, token.Attempt, id)
+						if token.Attempt != 1 && token.WorkerEpoch != finalEpochs[token.WorkerID] {
+							live := finalEpochs[token.WorkerID]
+							cluster.fatalf("Suspect-only job task %+v attempt %d names stale epoch %x (live %x)", token.Task, token.Attempt, token.WorkerEpoch[:4], live[:4])
 						}
 					}
 				}
