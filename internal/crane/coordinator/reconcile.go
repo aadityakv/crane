@@ -186,8 +186,9 @@ func (actor *Actor) fenceWorkers(ctx context.Context, epoch model.CoordinatorEpo
 		}
 		if !session.needsFence(worker, epoch) {
 			// The exact incarnation acknowledged this session's fence, so
-			// the durable worker-side fence still stands and the worker
-			// remains control-reachable for the event drain.
+			// the durable worker-side fence still stands and the worker is
+			// treated as reachable until the drain proves otherwise (drain
+			// failures feed the failure tracker).
 			reachable[worker.NodeID] = true
 			continue
 		}

@@ -332,7 +332,10 @@ type sessionState struct {
 
 // handshakeMemory records one member's completed this-session handshake: the
 // membership incarnation and status the dial was validated against and the
-// authenticated identity it returned.
+// authenticated identity it returned. The skip's safety relies on a replaced
+// worker process always arriving with a new SWIM incarnation, enforced by the
+// runtime's single-process composition and swim.PrepareJoin's durable
+// incarnation advance (swim/join.go).
 type handshakeMemory struct {
 	incarnation uint64
 	status      swim.Status

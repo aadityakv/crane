@@ -36,6 +36,9 @@ func TestRegisterWorkersSkipsHandshakeForUnchangedMembers(t *testing.T) {
 		return h.log.count("status:2") >= 2 && h.log.count("status:3") >= 2
 	}, "second pass drained both workers")
 	unchangedTwo, unchangedThree := h.log.count("handshake:2"), h.log.count("handshake:3")
+	if unchangedTwo != 1 || unchangedThree != 1 {
+		t.Fatalf("first-pass handshake dials = %d/%d, want 1/1", unchangedTwo, unchangedThree)
+	}
 
 	// An incarnation bump re-handshakes exactly the changed member.
 	h.members.setMember(swim.Member{NodeID: 3, Host: "127.0.0.1", BasePort: 9000, Incarnation: 2, Status: swim.Alive})
