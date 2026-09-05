@@ -742,6 +742,14 @@ func (repository *repairControlRepository) RecoverWorkBounded() (store.Recovered
 	return repository.RecoverWork()
 }
 
+func (repository *repairControlRepository) RecoverWorkViewWithin(borrow func(*store.RecoveredWork) error) error {
+	work, err := repository.RecoverWork()
+	if err != nil {
+		return err
+	}
+	return borrow(&work)
+}
+
 func (repository *repairControlRepository) RecoverWork() (store.RecoveredWork, error) {
 	return repository.repository.RecoverWork()
 }

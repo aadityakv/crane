@@ -618,6 +618,13 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool, pro
 	}
 }
 
+// recoveredWorkCloneObserver, when non-nil, is invoked once for every
+// full-store recovered-work clone served to a caller (RecoverWork and
+// RecoverWorkWithin). Production leaves it nil; it exists as the test seam
+// that pins the borrowed-view zero-clone contract. Package tests are
+// sequential: do not add t.Parallel tests that swap this seam.
+var recoveredWorkCloneObserver func()
+
 // RecoverWork returns a complete independently owned validated worker view.
 func (store *Store) RecoverWork() (RecoveredWork, error) {
 	store.mu.Lock()
@@ -627,6 +634,9 @@ func (store *Store) RecoverWork() (RecoveredWork, error) {
 	}
 	if store.failed {
 		return RecoveredWork{}, ErrUnavailable
+	}
+	if recoveredWorkCloneObserver != nil {
+		recoveredWorkCloneObserver()
 	}
 	return store.work.Clone(), nil
 }
@@ -654,7 +664,83 @@ func (store *Store) RecoverWorkWithin(wait time.Duration) (RecoveredWork, error)
 	if store.failed {
 		return RecoveredWork{}, ErrUnavailable
 	}
+	if recoveredWorkCloneObserver != nil {
+		recoveredWorkCloneObserver()
+	}
 	return store.work.Clone(), nil
+}
+
+// RecoverWorkViewWithin lends the callback the internal recovered work
+// WITHOUT cloning, under the same bounded-lock discipline as
+// RecoverWorkWithin. The callback must not mutate, must not block, and
+// must not retain the borrowed pointer or any aliasing reference after it
+// returns; callers copy out the values they keep. The store is
+// copy-on-write, so values copied out stay immune to later commits, and the
+// borrowed view keeps every cloned-view field except Results — logical
+// records stay solely in the search indexes there, so borrowed readers must
+// not read Results.
+func (store *Store) RecoverWorkViewWithin(wait time.Duration, borrow func(*RecoveredWork) error) error {
+	if borrow == nil {
+		return errors.New("nil borrowed recovered-work callback")
+	}
+	if wait <= 0 {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if store.closed {
+			return ErrClosed
+		}
+		if store.failed {
+			return ErrUnavailable
+		}
+		return borrow(&store.work)
+	}
+	deadline := time.Now().Add(wait)
+	for !store.mu.TryLock() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: %s", ErrBusy, wait)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	if store.failed {
+		return ErrUnavailable
+	}
+	return borrow(&store.work)
+}
+
+// DurableSequenceWithin reports the last durable transaction sequence under
+// the same bounded-lock discipline, without cloning recovered work. The
+// sequence lives on the recovered WAL metadata (RecoveredState.LastSequence).
+func (store *Store) DurableSequenceWithin(wait time.Duration) (uint64, error) {
+	if wait <= 0 {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if store.closed {
+			return 0, ErrClosed
+		}
+		if store.failed {
+			return 0, ErrUnavailable
+		}
+		return store.state.LastSequence, nil
+	}
+	deadline := time.Now().Add(wait)
+	for !store.mu.TryLock() {
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w: %s", ErrBusy, wait)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	defer store.mu.Unlock()
+	if store.closed {
+		return 0, ErrClosed
+	}
+	if store.failed {
+		return 0, ErrUnavailable
+	}
+	return store.state.LastSequence, nil
 }
 
 // applyWorkTransaction commits one registered transaction and, only after its
