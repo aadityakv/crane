@@ -963,7 +963,7 @@ func TestTransactionRound2CheckpointRetiresEveryCoveredTombstone(t *testing.T) {
 		if err := applyEvent(&work, completionEventForCheckpoint(t, work, notice)); err != nil {
 			t.Fatal(err)
 		}
-		if err := applyCheckpoint(&work, notice); err != nil {
+		if err := applyCheckpoint(&work, notice, nil); err != nil {
 			t.Fatal(err)
 		}
 		if len(work.Deliveries) != 0 {

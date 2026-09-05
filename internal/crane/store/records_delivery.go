@@ -347,6 +347,7 @@ func validateDelivery(record DeliveryRecord, assignment InstalledAssignment, fen
 // expensive outbox proof (TupleDelivery construction + marshal + assignment
 // containment + deterministic route validation). Production leaves it nil; it
 // exists as the test seam that pins the once-per-record proof contract.
+// Package tests are sequential: do not add t.Parallel tests that swap this seam.
 var outboxProofObserver func(record OutboxRecord)
 
 // validateOutbox enforces the per-commit structural invariants of one outbox

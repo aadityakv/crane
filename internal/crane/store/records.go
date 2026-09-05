@@ -553,11 +553,11 @@ func applyDomainRecord(work *RecoveredWork, record Record, allowLegacy bool, pro
 				return errors.New("legacy checkpoint schema is recovery-only")
 			}
 			if exactLegacyCheckpointProofAvailable(work, notice) {
-				return applyCheckpoint(work, notice)
+				return applyCheckpoint(work, notice, proven)
 			}
-			return applyLegacyCheckpoint(work, notice)
+			return applyLegacyCheckpoint(work, notice, proven)
 		}
-		return applyCheckpoint(work, notice)
+		return applyCheckpoint(work, notice, proven)
 	case recordResult:
 		result, err := decodeStoredResult(record.Payload)
 		if err != nil {

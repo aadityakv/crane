@@ -168,6 +168,45 @@ func TestOutboxStateTransitionsDoNotReprove(t *testing.T) {
 	}
 }
 
+// TestCheckpointCompactionPrunesProvenOutboxes pins the proof-set pruning
+// contract: checkpoint compaction drops covered outboxes from the durable set
+// and deletes their proofs from the in-memory set, while surviving outboxes
+// stay proven and no proof re-runs during or after compaction.
+func TestCheckpointCompactionPrunesProvenOutboxes(t *testing.T) {
+	fixture := newProofFixture(t, 16<<20)
+	proofs := observeOutboxProofs(t)
+
+	first := fixture.advanceProofSource(t, 1)
+	second := fixture.advanceProofSource(t, 2)
+	notice := model.CheckpointNotice{JobID: fixture.assignment.JobID, Source: fixture.source.Task, Watermark: 1, RaftIndex: 9, Epoch: fixture.epoch}
+	if err := fixture.store.ApplyCheckpoint(notice); err != nil {
+		t.Fatal(err)
+	}
+	work := mustRecoverWork(t, fixture.store)
+	if len(work.Outboxes) != 1 || work.Outboxes[0].ID != second {
+		t.Fatalf("compaction retained outboxes %+v, want only %v", work.Outboxes, second)
+	}
+	fixture.store.mu.Lock()
+	proven, firstCached := len(fixture.store.validatedOutboxes), false
+	if _, ok := fixture.store.validatedOutboxes[first]; ok {
+		firstCached = true
+	}
+	_, secondCached := fixture.store.validatedOutboxes[second]
+	fixture.store.mu.Unlock()
+	if proven != 1 || firstCached || !secondCached {
+		t.Fatalf("proof set after compaction: len=%d compacted=%t survivor=%t, want len=1 compacted=false survivor=true", proven, firstCached, secondCached)
+	}
+	if proofs.counts[first] != 1 || proofs.counts[second] != 1 {
+		t.Fatalf("compaction re-proved outboxes: first=%d second=%d, want 1 and 1", proofs.counts[first], proofs.counts[second])
+	}
+	if err := fixture.store.MarkOutboxDispatched(second, 11_000); err != nil {
+		t.Fatal(err)
+	}
+	if proofs.counts[first] != 1 || proofs.counts[second] != 1 {
+		t.Fatalf("post-compaction commit re-proved outboxes: first=%d second=%d, want 1 and 1", proofs.counts[first], proofs.counts[second])
+	}
+}
+
 // TestSupersededAssignmentOutboxNotReprovenPerCommit pins the historical
 // outbox branch: after the assignment revision advances past an outbox, later
 // commits validate it through the cheap authority/token checks and the cached
