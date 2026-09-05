@@ -78,7 +78,7 @@ func TestEmptySnapshotCanonicalGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded, _ := capture.MarshalBinary()
-	const wantPrefix = "4352534e000280586b11b13c86be8ec0578a802c6d0f31b5126083e2fd4bcedbc3b8a8776950"
+	const wantPrefix = "4352534e00023643617380aac22794af1b823d7da6beddbca7cc620e469928c4d3f3c533c116"
 	wantHex := wantPrefix + strings.Repeat("00", 90)
 	if got := hex.EncodeToString(encoded); got != wantHex {
 		t.Fatalf("empty snapshot golden=%s", got)

@@ -106,6 +106,10 @@ const (
 	// mutation whose durable result exceeded the replicated cache bound, so
 	// the sequence is spent but no cached outcome can ever be served.
 	ControlErrorResultTooLarge
+	// ControlErrorResultsNoLongerRetained reports a Succeeded job whose
+	// sealed result artifact was declared lost after every durable copy was
+	// destroyed: the committed identity remains, the bytes do not.
+	ControlErrorResultsNoLongerRetained
 )
 
 // SubmitRequest submits one canonical topology under a sequenced client identity.
@@ -699,7 +703,7 @@ func validateControlEndpoint(endpoint string) error {
 }
 
 func validateControlError(value ControlError) error {
-	if value.Code < ControlErrorMalformed || value.Code > ControlErrorResultTooLarge || len(value.Detail) > MaxControlErrorDetailBytes || !utf8.Valid(value.Detail) || bytes.IndexByte(value.Detail, 0) >= 0 {
+	if value.Code < ControlErrorMalformed || value.Code > ControlErrorResultsNoLongerRetained || len(value.Detail) > MaxControlErrorDetailBytes || !utf8.Valid(value.Detail) || bytes.IndexByte(value.Detail, 0) >= 0 {
 		return errors.New("invalid control error code or detail")
 	}
 	selectors := 0
@@ -777,7 +781,7 @@ func controlErrorCodeCompatible(message wire.MessageType, code ControlErrorCode)
 	case wire.MessageCraneStatusRequest:
 		return code == ControlErrorNotFound
 	case wire.MessageCraneResultPageRequest:
-		return code == ControlErrorNotFound || code == ControlErrorPageLimitTooSmall || code == ControlErrorResultUnavailable || code == ControlErrorCorruptResult
+		return code == ControlErrorNotFound || code == ControlErrorPageLimitTooSmall || code == ControlErrorResultUnavailable || code == ControlErrorCorruptResult || code == ControlErrorResultsNoLongerRetained
 	case wire.MessageCraneJobListRequest:
 		return false
 	default:

@@ -254,7 +254,7 @@ func (actor *Actor) reconcileJob(ctx context.Context, epoch model.CoordinatorEpo
 		return
 	}
 	if terminalLifecycle(job.Lifecycle) {
-		if job.Lifecycle == state.JobSucceeded && !actor.maintainTerminalResults(ctx, epoch, job) {
+		if job.Lifecycle == state.JobSucceeded && !actor.maintainTerminalResults(ctx, epoch, job, session) {
 			*converged = false
 			return
 		}

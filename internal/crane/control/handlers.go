@@ -352,6 +352,8 @@ func (service *Service) resultPageRejection(request protocol.ResultPageRequest, 
 		return response
 	case errors.Is(err, ErrInvalidResultPage):
 		return protocol.ControlError{RelatedMessage: wire.MessageCraneResultPageRequest, Code: protocol.ControlErrorInvalidRequest, Detail: []byte("invalid result page binding")}
+	case errors.Is(err, ErrResultsNoLongerRetained):
+		return requestBoundError(request, protocol.ControlErrorResultsNoLongerRetained, false, "results no longer retained")
 	case errors.Is(err, ErrCorruptResultSet):
 		return requestBoundError(request, protocol.ControlErrorCorruptResult, false, "committed result set is corrupt")
 	case errors.Is(err, ErrResultQueryUnavailable):

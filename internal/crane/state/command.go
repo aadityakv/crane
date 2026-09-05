@@ -39,6 +39,7 @@ const (
 	CommandSealManifest          CommandKind = 12 // CommandSealManifest commits one result artifact.
 	CommandTransitionJob         CommandKind = 13 // CommandTransitionJob advances normal lifecycle.
 	CommandFailJob               CommandKind = 14 // CommandFailJob commits terminal failure.
+	CommandMarkManifestLost      CommandKind = 15 // CommandMarkManifestLost declares one sealed artifact lost.
 )
 
 // InternalCommandID is the stable deduplication identity of one coordinator command.
@@ -124,7 +125,7 @@ func (envelope Envelope) Validate() error {
 	if envelope.ConsensusFingerprint == ([32]byte{}) || envelope.ConsensusFingerprint != model.ConsensusFingerprint() {
 		return ErrConsensusFingerprintMismatch
 	}
-	if envelope.Kind < CommandBeginCoordinatorEpoch || envelope.Kind > CommandFailJob {
+	if envelope.Kind < CommandBeginCoordinatorEpoch || envelope.Kind > CommandMarkManifestLost {
 		return fmt.Errorf("%w: %d", ErrUnknownCommandKind, envelope.Kind)
 	}
 	if envelope.Kind == CommandBeginCoordinatorEpoch {

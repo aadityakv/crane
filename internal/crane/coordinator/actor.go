@@ -309,6 +309,11 @@ type sessionState struct {
 	// one unreachable or rejecting worker never forces the converged workers
 	// to re-commit the identical terminal install on every pass.
 	terminal map[model.JobID]terminalProgress
+	// lostManifests retains the manifest subjects whose terminal
+	// MarkManifestLost this session has already proposed, so the terminal
+	// loss declaration is proposed exactly once per leadership session and a
+	// later session re-derives it from the replicated view.
+	lostManifests map[lostManifestKey]bool
 	// admission retains each worker's last observed process admission epoch
 	// from the durable status exchange. A missing or non-current entry means
 	// the worker's gate was not observed open under this leadership epoch —
@@ -351,14 +356,21 @@ type fenceMemory struct {
 
 func newSessionState() *sessionState {
 	return &sessionState{
-		observations: make(map[uint16]time.Time),
-		reconciled:   make(map[model.JobID]jobFence),
-		terminal:     make(map[model.JobID]terminalProgress),
-		admission:    make(map[uint16]model.CoordinatorEpoch),
-		handshakes:   make(map[uint16]handshakeMemory),
-		fences:       make(map[uint16]fenceMemory),
-		fenceFailed:  make(map[uint16]bool),
+		observations:  make(map[uint16]time.Time),
+		reconciled:    make(map[model.JobID]jobFence),
+		terminal:      make(map[model.JobID]terminalProgress),
+		lostManifests: make(map[lostManifestKey]bool),
+		admission:     make(map[uint16]model.CoordinatorEpoch),
+		handshakes:    make(map[uint16]handshakeMemory),
+		fences:        make(map[uint16]fenceMemory),
+		fenceFailed:   make(map[uint16]bool),
 	}
+}
+
+// lostManifestKey identifies one sink manifest subject proposed lost.
+type lostManifestKey struct {
+	job  model.JobID
+	sink model.TaskID
 }
 
 // settledHandshake reports the recorded handshake result for one member when
@@ -417,6 +429,11 @@ func (session *sessionState) pruneJobs(view state.View) {
 	for jobID := range session.terminal {
 		if !retained[jobID] {
 			delete(session.terminal, jobID)
+		}
+	}
+	for key := range session.lostManifests {
+		if !retained[key.job] {
+			delete(session.lostManifests, key)
 		}
 	}
 }

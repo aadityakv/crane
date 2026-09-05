@@ -99,6 +99,9 @@ func TestSucceededJobRestoresSecondCopyAfterReplicaStoreLoss(t *testing.T) {
 // when no current or retained holder can prove the sealed bytes — both
 // durable copies lost before repair — the leader must refuse the re-seal
 // rather than commit a shrunken (empty) manifest over the committed one.
+// The loss is discharged through exactly one terminal MarkManifestLost whose
+// committed marker keeps the no-shrink guarantee honest, after which Raft
+// snapshot capture succeeds with the manifest↔placement divergence.
 func TestSucceededJobNeverResealsShrunkenResultSet(t *testing.T) {
 	h, job, topology, assignment := terminalHarness(t, 1)
 	h.seedWorker(4, model.WorkerEpoch{4}, 8)
@@ -138,15 +141,46 @@ func TestSucceededJobNeverResealsShrunkenResultSet(t *testing.T) {
 		h.workers.mu.Unlock()
 	}
 
-	for index := 0; index < 40; index++ {
+	marked := false
+	for index := 0; index < 60 && !marked; index++ {
 		h.rescan()
+		record, ok := h.job(job)
+		if !ok {
+			continue
+		}
+		marked = record.Manifests[replica.SinkTask].Lost
+	}
+	if !marked {
+		t.Fatalf("total loss never declared the manifest lost: %v", h.log.snapshot())
 	}
 	record, _ := h.job(job)
 	if record.Lifecycle != state.JobSucceeded {
 		t.Fatalf("total loss left the lifecycle: %v", record.Lifecycle)
 	}
-	current, sealed := record.Manifests[replica.SinkTask]
-	if !sealed || current != committed {
-		t.Fatalf("committed manifest mutated after total loss: %#v want %#v", current, committed)
+	current := record.Manifests[replica.SinkTask]
+	// (a) The re-seal never happened: the committed artifact identity — the
+	// honest record of the destroyed bytes — is exactly what the marker kept.
+	if current.ManifestRevision != committed.ManifestRevision+1 ||
+		current.RecordCount != committed.RecordCount || current.TotalBytes != committed.TotalBytes || current.Checksum != committed.Checksum ||
+		current.Replicas != committed.Replicas || !current.Lost || current.LostRevision != current.ManifestRevision {
+		t.Fatalf("lost manifest = %#v want committed identity plus marker: %#v", current, committed)
+	}
+	// (b) Exactly one terminal MarkManifestLost was proposed.
+	if got := h.log.count("propose:mark-lost"); got != 1 {
+		t.Fatalf("mark-lost proposals=%d: %v", got, h.log.snapshot())
+	}
+	// No shrunken re-seal ever committed over the lost identity.
+	if got := h.log.count("propose:seal"); got != 1 {
+		t.Fatalf("seal proposals=%d: %v", got, h.log.snapshot())
+	}
+	// (c) Raft snapshot capture succeeds after the marker commits even
+	// though the manifest placement diverges from the live assignment.
+	view := h.machine.View()
+	snapshot, err := h.machine.Capture(view.AppliedIndex, 2)
+	if err != nil {
+		t.Fatalf("capture after total loss: %v", err)
+	}
+	if _, err := snapshot.MarshalBinary(); err != nil {
+		t.Fatalf("marshal captured snapshot: %v", err)
 	}
 }

@@ -113,6 +113,8 @@ func (machine *Machine) Apply(index, term uint64, encoded []byte) ([]byte, error
 		result, err = machine.applyAdvanceCheckpointLocked(command)
 	case SealManifest:
 		result, err = machine.applySealManifestLocked(command)
+	case MarkManifestLost:
+		result, err = machine.applyMarkManifestLostLocked(command)
 	case TransitionJob:
 		result, err = machine.applyTransitionJobLocked(command)
 	case FailJob:

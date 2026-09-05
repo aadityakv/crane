@@ -25,6 +25,11 @@ var (
 	// satisfies the request, or that both copies of a required partition
 	// could not be opened.
 	ErrResultQueryUnavailable = errors.New("crane result query unavailable")
+	// ErrResultsNoLongerRetained reports that the job's sealed result
+	// artifact was declared lost after every durable copy was destroyed:
+	// the committed identity remains, the bytes do not, and no page can ever
+	// be served for the manifest set again.
+	ErrResultsNoLongerRetained = errors.New("crane results no longer retained")
 	// ErrCorruptResultSet reports a cross-partition duplicate TupleID or any
 	// other violation of the global canonical result order.
 	ErrCorruptResultSet = errors.New("crane result set is corrupt")
@@ -112,6 +117,12 @@ func (engine *QueryEngine) Page(ctx context.Context, request protocol.ResultPage
 	record, ok := viewJob(view, request.JobID)
 	if !ok || record.Assignment == nil {
 		return protocol.ResultPageResponse{}, ErrResultQueryUnavailable
+	}
+	if lostManifest(record) != nil {
+		// A lost manifest can never again satisfy any manifest-set digest:
+		// answer with the explicit terminal unavailability instead of an
+		// empty silent page or a generic transient refusal.
+		return protocol.ResultPageResponse{}, ErrResultsNoLongerRetained
 	}
 	manifests, ok := completeCurrentManifests(record)
 	if !ok {
@@ -297,6 +308,19 @@ func viewJob(view state.View, job model.JobID) (state.JobRecord, bool) {
 		}
 	}
 	return state.JobRecord{}, false
+}
+
+// lostManifest returns one committed manifest carrying the durable lost
+// marker, if any: its sealed artifact was declared gone after every durable
+// copy was destroyed, so the job's results are no longer retained.
+func lostManifest(record state.JobRecord) *state.ResultManifest {
+	for _, manifest := range record.Manifests {
+		if manifest.Lost {
+			lost := manifest
+			return &lost
+		}
+	}
+	return nil
 }
 
 // completeCurrentManifests reports the committed manifest list only when

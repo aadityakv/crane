@@ -258,6 +258,8 @@ func commandName(command any) string {
 		return "transition"
 	case state.FailJob:
 		return "fail"
+	case state.MarkManifestLost:
+		return "mark-lost"
 	default:
 		return "unknown"
 	}
