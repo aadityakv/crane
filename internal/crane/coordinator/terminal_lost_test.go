@@ -25,15 +25,6 @@ func closedInstallsFor(h *harness, job model.JobID, revision uint64) int {
 	return total
 }
 
-func assignmentMustExist(t *testing.T, h *harness, job model.JobID) *model.AssignmentSet {
-	t.Helper()
-	record, ok := h.job(job)
-	if !ok || record.Assignment == nil {
-		t.Fatalf("job %x has no assignment", job[:4])
-	}
-	return record.Assignment
-}
-
 // deposedHolderHarness drives one Succeeded job whose sealed artifact ends up
 // stranded on a deposed-but-live holder: the committed secondary is first
 // drained (excluding it from every future placement) and then epoch-replaced
