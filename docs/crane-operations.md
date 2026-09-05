@@ -129,9 +129,10 @@ Example documents live in `examples/topologies/` (`scaled-range.json`, `word-cou
   inventories agree.
 - **Leader loss.** Leadership, assignments, checkpoints, and manifests live in
   the Raft state machine. A new leader barriers, fences every worker to a new
-  coordinator epoch, re-reads worker status, re-installs the exact committed
-  scheduling state, repairs result copies, and only then reopens admission.
-  Stale coordinators cannot mutate anything after the fence.
+  coordinator epoch, and then reopens admission once per epoch; re-reading
+  worker status, re-installing the exact committed scheduling state, and
+  repairing result copies continue in the background without closing
+  admission again. Stale coordinators cannot mutate anything after the fence.
 - **Worker crash with store preserved.** The process recovers its log and
   snapshots before reporting Ready; its admission gate stays closed until the
   leader re-installs Running; retained custody under a superseded epoch or
