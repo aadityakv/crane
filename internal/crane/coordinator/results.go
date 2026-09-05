@@ -226,13 +226,15 @@ func terminalManifestsSatisfied(job state.JobRecord) bool {
 
 // restoreTerminalManifests re-establishes each invalidated manifest's sealed
 // artifact on the live placement and re-commits it. The committed manifest is
-// the discovery identity: the fetched stream must match its exact count,
-// length, and checksum, and the committed revision advances only over an
-// identical artifact, so a lost sole copy can never silently shrink the
-// result set. When neither the current placement nor any retained holder can
-// prove the sealed bytes, the partition is terminally declared lost through
-// one memoized MarkManifestLost proposal, after which the honest divergence
-// from the placement becomes the final legal state.
+// the discovery identity: a holder proves the sealed bytes only with an
+// exact count, length, and checksum match — a fetched stream that merely
+// self-confirms under a different checksum (a worker's on-demand seal checks
+// only count and total) is a mismatched holder, not proof — and every live
+// holder is probed in order: both current placement endpoints, then every
+// retained holder. Only when all of them are absent or mismatched is the
+// partition terminally declared lost through one memoized MarkManifestLost
+// proposal, after which the honest divergence from the placement becomes the
+// final legal state.
 func (actor *Actor) restoreTerminalManifests(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord, session *sessionState) bool {
 	if manifestPartitionBound(len(job.Assignment.ResultReplicas)) {
 		return false
@@ -251,13 +253,8 @@ func (actor *Actor) restoreTerminalManifests(ctx context.Context, epoch model.Co
 			// later pass may fetch, re-seal, or shrink this partition.
 			continue
 		}
-		summary := protocol.ResultInventorySummary{RecordCount: committed.RecordCount, TotalBytes: committed.TotalBytes, ContentDigest: committed.Checksum}
-		artifact, stream, fetched := actor.fetchPartitionArtifact(ctx, epoch, replica, replica.SinkTask, record.TopologyDigest, summary)
-		if !fetched {
-			artifact, stream, fetched = actor.scanRetainedArtifactHolders(ctx, epoch, record, replica, committed)
-		}
-		if fetched &&
-			artifact.RecordCount == committed.RecordCount && artifact.TotalLength == committed.TotalBytes && artifact.Checksum == committed.Checksum {
+		artifact, stream, restored := actor.fetchCommittedArtifact(ctx, epoch, record, replica, committed)
+		if restored {
 			for _, endpoint := range []repairEndpoint{
 				{node: replica.PrimaryNodeID, epoch: replica.PrimaryEpoch},
 				{node: replica.SecondaryNodeID, epoch: replica.SecondaryEpoch},
@@ -287,6 +284,38 @@ func (actor *Actor) restoreTerminalManifests(ctx context.Context, epoch model.Co
 	return true
 }
 
+// artifactProvesCommitted reports whether one fetched artifact is exactly the
+// committed manifest's sealed identity: count, bytes, and checksum all
+// matching. This is the sole acceptance predicate for installing or
+// re-sealing a terminal artifact — the no-shrink guard — so a holder serving
+// a self-consistent stream under a foreign checksum never counts as found.
+func artifactProvesCommitted(artifact protocol.ResultArtifact, committed state.ResultManifest) bool {
+	return artifact.RecordCount == committed.RecordCount && artifact.TotalLength == committed.TotalBytes && artifact.Checksum == committed.Checksum
+}
+
+// fetchCommittedArtifact probes every live holder in order for one complete
+// stream proving the exact committed artifact identity: the primary current
+// endpoint first, then the secondary — a fetch that succeeds but streams a
+// different identity is a mismatched holder, so the probe continues to the
+// next candidate exactly like the retained scan iterates its candidates —
+// and finally every retained holder outside the current placement.
+func (actor *Actor) fetchCommittedArtifact(ctx context.Context, epoch model.CoordinatorEpoch, job state.JobRecord, replica model.ResultReplicaSet, committed state.ResultManifest) (protocol.ResultArtifact, []byte, bool) {
+	summary := protocol.ResultInventorySummary{RecordCount: committed.RecordCount, TotalBytes: committed.TotalBytes, ContentDigest: committed.Checksum}
+	for _, endpoint := range []repairEndpoint{
+		{node: replica.PrimaryNodeID, epoch: replica.PrimaryEpoch},
+		{node: replica.SecondaryNodeID, epoch: replica.SecondaryEpoch},
+	} {
+		artifact, stream, fetched := actor.fetchFromReplica(ctx, epoch, endpoint, replica.SinkTask, job.TopologyDigest, summary)
+		if ctx.Err() != nil {
+			return protocol.ResultArtifact{}, nil, false
+		}
+		if fetched && artifactProvesCommitted(artifact, committed) {
+			return artifact, stream, true
+		}
+	}
+	return actor.scanRetainedArtifactHolders(ctx, epoch, job, replica, committed)
+}
+
 // scanRetainedArtifactHolders is the artifact-level analog of
 // scanRetainedHolders: before declaring a sealed artifact lost, every other
 // replicated registered worker in NodeID order — retained or deposed holders
@@ -308,8 +337,7 @@ func (actor *Actor) scanRetainedArtifactHolders(ctx context.Context, epoch model
 			continue
 		}
 		artifact, stream, fetched := actor.fetchFromReplica(ctx, epoch, repairEndpoint{node: worker.NodeID, epoch: worker.Epoch}, replica.SinkTask, job.TopologyDigest, summary)
-		if fetched &&
-			artifact.RecordCount == committed.RecordCount && artifact.TotalLength == committed.TotalBytes && artifact.Checksum == committed.Checksum {
+		if fetched && artifactProvesCommitted(artifact, committed) {
 			return artifact, stream, true
 		}
 	}

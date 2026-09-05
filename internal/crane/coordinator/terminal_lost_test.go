@@ -193,28 +193,19 @@ func TestTotalLossRestoresFromRetainedDeposedHolder(t *testing.T) {
 	}
 }
 
-// TestTotalLossSkipsRetainedHolderWithMismatchedChecksum pins the identity
-// guard of the retained scan: a deposed holder whose bytes no longer prove
-// the committed artifact — same count and total length, different content
-// checksum — is skipped, the scan exhausts, and the terminal lost marker
-// fires instead.
-func TestTotalLossSkipsRetainedHolderWithMismatchedChecksum(t *testing.T) {
-	h, job, sink, _, deposed, reload := deposedHolderHarness(t)
-
-	// Corrupt the deposed holder's retained copy: swap two same-length
-	// record values, so an on-demand seal derives the same count and total
-	// bytes under a different content checksum.
-	script := h.workers.script(deposed)
-	script.results.mu.Lock()
-	retained := append([]model.ResultRecord(nil), script.results.records...)
-	script.results.sealed = make(map[[32]byte]protocol.ResultArtifact)
-	script.results.sealedStream = make(map[[32]byte][]byte)
-	script.results.records = nil
-	script.results.mu.Unlock()
-	if len(retained) < 2 {
-		t.Fatalf("fixture requires two retained records: %d", len(retained))
+// corruptResultRecords turns one worker into a mismatched holder: its
+// retained records are replaced by a value-swapped same-count same-length
+// divergent set and every sealed artifact is forgotten, so an on-demand seal
+// streams a self-consistent artifact under a foreign checksum — exactly the
+// holder a restore must look past on its way to the exact copy. The exact
+// record list is supplied so holders that never retained records can be
+// corrupted too.
+func corruptResultRecords(t *testing.T, h *harness, node uint16, exact []model.ResultRecord) {
+	t.Helper()
+	if len(exact) < 2 {
+		t.Fatalf("corruption fixture requires two exact records: %d", len(exact))
 	}
-	first, second := retained[0], retained[1]
+	first, second := exact[0], exact[1]
 	rebuiltFirst, err := model.NewResultRecord(first.TupleID, first.SinkTask, first.SpecificationHash, second.Value)
 	if err != nil {
 		t.Fatalf("rebuild first record: %v", err)
@@ -223,9 +214,32 @@ func TestTotalLossSkipsRetainedHolderWithMismatchedChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rebuild second record: %v", err)
 	}
+	divergent := append([]model.ResultRecord(nil), exact...)
+	divergent[0], divergent[1] = rebuiltFirst, rebuiltSecond
+	script := h.workers.script(node)
 	script.results.mu.Lock()
-	script.results.records = []model.ResultRecord{rebuiltFirst, rebuiltSecond}
+	defer script.results.mu.Unlock()
+	script.results.records = divergent
+	script.results.sealed = make(map[[32]byte]protocol.ResultArtifact)
+	script.results.sealedStream = make(map[[32]byte][]byte)
+	script.results.partial = make(map[[32]byte][]byte)
+}
+
+// TestTotalLossSkipsRetainedHolderWithMismatchedChecksum pins the identity
+// guard of the retained scan: a deposed holder whose bytes no longer prove
+// the committed artifact — same count and total length, different content
+// checksum — is skipped, the scan exhausts, and the terminal lost marker
+// fires instead.
+func TestTotalLossSkipsRetainedHolderWithMismatchedChecksum(t *testing.T) {
+	h, job, sink, _, deposed, reload := deposedHolderHarness(t)
+	before, _ := h.job(job)
+	committed := before.Manifests[sink]
+
+	script := h.workers.script(deposed)
+	script.results.mu.Lock()
+	retained := append([]model.ResultRecord(nil), script.results.records...)
 	script.results.mu.Unlock()
+	corruptResultRecords(t, h, deposed, retained)
 
 	reload()
 
@@ -246,6 +260,202 @@ func TestTotalLossSkipsRetainedHolderWithMismatchedChecksum(t *testing.T) {
 	}
 	if got := h.log.count("propose:mark-lost"); got != 1 {
 		t.Fatalf("mark-lost proposals=%d: %v", got, h.log.snapshot())
+	}
+	_ = committed
+}
+
+// TestRestoreFallsThroughMismatchedPrimaryToExactSecondary pins the current
+// endpoint fall-through: a primary whose on-demand seal streams a
+// self-consistent artifact under a foreign checksum is a mismatched holder,
+// not proof of loss, so the restore probes the other current endpoint —
+// whose exact copy re-establishes the partition without any lost marker.
+func TestRestoreFallsThroughMismatchedPrimaryToExactSecondary(t *testing.T) {
+	h, job, topology, assignment := terminalHarness(t, 1)
+	h.seedWorker(4, model.WorkerEpoch{4}, 8)
+	h.addWorkerMember(4, model.WorkerEpoch{4}, 8)
+	replica := assignment.ResultReplicas[0]
+	records := terminalRecords(t, job, topology, assignment, 3)
+	h.seedResultRecords(replica.PrimaryNodeID, records[replica.SinkTask]...)
+	h.seedResultRecords(replica.SecondaryNodeID, records[replica.SinkTask]...)
+	h.start()
+	h.markReady()
+	h.lead(2)
+	succeeded := waitForSucceeded(t, h, job)
+	committed := succeeded.Manifests[replica.SinkTask]
+
+	// The primary's store diverges (same count and bytes, foreign checksum)
+	// and its incarnation is replaced store-preserving: the reassigned
+	// placement keeps naming it as the probed primary while the secondary
+	// still holds the exact sealed copy.
+	corruptResultRecords(t, h, replica.PrimaryNodeID, records[replica.SinkTask])
+	view := h.machine.View()
+	workerRecord, ok := h.workerRecord(replica.PrimaryNodeID)
+	if !ok {
+		t.Fatal("primary worker record missing")
+	}
+	reincarnation := state.WorkerRecord{
+		NodeID: workerRecord.NodeID, Epoch: model.WorkerEpoch{byte(workerRecord.NodeID), 0x41}, State: workerRecord.State, Revision: workerRecord.Revision + 1, Slots: workerRecord.Slots,
+		ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint(),
+	}
+	replace, err := state.NewReplaceWorkerEpoch(testCommandID("seed-mismatch", []byte{byte(workerRecord.NodeID)}), workerRecord.Revision, workerRecord.NodeID, workerRecord.Epoch, reincarnation, affectedForWorker(view, workerRecord.NodeID, workerRecord.Epoch), view.CoordinatorEpoch)
+	if err != nil {
+		t.Fatalf("seed replace: %v", err)
+	}
+	h.raft.applySeed(t, replace)
+	h.addWorkerMember(workerRecord.NodeID, reincarnation.Epoch, reincarnation.Slots)
+	script := h.workers.script(workerRecord.NodeID)
+	h.workers.mu.Lock()
+	script.identity.WorkerEpoch = reincarnation.Epoch
+	h.workers.mu.Unlock()
+
+	restored := false
+	for index := 0; index < 80 && !restored; index++ {
+		h.rescan()
+		record, ok := h.job(job)
+		if !ok || record.Assignment == nil || len(record.NeedsReassignment) > 0 {
+			continue
+		}
+		manifest := record.Manifests[replica.SinkTask]
+		restored = manifest.ManifestRevision > committed.ManifestRevision && manifest.Replicas == record.Assignment.ResultReplicas[0] && !manifest.Lost
+	}
+	if !restored {
+		t.Fatalf("mismatched primary never fell through to the exact secondary: %v", h.log.snapshot())
+	}
+	if got := h.log.count("propose:mark-lost"); got != 0 {
+		t.Fatalf("lost marker fired despite an exact current copy: %v", h.log.snapshot())
+	}
+	if got := h.log.count(fmt.Sprintf("fetch:%d", replica.PrimaryNodeID)); got == 0 {
+		t.Fatalf("mismatched primary never answered a probe: %v", h.log.snapshot())
+	}
+	if got := h.log.count(fmt.Sprintf("fetch:%d", replica.SecondaryNodeID)); got == 0 {
+		t.Fatalf("exact secondary never served the fall-through fetch: %v", h.log.snapshot())
+	}
+}
+
+// TestRestoreScansRetainedHoldersAfterMismatchedCurrentEndpoints pins the
+// retained scan's position in the exhaustion order: when BOTH current
+// placement endpoints stream foreign checksums, the exact stranded copy on
+// the deposed holder restores the partition — still no lost marker.
+func TestRestoreScansRetainedHoldersAfterMismatchedCurrentEndpoints(t *testing.T) {
+	h, job, sink, artifact, deposed, _ := deposedHolderHarness(t)
+	before, _ := h.job(job)
+	committed := before.Manifests[sink]
+
+	// Both current endpoints diverge store-preserving and their incarnations
+	// are replaced, so the reassigned placement's probes can only meet
+	// mismatched or absent holders.
+	record, _ := h.job(job)
+	live := record.Assignment.ResultReplicas[0]
+	exact := terminalRecords(t, job, assignmentTopology(t, h, job), *record.Assignment, committed.RecordCount)[sink]
+	for _, node := range []uint16{live.PrimaryNodeID, live.SecondaryNodeID} {
+		if node == deposed {
+			t.Fatalf("fixture placed the deposed holder back: %+v", live)
+		}
+		corruptResultRecords(t, h, node, exact)
+		view := h.machine.View()
+		workerRecord, ok := h.workerRecord(node)
+		if !ok {
+			t.Fatalf("worker %d record missing", node)
+		}
+		replacement := state.WorkerRecord{
+			NodeID: workerRecord.NodeID, Epoch: model.WorkerEpoch{byte(workerRecord.NodeID), 0x51}, State: workerRecord.State, Revision: workerRecord.Revision + 1, Slots: workerRecord.Slots,
+			ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint(),
+		}
+		replace, err := state.NewReplaceWorkerEpoch(testCommandID("seed-mismatch-holders", []byte{byte(workerRecord.NodeID)}), workerRecord.Revision, workerRecord.NodeID, workerRecord.Epoch, replacement, affectedForWorker(view, workerRecord.NodeID, workerRecord.Epoch), view.CoordinatorEpoch)
+		if err != nil {
+			t.Fatalf("seed replace %d: %v", node, err)
+		}
+		h.raft.applySeed(t, replace)
+		h.addWorkerMember(workerRecord.NodeID, replacement.Epoch, replacement.Slots)
+		script := h.workers.script(workerRecord.NodeID)
+		h.workers.mu.Lock()
+		script.identity.WorkerEpoch = replacement.Epoch
+		h.workers.mu.Unlock()
+	}
+
+	restored := false
+	for index := 0; index < 80 && !restored; index++ {
+		h.rescan()
+		current, ok := h.job(job)
+		if !ok || current.Assignment == nil || len(current.NeedsReassignment) > 0 {
+			continue
+		}
+		manifest := current.Manifests[sink]
+		restored = manifest.ManifestRevision > committed.ManifestRevision && manifest.Replicas == current.Assignment.ResultReplicas[0] && !manifest.Lost
+	}
+	if !restored {
+		t.Fatalf("mismatched current endpoints never exhausted to the retained holder: %v", h.log.snapshot())
+	}
+	if got := h.log.count("propose:mark-lost"); got != 0 {
+		t.Fatalf("lost marker fired despite an exact retained copy: %v", h.log.snapshot())
+	}
+	if got := h.log.count(fmt.Sprintf("fetch:%d", deposed)); got == 0 {
+		t.Fatalf("retained scan never probed the deposed holder: %v", h.log.snapshot())
+	}
+	current, _ := h.job(job)
+	restoredPlacement := current.Assignment.ResultReplicas[0]
+	if sealedResultStream(t, h, restoredPlacement.PrimaryNodeID, artifact) == nil || sealedResultStream(t, h, restoredPlacement.SecondaryNodeID, artifact) == nil {
+		t.Fatalf("current placement holds no restored copy: %+v", restoredPlacement)
+	}
+}
+
+// TestMarkerFiresOnceWhenEveryHolderIsMismatchedOrAbsent pins the full
+// exhaustion contract: mismatched current endpoints, an absent spare, and a
+// mismatched retained holder together leave nothing that proves the
+// committed bytes, so exactly one terminal MarkManifestLost fires and the
+// committed identity is what the marker keeps.
+func TestMarkerFiresOnceWhenEveryHolderIsMismatchedOrAbsent(t *testing.T) {
+	h, job, sink, _, deposed, _ := deposedHolderHarness(t)
+	before, _ := h.job(job)
+	committed := before.Manifests[sink]
+
+	record, _ := h.job(job)
+	live := record.Assignment.ResultReplicas[0]
+	exact := terminalRecords(t, job, assignmentTopology(t, h, job), *record.Assignment, committed.RecordCount)[sink]
+	for _, node := range []uint16{live.PrimaryNodeID, live.SecondaryNodeID, deposed} {
+		corruptResultRecords(t, h, node, exact)
+	}
+	for _, node := range []uint16{live.PrimaryNodeID, live.SecondaryNodeID} {
+		view := h.machine.View()
+		workerRecord, ok := h.workerRecord(node)
+		if !ok {
+			t.Fatalf("worker %d record missing", node)
+		}
+		replacement := state.WorkerRecord{
+			NodeID: workerRecord.NodeID, Epoch: model.WorkerEpoch{byte(workerRecord.NodeID), 0x61}, State: workerRecord.State, Revision: workerRecord.Revision + 1, Slots: workerRecord.Slots,
+			ConsensusFingerprint: model.ConsensusFingerprint(), RegistryFingerprint: model.RegistryFingerprint(),
+		}
+		replace, err := state.NewReplaceWorkerEpoch(testCommandID("seed-exhaust-holders", []byte{byte(workerRecord.NodeID)}), workerRecord.Revision, workerRecord.NodeID, workerRecord.Epoch, replacement, affectedForWorker(view, workerRecord.NodeID, workerRecord.Epoch), view.CoordinatorEpoch)
+		if err != nil {
+			t.Fatalf("seed replace %d: %v", node, err)
+		}
+		h.raft.applySeed(t, replace)
+		h.addWorkerMember(workerRecord.NodeID, replacement.Epoch, replacement.Slots)
+		script := h.workers.script(workerRecord.NodeID)
+		h.workers.mu.Lock()
+		script.identity.WorkerEpoch = replacement.Epoch
+		h.workers.mu.Unlock()
+	}
+
+	marked := false
+	for index := 0; index < 80 && !marked; index++ {
+		h.rescan()
+		current, ok := h.job(job)
+		if !ok {
+			continue
+		}
+		marked = current.Manifests[sink].Lost
+	}
+	if !marked {
+		t.Fatalf("exhausted holders never produced the lost marker: %v", h.log.snapshot())
+	}
+	if got := h.log.count("propose:mark-lost"); got != 1 {
+		t.Fatalf("mark-lost proposals=%d: %v", got, h.log.snapshot())
+	}
+	current, _ := h.job(job)
+	lost := current.Manifests[sink]
+	if lost.RecordCount != committed.RecordCount || lost.TotalBytes != committed.TotalBytes || lost.Checksum != committed.Checksum || lost.Replicas != committed.Replicas {
+		t.Fatalf("lost manifest abandoned the committed identity: %#v want %#v", lost, committed)
 	}
 }
 
